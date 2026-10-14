@@ -193,7 +193,7 @@ export function serverSyncProgressView(attempt: ServerSyncAttempt, text: Text, n
     return {
         // Asset downloads have one native step, so their stage names them more precisely.
         label: staging?.label ?? (lane && current !== 'assets' ? text.activity[ACTIVITY[lane.step as Exclude<ServerSyncNativeStep, 'idle'>]] : text.progress[current]),
-        detail: staging?.detail ?? (lane ? laneDetail(attempt, lane, text) : ''),
+        detail: lane ? laneDetail(attempt, lane, text) : '',
         fraction: staging ? staging.fraction : work ? share(work) : null,
         stages,
         counters,

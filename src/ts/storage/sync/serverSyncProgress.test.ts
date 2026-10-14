@@ -107,15 +107,16 @@ describe('server sync progress view', () => {
             stages: ['downloading'], active: ['downloading'], current: 'downloading',
             lanes: laneDeltas([lane('binding', { active: true, step, itemsDone: 200, itemsTotal: 200, receivedBytes: 1024, staging })], baseline),
         }), text, 0)
+        // Phase work counts passes and rows, so the bar shows its share and never a count beside the items row.
         const validating = view({ phase: 'validate', done: 125, total: 200 })
-        expect([validating.label, validating.detail, validating.fraction]).toEqual([text.staging.validate, '125 / 200', 0.625])
+        expect([validating.label, validating.detail, validating.fraction]).toEqual([text.staging.validate, '', 0.625])
         expect(validating.counters.find(counter => counter.key === 'items')?.value).toBe('100 / 100')
         expect(validating.counters.find(counter => counter.key === 'bytes')?.value).toBe('↑ 0 B · ↓ 1.0 KiB')
         const project = view({ phase: 'project', done: 3, total: null })
-        expect([project.label, project.detail, project.fraction]).toEqual([text.staging.project, text.staging.items.replace('{0}', '3'), null])
+        expect([project.label, project.detail, project.fraction]).toEqual([text.staging.project, '', null])
         const copying = view({ phase: 'copy', done: 0, total: 0 })
-        expect([copying.label, copying.detail, copying.fraction]).toEqual([text.staging.copy, text.staging.items.replace('{0}', '0'), null])
-        expect(view({ phase: 'check', done: 4, total: 3 }).detail).toBe('3 / 3')
+        expect([copying.label, copying.detail, copying.fraction]).toEqual([text.staging.copy, '', null])
+        expect(view({ phase: 'check', done: 4, total: 3 }).fraction).toBe(1)
         const downloading = view({ phase: 'check', done: 3, total: 3 }, 'downloading')
         expect([downloading.label, downloading.detail, downloading.fraction]).toEqual([text.activity.downloading, '', null])
     })

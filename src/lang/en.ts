@@ -2292,7 +2292,7 @@ export const languageEnglish = {
             count: '{0}',
             itemsCount: '{0} items',
             activity: { enumerating: 'Counting items', preparing: 'Preparing changes on this device', downloading: 'Downloading and checking incoming data', verifying: 'Checking items on the server', uploading: 'Uploading', confirming: 'Waiting for server confirmation', staging: 'Saving received data' },
-            staging: { read: 'Reading received items', validate: 'Checking received items', project: 'Preparing received content', copy: 'Saving received content', check: 'Checking saved content', items: '{0} items' },
+            staging: { read: 'Reading received items', validate: 'Checking received items', project: 'Preparing received content', copy: 'Saving received content', check: 'Checking saved content' },
             progress: {
                 preparing: 'Comparing changes on this device and the server',
                 downloading: 'Receiving server content',

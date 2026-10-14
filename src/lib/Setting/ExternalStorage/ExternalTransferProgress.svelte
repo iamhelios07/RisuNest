@@ -57,7 +57,7 @@
         {@const title = operation.kind === 'export' ? strings.download : operation.kind === 'download' ? copy.filesDownloading : operation.kind === 'binding' ? copy.connecting : copy.syncing}
         {@const label = staging?.label ?? (done ? operation.kind === 'export' ? strings.completed : operation.kind === 'download' ? copy.downloadComplete : operation.kind === 'binding' ? copy.connectionComplete : copy.syncComplete : operation.state === 'cancelled' ? strings.cancelled : operation.state === 'failed' ? strings.failed : operation.kind === 'export' ? strings.download : operation.kind === 'download' ? copy.filesDownloading : copy[operation.stage])}
         {@const exported = operation.exported}
-        {@const detail = staging?.detail ?? (exported ? `${bytes(Number(exported.completedBytes))}${exported.totalBytes ? ` / ${bytes(Number(exported.totalBytes))}` : ''}` : stopped || done || title === label ? '' : title)}
+        {@const detail = exported ? `${bytes(Number(exported.completedBytes))}${exported.totalBytes ? ` / ${bytes(Number(exported.totalBytes))}` : ''}` : stopped || done || title === label ? '' : title}
         <div data-external-progress={operation.kind}>
             <TransferProgress {label} {detail} {done} {stopped}
                 fraction={staging ? staging.fraction : done ? 1 : exported && Number(exported.totalBytes) > 0 ? Number(exported.completedBytes) / Number(exported.totalBytes) : operation.kind === 'download' && operation.totalItems ? (operation.completedItems ?? 0) / operation.totalItems : null}

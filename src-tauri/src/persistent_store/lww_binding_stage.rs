@@ -47,14 +47,10 @@ impl<'a> StagingObserver<'a> {
     }
     fn advance(&mut self) -> StoreResult<()> {
         self.progress.done += 1;
-        if self.progress.total == Some(self.progress.done)
-            || (self.progress.done % 128 == 0 && self.updated.elapsed() >= std::time::Duration::from_millis(100)) {
-            self.flush()?;
-        }
-        Ok(())
+        if self.progress.total == Some(self.progress.done) { self.flush() } else { self.poll() }
     }
     fn poll(&mut self) -> StoreResult<()> {
-        if self.updated.elapsed() >= std::time::Duration::from_millis(100) { self.flush()?; }
+        if self.updated.elapsed() >= report_interval() { self.flush()?; }
         Ok(())
     }
     fn flush(&mut self) -> StoreResult<()> {
@@ -63,6 +59,12 @@ impl<'a> StagingObserver<'a> {
         Ok(())
     }
 }
+
+const STAGING_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(not(test))]
+fn report_interval() -> std::time::Duration { STAGING_REPORT_INTERVAL }
+#[cfg(test)]
+fn report_interval() -> std::time::Duration { REPORT_INTERVAL.with(std::cell::Cell::get) }
 
 struct HashWriter(Sha256, #[cfg(test)] &'static str);
 impl Write for HashWriter {
@@ -258,7 +260,9 @@ impl PersistentStore {
         })?;
         progress.flush()?;
         let count = progress.progress.done;
-        progress.begin("check", Some(count))?;
+        // Each phase reports one bar: validate hashes and then checks every unit, project applies
+        // three passes and hashes their statuses, and copy and check cover every copied row.
+        progress.begin("validate", Some(count * 2))?;
         let digest = source_digest_rows_observed(&changes, &mut || progress.advance())?;
         let existing: Option<(String,String,String,String,String)> = self.connection.query_row(
             "SELECT staging_id,authority,inspection_id,source_digest,admitted_upper_ms FROM lww_binding_sources WHERE request_id=?1",
@@ -284,7 +288,6 @@ impl PersistentStore {
             let mut isolated = crate::sqlite_open::open(&path)?;
             schema::initialize(&mut isolated)?;
             isolated.execute_batch("INSERT INTO meta VALUES('activeGeneration','\"incoming\"'),('currentRevision','0'); INSERT INTO root VALUES('incoming','{}');")?;
-            progress.begin("validate", Some(count))?;
             let controls = isolated.transaction_with_behavior(TransactionBehavior::Immediate)?;
             changes.visit(false, |key, stamp, value, _| {
                 let change = Change { key, stamp: stamp.ok_or_else(|| error("request-id-integrity"))?, value };
@@ -293,11 +296,9 @@ impl PersistentStore {
                 progress.advance()
             })?;
             controls.commit()?;
-            progress.begin("project", Some(count * 3))?;
+            progress.begin("project", Some(count * 4))?;
             project_source(&mut isolated, &changes, &header.request_id, &mut progress)?;
-            progress.begin("check", None)?;
             let statuses = stored_status_digest_observed(&isolated, "incoming", &mut || progress.advance())?;
-            progress.flush()?;
             isolated.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
             drop(isolated);
             let id = format!("staging-{}", uuid::Uuid::new_v4());
@@ -305,14 +306,16 @@ impl PersistentStore {
             let copied = (|| -> StoreResult<()> {
                 let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 super::commit::begin_generation(&tx, &id)?;
-                progress.begin("copy", None)?;
+                let mut rows = 0;
+                for &(table, _) in GENERATION_TABLES {
+                    rows += tx.query_row(&format!("SELECT count(*) FROM binding_incoming.{table} WHERE generation='incoming'"), [], |row| row.get::<_,i64>(0))? as u64;
+                }
+                progress.begin("copy", Some(rows))?;
                 for &(table, _) in GENERATION_TABLES {
                     copy_binding_table_observed(&tx, table, &id, &mut || progress.advance())?;
                 }
-                progress.flush()?;
-                progress.begin("check", None)?;
+                progress.begin("check", Some(rows))?;
                 let catalog_digest = catalog_digest_observed(&tx, &id, &mut || progress.advance())?;
-                progress.flush()?;
                 tx.execute("INSERT INTO lww_binding_sources VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![header.request_id,id,header.binding_authority.0.to_string(),inspection_id,digest,admitted_upper_ms.0.to_string(),statuses,catalog_digest])?;
                 tx.execute("INSERT INTO lww_binding_source_units SELECT ?1,key,stamp,value,status FROM binding_incoming.lww_binding_source_units WHERE staging_id='incoming'", [&id])?;
                 tx.execute("INSERT INTO lww_binding_stages VALUES(?1,?2,?3,?4,NULL,?5)", params![id,inspection_id,header.request_id,digest,catalog_digest])?;
@@ -326,8 +329,8 @@ impl PersistentStore {
         };
         #[cfg(test)]
         if FAIL_AFTER_STAGE_COPY.with(|fail| fail.replace(false)) { return Err(error("synthetic-after-binding-copy")); }
+        // The stage is durable here, so a cancellation must not turn it into a failure.
         self.prepare_replace_commit(&staging_id, None)?;
-        progress.flush()?;
         Ok(BindingUnitStage { staging_id, source_digest: digest })
     }
 }
@@ -380,9 +383,8 @@ fn project_source(db: &mut Connection, changes: &super::FrozenRows, version: &st
         tx.execute("INSERT INTO lww_binding_source_units VALUES('incoming',?1,?2,?3,?4)", params![key.as_str(),serde_json::to_string(&stamp.ok_or_else(|| error("request-id-integrity"))?)?,serde_json::to_string(&value)?,status])?;
         progress.advance()
     })?;
-    progress.begin("check", None)?;
-    affected.refresh_orders_observed(&tx, "incoming", &mut || progress.advance())?;
-    progress.flush()?;
+    // Order scopes are known only after this pass, so it reports time rather than work.
+    affected.refresh_orders_observed(&tx, "incoming", &mut || progress.poll())?;
     tx.commit()?;
     Ok(())
 }
@@ -543,6 +545,8 @@ fn validate_binding_source_rows_observed(db: &Connection, staging_id: &str, head
 thread_local! { static FAIL_AFTER_STAGE_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 thread_local! { static STAGE_SCRATCH: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { static REPORT_INTERVAL: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(STAGING_REPORT_INTERVAL) }; }
 
 pub(in crate::persistent_store) fn seed_binding_holds(tx: &Transaction<'_>, staging_id: &str, header: &Header) -> StoreResult<()> {
     tx.execute("INSERT INTO lww_receive_rows(request_id,key,stamp,value,status) SELECT ?2,key,stamp,value,'held' FROM lww_binding_source_units WHERE staging_id=?1 AND status='held'", params![staging_id,header.request_id])?;

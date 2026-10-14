@@ -249,34 +249,25 @@ fn crash_after_atomic_copy_retains_exact_receipt_before_caller_registration() {
 }
 
 #[test]
-fn final_observer_cancellation_retains_committed_stage_for_retry_and_activation() {
+fn cancellation_after_the_stage_commits_returns_the_committed_stage() {
     let dir = tempfile::tempdir().unwrap(); let mut store = PersistentStore::open(dir.path()).unwrap();
     let (header, inspection) = context(&store);
     let incoming = vec![change(&["root","language"], json!("remote"))];
-    let generation = active_generation(&store.connection).unwrap();
-    let original = catalog(&store, &generation);
     let path: String = store.connection.query_row("SELECT file FROM pragma_database_list WHERE name='main'", [], |row| row.get(0)).unwrap();
     let reader = crate::sqlite_open::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let failed = store.lww_stage_binding_units_observed(&header, &inspection, &incoming, 7.into(), |_| {
+    let stage = store.lww_stage_binding_units_observed(&header, &inspection, &incoming, 7.into(), |_| {
         let committed: bool = reader.query_row("SELECT EXISTS(SELECT 1 FROM lww_binding_sources WHERE request_id=?1)", [&header.request_id], |row| row.get(0))?;
         if committed { return Err(error("synthetic-observer-after-commit")); }
         Ok(())
-    });
-    assert!(failed.unwrap_err().to_string().contains("synthetic-observer-after-commit"));
+    }).unwrap();
     drop(reader);
-    assert_eq!(active_generation(&store.connection).unwrap(), generation);
-    assert_eq!(store.revision().unwrap(), 0);
-    assert_eq!(catalog(&store, &generation), original);
     let frozen = store.connection.query_row("SELECT staging_id,source_digest FROM lww_binding_sources WHERE request_id=?1", [&header.request_id], |row| {
         Ok(BindingUnitStage { staging_id: row.get(0)?, source_digest: row.get(1)? })
     }).unwrap();
-    assert_eq!(catalog(&store, &frozen.staging_id)["language"], "remote");
-    drop(store); let mut store = PersistentStore::open(dir.path()).unwrap();
-    let stage = store.lww_stage_binding_units_observed(&header, &inspection, &incoming, 7.into(), |_| Ok(())).unwrap();
     assert_eq!(stage, frozen);
     activate(&mut store, &header, &inspection, &stage);
-    assert_eq!(active_generation(&store.connection).unwrap(), frozen.staging_id);
-    assert_eq!(catalog(&store, &frozen.staging_id)["language"], "remote");
+    assert_eq!(active_generation(&store.connection).unwrap(), stage.staging_id);
+    assert_eq!(catalog(&store, &stage.staging_id)["language"], "remote");
     assert_eq!(store.revision().unwrap(), 1);
 }
 
@@ -724,14 +715,20 @@ fn observed_binding_reports_stored_work_and_cancellation_retries_without_partial
     ).collect::<Vec<_>>();
     let expected = (0..129).map(|index| (format!("synthetic-{index:03}"), json!(index)))
         .collect::<serde_json::Map<String, Value>>();
-    for phase in ["validate", "project", "copy"] {
+    struct RestoreInterval(std::time::Duration);
+    impl Drop for RestoreInterval { fn drop(&mut self) { REPORT_INTERVAL.with(|interval| interval.set(self.0)); } }
+    let _restore = RestoreInterval(REPORT_INTERVAL.with(|interval| interval.replace(std::time::Duration::ZERO)));
+    for phase in ["validate", "project", "copy", "check"] {
+        let mut cancelled_at = None;
         let failed = store.lww_stage_binding_units_observed(&header, &inspection, &incoming, 7.into(), |progress| {
-            if progress.phase == phase && (phase != "copy" || progress.done > 0) {
+            if progress.phase == phase && progress.done > 0 {
+                cancelled_at = Some(progress.done);
                 return Err(error("synthetic-observer-cancelled"));
             }
             Ok(())
         });
         assert!(failed.unwrap_err().to_string().contains("synthetic-observer-cancelled"));
+        assert_eq!(cancelled_at, Some(1), "{phase}");
         for &(table, _) in GENERATION_TABLES {
             assert_eq!(store.connection.query_row(&format!("SELECT count(*) FROM {table} WHERE generation LIKE 'staging-%'"), [], |row| row.get::<_,i64>(0)).unwrap(), 0, "{phase}: {table}");
         }
@@ -748,16 +745,19 @@ fn observed_binding_reports_stored_work_and_cancellation_retries_without_partial
         Ok(())
     }).unwrap();
     let count = incoming.len() as u64;
-    assert!(observed.iter().any(|progress| progress.phase == "read" && progress.done == count && progress.total.is_none()));
-    assert!(observed.iter().any(|progress| progress.phase == "validate" && progress.done == count && progress.total == Some(count)));
-    assert!(observed.iter().any(|progress| progress.phase == "check" && progress.done == count && progress.total == Some(count)));
-    assert!(observed.iter().any(|progress| progress.phase == "project" && progress.done > 0 && progress.total == Some(progress.done)));
-    assert!(observed.iter().all(|progress| progress.total.is_none_or(|total| progress.done <= total)));
     let copied: u64 = GENERATION_TABLES.iter().map(|(table, _)| {
         store.connection.query_row(&format!("SELECT count(*) FROM {table} WHERE generation=?1"), [&stage.staging_id], |row| row.get::<_,i64>(0)).unwrap() as u64
     }).sum();
     assert!(copied > 0);
-    assert_eq!(observed.iter().rev().find(|progress| progress.phase == "copy").unwrap().done, copied);
+    // Each phase is one bar with a fixed total that fills without restarting.
+    let mut phases = observed.iter().map(|progress| (progress.phase, progress.total)).collect::<Vec<_>>();
+    phases.dedup();
+    assert_eq!(phases, [("read", None), ("validate", Some(count * 2)), ("project", Some(count * 4)), ("copy", Some(copied)), ("check", Some(copied))]);
+    assert!(observed.windows(2).all(|pair| pair[0].phase != pair[1].phase || pair[0].done <= pair[1].done));
+    assert!(observed.iter().any(|progress| progress.phase == "read" && progress.done == count));
+    for (phase, total) in &phases[1..] {
+        assert_eq!(Some(observed.iter().rev().find(|progress| progress.phase == *phase).unwrap().done), *total, "{phase}");
+    }
     assert_eq!(catalog(&store, &stage.staging_id)["explicitGlobalChatVariables"], json!(expected));
     assert_eq!(active_generation(&store.connection).unwrap(), generation);
     assert_eq!(store.lww_stage_binding_units(&header, &inspection, &incoming, 7.into()).unwrap(), stage);

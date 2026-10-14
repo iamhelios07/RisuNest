@@ -34,9 +34,14 @@ an axis. An explicit character order is
 always present, so the unit count can differ from the sum of fixture records.
 
 Each `staging_measurement` JSON line contains input counts, elapsed milliseconds,
-and phase observations with elapsed time and actual work counts. Phase work can
-include several passes over the same records; it is not the transfer item count
-or an overall completion percentage. Unknown totals remain null.
+and phase observations with elapsed time and actual work counts. Phases run in
+the order `read`, `validate`, `project`, `copy`, `check`. With N received units,
+`validate` covers 2N steps (source hash and checks), `project` covers 4N (three
+projection passes and the status hash; order refresh is timed but not counted),
+and `copy` and `check` each cover the rows copied into the stage. `read` has a
+null total. A retried request that reuses an existing stage leaves `validate`
+after the source hash and reports one `check` phase with a null total. Phase
+work is not the transfer item count or an overall completion percentage.
 
 For shorter compilation during investigation, the build accepts
 `--config 'profile.release.package.risunest.opt-level=1'`. Use identical compiler
