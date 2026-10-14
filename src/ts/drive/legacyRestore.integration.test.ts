@@ -128,20 +128,37 @@ describe('legacy WebView restore integrity', () => {
     })
 
     it.each([
-        ['http', 'backup-key-request-failed'],
-        ['network', 'backup-key-request-failed'],
-        ['json', 'backup-key-invalid'],
-        ['missing-key', 'backup-key-invalid'],
-        ['empty-key', 'backup-key-invalid'],
-        ['wrong-key', 'backup-decryption-failed'],
-    ])('classifies %s failures without replacing the library or publishing attachments', async (failure, code) => {
-        vi.stubGlobal('fetch', async () => {
-            if (failure === 'network') throw new TypeError('Failed to fetch')
-            if (failure === 'http') return new Response('Forbidden', { status: 403 })
+        ['network', 'backup-key-request-failed', /DNS lookup failed/],
+        ['plugin', 'backup-key-request-failed', /Synthetic HTTP plugin failure/],
+        ['json', 'backup-key-invalid', /JSON/],
+        ['missing-key', 'backup-key-invalid', /no valid backup key/],
+        ['empty-key', 'backup-key-invalid', /no valid backup key/],
+        ['wrong-key', 'backup-decryption-failed', /operation-specific reason/],
+    ] as const)('classifies %s failures and preserves their details without replacing the library or publishing attachments', async (failure, code, detail) => {
+        state.native = failure === 'plugin'
+        const failRequest: typeof fetch = async () => {
+            if (failure === 'network') throw new TypeError('DNS lookup failed')
+            if (failure === 'plugin') throw 'Synthetic HTTP plugin failure'
             if (failure === 'json') return new Response('not JSON')
             return new Response(JSON.stringify(failure === 'missing-key' ? {} : { key: failure === 'empty-key' ? '' : 'wrong-key' }))
+        }
+        vi.stubGlobal('fetch', failRequest)
+        state.nativeFetch.mockImplementation(failRequest)
+        await expect(restore(encryptedArchive())).rejects.toMatchObject({ code, message: expect.stringMatching(detail) })
+        expect(state.replace).not.toHaveBeenCalled()
+        expect(state.blobs.size).toBe(0)
+    })
+
+    it.each([
+        [false, 403], [true, 403], [false, 503], [true, 503],
+    ] as const)('distinguishes HTTP rejection from connectivity failure, native=%s status=%s', async (native, status) => {
+        state.native = native
+        const rejectRequest: typeof fetch = async () => new Response('Request rejected', { status })
+        vi.stubGlobal('fetch', rejectRequest)
+        state.nativeFetch.mockImplementation(rejectRequest)
+        await expect(restore(encryptedArchive())).rejects.toMatchObject({
+            code: 'backup-key-http-error', message: expect.stringContaining(`HTTP ${status}`),
         })
-        await expect(restore(encryptedArchive())).rejects.toMatchObject({ code })
         expect(state.replace).not.toHaveBeenCalled()
         expect(state.blobs.size).toBe(0)
     })
@@ -177,7 +194,17 @@ describe('legacy WebView restore integrity', () => {
 
     it('classifies an undecodable database separately from account decryption', async () => {
         await expect(restore(backupEntry('database.risudat', Uint8Array.of(7, 7, 7, 7))))
-            .rejects.toMatchObject({ code: 'backup-database-invalid' })
+            .rejects.toMatchObject({ code: 'backup-database-invalid', message: expect.stringContaining('invalid block type') })
+        expect(state.replace).not.toHaveBeenCalled()
+    })
+
+    it('preserves the parse error for malformed encryption metadata', async () => {
+        const invalid = '{"type":'
+        let detail = ''
+        try { JSON.parse(invalid) } catch (error) { detail = (error as Error).message }
+        await expect(restore(backupArchive(
+            backupEntry('encryption.risudat', new TextEncoder().encode(invalid)), databaseEntry(),
+        ))).rejects.toMatchObject({ code: 'backup-encryption-invalid', message: expect.stringContaining(detail) })
         expect(state.replace).not.toHaveBeenCalled()
     })
 

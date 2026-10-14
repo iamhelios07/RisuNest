@@ -47,6 +47,11 @@ type LegacyLocalBackupFallbackContext = Pick<SharedNativeFileOperationContext,
 
 const NATIVE_BACKUP_READ_BYTES = 1024 * 1024
 
+function backupFailure(code: string, message: string, error: unknown): NativeFileJobError {
+    const detail = error instanceof Error ? error.message : String(error)
+    return new NativeFileJobError(code, detail ? `${message}: ${detail}` : message)
+}
+
 async function getAccountBackupKey(time: number, signal?: AbortSignal): Promise<string> {
     signal?.throwIfAborted()
     let response: Response
@@ -56,21 +61,21 @@ async function getAccountBackupKey(time: number, signal?: AbortSignal): Promise<
         response = isTauri
             ? await nativeFetch(url, { headers: { 'Sec-Fetch-Site': 'same-site' }, signal })
             : await fetch(url, { signal })
-    } catch {
+    } catch (error) {
         signal?.throwIfAborted()
-        throw new NativeFileJobError('backup-key-request-failed', 'Could not request the account backup key')
+        throw backupFailure('backup-key-request-failed', 'Could not request the account backup key', error)
     }
     if (!response.ok) {
         await response.body?.cancel().catch(() => {})
         signal?.throwIfAborted()
-        throw new NativeFileJobError('backup-key-request-failed', `Account backup key request failed (HTTP ${response.status})`)
+        throw new NativeFileJobError('backup-key-http-error', `Account backup key request failed (HTTP ${response.status})`)
     }
     let data: unknown
     try {
         data = await response.json()
-    } catch {
+    } catch (error) {
         signal?.throwIfAborted()
-        throw new NativeFileJobError('backup-key-invalid', 'The account server returned an invalid backup key response')
+        throw backupFailure('backup-key-invalid', 'The account server returned an invalid backup key response', error)
     }
     signal?.throwIfAborted()
     if (!data || typeof data !== 'object' || !('key' in data) || typeof data.key !== 'string' || data.key.trim().length === 0) {
@@ -582,8 +587,8 @@ async function importLegacyBackupFile(
                         } else if (meta?.type !== 'none') {
                             throw new Error('Invalid encryption metadata')
                         }
-                    } catch {
-                        throw new NativeFileJobError('backup-encryption-invalid', 'The backup has invalid encryption metadata')
+                    } catch (error) {
+                        throw backupFailure('backup-encryption-invalid', 'The backup has invalid encryption metadata', error)
                     }
                 } else if (name === 'database.risudat') {
                     if (pendingDatabase) throw new NativeFileJobError('invalid-source', 'Duplicate database entry')
@@ -616,18 +621,18 @@ async function importLegacyBackupFile(
                 const decrypted = await decryptBuffer(db, key)
                 db = new Uint8Array(decrypted)
             }
-            catch {
+            catch (error) {
                 checkCancelled()
-                throw new NativeFileJobError('backup-decryption-failed', 'Could not decrypt the account backup database')
+                throw backupFailure('backup-decryption-failed', 'Could not decrypt the account backup database', error)
             }
         }
         checkCancelled()
         let decoded: Awaited<ReturnType<typeof decodeRisuSave>>
         try {
             decoded = await decodeRisuSave(db)
-        } catch {
+        } catch (error) {
             checkCancelled()
-            throw new NativeFileJobError('backup-database-invalid', 'Could not decode the backup database')
+            throw backupFailure('backup-database-invalid', 'Could not decode the backup database', error)
         }
         const dbData = prepareExternalDatabaseImport(decoded)
         counts.characters = dbData.characters?.length ?? 0

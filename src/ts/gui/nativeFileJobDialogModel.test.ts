@@ -867,6 +867,7 @@ describe('nativeFileJobDialogModel', () => {
     it.each([
         ['backup-encryption-invalid', 'reasonBackupEncryptionInvalid'],
         ['backup-key-request-failed', 'reasonBackupKeyRequest'],
+        ['backup-key-http-error', 'reasonBackupKeyHttp'],
         ['backup-key-invalid', 'reasonBackupKeyInvalid'],
         ['backup-decryption-failed', 'reasonBackupDecryption'],
         ['backup-database-invalid', 'reasonBackupDatabase'],

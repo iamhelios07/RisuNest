@@ -555,6 +555,8 @@ export function failureReason(code: string, direction: 'import' | 'export' = 'im
             return copy.reasonBackupEncryptionInvalid
         case 'backup-key-request-failed':
             return copy.reasonBackupKeyRequest
+        case 'backup-key-http-error':
+            return copy.reasonBackupKeyHttp
         case 'backup-key-invalid':
             return copy.reasonBackupKeyInvalid
         case 'backup-decryption-failed':
