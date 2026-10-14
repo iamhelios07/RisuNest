@@ -116,11 +116,24 @@ describe('common backup file production route', () => {
     })
     it('materializes confirmed upstream Android source after format probe',async()=>{
         m.invoke.mockResolvedValue('local-backup')
-        m.materializeAndroid.mockImplementation(async()=>{
+        const bridge = {
+            copyExport() {},
+            materializeBackupSource(_token: string, report?: (progress: { copiedBytes: number; totalBytes: number | null }) => void) {
+                report?.({ copiedBytes: 4 * 1024 ** 3, totalBytes: 8 * 1024 ** 3 })
+                return JSON.stringify({ ready: [{ token: 'synthetic-materialized' }], failures: [] })
+            },
+        }
+        const { materializeAndroidBackupSource } = await vi.importActual<typeof import('./androidSafBridge')>('./androidSafBridge')
+        m.materializeAndroid.mockImplementation(async(token, options)=>{
             expect(m.invoke).toHaveBeenCalledWith('native_backup_source_format',{source:{type:'androidSeekable',token:'synthetic-custody'}})
-            return {type:'androidSpool',token:'synthetic-materialized'}
+            return materializeAndroidBackupSource(token, options, bridge)
         })
         await restoreBackupFromNativeSource({type:'androidSeekable',token:'synthetic-custody'})
+        expect(m.status).toHaveBeenCalledWith(expect.objectContaining({
+            detail: expect.objectContaining({
+                stage: 'copying-source', stageUnit: 'bytes', stageCompleted: 4 * 1024 ** 3, stageTotal: 8 * 1024 ** 3,
+            }),
+        }))
         expect(m.legacy.mock.calls[0][1]).toEqual({type:'androidSpool',token:'synthetic-materialized'})
         expect(m.discard).toHaveBeenCalledWith('synthetic-materialized')
     })

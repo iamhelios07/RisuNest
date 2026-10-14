@@ -228,7 +228,17 @@ export async function restoreBackupFromNativeSource(
                 >('native_backup_source_format', { source: input })
                 checkSignal(joined.signal)
                 if (format !== 'portable') {
-                    if (input.type === 'androidSeekable') input = await materializeAndroidBackupSource(input.token)
+                    if (input.type === 'androidSeekable') input = await materializeAndroidBackupSource(input.token, {
+                        signal: joined.signal,
+                        onProgress: progress => onStatus(syntheticNativeFileJobStatus(
+                            { jobId: progress.requestId, kind: format === 'local-backup' ? 'restore-legacy-local-backup' : 'restore-block-risu-save' },
+                            'copying-source',
+                            {
+                                stageUnit: 'bytes', stageCompleted: progress.copiedBytes,
+                                ...(progress.totalBytes === null ? {} : { stageTotal: progress.totalBytes }),
+                            },
+                        )),
+                    })
                     else if (input.type === 'iosScoped') {
                         const materialized = await materializeIOSBackupSource(input.token)
                         materializedIOSPath = materialized.path
