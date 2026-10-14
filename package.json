@@ -65,6 +65,7 @@
     "android:build:release:aab": "node scripts/prepareAndroidGenerated.mjs aarch64 && tauri android build --aab --target aarch64 --ci -- --locked",
     "ios:init:agent": "tauri ios init --ci --skip-targets-install --config src-tauri/tauri.agent.conf.json",
     "ios:build:simulator:agent": "tauri ios build --ci --target aarch64-sim --no-sign --config src-tauri/tauri.agent.conf.json",
+    "ios:test:portable-source": "node scripts/testIOSPortableSourceContracts.mjs",
     "benchmark:vitest": "vitest bench --config vitest.benchmark.config.ts --run --pool=forks --maxWorkers=1 --no-file-parallelism",
     "benchmark:phase1": "pnpm benchmark:vitest src/ts/process/phase1Algorithms.bench.ts",
     "benchmark:streaming:display": "pnpm benchmark:vitest src/ts/process/streamingDisplayReplay.bench.ts",
