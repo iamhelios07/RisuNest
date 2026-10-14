@@ -305,14 +305,35 @@ struct ArchivePayloadMetadata {
     message_count: i64,
 }
 
+struct ArchiveSizeWriter<W> {
+    inner: W,
+    bytes: u64,
+    limit: u64,
+}
+
+impl<W: Write> Write for ArchiveSizeWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > self.limit.saturating_sub(self.bytes) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                "archived character exceeds the decoded size limit"));
+        }
+        let written = self.inner.write(bytes)?;
+        self.bytes += written as u64;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+}
+
 fn write_payload_to(
     connection: &Connection,
     generation: &str,
     character_id: &str,
-    mut writer: impl Write,
+    writer: impl Write,
     is_cancelled: &dyn Fn() -> bool,
     shared: bool,
+    max_decoded_bytes: u64,
 ) -> StoreResult<ArchivePayloadMetadata> {
+    let mut writer = ArchiveSizeWriter { inner: writer, bytes: 0, limit: max_decoded_bytes };
     ensure_not_cancelled(is_cancelled)?;
     let row: Option<(String, String, Option<String>)> = connection
         .query_row(
@@ -940,6 +961,20 @@ pub(super) fn archive_character_with_cancellation_lww(
     is_cancelled: &dyn Fn() -> bool,
     context: Option<&super::lww::ArchiveContext<'_>>,
 ) -> StoreResult<RevisionResult> {
+    archive_character_with_limit(connection, cas, character_id, expected_revision, now_ms,
+        is_cancelled, context, MAX_DECODED_ARCHIVE_BYTES)
+}
+
+pub(super) fn archive_character_with_limit(
+    connection: &mut Connection,
+    cas: &PayloadCas,
+    character_id: &str,
+    expected_revision: i64,
+    now_ms: i64,
+    is_cancelled: &dyn Fn() -> bool,
+    context: Option<&super::lww::ArchiveContext<'_>>,
+    max_decoded_bytes: u64,
+) -> StoreResult<RevisionResult> {
     if let Some(result)=super::lww::archive_request_result(connection,context)?{return Ok(result);}
     ensure_not_cancelled(is_cancelled)?;
     if now_ms < 0 {
@@ -973,6 +1008,7 @@ pub(super) fn archive_character_with_cancellation_lww(
             &mut encoder,
             is_cancelled,
             false,
+            max_decoded_bytes,
         )?;
         encoder.finish()?;
         metadata
@@ -990,7 +1026,7 @@ pub(super) fn archive_character_with_cancellation_lww(
         now_ms,
     )?;
     let shared_object_hash=if let Some(incoming)=context.and_then(|c|c.incoming){super::lww::archive_metadata(connection,&incoming.value)?.object_hash}else{
-        let mut shared=cas.create_ipc_staging_file()?;let mut encoder=GzEncoder::new(CancellationAwareIo::new(shared.as_file_mut(),is_cancelled),Compression::default());write_payload_to(connection,&generation,character_id,&mut encoder,is_cancelled,true)?;encoder.finish()?;shared.as_file_mut().seek(SeekFrom::Start(0))?;let object=cas.prepare_reader(&mut CancellationAwareIo::new(shared.as_file_mut(),is_cancelled))?;
+        let mut shared=cas.create_ipc_staging_file()?;let mut encoder=GzEncoder::new(CancellationAwareIo::new(shared.as_file_mut(),is_cancelled),Compression::default());write_payload_to(connection,&generation,character_id,&mut encoder,is_cancelled,true,max_decoded_bytes)?;encoder.finish()?;shared.as_file_mut().seek(SeekFrom::Start(0))?;let object=cas.prepare_reader(&mut CancellationAwareIo::new(shared.as_file_mut(),is_cancelled))?;
         super::AssetObjectCatalog::new(connection).register(&[super::asset_object_catalog::AssetObjectRegistration{object_hash:object.content_hash.clone(),byte_size:object.byte_size}],now_ms)?;object.content_hash
     };
     let archived = ArchivedObject {
