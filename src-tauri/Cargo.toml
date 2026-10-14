@@ -178,3 +178,5 @@ tauri-plugin-updater = { path = "../crates/tauri-plugin-updater" }
 tauri-plugin-window-state = { path = "../crates/tauri-plugin-window-state" }
 # Accept a string request body as text instead of a JSON number array.
 tauri-plugin-http = { path = "../crates/tauri-plugin-http" }
+# Key each launch profile's single instance separately on every desktop platform.
+tauri-plugin-single-instance = { path = "../crates/tauri-plugin-single-instance" }
