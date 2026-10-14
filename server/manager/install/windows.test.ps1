@@ -430,6 +430,17 @@ FunctionEnd
                 if (!(Test-Path $unowned) -or !(Test-Path (Join-Path $data 'metadata.sqlite'))) { throw 'Forced removal deleted unowned files or unregistered data.' }
                 Write-Output 'Generated Sync forced removal preserves unowned files and unregistered data.'
                 Remove-Item -LiteralPath $unowned
+                # Data deletion runs right after the installer guard is released, and the manager alone
+                # decides which GUI profiles go. The template's own profile folder must survive.
+                Run-Installer $syncFixture @('/S', '/NS', "/D=$syncInstall") 0
+                $appProfile = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "test.risunest.$fixtureName"
+                New-Item -ItemType Directory -Path $appProfile | Out-Null
+                'synthetic profile' | Set-Content (Join-Path $appProfile 'keep.txt')
+                Run-Installer (Join-Path $syncInstall 'uninstall.exe') @('/S', '/DELETEAPPDATA', "_?=$syncInstall") 0
+                if (Test-Path $oldManager) { throw 'Removal with data deletion left program files.' }
+                if (Test-Path $data) { throw 'Removal with data deletion kept the registered server data.' }
+                if (!(Test-Path (Join-Path $appProfile 'keep.txt'))) { throw 'Sync removal deleted a profile folder the manager did not choose.' }
+                Write-Output 'Generated Sync removal deletes registered data and leaves profile decisions to the manager.'
                 foreach ($removalMode in @('normal', 'force')) {
                     if (!(Test-Path $data)) {
                         $seedServer = Join-Path $released 'risunest-sync-server.exe'
@@ -464,6 +475,7 @@ FunctionEnd
                     & $oldManager --data-dir $data --server $server installer forget-removal | Out-Null
                 }
                 $env:LOCALAPPDATA = $priorLocal
+                if ($appProfile -and (Test-Path -LiteralPath $appProfile)) { Remove-Item -LiteralPath $appProfile -Recurse -Force }
             }
         }
     } finally {

@@ -1019,8 +1019,10 @@ Section Uninstall
     DeleteRegKey /ifempty HKCU "${MANUKEY}"
 
     SetShellVarContext current
-    RmDir /r "$APPDATA\${BUNDLEID}"
-    RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
+    !ifndef RISUNEST_HOOK_OWNS_APP_DATA
+      RmDir /r "$APPDATA\${BUNDLEID}"
+      RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
+    !endif
   ${EndIf}
 
   !ifmacrodef NSIS_HOOK_POSTUNINSTALL

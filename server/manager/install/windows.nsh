@@ -79,6 +79,8 @@ LangString SyncFilesFailed 1042 "RisuNest Sync 프로그램 파일을 모두 제
 !ifndef RISUNEST_SYNC_INSTALL_DIR
   !define RISUNEST_SYNC_INSTALL_DIR "$LOCALAPPDATA\RisuNestSync"
 !endif
+; installer delete-data removes the GUI profile unless another registered instance shares it.
+!define RISUNEST_HOOK_OWNS_APP_DATA
 
 Var SyncFailureMessage
 Var SyncForce
