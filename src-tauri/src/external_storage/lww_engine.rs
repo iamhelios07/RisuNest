@@ -2001,7 +2001,7 @@ impl ExternalLwwEngine {
         self.provider.progress_stage("applying");
         let mut source_failure = None;
         let mut cancellation_failure = None;
-        let mut report_staging = super::progress::staging_reporter();
+        let report_staging = super::progress::staging_reporter();
         let stage = store
             .lww_stage_binding_units_stream_observed(
                 header,
@@ -2023,7 +2023,7 @@ impl ExternalLwwEngine {
                         cancellation_failure = Some(error);
                         return Err(crate::persistent_store::StoreError::Validation { message: "Binding staging cancelled".into() });
                     }
-                    report_staging(progress);
+                    report_staging(Some(progress));
                     Ok(())
                 },
             )

@@ -11,6 +11,7 @@ use super::{
 use crate::persistent_store::{
     commands::PersistentStoreState,
     external_apply::{ExternalSnapshotApplication, ExternalSnapshotObject, ExternalSnapshotRecord},
+    lww::StagingProgress,
     PersistentStore, StoreError,
 };
 use crate::native_log::logged;
@@ -518,6 +519,7 @@ pub(crate) async fn run_restore<R: Runtime>(
     let worker_app = app.clone();
     let worker_job = job.clone();
     let worker_cancel = cancel.clone();
+    let report_staging = observation.staging_reporter();
     let prepared = spawn_blocking(move || {
         prepare_local_restore(
             &worker_app,
@@ -531,6 +533,7 @@ pub(crate) async fn run_restore<R: Runtime>(
             database.sources,
             database.present,
             permit,
+            &report_staging,
         )
     })
     .await.map_err(runtime::local_error)?;
@@ -780,10 +783,11 @@ fn prepare_local_restore<R: Runtime>(
     sources:Vec<super::lww_residency::SharedPackedSource>,
     present:BTreeSet<String>,
     permit:crate::native_file_jobs::admission::Permit,
+    report:&dyn Fn(Option<StagingProgress>),
 ) -> Result<(Value,crate::native_file_jobs::admission::Permit,PersistentStore)> {
     let app_data_dir=crate::app_paths::data_root(app).map_err(runtime::local_error)?;
     let mut store=runtime::native_store(app)?;
-    let (result,permit)=prepare_local_restore_in_store(&mut store,&app.state::<PersistentStoreState>(),&app_data_dir,job,expected_revision,snapshot,original_units,selection,sections,cancel,sources,present,permit)?;
+    let (result,permit)=prepare_local_restore_in_store(&mut store,&app.state::<PersistentStoreState>(),&app_data_dir,job,expected_revision,snapshot,original_units,selection,sections,cancel,sources,present,permit,report)?;
     Ok((result,permit,store))
 }
 
@@ -817,6 +821,7 @@ fn prepare_local_restore_in_store(
     sources:Vec<super::lww_residency::SharedPackedSource>,
     present:BTreeSet<String>,
     mut permit:crate::native_file_jobs::admission::Permit,
+    report:&dyn Fn(Option<StagingProgress>),
 ) -> Result<(Value,crate::native_file_jobs::admission::Permit)> {
     cancel.check()?;
     // The caller opened this dedicated native connection while renderer
@@ -873,7 +878,7 @@ fn prepare_local_restore_in_store(
         let probe = runtime::CancelProbe(cancel.clone());
         Some(
             store
-                .prepare_external_snapshot_application(
+                .prepare_external_snapshot_application_observed(
                     &ExternalSnapshotApplication {
                         expected_revision,
                         staging_root: &staging_root,
@@ -883,6 +888,7 @@ fn prepare_local_restore_in_store(
                     },
                     records,
                     objects,
+                    &mut |progress| { report(Some(progress)); Ok(()) },
                 )
                 .map_err(|error| {
                     if cancel.check().is_err() {
@@ -895,6 +901,8 @@ fn prepare_local_restore_in_store(
     } else {
         None
     };
+    // Only the snapshot application reports a share; the steps after it do not.
+    report(None);
 
     // Preparing every selected section before touching the device file keeps a
     // bundle with a missing object from installing half of itself.
@@ -1023,12 +1031,22 @@ pub(crate) fn activate_database_first_backup(
     prepared:snapshot_restore::DatabaseFirstSnapshot,sections:Vec<super::sections::CapturedSection>,
     cancel:Cancellation,permit:crate::native_file_jobs::admission::Permit,
 )->Result<(Value,crate::native_file_jobs::admission::Permit)> {
+    activate_database_first_backup_observed(store,state,job,prepared,sections,cancel,permit,&|_|{})
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn activate_database_first_backup_observed(
+    store:&mut PersistentStore,state:&PersistentStoreState,job:&DurableJob,
+    prepared:snapshot_restore::DatabaseFirstSnapshot,sections:Vec<super::sections::CapturedSection>,
+    cancel:Cancellation,permit:crate::native_file_jobs::admission::Permit,report:&dyn Fn(Option<StagingProgress>),
+)->Result<(Value,crate::native_file_jobs::admission::Permit)> {
     let expected=job.request.target_revision.as_deref().ok_or_else(corrupt)?.parse::<i64>().map_err(|_|corrupt())?;
     let selection=restore_selection(job.request.restore_areas.as_deref())?;
     require_restorable_sections(&selection,&prepared.snapshot,&job.admission_identity.store_id)?;
     let app_data_dir=store.repository_root().to_owned();
     prepare_local_restore_in_store(store,state,&app_data_dir,job,expected,prepared.snapshot,prepared.original_units,
-        selection,sections,cancel,prepared.sources,prepared.present,permit)
+        selection,sections,cancel,prepared.sources,prepared.present,permit,report)
 }
 
 #[cfg(test)]
@@ -1901,6 +1919,41 @@ pub(super) mod tests {
     async fn restore_over(root:&Path,store:&mut PersistentStore,backup:&PackagedBackup) -> Result<Value> {
         let job=admit(root,store,backup);
         run_job(root,store,backup,&job).await
+    }
+
+    #[test]
+    fn a_restore_reports_each_snapshot_application_phase_and_ends_the_share_before_the_device_steps() {
+        run(async {
+            let backup=packaged_backup_seeded(&[vec![53;4096]],|store|{
+                let staging=store.replace_begin().unwrap().staging_id;
+                store.replace_put_root(&staging,&json!({"temperature":1})).unwrap();
+                store.replace_add_characters(&staging,&[json!({"chaId":"synthetic-character","type":"character","name":"Synthetic","chatPage":0,
+                    "chats":[{"id":"synthetic-conversation","name":"Synthetic","message":[{"role":"user","data":"synthetic message","chatId":"synthetic-message"}]}]})]).unwrap();
+                store.replace_commit(&staging,Some(store.revision().unwrap())).unwrap();
+            }).await;
+            let directory=tempfile::tempdir().unwrap();
+            let root=directory.path();
+            let mut store=PersistentStore::open(root).unwrap();
+            let job=admit(root,&store,&backup);
+            let (database,sections)=prepare_database_first_backup(root,&backup.connected,&job,&Cancellation::default()).await.unwrap();
+            let (objects,records)=(database.snapshot.objects.len() as u64,database.snapshot.records.len() as u64);
+            assert!(objects>0 && records>0);
+            let seen=std::cell::RefCell::new(Vec::new());
+            let admission=std::sync::Arc::new(crate::native_file_jobs::admission::Admission::default());
+            activate_database_first_backup_observed(&mut store,&PersistentStoreState::default(),&job,database,sections,Cancellation::default(),
+                admission.staging().unwrap(),&|progress:Option<StagingProgress>| seen.borrow_mut().push(progress.map(|progress|(progress.phase,progress.done,progress.total)))).unwrap();
+            let seen=seen.into_inner();
+            // Each phase is one bar that fills to the count its input declares.
+            let mut phases=seen.iter().flatten().map(|&(phase,_,total)|(phase,total)).collect::<Vec<_>>();
+            phases.dedup();
+            assert_eq!(phases,[("validate",Some(objects)),("project",Some(records))]);
+            for (phase,total) in phases {
+                assert_eq!(seen.iter().flatten().rev().find(|(name,..)|*name==phase).map(|&(_,done,_)|done),total,"{phase}");
+            }
+            // The share ends once, before the steps that follow report nothing.
+            assert_eq!(seen.last(),Some(&None));
+            assert_eq!(seen.iter().filter(|progress|progress.is_none()).count(),1);
+        });
     }
 
     fn request_id(job:&DurableJob) -> String {

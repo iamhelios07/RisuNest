@@ -72,10 +72,12 @@
     {#if activeJob}
         {@const fraction = externalJobFraction(activeJob)}
         {@const size = `${bytes(Number(activeJob.completedBytes))}${activeJob.totalBytes && !externalJobTotalGrows(activeJob) ? ` / ${bytes(Number(activeJob.totalBytes))}` : ''}`}
+        {@const title = (activeJob.kind === 'restore' && strings.restorePhases[activeJob.phase]) || strings.jobActive[activeJob.kind]}
+        {@const staging = activeJob.kind === 'restore' && activeJob.phase === 'preparing-local' ? stagingProgressView(activeJob.transfer?.staging, strings.staging) : undefined}
         <TransferProgress
-            label={(activeJob.kind === 'restore' && strings.restorePhases[activeJob.phase]) || strings.jobActive[activeJob.kind]}
-            detail={localApply ? '' : activeJob.counters ? `${strings.jobCounters[activeJob.counters]} ${size}` : size}
-            {fraction} detailsLabel={copy.details} collapsible={!onboarding}
+            label={staging?.label ?? title}
+            detail={staging ? title : localApply ? '' : activeJob.counters ? `${strings.jobCounters[activeJob.counters]} ${size}` : size}
+            fraction={staging ? staging.fraction : fraction} detailsLabel={copy.details} collapsible={!onboarding}
             counters={jobCounters}
             speed={validTransferRateSample(activeJob.transfer?.network) ? {
                 sample: activeJob.transfer.network, active: !localApply, uploadLabel: copy.uploadSpeed, downloadLabel: copy.downloadSpeed,
