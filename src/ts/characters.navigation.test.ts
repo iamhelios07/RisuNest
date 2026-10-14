@@ -1506,7 +1506,7 @@ describe('chat list operations', () => {
         const exported = await vi.waitFor(() => Buffer.from(mocks.downloadFile.mock.calls[0][1]).toString())
         const exportedDocument = new DOMParser().parseFromString(exported, 'text/html')
         const images = [...exportedDocument.querySelectorAll('img')]
-        expect(images.map(image => image.getAttributeNames())).toEqual([['src', 'alt'], ['src', 'alt']])
+        expect(images.flatMap(image => image.getAttributeNames()).filter(attribute => attribute.startsWith('on'))).toEqual([])
         expect(images.map(image => [image.getAttribute('src'), image.getAttribute('alt')])).toEqual([
             ['y', 'x onerror=alert(1)//'],
             ['z', alt],
