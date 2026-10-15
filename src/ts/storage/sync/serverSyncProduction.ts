@@ -28,6 +28,8 @@ import { createRemainingTimeEstimator } from './remainingTime'
 import { setAssetResidencyPolicy, type AssetResidencyPolicy } from './serverAssetResidency'
 import { isLibraryFileOperationReserved, registerLibraryFileOperationGate, subscribeLibraryFileOperationReleased } from '../libraryFileOperation'
 
+import { readRepresentativeImagePriority, subscribeRepresentativeImagePriority } from '../../ui/representativeImagePriority'
+
 const selectedCharacterId = () => getDatabase().characters[get(selectedCharID)]?.chaId ?? null
 
 let nativeBindings: ReturnType<typeof installSyncBindingFlow> | undefined
@@ -200,7 +202,8 @@ const receivedRepresentativeReferences = (changes: LwwRemoteChange[]) => changes
     const key: string[] = JSON.parse(change.key)
     return key[0] === 'character' && (key[2] === 'image' || key[2] === 'trashTime')
         || key[0] === 'exists' && key[1] === 'character'
-        || key[0] === 'archive'
+        || key[0] === 'archive' || key[0] === 'asset'
+        || key[0] === 'order' && key[1] === 'characters'
 })
 function continueHydration(): void {
     if ((!hydrationPending && !representativesPending) || !foreground || !context || context.signal.aborted || scheduler.isBlocked() || isLibraryFileOperationReserved()) return
@@ -210,7 +213,8 @@ function continueHydration(): void {
     hydrationPending = false
     representativesPending = false
     hydrationAgain = false
-    hydrating = during('assets', () => invoke('server_sync_lww_hydrate', { request: header(), selectedCharacterId: selectedCharacterId(), ...(representativesOnly ? { representativesOnly: true } : {}) })).then(() => {
+    const iconPriority = readRepresentativeImagePriority()
+    hydrating = during('assets', () => invoke('server_sync_lww_hydrate', { request: header(), selectedCharacterId: selectedCharacterId(), ...(iconPriority ? { iconPriority } : {}), ...(representativesOnly ? { representativesOnly: true } : {}) })).then(() => {
         if (captured === context && !captured.signal.aborted && hydrationError && error === hydrationError) { error = ''; hydrationError = '' }
     }).catch(value => {
         attemptFailed = true
@@ -448,6 +452,11 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
         void scheduler.conversationOpened().then(continueHydration)
     }))
     disposers.push(await listen(SERVER_SYNC_REMOTE_HINT_EVENT, () => scheduler.remoteHint()))
+    disposers.push(subscribeRepresentativeImagePriority(() => {
+        if (status.assetPolicy !== 'remote') return
+        representativesPending = true
+        continueHydration()
+    }))
     disposers.push(await listen<{ connected: boolean }>('risu-server-sync-notification', event => scheduler.socket(event.payload.connected)))
     const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; error = serverSyncErrorCode(value) || 'server-unreachable'; changed() }) }
     document.addEventListener('visibilitychange', visibility)

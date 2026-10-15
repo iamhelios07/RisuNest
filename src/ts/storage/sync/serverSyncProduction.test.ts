@@ -426,6 +426,7 @@ describe('production server LWW composition', () => {
         { key: ['character', 'first', 'trashTime'], value: { kind: 'deleted' } },
         { key: ['exists', 'character', 'first'], value: { kind: 'inline', bytes: 'dHJ1ZQ==' } },
         { key: ['archive', 'first'], value: { kind: 'deleted' } },
+        { key: ['order', 'characters'], value: { kind: 'inline', bytes: btoa(JSON.stringify([{ id: 'folder', imgFile: 'assets/folder.png', data: [] }])) } },
     ]
     const receiveUnder = async (assetPolicy: string, key: string[], value: unknown) => {
         const base = f.invoke.getMockImplementation()!
@@ -452,6 +453,23 @@ describe('production server LWW composition', () => {
     it.each(representativeChanges)('asks nothing of a device that keeps every asset after receiving $key', async ({ key, value }) => {
         await receiveUnder('full', key, value)
         expect(hydrationCalls()).toHaveLength(0)
+    })
+    it('sends updated list order to representative hydration without a library save', async () => {
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => command === 'server_sync_status'
+            ? { configured: true, writerId: 'writer', bindingAuthority: '0', assetPolicy: 'remote' } : base(command, args))
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle(); f.invoke.mockClear()
+        const { RepresentativeImageList } = await import('../../ui/representativeImagePriority')
+        const list = new RepresentativeImageList()
+        try {
+            list.setOrder(['assets/z.png', 'assets/folder.png', 'assets/a.png'])
+            await settle()
+            expect(hydrationCalls()).toEqual([['server_sync_lww_hydrate', {
+                request: expect.objectContaining({ bindingAuthority: '0' }), selectedCharacterId: 'selected-stable-id', representativesOnly: true,
+                iconPriority: { ordered: ['assets/z.png', 'assets/folder.png', 'assets/a.png'], visible: [] },
+            }]])
+        } finally { list.dispose(); await settle() }
     })
     it('coalesces local remote-policy edits and preserves another edit during representative hydration', async () => {
         const base = f.invoke.getMockImplementation()!
