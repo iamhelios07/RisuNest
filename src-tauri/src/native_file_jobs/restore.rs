@@ -703,9 +703,8 @@ fn stream_legacy_characters<S: TrackedSource>(
         character = sink.prepare_character(character).map_err(store_error)?;
         if upstream_import::exclude_record(&character, excluded) { continue; }
         retained += 1;
-        pocket_features::character(&mut character, &format!("character:{index}"))
-            .map_err(invalid)?;
-        assign_legacy_chat_ids(std::slice::from_mut(&mut character))?;
+        pocket_features::character(&mut character, &format!("character:{index}"));
+        assign_legacy_chat_ids(std::slice::from_mut(&mut character));
         if !batch.is_empty() && batch_bytes.saturating_add(bytes) > CHARACTER_BATCH_BYTES as u64 {
             sink.add_characters(staging_id, &batch)
                 .map_err(store_error)?;
@@ -794,6 +793,11 @@ fn finish_legacy_database<R: Read>(
             return Err(invalid("legacy MessagePack database must be an object"))
         }
     };
+    for key in NULLABLE_ROOT_COLLECTIONS {
+        if root.scalar(key).map_err(store_error)? == Some(Value::Null) {
+            root.remove(key).map_err(|error|legacy_staging_error(job,error))?;
+        }
+    }
     let preset_count = match root.kind("botPresets").map_err(store_error)? {
         Some(FieldKind::Array) => root.count("botPresets").map_err(store_error)?,
         Some(_) => return Err(invalid("legacy MessagePack botPresets must be an array")),
@@ -837,39 +841,30 @@ fn finish_legacy_database<R: Read>(
     })
 }
 
+// PocketRisu stores a root field that became undefined as null, and upstream
+// RisuAI loads a null collection as absent.
+const NULLABLE_ROOT_COLLECTIONS: [&str; 5] = ["botPresets", "pluginCustomStorage", "modules", "loadouts", "plugins"];
+
+// Streamed counterpart of pocket_features::root.
 fn prepare_legacy_root(root: &RootSpool, excluded: &HashSet<String>) -> StoreResult<()> {
-    let validation = |message: String| StoreError::Validation { message };
-    if root.kind("disableToggleBinding")?.is_some() {
-        if !root.scalar("disableToggleBinding")?.is_some_and(|value|value.is_boolean()) {
-            return Err(validation("PocketRisu disableToggleBinding must be boolean".into()));
-        }
+    if root.kind("disableToggleBinding")?.is_some()
+        && !root.scalar("disableToggleBinding")?.is_some_and(|value|value.is_boolean()) {
+        root.remove("disableToggleBinding")?;
     }
-    if let Some(kind)=root.kind("defaultToggleValues")? {
-        if kind != FieldKind::Object { return Err(validation("PocketRisu toggle values must be a record".into())); }
-        root.visit("defaultToggleValues",|key,value| {
-            if !key.starts_with("toggle_") || !value.is_string() {
-                return Err(validation("PocketRisu toggle values must be toggle_ strings".into()));
-            }
-            Ok(())
-        })?;
+    match root.kind("defaultToggleValues")? {
+        Some(FieldKind::Object) => root.visit("defaultToggleValues",|key,value| {
+            if pocket_features::toggle_entry(key,&value) { Ok(()) } else { root.remove_member("defaultToggleValues",key) }
+        })?,
+        Some(_) => root.remove("defaultToggleValues")?,
+        None => {}
     }
-    if let Some(kind) = root.kind("togglePresets")? {
-        if kind != FieldKind::Array { return Err(validation("PocketRisu toggle presets must be an array".into())); }
-        root.visit("togglePresets",|_,value| {
-            let mut entry=Map::new(); entry.insert("togglePresets".into(),Value::Array(vec![value]));
-            pocket_features::root(&entry).map_err(&validation)
-        })?;
-    }
-    if root.kind("personas")? == Some(FieldKind::Array) {
-        root.visit("personas",|_,value| {
-            if let Some(id) = value.get("id") {
-                let id=id.as_str().ok_or_else(||validation("PocketRisu persona IDs must be strings".into()))?;
-                if !id.is_empty() && !root.remember_id("pocket-personas",id)? {
-                    return Err(validation("PocketRisu persona IDs must be unique".into()));
-                }
-            }
-            Ok(())
-        })?;
+    match root.kind("togglePresets")? {
+        Some(FieldKind::Array) => root.visit("togglePresets",|key,mut value| {
+            if pocket_features::toggle_preset(&mut value) { root.put_member("togglePresets",key,Some(&value)) }
+            else { root.remove_member("togglePresets",key) }
+        })?,
+        Some(_) => root.remove("togglePresets")?,
+        None => {}
     }
     root.remove("account")?;
     for field in ["characterOrder","loadouts"] {
@@ -902,37 +897,45 @@ enum JsonSlot {
 }
 
 // PocketRisu and upstream RisuAI assign absent/duplicate chat IDs when loading
-// legacy saves. Do that before staging; the persistent store remains strict.
-fn assign_legacy_chat_ids(characters: &mut [Value]) -> Result<(), NativeJobError> {
+// legacy saves, and PocketRisu skips chat entries that are not objects. Do that
+// before staging; the persistent store remains strict.
+fn assign_legacy_chat_ids(characters: &mut [Value]) {
     for character in characters {
         let Some(chats) = character.get_mut("chats").and_then(Value::as_array_mut) else {
             continue;
         };
+        chats.retain(Value::is_object);
         let mut reserved: HashSet<String> = chats
             .iter()
-            .filter_map(|chat| chat.get("id").and_then(Value::as_str).map(str::to_owned))
+            .filter_map(|chat| legacy_chat_id(chat.get("id")))
             .collect();
         let mut seen = HashSet::new();
-        for chat in chats {
-            let chat = chat
-                .as_object_mut()
-                .ok_or_else(|| invalid("legacy chat must be an object"))?;
-            match chat.get("id") {
-                Some(Value::String(id)) if !id.is_empty() && seen.insert(id.clone()) => continue,
-                None | Some(Value::Null) | Some(Value::String(_)) => {}
-                _ => return Err(invalid("legacy chat ID must be a string when present")),
-            }
-            let id = loop {
-                let candidate = uuid::Uuid::new_v4().to_string();
-                if reserved.insert(candidate.clone()) {
-                    break candidate;
+        for chat in chats.iter_mut().filter_map(Value::as_object_mut) {
+            let id = match legacy_chat_id(chat.get("id")) {
+                Some(id) if !id.is_empty() && seen.insert(id.clone()) => id,
+                _ => {
+                    let id = loop {
+                        let candidate = uuid::Uuid::new_v4().to_string();
+                        if reserved.insert(candidate.clone()) {
+                            break candidate;
+                        }
+                    };
+                    seen.insert(id.clone());
+                    id
                 }
             };
-            seen.insert(id.clone());
             chat.insert("id".to_owned(), Value::String(id));
         }
     }
-    Ok(())
+}
+
+// A numeric chat ID keeps its text form, as it does as a JavaScript object key.
+fn legacy_chat_id(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(id) => Some(id.clone()),
+        Value::Number(id) => Some(id.to_string()),
+        _ => None,
+    }
 }
 
 fn messagepack_to_json(value: MessagePackValue) -> Result<JsonSlot, NativeJobError> {
@@ -1304,10 +1307,9 @@ fn parse_and_stage<R: Read>(
                     continue;
                 }
                 if reject_cold_references && has_cold_references(&value) { return Err(cold_expansion_required()); }
-                assign_legacy_chat_ids(std::slice::from_mut(&mut value))?;
+                assign_legacy_chat_ids(std::slice::from_mut(&mut value));
                 character_batch_bytes = character_batch_bytes.saturating_add(decoded_bytes);
-                pocket_features::character(&mut value, &format!("character:{character_count}"))
-                    .map_err(invalid)?;
+                pocket_features::character(&mut value, &format!("character:{character_count}"));
                 character_batch.push(value);
                 character_count += 1;
                 reader.counts.characters = character_count;
@@ -1428,7 +1430,7 @@ fn parse_and_stage<R: Read>(
         root.insert("pluginStorageMeta".to_owned(), meta);
     }
     let mut presets = presets.ok_or_else(|| invalid("missing required block preset"))?;
-    pocket_features::root(&root).map_err(invalid)?;
+    pocket_features::root(&mut root);
     root.shift_remove("account");
     upstream_import::prepare_root(&mut root, &excluded);
     upstream_import::prepare_presets(&mut presets);
@@ -1865,8 +1867,14 @@ impl IgnoredJsonValue for i64 {
     }
 }
 
+impl IgnoredJsonValue for bool {
+    fn ignored<E: de::Error>() -> Result<Self, E> {
+        Ok(false)
+    }
+}
+
 macro_rules! ignored_visits {
-    ($value:ty) => {
+    (@scalars $value:ty) => {
         fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
         where
             E: de::Error,
@@ -1930,6 +1938,9 @@ macro_rules! ignored_visits {
             IgnoredAny::deserialize(deserializer)?;
             <$value as IgnoredJsonValue>::ignored()
         }
+    };
+    ($value:ty) => {
+        ignored_visits!(@scalars $value);
 
         fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
         where
@@ -2083,7 +2094,7 @@ impl<'de> Visitor<'de> for ChatsVisitor<'_> {
     {
         let mut count = 0i64;
         let seen_ids = RefCell::new(HashSet::new());
-        while sequence
+        while let Some(staged) = sequence
             .next_element_seed(ConversationSeed {
                 limits: self.0.limits,
                 record_bytes: self.0.record_bytes,
@@ -2102,9 +2113,8 @@ impl<'de> Visitor<'de> for ChatsVisitor<'_> {
                 sink: self.0.sink,
                 staging_error: self.0.staging_error,
             })?
-            .is_some()
         {
-            count += 1;
+            count += i64::from(staged);
         }
         Ok(count)
     }
@@ -2128,25 +2138,36 @@ struct ConversationSeed<'a> {
     staging_error: &'a RefCell<Option<StoreError>>,
 }
 
+// Stages one conversation; a chat entry that is not an object is skipped, as in PocketRisu.
 impl<'de> DeserializeSeed<'de> for ConversationSeed<'_> {
-    type Value = ();
+    type Value = bool;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: de::Deserializer<'de>,
     {
-        deserializer.deserialize_map(ConversationVisitor(self))
+        deserializer.deserialize_any(ConversationVisitor(self))
     }
 }
 
 struct ConversationVisitor<'a>(ConversationSeed<'a>);
 
 impl<'de> Visitor<'de> for ConversationVisitor<'_> {
-    type Value = ();
+    type Value = bool;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a conversation object")
     }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(false)
+    }
+
+    ignored_visits!(@scalars bool);
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
     where
@@ -2202,21 +2223,16 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
                 }
             }
         }
-        let conversation_id = match detail.get("id") {
-            Some(Value::String(id)) if !id.is_empty() && self.0.seen_ids.borrow_mut().insert(id.clone()) => id.clone(),
-            None | Some(Value::Null) | Some(Value::String(_)) => {
-                let id = loop {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    if self.0.seen_ids.borrow_mut().insert(id.clone()) { break id; }
-                };
-                detail.insert("id".into(), Value::String(id.clone()));
-                id
-            }
-            _ => return Err(de::Error::custom("legacy chat ID must be a string when present")),
+        let conversation_id = match legacy_chat_id(detail.get("id")) {
+            Some(id) if !id.is_empty() && self.0.seen_ids.borrow_mut().insert(id.clone()) => id,
+            _ => loop {
+                let id = uuid::Uuid::new_v4().to_string();
+                if self.0.seen_ids.borrow_mut().insert(id.clone()) { break id; }
+            },
         };
+        detail.insert("id".into(), Value::String(conversation_id.clone()));
         let mut normalized_detail = Value::Object(detail);
-        pocket_features::chat(&mut normalized_detail, &self.0.fallback)
-            .map_err(de::Error::custom)?;
+        pocket_features::chat(&mut normalized_detail, &self.0.fallback);
         let recent_at = normalized_detail
             .get("lastDate")
             .and_then(Value::as_i64)
@@ -2243,7 +2259,8 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
                 self.0.sink,
                 self.0.staging_error,
             )
-            .map_err(de::Error::custom)
+            .map_err(de::Error::custom)?;
+        Ok(true)
     }
 }
 
@@ -2355,7 +2372,7 @@ impl MessageSpool {
             pocket_features::message(
                 &mut message,
                 &format!("{conversation_id}:response:{index}"),
-            )?;
+            );
             let length = retained_json_bytes::<serde_json::Error>(&message, self.record_limit).map_err(|error| error.to_string())?;
             if !page.is_empty()
                 && (page.len() >= MESSAGE_PAGE_COUNT
@@ -3942,10 +3959,11 @@ mod tests {
             "char-1",
             &json!({
                 "type":"character", "chaId":"char-1", "name":"Imported",
-                "chats":[{"id":"chat-1", "name":"Chat", "message":[{
+                "chats":[null, {"id":7, "name":"Chat", "message":[{
                     "role":"char", "data":"second", "chatId":"message-1",
-                    "swipes":["first", "second"], "swipeId":1
-                }]}]
+                    "swipes":["first", null, "second"], "swipeId":2
+                }]}, "not a chat", {"id":"chat-2", "name":"Second", "bindedPersona":null,
+                    "savedToggleValues":{"toggle_a":"1", "other":"x"}, "message":[]}]
             }),
         );
         fs::write(&source, save_bytes(blocks)).unwrap();
@@ -3953,7 +3971,10 @@ mod tests {
         let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
         restore_block_risu_save_path(&source, 1, &job, &sink).unwrap();
         let restored = sink.store.lock().unwrap().materialize(None).unwrap();
-        let message = &restored["characters"][0]["chats"][0]["message"][0];
+        let chats = restored["characters"][0]["chats"].as_array().unwrap();
+        assert_eq!(chats.len(), 2);
+        assert_eq!(chats[0]["id"], "7");
+        let message = &chats[0]["message"][0];
         assert_eq!(message["data"], "second");
         assert_eq!(
             message["responseVariants"]["candidates"]
@@ -3962,7 +3983,9 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(message["swipes"], json!(["first", "second"]));
+        assert_eq!(message["swipes"], json!(["first", null, "second"]));
+        assert_eq!(chats[1]["savedToggleValues"], json!({"toggle_a":"1"}));
+        assert!(chats[1].get("bindedPersona").is_none());
     }
 
     #[test]
@@ -4171,7 +4194,7 @@ mod tests {
     #[test]
     fn legacy_restore_rejects_present_nonarray_optional_root_sections() {
         for (key, invalid_value) in [
-            ("modules", Value::Null),
+            ("modules", json!(7)),
             ("loadouts", json!({})),
             ("plugins", json!("invalid")),
         ] {
