@@ -537,9 +537,10 @@ impl ServerClient {
         limit: usize,
     ) -> Result<RequestAttempt> {
         let body = self.prepare_body(body)?;
+        let operation_id = uuid::Uuid::new_v4();
         loop {
             let attempted = (self.retry_budget.clock)();
-            let result = self.request_once(method.clone(), path, &[], body.as_ref(), headers, limit);
+            let result = self.request_once(method.clone(), path, &[], body.as_ref(), headers, limit, operation_id);
             let elapsed = (self.retry_budget.clock)().saturating_duration_since(attempted);
             match result {
                 Ok(mut reply) => {
@@ -591,10 +592,11 @@ impl ServerClient {
         let replay_safe = replay_safe(&method, path);
         let mut recovering = false;
         let body = self.prepare_body(body)?;
+        let operation_id = uuid::Uuid::new_v4();
         loop {
             let attempted = (self.retry_budget.clock)();
             let result =
-                self.request_once(method.clone(), path, query, body.as_ref(), headers, limit);
+                self.request_once(method.clone(), path, query, body.as_ref(), headers, limit, operation_id);
             match result {
                 Ok(mut reply) => {
                     let elapsed = (self.retry_budget.clock)().saturating_duration_since(attempted);
@@ -692,6 +694,7 @@ impl ServerClient {
         body: Option<&PreparedBody>,
         headers: &[(&str, String)],
         limit: usize,
+        operation_id: uuid::Uuid,
     ) -> Result<Reply> {
         self.ensure_active()?;
         #[cfg(test)]
@@ -755,7 +758,7 @@ impl ServerClient {
             request = request.body(reqwest::blocking::Body::sized(reader, length));
         }
         let request = request.build().map_err(|_| SyncError::new("server-unreachable", 503))?;
-        let capture = risunest_network_log::begin("sync", request.method().as_str(), request.url().as_str(), request.headers());
+        let capture = risunest_network_log::begin_operation("sync", request.method().as_str(), request.url().as_str(), request.headers(), operation_id);
         if capture.is_active() {
             if let Some(body) = body {
                 let raw = body.log_body.as_deref().unwrap_or(&body.wire);
@@ -1023,7 +1026,7 @@ mod progress_tests {
         let worker = std::thread::spawn(move || super::super::progress::within(&worker_lane, || {
             let client = ServerClient::new(super::tests::config(&endpoint)).unwrap();
             let body = PreparedBody { wire: vec![7; UPLOAD], log_body: None, encoded: false, raw_len: UPLOAD };
-            client.request_once(Method::PUT, "synthetic", &[], Some(&body), &[], 8192).unwrap().body
+            client.request_once(Method::PUT, "synthetic", &[], Some(&body), &[], 8192, uuid::Uuid::new_v4()).unwrap().body
         }));
         noticed.recv_timeout(Duration::from_secs(5)).unwrap();
         let uploading = lane.snapshot("send");
@@ -1365,39 +1368,81 @@ mod tests {
 
     #[test]
     fn explicit_maintenance_retries_an_unadmitted_mutation_with_retry_after() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", server.server_addr());
-        let task = std::thread::spawn(move || {
-            let mut request = server.recv().unwrap();
-            assert_eq!(request.method(), &tiny_http::Method::Post);
-            std::io::copy(request.as_reader(), &mut std::io::sink()).unwrap();
-            request
-                .respond(
-                    tiny_http::Response::from_string(r#"{"error":"server-updating"}"#)
-                        .with_status_code(503)
-                        .with_header(tiny_http::Header::from_bytes("Retry-After", "45").unwrap()),
-                )
-                .unwrap();
-            let mut request = server.recv().unwrap();
-            assert_eq!(request.method(), &tiny_http::Method::Post);
-            std::io::copy(request.as_reader(), &mut std::io::sink()).unwrap();
-            request.respond(tiny_http::Response::empty(201)).unwrap();
-        });
-        let mut client = ServerClient::new(config(&endpoint)).unwrap();
-        client.retry_budget = no_sleep_budget();
-        let reply = client
-            .request(
-                Method::POST,
-                "uploads",
-                &[],
-                Some(b"synthetic".to_vec()),
-                &[],
-                MAX_METADATA_BYTES,
-            )
-            .unwrap();
-        assert_eq!(reply.status, 201);
-        assert_eq!(*client.retry_budget.spent.lock().unwrap(), MAX_RETRY_DELAY);
-        task.join().unwrap();
+        let _guard = crate::network_log::TEST_RECORDER_LOCK
+            .lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let recorder = risunest_network_log::Recorder::open(
+            root.path().join("recent"), root.path().join("retained"),
+        ).unwrap();
+        recorder.configure(risunest_network_log::Settings {
+            enabled: true, ..Default::default()
+        }).unwrap();
+        risunest_network_log::install(recorder.clone());
+        for ambiguous in [false, true] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", server.server_addr());
+            let task = std::thread::spawn(move || {
+                let mut request = server.recv().unwrap();
+                assert_eq!(request.method(), &tiny_http::Method::Post);
+                std::io::copy(request.as_reader(), &mut std::io::sink()).unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string(r#"{"error":"server-updating"}"#)
+                            .with_status_code(503)
+                            .with_header(tiny_http::Header::from_bytes("Retry-After", "45").unwrap()),
+                    )
+                    .unwrap();
+                let mut request = server.recv().unwrap();
+                assert_eq!(request.method(), &tiny_http::Method::Post);
+                std::io::copy(request.as_reader(), &mut std::io::sink()).unwrap();
+                request.respond(tiny_http::Response::empty(201)).unwrap();
+                let mut request = server.recv().unwrap();
+                std::io::copy(request.as_reader(), &mut std::io::sink()).unwrap();
+                request.respond(tiny_http::Response::empty(201)).unwrap();
+            });
+            let mut client = ServerClient::new(config(&endpoint)).unwrap();
+            client.retry_budget = no_sleep_budget();
+            let request = || {
+                if ambiguous {
+                    match client.request_ambiguous_mutation(
+                        Method::POST, "uploads", Some(b"synthetic".to_vec()), &[], MAX_METADATA_BYTES,
+                    ).unwrap() {
+                        RequestAttempt::Response(reply) => reply,
+                        RequestAttempt::Failure { error, .. } => panic!("{error:?}"),
+                    }
+                } else {
+                    client.request(
+                        Method::POST,
+                        "uploads",
+                        &[],
+                        Some(b"synthetic".to_vec()),
+                        &[],
+                        MAX_METADATA_BYTES,
+                    )
+                    .unwrap()
+                }
+            };
+            let reply = request();
+            assert_eq!(reply.status, 201);
+            assert_eq!(*client.retry_budget.spent.lock().unwrap(), MAX_RETRY_DELAY);
+            let attempts = recorder.list(risunest_network_log::Query {
+                search: endpoint.clone(), ..Default::default()
+            }).unwrap().items;
+            assert_eq!(attempts.len(), 2);
+            let operation = attempts[0].operation_id.clone().expect("retry operation ID");
+            assert!(uuid::Uuid::parse_str(&operation).is_ok());
+            assert_eq!(attempts[1].operation_id.as_deref(), Some(operation.as_str()));
+            assert_ne!(attempts[0].id, attempts[1].id);
+            assert_eq!(request().status, 201);
+            task.join().unwrap();
+            let next = recorder.list(risunest_network_log::Query {
+                search: endpoint, ..Default::default()
+            }).unwrap().items;
+            assert_eq!(next.len(), 3);
+            assert_eq!(next.iter().filter(|item| item.operation_id.as_deref() == Some(operation.as_str())).count(), 2);
+            assert!(next.iter().all(|item| item.operation_id.is_some()));
+        }
+        recorder.shutdown();
     }
 
     #[test]

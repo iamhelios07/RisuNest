@@ -2149,6 +2149,7 @@ export const languageKorean = {
             networkLogs: "네트워크 로그",
         },
         networkLog: {
+            "operation": "작업 ID",
             readersBusy: "로그를 읽고 있습니다. 잠시 후 다시 시도해주세요.",
             "title": "네트워크 로그",
             "recording": "네트워크 기록",
