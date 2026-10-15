@@ -1067,6 +1067,7 @@ impl DataHealthReader {
             "WITH archived(value) AS (SELECT archived_object FROM characters WHERE json_valid(archived_object))
              SELECT object_hash,byte_size FROM asset_objects WHERE object_hash NOT IN (
                  SELECT object_hash FROM asset_aliases WHERE object_hash IS NOT NULL
+                 UNION SELECT manifest_hash FROM asset_owner_heads WHERE present = 1
                  UNION SELECT json_extract(value,'$.objectHash') FROM archived
                  UNION SELECT json_extract(value,'$.sharedObjectHash') FROM archived
                  UNION SELECT hashes.value FROM archived, json_each(archived.value,'$.assetHashes') AS hashes

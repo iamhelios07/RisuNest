@@ -2477,6 +2477,7 @@ export const languageKorean = {
             actionDropAlias: '파일 사용 중단',
             actionAdoptStoredPayload: '지금 파일 그대로 쓰기',
             actionNormalizeRecords: '값 다시 계산',
+            actionSelectFirstConversation: '첫 채팅 선택',
             actionKeepSingleRecord: '하나만 남기고 정리',
             actionRecoverOrphans: '주인 아래로 되돌리기',
             actionDiscards: '값이 삭제됨',

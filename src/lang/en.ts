@@ -2662,6 +2662,7 @@ export const languageEnglish = {
             actionDropAlias: 'Stop using the file',
             actionAdoptStoredPayload: 'Use the file as it is now',
             actionNormalizeRecords: 'Recalculate the values',
+            actionSelectFirstConversation: 'Select the first chat',
             actionKeepSingleRecord: 'Keep one and drop the rest',
             actionRecoverOrphans: 'Put them back under an owner',
             actionDiscards: 'deletes the value',

@@ -681,6 +681,7 @@ fn suppress_retired(db: &Connection, parent: &UnitKey) -> StoreResult<()> {
         other=>("json_extract(key,'$[0]')='record' AND json_extract(key,'$[1]')=?2 AND json_extract(key,'$[2]')=?1",p[2].as_str(),Some(other)),
     };
     for (table, action) in [
+        ("lww_units", "DELETE FROM lww_units"),
         ("lww_outbox", "DELETE FROM lww_outbox"),
         (
             "lww_receive_rows",
@@ -808,10 +809,13 @@ impl PersistentStore {
         let values = crate::sqlite_open::open(scratch.path().join("units.sqlite"))?;
         values.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
             CREATE TABLE units(key TEXT PRIMARY KEY,stamp TEXT NOT NULL,value TEXT NOT NULL); BEGIN")?;
-        for row in rows {
+        'units: for row in rows {
             if probe.is_cancelled() { return Err(error("cancelled")); }
             let (key,stamp,value) = row?;
             let key: UnitKey = wire(key.try_into())?;
+            for parent in parent_keys(&key)? {
+                if is_retired(&reader.connection, &parent)? { continue 'units; }
+            }
             let stamp: Stamp = serde_json::from_str(&stamp)?;
             wire(stamp.validate())?;
             let value: UnitValue = serde_json::from_str(&value)?;

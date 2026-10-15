@@ -3,7 +3,9 @@ import { invoke } from '@tauri-apps/api/core'
 import {
     acquireDestructiveReplacementFence,
     capturePersistentMutationToken,
+    getPersistentDataRuntime,
 } from './persistentDataRuntime.svelte'
+import { registerCommittedWorkingSetContinuation } from './committedWorkingSetContinuation'
 import {
     isTerminalJob as isTerminal,
     NativeFileJobActivationCommittedError,
@@ -13,7 +15,7 @@ import {
     type NativeFileJobStatus,
 } from './nativeFileJobs'
 import type { PersistentMutationToken } from './saveCoordinator'
-import type { PersistentDestructiveReplacementFence } from './persistentDataRuntime'
+import type { PersistentDataRuntime, PersistentDestructiveReplacementFence } from './persistentDataRuntime'
 
 export interface NativeJpegAssetDestination {
     kind: 'current-character-image'
@@ -36,6 +38,7 @@ export interface NativeJpegAssetImportDependencies {
     wait(milliseconds: number): Promise<void>
     captureMutationToken(reason: string): Promise<PersistentMutationToken>
     acquireFence(token: PersistentMutationToken): Promise<PersistentDestructiveReplacementFence>
+    getRuntime(): Pick<PersistentDataRuntime, 'markCommittedWorkingSetRefreshRequired' | 'getStorageAuthorityEpoch'>
 }
 
 const productionDependencies: NativeJpegAssetImportDependencies = {
@@ -43,6 +46,7 @@ const productionDependencies: NativeJpegAssetImportDependencies = {
     wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     captureMutationToken: capturePersistentMutationToken,
     acquireFence: acquireDestructiveReplacementFence,
+    getRuntime: getPersistentDataRuntime,
 }
 
 function abortError(): DOMException {
@@ -73,6 +77,18 @@ export async function importNativeJpegAsset(
     let jobId: string | undefined
     let cancellationRequested = false
     let retainJobForRecovery = false
+    let retainFenceForRecovery = false
+    let terminalObserved = false
+    const preventFutureCommit = async (): Promise<boolean> => {
+        try {
+            const cancellation = await dependencies.invoke('native_file_job_cancel', { jobId })
+            // Acknowledged cancellation prevents entering the native commit phase.
+            if (['requested', 'alreadyRequested', 'terminal', 'missing'].includes(cancellation as string)) return true
+        } catch {}
+        try {
+            return isTerminal(await dependencies.invoke('native_file_job_status', { jobId }) as NativeFileJobStatus)
+        } catch { return false }
+    }
     try {
         if (options.signal?.aborted) throw abortError()
         const started = await dependencies.invoke('native_file_job_start', {
@@ -97,6 +113,7 @@ export async function importNativeJpegAsset(
             }) as NativeFileJobStatus
             options.onStatus?.(status)
             if (isTerminal(status)) {
+                terminalObserved = true
                 terminal = status
                 break
             }
@@ -135,6 +152,23 @@ export async function importNativeJpegAsset(
             logicalId: `assets/${hash}.${extension}`,
         }
     }
+    catch (error) {
+        if (jobId && !terminalObserved && !(await preventFutureCommit())) {
+            retainJobForRecovery = true
+            retainFenceForRecovery = true
+            const runtime = dependencies.getRuntime()
+            runtime.markCommittedWorkingSetRefreshRequired(fence.revision, error)
+            registerCommittedWorkingSetContinuation(fence.revision, runtime, runtime.getStorageAuthorityEpoch(),
+                async () => {
+                    try { await dependencies.invoke('native_file_job_forget', { jobId }) } catch {}
+                },
+                async () => {
+                    if (!(await preventFutureCommit())) throw new NativeFileJobError('native-job-outcome-unknown', 'Native JPEG asset import is still unresolved')
+                    await fence.release({ verifyStoreRevision: true })
+                }, true)
+        }
+        throw error
+    }
     finally {
         if (jobId && !retainJobForRecovery) {
             try {
@@ -142,6 +176,6 @@ export async function importNativeJpegAsset(
             }
             catch {}
         }
-        fence.release()
+        if (!retainFenceForRecovery) await fence.release({ verifyStoreRevision: true })
     }
 }
