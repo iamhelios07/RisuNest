@@ -95,10 +95,23 @@ fn open_packs_downloads_four_ciphertexts_and_preserves_identity_after_reverse_co
 });}
 
 #[test]
+fn open_packs_reports_bytes_before_one_pack_finishes() {run(async {
+    let stage=tempfile::tempdir().unwrap();let provider=Arc::new(DownloadProvider::new(1,&[]));
+    let (packs,_,_)=fixture(&provider,1);let expected=packs["pack-0"].receipt.byte_length;
+    let barrier=provider.inner.arm_partial_read_barrier("pack-0",16).unwrap();
+    let progress=PhaseProgress::silent();let observed=progress.clone();let path=stage.path().to_owned();let worker=provider.clone();
+    let task=tokio::spawn(async move {open_packs(&packs,&[7;32],&path,worker.as_ref(),&fake::repository(),&observed,&Cancellation::default()).await});
+    barrier.reached.notified().await;
+    assert_eq!((progress.read().items,progress.read().bytes),(0,16));
+    barrier.release();task.await.unwrap().unwrap();
+    assert_eq!((progress.read().items,progress.read().bytes),(1,expected));
+});}
+
+#[test]
 fn ciphertext_batch_deduplicates_destinations_and_stops_at_a_slow_consumer() {run(async {
     let stage=tempfile::tempdir().unwrap();let provider=DownloadProvider::new(4,&[]);let (packs,_,_)=fixture(&provider,4);
     let repository=fake::repository();let cancel=Cancellation::default();let objects=vec![&packs["pack-0"],&packs["pack-0"],&packs["pack-1"],&packs["pack-2"]];
-    let mut downloads=stage_ciphertexts(&objects,stage.path(),&provider,&repository,Durability::Scratch,&cancel).unwrap();
+    let mut downloads=stage_ciphertexts(&objects,stage.path(),&provider,&repository,Durability::Scratch,None,&cancel).unwrap();
     let (first,result)=downloads.next().await.unwrap();assert_eq!(first.object_id,"pack-0");assert!(result.unwrap().unwrap().exists());
     assert!(!stage.path().join("plaintext").exists());
     let reads=provider.inner.read_count();tokio::task::yield_now().await;assert_eq!(provider.inner.read_count(),reads);

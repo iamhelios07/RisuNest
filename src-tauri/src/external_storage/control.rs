@@ -1011,6 +1011,56 @@ pub(crate) async fn delete_authenticated_inventory_page_for_repository(
     Ok(RemoteInventoryPageDeleteOutcome::Deleted)
 }
 
+#[derive(Default)]
+pub(super) struct PointHistoryCache {
+    points: std::collections::BTreeMap<String, ListedBackupPoint>,
+    order: Vec<(u64,String,String)>,
+    ready: bool,
+}
+
+pub(super) async fn list_ordered_backup_points_page(
+    connected: &super::connection_commands::ConnectedRepository,
+    cache: &mut PointHistoryCache,
+    cursor: Option<&str>,
+    limit: u16,
+    cancel: &Cancellation,
+) -> Result<BackupPointPage> {
+    if limit == 0 || limit > 100 {return Err(corrupt("invalid history page limit"));}
+    let after: Option<(u64,String)> = cursor.map(|value|serde_json::from_str(value).map_err(|_|corrupt("invalid ordered history cursor"))).transpose()?;
+    if after.is_none() || !cache.ready {
+        cache.ready=false;
+        let mut points=std::collections::BTreeMap::new();
+        let mut point_ids=std::collections::BTreeSet::new();
+        let mut cursor=None;
+        let mut tracker=super::leases::PageTracker::default();
+        loop {
+            let page=super::leases::control_request(cancel,connected.provider.list_objects(&connected.handle,Collection::BackupPoints,cursor.as_deref(),100,cancel)).await?;
+            tracker.accept(&connected.handle,&page.objects,page.next_cursor.as_deref())?;
+            for receipt in page.objects {
+                cancel.check()?;
+                let id=super::gc_store::locator_key(&receipt.locator)?;
+                let point=match cache.points.get(&id).filter(|point|point.reference.receipt==receipt) {
+                    Some(point)=>point.clone(),
+                    None=>open_listed_point(receipt,&connected.stored.descriptor,&connected.root_key,connected.provider.as_ref(),&connected.handle,cancel).await?,
+                };
+                if !point_ids.insert(point.document.point_id.clone()) {return Err(corrupt("duplicate backup point identity"));}
+                cache.points.insert(id.clone(),point.clone());
+                points.insert(id,point);
+            }
+            match page.next_cursor {Some(next)=>cursor=Some(next),None=>break}
+        }
+        cache.order=points.iter().map(|(locator,point)|(point.document.created_at_ms,point.document.point_id.clone(),locator.clone())).collect();
+        cache.order.sort_by(|a,b|b.cmp(a));
+        cache.points=points;
+        cache.ready=true;
+    }
+    let start=after.as_ref().map_or(0,|after|cache.order.partition_point(|(time,id,_)|(*time,id.as_str())>=(after.0,after.1.as_str())));
+    let end=start.saturating_add(limit as usize).min(cache.order.len());
+    let points=cache.order[start..end].iter().map(|(_,_,locator)|cache.points[locator].clone()).collect();
+    let next_cursor=if end<cache.order.len() {let (time,id,_)=&cache.order[end-1];Some(serde_json::to_string(&(time,id)).map_err(|_|corrupt("invalid history cursor"))?)} else {None};
+    Ok(BackupPointPage {points,next_cursor})
+}
+
 pub(crate) async fn list_backup_points_page(
     descriptor: &Descriptor,
     root_key: &[u8; 32],
@@ -2044,6 +2094,48 @@ mod tests {
 
             assert_eq!(error.kind, ErrorKind::Corrupt);
             assert_eq!(provider.listing_count(), 2);
+        });
+    }
+
+    #[test]
+    fn history_pages_are_newest_first_and_refresh_only_new_points() {
+        runtime().block_on(async {
+            let provider=Arc::new(fake::FakeProvider::new(false));
+            let connected=connected(provider.clone());
+            let root=tempfile::tempdir().unwrap();
+            let identity=JobIdentity {job_id:"history".into(),connection_id:"connection".into(),repository_id:connected.handle.repository_id.clone(),capture_id:"capture".into(),
+                capture:CaptureIdentity {store_id:"store".into(),library_epoch:"epoch".into(),generation:"generation".into(),selection_epoch:"selection".into(),revision:1}};
+            let mut journal=TransferJournal::open(root.path(),identity).unwrap();
+            let cancel=Cancellation::default();
+            for id in 0..65 {
+                let document=BackupPointDocument::single(&connected.stored.descriptor,format!("point-{id:03}"),BackupPointKind::Manual,1000+id,bundle(&connected.handle,"bundle")).unwrap();
+                upload_backup_point(&connected.stored.descriptor,&connected.root_key,document,&mut journal,provider.as_ref(),&connected.handle,&cancel).await.unwrap();
+            }
+            let mut cache=PointHistoryCache::default();
+            let first=list_ordered_backup_points_page(&connected,&mut cache,None,30,&cancel).await.unwrap();
+            assert_eq!(first.points.iter().map(|point|point.document.created_at_ms).collect::<Vec<_>>(),(1035..=1064).rev().collect::<Vec<_>>());
+            let second=list_ordered_backup_points_page(&connected,&mut cache,first.next_cursor.as_deref(),30,&cancel).await.unwrap();
+            assert_eq!(second.points.iter().map(|point|point.document.created_at_ms).collect::<Vec<_>>(),(1005..=1034).rev().collect::<Vec<_>>());
+            let last=list_ordered_backup_points_page(&connected,&mut cache,second.next_cursor.as_deref(),30,&cancel).await.unwrap();
+            assert_eq!(last.points.len(),5);assert!(last.next_cursor.is_none());
+            let reads=provider.uploaded_ids().iter().map(|id|provider.read_attempts(id)).sum::<usize>();
+            let refreshed=list_ordered_backup_points_page(&connected,&mut cache,None,30,&cancel).await.unwrap();
+            assert_eq!(first.points,refreshed.points);
+            assert_eq!(reads,provider.uploaded_ids().iter().map(|id|provider.read_attempts(id)).sum::<usize>());
+            let receipt=first.points[0].reference.receipt.clone();
+            let mut interrupted=PointHistoryCache::default();
+            provider.script_page(Collection::BackupPoints,Ok(crate::external_storage::contract::ObjectPage {objects:vec![receipt.clone()],next_cursor:Some("more".into())}));
+            provider.script_page(Collection::BackupPoints,Err(ProviderError::new(ErrorKind::Transient)));
+            assert_eq!(list_ordered_backup_points_page(&connected,&mut interrupted,None,30,&cancel).await.err().unwrap().kind,ErrorKind::Transient);
+            let reads=provider.read_attempts(&receipt.locator.object);
+            let retried=list_ordered_backup_points_page(&connected,&mut interrupted,None,30,&cancel).await.unwrap();
+            assert_eq!(retried.points,first.points);
+            assert_eq!(provider.read_attempts(&receipt.locator.object),reads,"retry keeps authenticated point metadata");
+            let body=provider.state.lock().unwrap().objects[&receipt.locator.object].0.clone();
+            provider.seed("duplicate-point",ObjectRole::BackupPoint,body);
+            let mut duplicate=receipt.clone();duplicate.locator.object="duplicate-point".into();
+            provider.script_page(Collection::BackupPoints,Ok(crate::external_storage::contract::ObjectPage {objects:vec![receipt,duplicate],next_cursor:None}));
+            assert_eq!(list_ordered_backup_points_page(&connected,&mut cache,None,30,&cancel).await.err().unwrap().kind,ErrorKind::Corrupt);
         });
     }
 

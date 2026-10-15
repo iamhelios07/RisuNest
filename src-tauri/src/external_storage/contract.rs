@@ -666,6 +666,15 @@ pub(crate) trait Provider: Send + Sync {
         locator: &'a RemoteLocator,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, ()>;
+    fn supports_incomplete_cleanup(&self) -> bool { false }
+    /// Removes empty unfinished uploads only while the caller owns cleanup protection.
+    fn cleanup_incomplete_objects<'a>(
+        &'a self,
+        _repository: &'a RepositoryHandle,
+        _protected_jobs: &'a [String],
+        _limit: usize,
+        _cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, u64> { Box::pin(async { Ok(0) }) }
     fn delete_empty_container<'a>(
         &'a self,
         _repository: &'a RepositoryHandle,

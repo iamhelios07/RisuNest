@@ -439,6 +439,7 @@ async fn download_database_first_backup(
         &selection.sections,
         &staging_root,
         &connected.root_key,
+        Some(&super::runtime::connection_directory(root,&job.request.connection_id).join("package-cache")),
         connected.provider.as_ref(),
         &connected.handle,
         &walked,
@@ -727,12 +728,11 @@ fn stage_original_backup_controls(
     let mut progress=StagingObserver::new(&mut emit);
     // Both passes read every unit, so one share counts the units twice.
     progress.begin("read",Some(units.count()?.saturating_mul(2))).map_err(pds_error)?;
-    // Nothing above the bound is read here. Message pages and large unit
-    // bodies are read once, in the second pass, at the lengths their
-    // manifests and the snapshot declare.
+    // Manifests and archive metadata use their declared content lengths.
+    // Message pages and large unit bodies are read in the second pass.
     let mut failure=None;
     let metadata=original_unit_control_lengths(store_units(units,&content,&mut failure).map(|unit| {progress.advance()?;unit}),
-        &|hash| read(hash,risunest_sync_wire::MAX_METADATA_BYTES as u64),
+        &|hash| match size(hash)? {Some(length)=>read(hash,length),None=>Ok(None)},
         &size,&size,&probe);
     cancel.check()?;
     if let Some(failure)=failure.take() {return Err(failure)}
@@ -1152,6 +1152,28 @@ pub(super) mod tests {
         assert!(observed.complete());
         assert_eq!(observed.asset_work(),Default::default());
         assert!(observed.objects.is_empty());
+    }
+
+    #[test]
+    fn original_control_admission_accepts_large_archive_metadata_and_manifests() {
+        let directory=tempfile::tempdir().unwrap();
+        let mut store=PersistentStore::open(directory.path()).unwrap();
+        let staging=directory.path().join("staging");
+        let mut content=super::super::content_store::ContentStore::open(&staging.join("external-storage")).unwrap();
+        let (units,bodies,large)=crate::persistent_store::external_capture::large_metadata_fixture();
+        let mut snapshot=prepared(Some("source-device"));snapshot.staging_root=staging;
+        for (hash,bytes) in &bodies {
+            content.put(hash,bytes).unwrap();
+            snapshot.objects.push(snapshot_restore::PreparedObject {content_hash:hash.clone(),byte_length:bytes.len() as u64,source:super::super::content_store::ObjectSource::Captured(hash.clone())});
+        }
+        let archive:crate::persistent_store::archive::ArchivedObject=serde_json::from_slice(&bodies[&large[0]]).unwrap();
+        for hash in archive.object_roots().collect::<std::collections::BTreeSet<_>>() {
+            snapshot.objects.push(snapshot_restore::PreparedObject {content_hash:hash.to_owned(),byte_length:1,source:super::super::content_store::ObjectSource::Library(hash.to_owned())});
+        }
+        content.commit().unwrap();
+        let units=snapshot_restore::OriginalUnits::staged(&mut content,&units);
+        stage_original_backup_controls(&mut store,&snapshot,&units,&Cancellation::default(),&|_|{}).unwrap();
+        for hash in &large {assert_eq!(store.lww_object_body(hash).unwrap().unwrap(),bodies[hash]);}
     }
 
     #[test]
