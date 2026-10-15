@@ -1,14 +1,39 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import { androidVersionCode, iosBundleVersion } from "../../scripts/release/common.mjs";
 import { releaseDownloads } from "../../scripts/release/downloads.mjs";
 import { sourceCheck, validateVendorInput } from "../../scripts/release/source-check.mjs";
-import { sourceIdentity } from "../../scripts/release/source-identity.mjs";
 import cloudflared from "../../scripts/release/cloudflared.json" with { type: "json" };
 import { releaseTauriConfig } from "../../scripts/release/tauri-config.mjs";
+
+const require = createRequire(import.meta.url);
+const workflow = readFileSync(new URL("../../.github/workflows/release.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+
+function sourceIdentity({ repository, product, tag = "", publish = false, eventName = "workflow_dispatch", refType, refName }, runGit) {
+  const step = /      - id: identity\n([\s\S]*?)(?=      - )/.exec(workflow)?.[1];
+  assert(step, "Missing release source identity step");
+  const inline = /        run: \|\n([\s\S]*?)(?=        env:|$)/.exec(step)?.[1]
+    .split("\n").map(line => line.replace(/^          /, "")).join("\n").trim();
+  const program = inline
+    ? /^node --input-type=commonjs <<'NODE'\n([\s\S]*)\nNODE$/.exec(inline)?.[1]
+    : readFileSync(join(repository, /        run: node (\S+)/.exec(step)?.[1]), "utf8");
+  assert(program, "Missing executable source identity program");
+  const output = join(repository, "identity-output");
+  writeFileSync(output, "");
+  runInNewContext(program, {
+    require: name => name === "node:child_process" ? { execFileSync: (_file, args) => runGit(args) } : require(name),
+    process: { cwd: () => repository, env: { PRODUCT: product, TAG: tag, PUBLISH: String(publish),
+      GITHUB_EVENT_NAME: eventName, GITHUB_REF_TYPE: refType, GITHUB_REF_NAME: refName, GITHUB_OUTPUT: output } },
+    console: { log() {} },
+  }, { timeout: 1000 });
+  const values = Object.fromEntries(readFileSync(output, "utf8").trim().split("\n").map(line => line.split("=")));
+  return { tag: values.tag, sourceCommit: values.source_commit };
+}
 
 function write(path, value = "locked\n") {
   mkdirSync(join(path, ".."), { recursive: true });
@@ -87,7 +112,7 @@ function gitState({ head = "a".repeat(40), tags = {}, contained = true } = {}) {
   };
 }
 
-test("rehearsals reuse the source version and notes after its tag was published on an older commit", t => {
+test("workflow rehearsals reuse version and notes from a source without the workflow's helper files", t => {
   for (const product of ["app", "sync"]) {
     const root = repository(product, "1.2.3");
     t.after(() => rmSync(root, { recursive: true, force: true }));

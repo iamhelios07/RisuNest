@@ -94,7 +94,6 @@ test("source validation and downstream builds use the resolved tag and checked c
   assert.ok(ancestry > 0 && ancestry < source.indexOf("      - uses: pnpm/action-setup"),
     "Reject sources outside main before executing checkout-owned tooling");
   const identity = source.slice(source.indexOf("      - id: identity"), source.indexOf("      - name: Validate source release inputs"));
-  assert.match(identity, /run: node scripts\/release\/source-identity\.mjs/);
   assert.match(identity, /PRODUCT: \$\{\{ inputs\.product \}\}/);
   assert.match(identity, /TAG: \$\{\{ inputs\.tag \}\}/);
   assert.match(identity, /PUBLISH: \$\{\{ inputs\.publish \}\}/);

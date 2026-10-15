@@ -80,7 +80,40 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
       - id: identity
-        run: node scripts/release/source-identity.mjs
+        shell: bash
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const { execFileSync } = require("node:child_process");
+          const { appendFileSync, readFileSync } = require("node:fs");
+          const { join } = require("node:path");
+          const { PRODUCT: product, TAG: requestedTag, PUBLISH: mode } = process.env;
+          if (!["app", "sync"].includes(product)) throw new Error("invalid-release-product");
+          if (!["true", "false"].includes(mode)) throw new Error("invalid-publication-mode");
+          const publish = mode === "true";
+          if (publish && !requestedTag) throw new Error("publication-tag-required");
+          const versionFile = join(process.cwd(), product === "app" ? "version.json" : "server/version.json");
+          const version = JSON.parse(readFileSync(versionFile, "utf8")).version;
+          if (typeof version !== "string" || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
+            throw new Error("Source version must be an unprefixed stable SemVer.");
+          }
+          const tag = requestedTag || `${product}-v${version}`;
+          if (!tag.startsWith(`${product}-v`)) throw new Error(`Tag ${tag} does not belong to ${product}.`);
+          if (tag !== `${product}-v${version}`) throw new Error(`Expected tag ${product}-v${version}, received ${tag}.`);
+          const git = args => execFileSync("git", args, { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+          const sourceCommit = git(["rev-parse", "HEAD"]);
+          if (!/^[a-f0-9]{40}$/.test(sourceCommit)) throw new Error("invalid-source-commit");
+          git(["merge-base", "--is-ancestor", sourceCommit, "refs/remotes/origin/main"]);
+          const { GITHUB_EVENT_NAME: eventName, GITHUB_REF_TYPE: refType, GITHUB_REF_NAME: refName } = process.env;
+          if (eventName === "push" && (refType !== "tag" || tag !== refName)) {
+            throw new Error("pushed-release-tag-mismatch");
+          }
+          if (publish || eventName === "push") {
+            const tagged = git(["rev-parse", "--verify", `refs/tags/${tag}^{commit}`]);
+            if (tagged !== sourceCommit) throw new Error("release-tag-commit-mismatch");
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `tag=${tag}\nsource_commit=${sourceCommit}\n`);
+          console.log(JSON.stringify({ tag, sourceCommit }));
+          NODE
         env:
           PRODUCT: ${{ inputs.product }}
           TAG: ${{ inputs.tag }}
