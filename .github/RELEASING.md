@@ -54,6 +54,40 @@ releases. Never commit private keys, passwords, or keystores.
 except when publishing the first product into an empty release catalogue. Set it
 back to `false` immediately after that first publication succeeds.
 
+## Rehearse without preparing a new release
+
+Run `Release build` with `publish=false` and leave `tag` empty. The workflow
+uses the selected source's App or Sync version and existing release notes.
+Version files must agree and the notes must pass the same validation as a
+publication. No version bump, new release notes, or Git tag is needed.
+
+```powershell
+$Sha = (git rev-parse HEAD).Trim()
+gh workflow run release.yml --ref main `
+    -f product=app -f source_ref=$Sha -f publish=false -f bootstrap=false
+gh workflow run release.yml --ref main `
+    -f product=sync -f source_ref=$Sha -f publish=false -f bootstrap=false
+```
+
+`--ref` selects the workflow definition; `source_ref` selects the source to
+build and must be contained in `origin/main`. Use a full commit SHA to keep
+retries on the same source. Dispatch a new run to verify another commit or
+repeat the whole build after earlier artifacts expire.
+
+A rehearsal may reuse a version whose tag already points to an older commit.
+An explicit `tag`, if provided, must still match the selected product version.
+Builds use the production signing Secrets and run the package verification
+gates, but do not create or modify GitHub Releases, tags, the update catalog,
+or README downloads. Download packages from that run's `rehearsal-*` artifacts;
+the release URLs in its validation manifest are not rehearsal download links.
+Use the run ID and recorded source commit to distinguish builds of the same
+version. Rehearsal packages and manifests are retained for two days.
+
+Before publishing a new version, prepare its release commit and rehearse that
+exact commit again. Same-version rehearsals do not prove an upgrade from the
+latest published version to the next version; the Sync Windows installer checks
+start from the newest published Sync version lower than the source version.
+
 ## Before the first publication
 
 Pushing an `app-v*` or `sync-v*` tag publishes a release. Never push a tag to
@@ -68,23 +102,8 @@ test the release build.
    Android release certificate. The workflow's signing preflight proves that
    the Secrets form a working key pair and keystore entry; it does not prove
    that they are the intended identity.
-3. Run a non-publishing rehearsal of the exact reviewed commit. The workflow
-   rejects a `source_ref` that is not contained in `origin/main`, and a tag that
-   already exists on another commit:
-
-   ```powershell
-   $Sha = (git rev-parse HEAD).Trim()
-   gh workflow run release.yml --ref main `
-       -f product=app -f tag=app-v1.0.0 -f source_ref=$Sha `
-       -f publish=false -f bootstrap=false
-   gh workflow run release.yml --ref main `
-       -f product=sync -f tag=sync-v1.0.0 -f source_ref=$Sha `
-       -f publish=false -f bootstrap=false
-   ```
-
-   `--ref` selects the workflow definition; `source_ref` selects the commit to
-   build. The tag may be unpushed for a rehearsal. A rehearsal still uses the
-   production signing Secrets.
+3. Run a non-publishing rehearsal of the exact reviewed commit using the
+   commands above. Compare the recorded source commit with the intended SHA.
 4. Check the rehearsal's `rehearsal-*` artifacts: every expected package and
    signature is present, versions and the source commit match, and nothing
    unexpected is included.

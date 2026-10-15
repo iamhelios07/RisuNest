@@ -1,11 +1,11 @@
 name: Release build
-run-name: ${{ inputs.publish && 'Release' || 'Rehearsal' }} ${{ inputs.tag }} (${{ inputs.source_ref || github.ref_name }})
+run-name: ${{ inputs.publish && 'Release' || 'Rehearsal' }} ${{ inputs.tag || inputs.product }} (${{ inputs.source_ref || github.ref_name }})
 
 on:
   workflow_call:
     inputs:
       product: { type: string, required: true }
-      tag: { type: string, required: true }
+      tag: { type: string, required: false }
       source_ref: { type: string, required: true }
       publish: { type: boolean, required: true }
       bootstrap: { type: boolean, default: false }
@@ -25,9 +25,9 @@ on:
         options: [app, sync]
         required: true
       tag:
-        description: Product tag; may be unpushed for rehearsal, must exist for publication
+        description: Product tag; leave empty to rehearse the source version, required for publication
         type: string
-        required: true
+        required: false
       source_ref:
         description: Git ref to build
         type: string
@@ -45,7 +45,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: risunest-release-${{ inputs.tag }}
+  group: ${{ inputs.publish && format('risunest-release-{0}', inputs.tag) || format('risunest-rehearsal-{0}', inputs.product) }}
   queue: max
   cancel-in-progress: false
 
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       product: ${{ inputs.product }}
-      tag: ${{ inputs.tag }}
+      tag: ${{ steps.identity.outputs.tag }}
       source_commit: ${{ steps.identity.outputs.source_commit }}
       publish: ${{ inputs.publish }}
       bootstrap: ${{ inputs.bootstrap }}
@@ -71,30 +71,20 @@ jobs:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
           persist-credentials: false
-      - id: identity
+      - name: Require a source commit contained in main
         shell: bash
-        run: |
-          set -euo pipefail
-          source_commit=$(git rev-parse HEAD)
-          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            test "$GITHUB_REF_TYPE" = "tag"
-            test "$TAG" = "$GITHUB_REF_NAME"
-            test "$(git rev-parse "$TAG^{commit}")" = "$source_commit"
-          elif tagged=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}"); then
-            test "$tagged" = "$source_commit"
-          else
-            test "$PUBLISH" != "true"
-          fi
-          printf 'source_commit=%s\n' "$source_commit" >> "$GITHUB_OUTPUT"
-        env:
-          TAG: ${{ inputs.tag }}
-          PUBLISH: ${{ inputs.publish }}
+        run: git merge-base --is-ancestor "$(git rev-parse HEAD)" refs/remotes/origin/main
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
+      - id: identity
+        run: node scripts/release/source-identity.mjs
+        env:
+          PRODUCT: ${{ inputs.product }}
+          TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ inputs.publish }}
       - name: Validate source release inputs
         shell: bash
         run: |
@@ -105,7 +95,7 @@ jobs:
           node scripts/release/source-check.mjs "${args[@]}"
         env:
           PRODUCT: ${{ inputs.product }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.identity.outputs.tag }}
           SOURCE_COMMIT: ${{ steps.identity.outputs.source_commit }}
           RISUNEST_DEFAULT_REGISTRY_URL: ${{ secrets.RISUNEST_DEFAULT_REGISTRY_URL }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
