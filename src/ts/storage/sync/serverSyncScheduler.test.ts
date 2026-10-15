@@ -4,10 +4,28 @@ import { createServerSyncScheduler } from './serverSyncScheduler'
 afterEach(() => vi.useRealTimers())
 function fixture() {
     vi.useFakeTimers()
-    const dependencies = { push: vi.fn(async () => {}), pull: vi.fn(async () => {}), connect: vi.fn(async () => {}), disconnect: vi.fn(async () => {}), retryClock: vi.fn(async () => {}), failed: vi.fn(), recovered: vi.fn() }
+    const dependencies = { push: vi.fn(async () => {}), pull: vi.fn(async () => {}), connect: vi.fn(async (_operationId: string) => {}), disconnect: vi.fn(async () => {}), retryClock: vi.fn(async () => {}), failed: vi.fn(), recovered: vi.fn() }
     return { ...dependencies, scheduler: createServerSyncScheduler(dependencies) }
 }
 describe('server LWW foreground scheduler', () => {
+    it('correlates notification retries until the socket connects or a fresh session starts', async () => {
+        const f = fixture()
+        f.connect.mockRejectedValueOnce({ code: 'server-unreachable' })
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        const first = f.connect.mock.calls[0][0]
+        expect(first).toMatch(/^[0-9a-f-]{36}$/)
+        await vi.advanceTimersByTimeAsync(1000)
+        expect(f.connect.mock.calls.at(-1)![0]).toBe(first)
+        // Starting the native worker succeeded, but the socket has not connected yet.
+        f.scheduler.socket(false); await vi.advanceTimersByTimeAsync(2000)
+        expect(f.connect.mock.calls.at(-1)![0]).toBe(first)
+        f.scheduler.socket(true); f.scheduler.socket(false); await vi.advanceTimersByTimeAsync(1000)
+        const afterSuccess = f.connect.mock.calls.at(-1)![0]
+        expect(afterSuccess).not.toBe(first)
+        await f.scheduler.foreground(false); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.connect.mock.calls.at(-1)![0]).not.toBe(afterSuccess)
+        f.scheduler.dispose()
+    })
     it('defers every automatic trigger while unavailable, retains explicit receive and resumes on release', async () => {
         const f = fixture()
         let available = false
