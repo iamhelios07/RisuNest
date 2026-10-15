@@ -199,6 +199,8 @@ impl Provider for ObservedProvider {
             result
         })
     }
+    fn supports_incomplete_cleanup(&self) -> bool { self.provider.supports_incomplete_cleanup() }
+    fn cleanup_incomplete_objects<'a>(&'a self, r: &'a RepositoryHandle, j: &'a [String], limit: usize, x: &'a Cancellation) -> ProviderFuture<'a, u64> { self.provider.cleanup_incomplete_objects(r,j,limit,x) }
     fn delete_empty_container<'a>(&'a self, r: &'a RepositoryHandle, l: &'a RemoteLocator, j: &'a [String], x: &'a Cancellation) -> ProviderFuture<'a, ()> { self.provider.delete_empty_container(r,l,j,x) }
     fn reconcile_upload<'a>(&'a self, r: &'a RepositoryHandle, i: &'a ObjectIntent, s: Option<&'a ResumeState>, x: &'a Cancellation) -> ProviderFuture<'a, UploadResolution> {
         Box::pin(async move {

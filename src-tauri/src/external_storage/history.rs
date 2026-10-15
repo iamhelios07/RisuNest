@@ -26,6 +26,7 @@ const READ_AHEAD_PAGES: usize = 4;
 /// reference, so its snapshot pages leave them out.
 static COVERED: LazyLock<Mutex<BTreeMap<String, BTreeSet<String>>>> =
     LazyLock::new(Default::default);
+static POINTS: LazyLock<Mutex<BTreeMap<String, control::PointHistoryCache>>> = LazyLock::new(Default::default);
 fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
 }
@@ -225,13 +226,11 @@ pub(crate) async fn external_storage_list_history(
             provider,
         };
         let next = if state.phase == "points" {
-            let page = control::list_connected_backup_points_page(
-                &connected,
-                state.provider.as_deref(),
-                PAGE,
-                &cancel,
-            )
-            .await?;
+            let scope=format!("{}:{}:{}",connected.handle.connection_identity,connected.stored.descriptor.repository_id,hex::encode(hash(&connected.root_key[..])));
+            let mut points=POINTS.lock().map_err(|_|corrupt())?.remove(&scope).unwrap_or_default();
+            let result=super::leases::control_request(&cancel,control::list_ordered_backup_points_page(&connected,&mut points,state.provider.as_deref(),PAGE,&cancel)).await;
+            POINTS.lock().map_err(|_|corrupt())?.insert(scope,points);
+            let page=result?;
             let mut referenced = Vec::new();
             for point in page.points {
                 let kind = match point.document.kind {

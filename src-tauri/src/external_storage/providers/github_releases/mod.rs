@@ -831,7 +831,7 @@ impl Provider for GithubReleases {
         limit: u16,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, ObjectPage> {
-        Box::pin(async move {
+        Box::pin(crate::external_storage::leases::control_request(cancel, async move {
             if collection == Collection::Segments { return Err(ProviderError::new(ErrorKind::Unsupported)); }
             cancel.check()?;
             let context = self.context(repository)?;
@@ -844,8 +844,11 @@ impl Provider for GithubReleases {
             let mut next_cursor = None;
             let mut exhausted_releases = false;
             let mut releases: Option<Vec<ReleaseView>> = None;
-            for _ in 0..api::MAX_LIST_STEPS {
+            let mut requests = 0;
+            while objects.is_empty() || requests < api::MAX_LIST_STEPS {
+                cancel.check()?;
                 if releases.is_none() {
+                    requests += 1;
                     releases = Some(self.releases_page(context, release_page, cancel).await?);
                 }
                 let page_length = releases.as_ref().map_or(0, Vec::len);
@@ -871,11 +874,12 @@ impl Provider for GithubReleases {
                     asset_index = 0;
                     continue;
                 }
+                requests += 1;
                 let assets = self.assets_page(context, id, asset_page, cancel).await?;
                 let exhausted = assets.len() < api::ASSET_PAGE_SIZE;
                 let matching: Vec<&AssetView> = assets
                     .iter()
-                    .filter(|asset| api::collection_holds(collection, &asset.name))
+                    .filter(|asset| asset.uploaded() && api::collection_holds(collection, &asset.name))
                     .collect();
                 let mut stopped = false;
                 for (index, asset) in matching.iter().enumerate().skip(asset_index) {
@@ -912,13 +916,74 @@ impl Provider for GithubReleases {
                 objects,
                 next_cursor,
             })
+        }))
+    }
+
+    fn supports_incomplete_cleanup(&self) -> bool { true }
+    fn cleanup_incomplete_objects<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        protected_jobs: &'a [String],
+        limit: usize,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, u64> {
+        Box::pin(async move {
+            let context = self.context(repository)?;
+            let mut removed = 0;
+            let mut page = 1;
+            while removed < limit as u64 {
+                cancel.check()?;
+                let releases = self.releases_page(context, page, cancel).await?;
+                let exhausted = releases.len() < api::RELEASE_PAGE_SIZE;
+                for release in releases {
+                    let prefix=format!("{}-",context.tag_prefix);
+                    let Some((batch,sequence))=release.tag_name.strip_prefix(&prefix).and_then(|tag|tag.rsplit_once('-')) else {continue;};
+                    let owned=batch==api::LEASE_BATCH || batch.strip_prefix(api::JOB_BATCH_PREFIX).is_some_and(|hash|
+                        hash.len()==16 && hash.bytes().all(|byte|byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+                    if !release.draft || !owned || sequence.parse::<u32>().ok().is_none_or(|value|value.to_string()!=sequence)
+                        || protected_jobs.iter().any(|job| {
+                            let tag = context.tag(&api::batch_key(ObjectRole::Pack, job), 0);
+                            release.tag_name.starts_with(tag.strip_suffix('0').unwrap_or(&tag))
+                        }) { continue; }
+                    // Collect before deleting: page-numbered assets shift after removal.
+                    let mut candidates = Vec::new();
+                    let mut asset_page = 1;
+                    loop {
+                        let assets = self.assets_page(context, release.id, asset_page, cancel).await?;
+                        let complete = assets.len() < api::ASSET_PAGE_SIZE;
+                        candidates.extend(assets.into_iter().filter(|asset| asset.state == "starter"
+                            && asset.size == 0 && api::removable_asset(&asset.name)));
+                        if complete || candidates.len() >= limit - removed as usize { break; }
+                        asset_page += 1;
+                    }
+                    if candidates.is_empty() { continue; }
+                    let response=self.send(self.request(context,Method::GET,context.release_url(release.id)?,ProviderOperation::Metadata),cancel).await?;
+                    if response.status==404 {continue;}
+                    let owner:ReleaseView=self.decode(response,cancel).await?;
+                    if owner.id!=release.id || owner.tag_name!=release.tag_name || !owner.draft {continue;}
+                    for asset in candidates {
+                        if removed >= limit as u64 { return Ok(removed); }
+                        let response = self.send(self.request(context, Method::GET,
+                            context.asset_url(asset.id)?, ProviderOperation::Metadata), cancel).await?;
+                        if response.status == 404 { continue; }
+                        let current: AssetView = self.decode(response, cancel).await?;
+                        if current.id != asset.id || current.name != asset.name
+                            || current.state != "starter" || current.size != 0 { continue; }
+                        let response = self.send(self.request(context, Method::DELETE,
+                            context.asset_url(asset.id)?, ProviderOperation::Delete), cancel).await?;
+                        match response.status {
+                            204 | 404 => removed += 1,
+                            status => return Err(api::classify(status, &response.headers, self.now())),
+                        }
+                    }
+                }
+                if exhausted { break; }
+                page = page.checked_add(1).ok_or_else(corrupt)?;
+            }
+            Ok(removed)
         })
     }
 
-    /// The adapter issues no upload session, so `resume` carries no offset of
-    /// its own. Reconciliation asks the service what it actually stored for
-    /// this object and reports that, which is the recovery path after a lost
-    /// upload response.
     fn delete_empty_container<'a>(
         &'a self,
         repository: &'a RepositoryHandle,
@@ -1012,7 +1077,8 @@ impl Provider for GithubReleases {
                     let Some(asset) = self.find_asset(context, release.id, &name, cancel).await? else {
                         continue;
                     };
-                    if !asset.uploaded() || !asset.matches(intent) || found.is_some() {
+                    if !asset.uploaded() { continue; }
+                    if !asset.matches(intent) || found.is_some() {
                         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                     }
                     found = Some(Self::receipt(context, &release.tag_name, release.id, &asset, intent));

@@ -555,6 +555,21 @@ async fn run_owned(
         } else if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
             outcome.stop_reason = reason;
         } else {
+            if sent < request.limits.per_run && context.provider.supports_incomplete_cleanup() {
+                if !marker_placed { owner.place_marker(context, cancel).await?; }
+                if let Some(reason) = recheck(context, owner, view, &before, &jobs, cancel).await? {
+                    outcome.stop_reason = reason;
+                    return Ok(());
+                }
+                let mut protected = view.protected_jobs();
+                protected.push(request.job_id.to_owned());
+                owner.set_delete_in_flight(true);
+                let removed = leases::control_request(cancel, context.provider.cleanup_incomplete_objects(
+                    context.repository, &protected, request.limits.per_run - sent, cancel,
+                )).await?;
+                owner.set_delete_in_flight(false);
+                outcome.deleted_objects = outcome.deleted_objects.saturating_add(removed);
+            }
             GcStore::open(context.root)?.set_last_reachable_bytes(context.connection_id, marked.reachable_bytes)?;
         }
     }
@@ -1716,6 +1731,22 @@ pub(super) mod tests {
         fn payload_deletes(&self) -> Vec<String> {
             self.provider.deletion_order().into_iter().filter(|id| id == "parent-catalog" || id == "child-pack").collect()
         }
+    }
+
+    #[test]
+    fn unfinished_provider_upload_is_removed_only_after_the_live_lease_releases() {
+        runtime().block_on(async {
+            let h=Harness::new();
+            let owner=match leases::admit(&h.context(),"active-upload",LeaseKind::Work,&Cancellation::default()).await.unwrap() {
+                Admission::Admitted(owner)=>owner,_=>panic!("work must be admitted"),
+            };
+            h.provider.seed("unfinished-pack",ObjectRole::Pack,Vec::new());
+            assert_eq!(h.run().await.unwrap().stop_reason,StopReason::Lease);
+            assert!(h.provider.holds("unfinished-pack"));
+            owner.release_all(&h.context()).await;
+            assert_eq!(h.run().await.unwrap().deleted_objects,1);
+            assert!(!h.provider.holds("unfinished-pack"));
+        });
     }
 
     #[test]

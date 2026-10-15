@@ -354,33 +354,67 @@ fn bounded_lookups_do_not_report_unscanned_objects_as_absent() {
 }
 
 #[test]
-fn discovery_returns_a_cursor_when_its_budget_ends_on_a_skipped_release_or_page() {
+fn lease_discovery_crosses_empty_releases_and_ignores_starters() {
     runtime().block_on(async {
-        for start in [0usize, 29] {
-            let tag = job_tag("retained-job", 0);
-            let first: Vec<_> = (0..30).map(|id| release(id + 100, "unrelated")).collect();
-            let second: Vec<_> = (0..30).map(|id| release(id + 200, "unrelated")).collect();
-            let mut third: Vec<_> = (0..30).map(|id| release(id + 300, "unrelated")).collect();
-            if start == 0 { third[2] = release(777, &tag); }
-            let resumed = if start == 0 { third.clone() } else { vec![release(777, &tag)] };
+        let mut replies = existing_repository_replies();
+        let mut releases: Vec<_> = (0..130).map(|id| release(id + 100, &job_tag("old-job", id as u32))).collect();
+        releases.push(release(777, &format!("{PREFIX}-l-0")));
+        for page in releases.chunks(api::RELEASE_PAGE_SIZE) { replies.push(reply(200, json!(page))); }
+        replies.push(reply(200, json!([
+            {"id":998,"name":"lease-work-starter","size":0,"state":"starter"},
+            asset(999, "lease-work-complete", 4, None),
+        ])));
+        let server = github_server(replies);
+        let provider = adapter(dependencies().dependencies);
+        let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
+        let page = provider.list_objects(&handle, Collection::Leases, None, 100, &Cancellation::default()).await.unwrap();
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].locator.object, "777/999");
+        assert!(page.objects[0].complete);
+        assert!(page.next_cursor.is_none());
+    });
+}
+
+#[test]
+fn locator_free_lookup_ignores_an_unfinished_upload() {
+    runtime().block_on(async {
+        let mut replies = existing_repository_replies();
+        replies.extend([
+            reply(200, json!([release(60, &job_tag("job-1", 0))])),
+            reply(200, json!([{"id":88,"name":"pack-object","size":0,"state":"starter"}])),
+        ]);
+        let server = github_server(replies);
+        let provider = adapter(dependencies().dependencies);
+        let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
+        let intent = object_intent(&handle, ObjectRole::Pack, "object", b"body");
+        assert!(provider.lookup_metadata(&handle, &intent, None, &Cancellation::default()).await.unwrap().is_none());
+    });
+}
+
+#[test]
+fn cleanup_removes_only_unprotected_zero_byte_starters_after_rechecking() {
+    runtime().block_on(async {
+        for case in 0..7 {
+            let tag = if case == 5 { format!("{PREFIX}-jforeign-0") } else if case == 4 { format!("{PREFIX}-l-0") } else { job_tag("job-1", 0) };
+            let starter = json!({"id":88,"name":if case==4 {"lease-work-abandoned"} else {"pack-object"},"size":0,"state":"starter"});
             let mut replies = existing_repository_replies();
-            for page in [first, second, third, resumed] { replies.push(reply(200, json!(page))); }
-            replies.push(reply(200, json!([asset(999, &api::asset_name(ObjectRole::BackupBundle, "snapshot-retained"), 4, None)])));
-            if start == 0 { replies.push(reply(200, json!([]))); }
+            replies.push(reply(200, json!([release(60, &tag)])));
+            if case != 1 && case != 5 {
+                replies.push(reply(200, json!([starter.clone()])));
+                replies.push(reply(200, release(60, if case==6 {"foreign"} else {&tag})));
+                let mut current = starter.clone();
+                if case == 2 { current["state"] = json!("uploaded"); }
+                if case == 3 { current["size"] = json!(10); }
+                if case!=6 {replies.push(reply(200, current));}
+                if case == 0 || case == 4 { replies.push(reply(204, json!(null))); }
+            }
             let server = github_server(replies);
-            let test = dependencies();
-            let provider = adapter(test.dependencies);
+            let provider = adapter(dependencies().dependencies);
             let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
-            let cancel = Cancellation::default();
-            let cursor = format!("1:{start}:1:0");
-            let first = provider.list_objects(&handle, Collection::Snapshots, Some(&cursor), 100, &cancel).await.unwrap();
-            assert!(first.objects.is_empty());
-            let next = first.next_cursor.expect("A bounded scan has not exhausted the repository");
-            assert_ne!(next, cursor);
-            let resumed = provider.list_objects(&handle, Collection::Snapshots, Some(&next), 100, &cancel).await.unwrap();
-            assert_eq!(resumed.objects.len(), 1);
-            assert!(resumed.objects[0].complete);
-            assert!(resumed.next_cursor.is_none());
+            let protected = if case == 1 { vec!["job-1".to_owned()] } else { vec![] };
+            let removed = provider.cleanup_incomplete_objects(&handle, &protected, 10, &Cancellation::default()).await.unwrap();
+            assert_eq!(removed, u64::from(case == 0 || case == 4), "case {case}");
+            assert_eq!(server.requests.lock().unwrap().iter().filter(|request|method_of(request)=="DELETE").count() as u64, removed);
         }
     });
 }

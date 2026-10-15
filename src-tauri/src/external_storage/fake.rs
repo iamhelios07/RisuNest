@@ -111,6 +111,7 @@ pub(super) struct FakeState {
 /// byte reaches it, until it is released or cancelled.
 pub(crate) struct FakeReadBarrier {
     pub object_id:String,
+    prefix_bytes:usize,
     pub reached:tokio::sync::Notify,
     release:tokio::sync::Notify,
     pub was_reached:AtomicBool,
@@ -128,11 +129,14 @@ pub(crate) struct FakeProvider {
 }
 impl FakeProvider {
     pub(crate) fn arm_read_barrier(&self,object_id:&str)->Result<Arc<FakeReadBarrier>> {
+        self.arm_partial_read_barrier(object_id,0)
+    }
+    pub(crate) fn arm_partial_read_barrier(&self,object_id:&str,prefix_bytes:usize)->Result<Arc<FakeReadBarrier>> {
         let mut state=self.state.lock().unwrap();
         if state.read_barrier.is_some() || !state.objects.contains_key(object_id) {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
-        let barrier=Arc::new(FakeReadBarrier {object_id:object_id.into(),reached:Default::default(),release:Default::default(),
+        let barrier=Arc::new(FakeReadBarrier {object_id:object_id.into(),prefix_bytes,reached:Default::default(),release:Default::default(),
             was_reached:false.into(),was_released:false.into()});
         state.read_barrier=Some((object_id.into(),barrier.clone()));Ok(barrier)
     }
@@ -423,13 +427,16 @@ impl Provider for FakeProvider {
             let mut writer = sink.open(0, bytes.len() as u64, c).await?;
             let barrier={let mut state=self.state.lock().unwrap();
                 if state.read_barrier.as_ref().is_some_and(|(object,_)|object==&l.object) {state.read_barrier.take().map(|(_,barrier)|barrier)}else{None}};
+            let mut offset=0;
             if let Some(barrier)=barrier {
+                offset=barrier.prefix_bytes.min(bytes.len());
+                writer.write_all(&bytes[..offset]).await.map_err(|_|ProviderError::new(ErrorKind::Transient))?;
                 barrier.was_reached.store(true,Ordering::SeqCst);barrier.reached.notify_one();
                 tokio::select! {_=barrier.release.notified()=>(),_=c.cancelled()=>()}
                 c.check()?;
             }
             writer
-                .write_all(&bytes)
+                .write_all(&bytes[offset..])
                 .await
                 .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
             {let mut state=self.state.lock().unwrap();state.received_body_bytes+=bytes.len() as u64;*state.body_bytes.entry(l.object.clone()).or_default()+=bytes.len();}
@@ -563,6 +570,16 @@ impl Provider for FakeProvider {
             c.check()?;
             l.validate_for(r)?;
             self.write(l, None, h.as_bytes())
+        })
+    }
+    fn supports_incomplete_cleanup(&self) -> bool { true }
+    fn cleanup_incomplete_objects<'a>(&'a self, _r: &'a RepositoryHandle, _protected: &'a [String], limit: usize, cancel: &'a Cancellation) -> ProviderFuture<'a,u64> {
+        Box::pin(async move {
+            cancel.check()?;
+            let mut state=self.state.lock().unwrap();
+            let unfinished=state.objects.iter().filter(|(id,(body,_))|id.starts_with("unfinished-") && body.is_empty()).map(|(id,_)|id.clone()).take(limit).collect::<Vec<_>>();
+            for id in &unfinished {state.objects.remove(id);state.roles.remove(id);state.delete_attempts.push(id.clone());}
+            Ok(unfinished.len() as u64)
         })
     }
     fn delete_object<'a>(
