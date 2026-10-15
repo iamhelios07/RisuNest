@@ -267,7 +267,7 @@ export interface PersistentDataRuntimeStateAdapter {
     captureCharacterIndex?(): ReadonlyMap<string, CompleteCharacter>
     beforeCapture?(): void
     afterRemoteApply?(): void
-    /** Root fields that projected units left without a value take the value a load gives them. */
+    /** Received root fields take the normalized value a load gives them. */
     fillRootFieldDefaults?(fields: readonly string[]): void
     /** Root fields whose working-set value changed when stored units were projected into it. */
     afterRemoteRootChange?(fields: ReadonlySet<string>): void
@@ -550,7 +550,7 @@ export interface PersistentDestructiveReplacementFence {
         revision: DataRevision,
         options?: PersistentCommittedWorkingSetRefreshOptions,
     ): Promise<CommittedApplyOutcome>
-    release(): void
+    release(options?: { verifyStoreRevision: boolean }): void | Promise<void>
 }
 
 export interface PersistentCommittedWorkingSetRefreshOptions {
@@ -1630,6 +1630,7 @@ export function createPersistentDataRuntime(
             const owner = await coordinator.acquireDestructiveReplacementFence(expected)
             const heldRevision = coordinator.revision
             let released = false
+            let releasing: Promise<void> | undefined
             return {
                 revision: heldRevision,
                 refreshCommittedWorkingSet(revision, options) {
@@ -1646,19 +1647,33 @@ export function createPersistentDataRuntime(
                     }
                     return refreshCommittedWorkingSet(revision, owner, options)
                 },
-                release() {
+                release(options) {
+                    if (releasing) return releasing
                     if (released) return
-                    coordinator.releaseDestructiveReplacementFence(owner)
-                    released = true
-                    // Nothing else can commit while the fence is held, so a later
-                    // revision is the holder's own change and sync must send it.
-                    const committed = coordinator.revision
-                    if (committed <= heldRevision) return
-                    try {
-                        dependencies.onLocalRevision?.(committed)
-                    } catch (error) {
-                        dependencies.onBackgroundError?.(error)
+                    const finish = () => {
+                        coordinator.releaseDestructiveReplacementFence(owner)
+                        released = true
+                        // Nothing else can commit while the fence is held, so a later
+                        // revision is the holder's own change and sync must send it.
+                        const committed = coordinator.revision
+                        if (committed <= heldRevision) return
+                        try {
+                            dependencies.onLocalRevision?.(committed)
+                        } catch (error) {
+                            dependencies.onBackgroundError?.(error)
+                        }
                     }
+                    if (!options?.verifyStoreRevision || coordinator.revision > heldRevision) return finish()
+                    releasing = (async () => {
+                        try {
+                            const latest = await dependencies.store.readRoot()
+                            if (latest.revision > coordinator.revision) coordinator.markCommittedWorkingSetRefreshRequired(
+                                latest.revision, new Error('Native commit completed without a working-set acknowledgement'))
+                        } catch (error) {
+                            coordinator.markCommittedWorkingSetRefreshRequired(coordinator.revision, error)
+                        } finally { finish() }
+                    })()
+                    return releasing
                 },
             }
         },

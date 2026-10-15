@@ -122,20 +122,39 @@ impl Residency {
             }
         }
         let mut db = crate::sqlite_open::open(&path)?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+        let configure_started = std::time::Instant::now();
+        let configure_budget = std::time::Duration::from_secs(5);
+        loop {
+            db.busy_timeout(configure_budget.saturating_sub(configure_started.elapsed()))?;
+            match db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;") {
+                Ok(()) => break,
+                // A simultaneous WAL-mode change can bypass SQLite's busy timeout.
+                Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                    && configure_started.elapsed() < configure_budget => {
+                        std::thread::sleep(std::time::Duration::from_millis(10).min(configure_budget.saturating_sub(configure_started.elapsed())));
+                    }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        db.busy_timeout(configure_budget)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version == 0 {
-            let tx = db.transaction()?;
-            let count: i64 =
-                tx.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
-            if count != 0 {
-                return Err(SyncError::new("invalid-residency-store", 409));
-            }
-            tx.execute_batch("CREATE TABLE contexts(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,device_id TEXT NOT NULL,epoch TEXT NOT NULL,config TEXT NOT NULL);
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version == 0 {
+                let count: i64 =
+                    tx.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+                if count != 0 {
+                    return Err(SyncError::new("invalid-residency-store", 409));
+                }
+                tx.execute_batch("CREATE TABLE contexts(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,device_id TEXT NOT NULL,epoch TEXT NOT NULL,config TEXT NOT NULL);
                 CREATE TABLE objects(context TEXT NOT NULL REFERENCES contexts(id),hash TEXT NOT NULL,size INTEGER NOT NULL CHECK(size>=0),retention_id TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('active','releasing','released')),confirmation_order INTEGER NOT NULL CHECK(confirmation_order>0),PRIMARY KEY(context,hash));
                 CREATE INDEX objects_hash ON objects(hash);
                 CREATE INDEX objects_confirmation_order ON objects(confirmation_order);
                 PRAGMA user_version=1;")?;
+            } else if version != 1 {
+                return Err(SyncError::new("incompatible-residency-store", 409));
+            }
             tx.commit()?;
         } else if version != 1 {
             return Err(SyncError::new("incompatible-residency-store", 409));

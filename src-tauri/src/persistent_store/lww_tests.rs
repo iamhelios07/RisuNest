@@ -357,6 +357,7 @@ fn missing_parent_is_durable_and_hard_retirement_suppresses_future_children() {
         vec![],
     );
     assert!(store.read_character("char", None).unwrap().is_none());
+    assert!(read_unit(&store.connection, &unit_key(&["character", "char", "name"]).unwrap()).unwrap().is_none());
     assert!(is_retired(
         &store.connection,
         &unit_key(&["exists", "character", "char"]).unwrap()
@@ -886,8 +887,12 @@ fn backup_device_revision_rejects_absent_released_unpinned_foreign_and_changed_i
 #[test]
 fn backup_unit_values_are_lease_fixed_and_include_opaque_held_and_permanent_deletions() {
     let (_dir,mut store)=store();
-    save(&mut store,vec![mutation(&["root","language"],serde_json::json!("before")),mutation(&["exists","character","retired"],serde_json::json!({"type":"character"}))]);
+    save(&mut store,vec![mutation(&["root","language"],serde_json::json!("before")),mutation(&["exists","character","retired"],serde_json::json!({"type":"character"})),mutation(&["character","retired","name"],serde_json::json!("Retired"))]);
     store.commit(&WorkingSetCommit{expected_revision:store.revision().unwrap(),unit_mutations:Some(vec![UnitMutation::Delete{key:unit_key(&["exists","character","retired"]).unwrap()}]),..Default::default()}).unwrap();
+    let retired_child = unit_key(&["character","retired","name"]).unwrap();
+    // Older stores can still carry a child of an already retired record.
+    store.connection.execute("INSERT OR REPLACE INTO lww_units(key,stamp,value,version,identity) SELECT ?1,stamp,value,version,identity FROM lww_units WHERE key=?2",
+        params![retired_child.as_str(), unit_key(&["root","language"]).unwrap().as_str()]).unwrap();
     let opaque=change(&["future-unit","opaque-backup"],1,serde_json::json!({"future":3}));
     let held=change(&["character","missing-parent","name"],1,serde_json::json!("held"));
     receive(&mut store,"backup-opaque-held",vec![opaque.clone(),held.clone()],vec![]);
@@ -897,6 +902,7 @@ fn backup_unit_values_are_lease_fixed_and_include_opaque_held_and_permanent_dele
     assert_eq!(before[&opaque.key],opaque.value);
     assert_eq!(before[&held.key],held.value);
     assert_eq!(before[&unit_key(&["exists","character","retired"]).unwrap()],UnitValue::Deleted);
+    assert!(!before.contains_key(&retired_child));
     assert!(before.keys().all(|key|!is_device(key)));
     save(&mut store,vec![mutation(&["root","language"],serde_json::json!("after"))]);
     assert_eq!(store.lww_backup_unit_values(&lease.lease).unwrap(),before);
@@ -982,7 +988,7 @@ fn backup_held_messages_restore_with_one_stamp_and_project_after_reopen_and_late
     receive(&mut store,"retire-restored-parent",vec![Change{key:unit_key(&["exists","character","waiting"]).unwrap(),stamp:stamp(4),value:UnitValue::Deleted}],vec![]);
     receive(&mut store,"retired-parent-arrives-again",vec![change(&["exists","character","waiting"],5,serde_json::json!(true)),Change{stamp:stamp(restored.0.physical_ms.0+1),..message.clone()}],vec![]);
     assert_eq!(store.connection.query_row("SELECT count(*) FROM characters WHERE generation=?1",[active_generation(&store.connection).unwrap()],|row|row.get::<_,i64>(0)).unwrap(),0);
-    assert_eq!(read_unit(&store.connection,&message.key).unwrap().unwrap(),restored);
+    assert!(read_unit(&store.connection,&message.key).unwrap().is_none());
     assert_eq!(parent_status(&store.connection,&message.key).unwrap(),"retired");
     assert!(store.lww_read_outbox(0.into(),100).unwrap().entries.iter().all(|entry|entry.key!=message.key));
     assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_receive_rows WHERE key=?1 AND status<>'done'",[message.key.as_str()],|row|row.get::<_,i64>(0)).unwrap(),0);
