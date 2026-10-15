@@ -8,6 +8,18 @@ const stableWorkflow = readFileSync(new URL("../../.github/workflows/stable-rele
 const cacheWorkflow = readFileSync(new URL("../../.github/workflows/release-cache.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const referenceAction = readFileSync(new URL("../../.github/actions/test-references/action.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
+test("all app distribution builds receive the mobile-forwarded key and mandatory native key validation", () => {
+  const environment = workflow.slice(workflow.indexOf("\nenv:\n"), workflow.indexOf("\njobs:\n"));
+  assert.match(environment, /TAURI_RISUNEST_UPDATE_PUBLIC_KEY: \$\{\{ secrets\.RISUNEST_UPDATE_PUBLIC_KEY \}\}/);
+  for (const job of ["app-desktop", "app-android", "app-ios"]) {
+    const block = new RegExp(`\\n  ${job}:\\n([\\s\\S]*?)(?=\\n  [\\w-]+:\\n|$)`).exec(workflow)?.[1];
+    assert(block, `Missing ${job} job`);
+    assert.match(block, /node scripts\/release\/tauri-config\.mjs --release-input release-input\.json --output "\$RUNNER_TEMP\/release-tauri\.json"/);
+    assert.match(block, /pnpm exec -- tauri (?:android |ios )?build [^\n]*--config "\$RUNNER_TEMP\/release-tauri\.json"/);
+    assert.doesNotMatch(block, /^\s+(?:TAURI_RISUNEST_UPDATE_PUBLIC_KEY|RISUNEST_UPDATE_PUBLIC_KEY):/m);
+  }
+});
+
 test("README updates follow successful production publication and share its serialization group", () => {
   const block = /\n  update-readme:\n([\s\S]*?)(?=\n  [\w-]+:\n|$)/.exec(workflow)?.[1];
   assert(block);

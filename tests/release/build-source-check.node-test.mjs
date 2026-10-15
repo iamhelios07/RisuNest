@@ -310,6 +310,8 @@ test("pinned cloudflared inputs reject a wrong native architecture", () => {
 
 test("release Tauri config leaves updater discovery to the verified native boundary", () => {
   const config = releaseTauriConfig({ product: "app", version: "1.2.3", mobileBuildNumber: 1_002_003, iosBuildNumber: "1.2.3" }, "synthetic-public-key");
+  assert.deepEqual(config.build.features, ["official-distribution"]);
   assert.deepEqual(config.plugins.updater.endpoints, []);
   assert.equal(JSON.stringify(config).includes("releases/latest/download/manifest.json"), false);
+  assert.equal(releaseTauriConfig({ product: "sync", version: "1.2.3" }, "synthetic-public-key").build, undefined);
 });
