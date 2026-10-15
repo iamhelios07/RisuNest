@@ -1,4 +1,7 @@
-import { advancePluginStorageRemoteChanges, type PluginStorageWriteCheck } from './pluginStorageProtection'
+import { advancePluginStorageRemoteChanges, setPluginStorageReloadHandler, type PluginStorageWriteCheck } from './pluginStorageProtection'
+import { deletePluginDataItems } from './pluginDataInventory'
+import { pluginStorageStore } from './plugins.svelte'
+vi.mock('./plugins.svelte', () => ({ pluginStorageStore: { forOwner: vi.fn() } }))
 const OWNER = 'test-plugin'
 import { describe, expect, it, vi } from 'vitest'
 import {
@@ -572,4 +575,37 @@ it('captures an observation before a delayed read and permits only a new read to
     await guest.setItem('key', 'fresh edit')
     expect(entries.key.value).toBe('fresh edit')
     guest.dispose()
+})
+
+it('records known snapshot keys once while later pages preserve intervening fresh reads', async () => {
+    const { storage } = harness({ key: { value: 'remote', byteSize: 6 } })
+    const guest = storage.forOwner(OWNER)
+    await guest.getItem('key')
+    const observePage = guest.observation.beginSnapshot()
+    observePage([])
+    advancePluginStorageRemoteChanges([JSON.stringify(['plugin', OWNER, 'key'])])
+    await expect(guest.setItem('key', 'stale')).rejects.toThrow('PLUGIN_STORAGE_STALE')
+    await guest.getItem('key')
+    observePage(['other'])
+    await expect(guest.setItem('key', 'fresh')).resolves.toBeUndefined()
+    guest.dispose()
+})
+
+it.each([false, true])('disposes an inventory deletion observer even after failure (%s)', async fail => {
+    const { storage, mutate } = harness({ key: { value: 'old', byteSize: 3 } })
+    vi.mocked(pluginStorageStore.forOwner).mockImplementation(owner => {
+        const guest = storage.forOwner(owner)
+        guest.observation.observe('key')
+        return guest
+    })
+    if (fail) mutate.mockRejectedValueOnce(new Error('disk failure'))
+    const owner = 'inventory-deletion-review'
+    const deleting = deletePluginDataItems([{ owner, key: 'key', valueType: 'string', byteSize: 3, automatic: false }], 'library')
+    if (fail) await expect(deleting).rejects.toThrow('disk failure')
+    else await deleting
+    const reload = vi.fn()
+    setPluginStorageReloadHandler(reload)
+    advancePluginStorageRemoteChanges([JSON.stringify(['plugin', owner, 'key'])])
+    expect(reload).not.toHaveBeenCalled()
+    setPluginStorageReloadHandler(() => {})
 })

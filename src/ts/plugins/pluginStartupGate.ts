@@ -40,17 +40,19 @@ export function createPluginStartupGate(dependencies: {
     let ready: string | undefined
     let once = false
     let checking: Promise<boolean> | undefined
-    const release = () => { if (get(state).phase !== 'released' || get(state).refused) state.set({ phase: 'released', refused: false, since: 0 }) }
+    let installingDefaults = false
+    const release = () => {
+        installingDefaults = false
+        if (get(state).phase !== 'released' || get(state).refused) state.set({ phase: 'released', refused: false, since: 0 })
+    }
     const start = () => { void dependencies.start().catch(error => console.error('Plugin startup failed', error)) }
-    const ensure = (): Promise<boolean> => {
-        if (!dependencies.enabled() || !dependencies.delay() || once) {
+    const ensure = (options: { installingDefaults?: boolean } = {}): Promise<boolean> => {
+        if (options.installingDefaults) installingDefaults = true
+        if ((!dependencies.enabled() && !installingDefaults) || !dependencies.delay() || once) {
             controller?.abort(); attempt++; release()
             return Promise.resolve(true)
         }
         if (checking) return checking
-        if (ready === undefined && get(state).phase === 'released') {
-            state.set({ phase: 'waiting', refused: false, since: Date.now() })
-        }
         const current = attempt
         const run = (async () => {
             let context: PluginStartupContext
@@ -90,7 +92,7 @@ export function createPluginStartupGate(dependencies: {
         get version() { return attempt },
         get refusalCount() { return refusals },
         ensure,
-        isWaiting: () => get(state).phase !== 'released',
+        isWaiting: () => checking !== undefined || get(state).phase !== 'released',
         refuse(): boolean {
             if (get(state).phase === 'released' || !dependencies.enabled()) return false
             refusals++
@@ -98,7 +100,10 @@ export function createPluginStartupGate(dependencies: {
             return true
         },
         invalidate() {
+            const recheck = checking !== undefined && get(state).phase === 'released'
             attempt++; controller?.abort(); controller = undefined; checking = undefined; ready = undefined
+            // Restart consumers whose binding lookup was cancelled before showing a wait.
+            if (recheck) state.update(value => ({ ...value }))
         },
         retry() { this.invalidate(); start() },
         loadOnce() { once = true; this.invalidate(); release(); start() },
@@ -151,7 +156,7 @@ export async function setDelayPluginLoadingUntilSync(value: boolean): Promise<vo
 subscribeSyncBindingChanges(() => {
     const waiting = pluginStartupGate.isWaiting()
     pluginStartupGate.invalidate()
-    if (waiting) void start()
+    if (waiting) void start().catch(error => console.error('Plugin startup failed', error))
 })
 
 export async function retryPluginStartup(): Promise<void> {
@@ -167,7 +172,7 @@ export async function retryPluginStartup(): Promise<void> {
             await requestExternalLwwNow(target.connectionId)
         }
     } catch { /* The gate reports the next receive result through its notice. */ }
-    await start()
+    await start().catch(error => console.error('Plugin startup failed', error))
 }
 
 subscribeSyncReceiveCompleted(() => { if (get(pluginStartupState).phase === 'failed') pluginStartupGate.retry() })

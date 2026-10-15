@@ -130,6 +130,7 @@ export function deviceSettingsModule(startup: BootstrapTestState) {
     return {
         getStartupExclusions: () => startup.exclusions,
         loadDeviceSettings: () => stub<ReturnType<DeviceSettings['loadDeviceSettings']>>({ nativeFileLogEnabled: false }),
+        reloadDeviceSettings: () => stub<ReturnType<DeviceSettings['reloadDeviceSettings']>>({ nativeFileLogEnabled: false }),
     } satisfies Partial<DeviceSettings>
 }
 
@@ -143,9 +144,9 @@ export function nativeFileJobRecoveryModule() {
     type Recovery = typeof import('./storage/nativeFileJobRecovery')
     return {
         shouldReconcileNativeFileJobs: vi.fn(() => false),
-        reconcileNativeFileJobsBeforeBootstrap: async () => stub<Awaited<ReturnType<Recovery['reconcileNativeFileJobsBeforeBootstrap']>>>({
+        reconcileNativeFileJobsBeforeBootstrap: vi.fn(async () => stub<Awaited<ReturnType<Recovery['reconcileNativeFileJobsBeforeBootstrap']>>>({
             pendingRestoreAcknowledgements: [], pendingOfficialPublications: [], interruptedRestores: [],
-        }),
+        })),
         acknowledgeRecoveredNativeRestores: vi.fn(),
     } satisfies Partial<Recovery>
 }
@@ -328,7 +329,7 @@ export function lifecycleCommitModule() {
 }
 
 export function deviceMarkersModule(startup: BootstrapTestState) {
-    return { initializeDeviceMarkers: vi.fn(), getDeviceMarkers: () => startup.markers } satisfies Partial<typeof import('./storage/deviceMarkers')>
+    return { initializeDeviceMarkers: vi.fn(), reloadDeviceMarkers: vi.fn(), getDeviceMarkers: () => startup.markers } satisfies Partial<typeof import('./storage/deviceMarkers')>
 }
 
 export function bootAttemptModule(startup: BootstrapTestState) {

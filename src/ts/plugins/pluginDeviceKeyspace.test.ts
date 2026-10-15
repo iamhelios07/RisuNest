@@ -360,6 +360,45 @@ describe('plugin device keyspace', () => {
 
 
 describe('native plugin device observations', () => {
+    it('reuses hydrated values with their original tokens until invalidated, without read IPC', async () => {
+        const owner = 'native-cached-observations'
+        const { backend, rows } = recordingBackend([{ owner, space: 'json', key: 'settings', value: 'old' }])
+        let sequence = 'epoch:0'
+        backend.sequence = vi.fn(async () => sequence)
+        const hydrate = backend.hydrate.bind(backend)
+        backend.hydrate = async owner => {
+            const loaded = await hydrate(owner)
+            return { ...loaded, entries: loaded.entries.map(entry => ({ ...entry, sequence })) }
+        }
+        const reads = vi.spyOn(backend, 'read')
+        const write = backend.write.bind(backend)
+        backend.write = async (owner, mutations, observations) => {
+            if (observations?.some(value => value.sequence !== sequence)) throw new Error('PLUGIN_STORAGE_STALE')
+            await write(owner, mutations)
+            return mutations.flatMap(value => value.type === 'clear' ? [] : [{ space: value.space, key: value.key, sequence }])
+        }
+        const storage = new PluginDeviceKeyspace(owner, backend)
+        const reload = vi.fn(); setPluginStorageReloadHandler(reload)
+        await storage.keys('json')
+        advancePluginStorageRemoteChanges([JSON.stringify(['plugin-local', owner, 'json', 'settings'])])
+        expect(reload).not.toHaveBeenCalled()
+        await expect(storage.getItem('json', 'settings')).resolves.toBe('old')
+        rows()[0].value = 'remote'; sequence = 'epoch:1'
+        // The native commit can precede its renderer notification.
+        await expect(storage.getItem('json', 'settings')).resolves.toBe('old')
+        expect(reads).not.toHaveBeenCalled()
+        expect(backend.sequence).not.toHaveBeenCalled()
+        await expect(storage.setItem('json', 'settings', 'stale')).rejects.toThrow('PLUGIN_STORAGE_STALE')
+        expect(rows()[0].value).toBe('remote')
+        advancePluginStorageRemoteChanges([JSON.stringify(['plugin-local', owner, 'json', 'settings'])])
+        await expect(storage.getItem('json', 'settings')).resolves.toBe('remote')
+        await storage.setItem('json', 'settings', 'fresh')
+        await expect(storage.getItem('json', 'settings')).resolves.toBe('fresh')
+        expect(reads).not.toHaveBeenCalled()
+        expect(backend.sequence).not.toHaveBeenCalled()
+        storage.dispose()
+        setPluginStorageReloadHandler(() => {})
+    })
     it('captures before reading, keeps enumeration blind, and forwards stale tokens to the transaction', async () => {
         const owner = 'conditional-wrapper'
         const { backend, rows } = recordingBackend([{ owner, space: 'json', key: 'settings', value: 'old' }])

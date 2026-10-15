@@ -801,11 +801,16 @@ export async function loadData() {
         await transition('format-update', language.risuNest.startup.data)
         performance.mark('boot:cold-storage-ready')
         await transition('plugins', language.risuNest.startup.plugins)
-        if (recoveredNativeRestoreJobs.length > 0 && !excluded('plugins')) {
-            const stop = afterPluginsStarted(async () => {
-                try { await acknowledgeRecoveredNativeRestores(recoveredNativeRestoreJobs); stop() }
+        if (recoveredNativeRestoreJobs.length > 0) {
+            if (excluded('plugins')) {
+                try { await acknowledgeRecoveredNativeRestores(recoveredNativeRestoreJobs) }
                 catch (error) { console.error('Native restore acknowledgement failed', error) }
-            })
+            } else {
+                const stop = afterPluginsStarted(async () => {
+                    try { await acknowledgeRecoveredNativeRestores(recoveredNativeRestoreJobs); stop() }
+                    catch (error) { console.error('Native restore acknowledgement failed', error) }
+                })
+            }
         }
         try { if (!excluded('plugins')) await loadPlugins() }
         catch (error) { console.error(error) }

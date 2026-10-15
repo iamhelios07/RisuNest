@@ -79,6 +79,7 @@ export class PluginStorageObservation {
                 this.observed.set(key, sequence)
                 stale ||= sequence !== this.sequence(key)
             }
+            knownKeys.clear()
             if (stale && instances.has(this)) requestReload()
         }
     }

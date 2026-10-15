@@ -1775,8 +1775,16 @@ impl PersistentStore {
         &self,
         lease: Option<&str>,
     ) -> StoreResult<PluginStorageCatalog> {
+        self.query_plugin_storage_for_owner(lease, None)
+    }
+
+    pub(crate) fn query_plugin_storage_for_owner(
+        &self,
+        lease: Option<&str>,
+        owner: Option<&str>,
+    ) -> StoreResult<PluginStorageCatalog> {
         let (connection, target) = self.read_view(lease)?;
-        query::query_plugin_storage(connection, &target)
+        query::query_plugin_storage(connection, &target, owner)
     }
 
     pub(crate) fn read_plugin_storage_page(

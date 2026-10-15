@@ -597,7 +597,7 @@ export interface PersistentRevisionReader {
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationMessageMetadataWindow> | null>
     readPluginStorageValues(query: PluginStorageValueQuery): Promise<PluginStorageValuePage>
-    queryPluginStorage(): Promise<PluginStorageCatalog>
+    queryPluginStorage(owner?: string): Promise<PluginStorageCatalog>
     readPluginStorage(owner: string, key: string): Promise<Versioned<unknown> | null>
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
     readAssetAliasesByKeys(kind: AssetAliasKind, keys: string[]): Promise<Versioned<AssetAlias[]>>
@@ -650,7 +650,7 @@ export interface PersistentDataStore {
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationMessageMetadataWindow> | null>
     readPluginStorageValues(query: PluginStorageValueQuery): Promise<PluginStorageValuePage>
-    queryPluginStorage(): Promise<PluginStorageCatalog>
+    queryPluginStorage(owner?: string): Promise<PluginStorageCatalog>
     readPluginStorage(owner: string, key: string): Promise<Versioned<unknown> | null>
     /** Sizes and ownership only. Values stay in the store until one is opened. */
     listPluginStorage(): Promise<PluginStorageListItem[]>

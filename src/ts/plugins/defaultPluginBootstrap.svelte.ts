@@ -24,13 +24,18 @@ const DEFAULT_PLUGINS = [
 
 let started = false
 
-async function installDefaultPlugins(): Promise<void> {
+function defaultPluginAttempts() {
     const markers = getDeviceMarkers()
     const attempted: unknown = JSON.parse(markers.getItem(ATTEMPT_KEY) ?? '[]')
     if (!Array.isArray(attempted) || attempted.some(name => typeof name !== 'string')) {
         throw new Error('Invalid default plugin attempt record')
     }
     const pending = DEFAULT_PLUGINS.filter(([name]) => !attempted.includes(name))
+    return { markers, attempted, pending }
+}
+
+async function installDefaultPlugins(): Promise<void> {
+    const { markers, attempted, pending } = defaultPluginAttempts()
     if (!pending.length) return
     const epoch = getPersistentStorageAuthorityEpoch()
     assertPersistentMutationAllowed(epoch)
@@ -79,7 +84,9 @@ export function startDefaultPluginBootstrap(): void {
             if (!DBState.db.didFirstSetup || held || replacing || waiting) return
             let cancelled = false
             void yieldToUi().then(async () => {
-                if (cancelled || !await pluginStartupGate.ensure()) return
+                if (cancelled) return
+                if (!defaultPluginAttempts().pending.length) { stop(); return }
+                if (!await pluginStartupGate.ensure({ installingDefaults: true }) || cancelled) return
                 stop()
                 await installDefaultPlugins()
             }).catch(error => console.error('Default plugin bootstrap failed', error))

@@ -1711,7 +1711,8 @@ export class SaveCoordinator {
                     : capturePluginMutationScope(liveBeforeCommit, committedMutations)
             const clearOwners = new Set(committedMutations.filter(mutation => mutation.type === 'clear').map(mutation => mutation.owner))
             const clearedKeys = check && clearOwners.size
-                ? (await this.dependencies.store.queryPluginStorage()).items.filter(item => clearOwners.has(item.owner)) : []
+                ? (await Promise.all([...clearOwners].map(owner => this.dependencies.store.queryPluginStorage(owner))))
+                    .flatMap(catalog => catalog.items) : []
             check?.validate()
             const committed = await this.commitRoutine({
                 expectedRevision: revision,

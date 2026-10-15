@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
-import { createPluginStartupGate, delayPluginLoadingUntilSync, PLUGIN_SYNC_SETTING } from './pluginStartupGate'
+import { configurePluginStartup, createPluginStartupGate, delayPluginLoadingUntilSync, PLUGIN_SYNC_SETTING,
+    pluginStartupGate, retryPluginStartup } from './pluginStartupGate'
+import { notifySyncBindingChanged } from '../storage/sync/bindingChanges'
+
+vi.mock('../storage/sync/bindingNative', () => ({ createNativeSyncBindingBridge: () => ({
+    state: async () => ({ target: { kind: 'none' } }),
+}) }))
 
 function deferred() {
     let resolve!: () => void
@@ -27,10 +33,28 @@ function harness() {
 }
 
 describe('plugin initial receive gate', () => {
+    it('handles failed plugin loads after a binding change and an explicit retry', async () => {
+        const failure = new Error('synthetic plugin load failure')
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+        configurePluginStartup(() => true, async () => { throw failure })
+        pluginStartupGate.state.set({ phase: 'waiting', refused: false, since: 1 })
+        try {
+            notifySyncBindingChanged()
+            await vi.waitFor(() => expect(log).toHaveBeenCalledWith('Plugin startup failed', failure))
+            log.mockClear()
+            await expect(retryPluginStartup()).resolves.toBeUndefined()
+            expect(log).toHaveBeenCalledWith('Plugin startup failed', failure)
+        } finally {
+            configurePluginStartup(() => false, async () => {})
+            pluginStartupGate.invalidate()
+            pluginStartupGate.state.set({ phase: 'released', refused: false, since: 0 })
+            log.mockRestore()
+        }
+    })
     it('returns control to the shell while receive is pending and executes only after completion', async () => {
         const { h, gate, receive } = harness()
         const checking = gate.ensure()
-        expect(gate.refuse()).toBe(true)
+        expect(gate.refuse()).toBe(false)
         expect(await checking).toBe(false)
         expect(get(gate.state).phase).toBe('waiting')
         expect(h.starts).toBe(0)
@@ -47,6 +71,30 @@ describe('plugin initial receive gate', () => {
         h[field] = false
         expect(await gate.ensure()).toBe(true)
         expect(get(gate.state).phase).toBe('released')
+    })
+    it('never shows a wait or refuses input while checking an unbound device again', async () => {
+        const { h, gate } = harness()
+        h.bound = false
+        const phases: string[] = []
+        const stop = gate.state.subscribe(value => phases.push(value.phase))
+        for (let index = 0; index < 3; index++) {
+            const pending = gate.ensure()
+            expect(gate.refuse()).toBe(false)
+            expect(await pending).toBe(true)
+        }
+        expect(phases).toEqual(['released'])
+        stop()
+    })
+    it('waits before installing defaults with no enabled plugins and retains that wait across loads', async () => {
+        const { h, gate, receive } = harness()
+        h.enabled = false
+        expect(await gate.ensure({ installingDefaults: true })).toBe(false)
+        expect(await gate.ensure()).toBe(false)
+        expect(gate.refuse()).toBe(false)
+        receive.resolve()
+        await vi.waitFor(() => expect(h.starts).toBe(1))
+        expect(h.received).toBe(true)
+        expect(await gate.ensure({ installingDefaults: true })).toBe(true)
     })
     it('bypasses only a committed server restore hold', async () => {
         const { h, gate } = harness()

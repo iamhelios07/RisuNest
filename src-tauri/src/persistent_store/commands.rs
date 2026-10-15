@@ -776,8 +776,9 @@ pub(crate) fn pds_read_conversation_message_metadata_window(
 pub(crate) fn pds_query_plugin_storage(
     state: State<'_, PersistentStoreState>,
     lease: Option<String>,
+    owner: Option<String>,
 ) -> Result<PluginStorageCatalog, StoreError> {
-    logged("pds_query_plugin_storage", with_store(state, |store| store.query_plugin_storage(lease.as_deref())))
+    logged("pds_query_plugin_storage", with_store(state, |store| store.query_plugin_storage_for_owner(lease.as_deref(), owner.as_deref())))
 }
 
 #[tauri::command(async)]

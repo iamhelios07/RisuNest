@@ -22,6 +22,7 @@ pub(crate) struct PluginDeviceEntry {
     pub(crate) space: String,
     pub(crate) key: String,
     pub(crate) value: String,
+    pub(crate) sequence: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,9 +138,10 @@ impl DeviceStore {
             });
         }
         let mut statement = self.connection.prepare(
-            "SELECT space,key,value FROM plugin_device_storage
-                WHERE owner=?1 AND tombstone=0 AND value IS NOT NULL
-                ORDER BY space,key",
+            "SELECT p.space,p.key,p.value,coalesce(r.sequence,0) FROM plugin_device_storage p
+                LEFT JOIN temp.plugin_remote_sequences r ON r.owner=p.owner AND r.space=p.space AND r.key=p.key
+                WHERE p.owner=?1 AND p.tombstone=0 AND p.value IS NOT NULL
+                ORDER BY p.space,p.key",
         )?;
         let entries = statement
             .query_map([owner], |row| {
@@ -147,6 +149,7 @@ impl DeviceStore {
                     space: row.get(0)?,
                     key: row.get(1)?,
                     value: row.get(2)?,
+                    sequence: format!("{}:{}", self.plugin_read_epoch, row.get::<_, i64>(3)?),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
