@@ -22,6 +22,16 @@
       },
       "versions": [
         {
+          "version": "1.0.5",
+          "buildVersion": "1.0.5",
+          "date": "2026-10-15T15:01:49Z",
+          "localizedDescription": "- Fixed failures when restoring RisuAI and PocketRisu backups.\n- Fixed large backups failing to restore on Android.\n- Fixed backups with 200,000 or more assets failing to restore.\n- Improved backup restores and Sync/external storage restores to show progress.\n- Improved restore and sync performance.\n- Fixed toggle changes being saved automatically when using toggle binding.\n- Fixed the scroll position jumping when message heights change.\n- Added support for Voyage Context 4 embeddings.\n- Raised the local plugin storage limit.\n- Fixed file selection not working properly on iOS.\n- Improved AltStore integration on iOS and fixed signatures not being passed to the IPA file.\n- Added multiple profiles on desktop through `--profile=<name>`.\n- Added multiple languages and an architecture check to the Windows installer.\n- Improved automatic updates, installation, and removal on Windows.",
+          "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-ios-aarch64-unsigned.ipa",
+          "size": 78459536,
+          "sha256": "da2d5f81279953e7d7c55c9442f3be518374d1a728ec3b0deb27a86bb51c5ab0",
+          "minOSVersion": "16.4"
+        },
+        {
           "version": "1.0.4",
           "buildVersion": "1.0.4",
           "date": "2026-10-13T17:09:48Z",
@@ -32,11 +42,11 @@
           "minOSVersion": "16.4"
         }
       ],
-      "version": "1.0.4",
-      "versionDate": "2026-10-13T17:09:48Z",
-      "versionDescription": "- Improved compatibility with bots, modules, and plugins.\n- Improved Lua, script, and UI performance in long chats.\n- Added a console log viewer.\n- Fixed update links not opening on Android.\n- Fixed a sidebar scrolling issue on iOS.",
-      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-ios-aarch64-unsigned.ipa",
-      "size": 78142028
+      "version": "1.0.5",
+      "versionDate": "2026-10-15T15:01:49Z",
+      "versionDescription": "- Fixed failures when restoring RisuAI and PocketRisu backups.\n- Fixed large backups failing to restore on Android.\n- Fixed backups with 200,000 or more assets failing to restore.\n- Improved backup restores and Sync/external storage restores to show progress.\n- Improved restore and sync performance.\n- Fixed toggle changes being saved automatically when using toggle binding.\n- Fixed the scroll position jumping when message heights change.\n- Added support for Voyage Context 4 embeddings.\n- Raised the local plugin storage limit.\n- Fixed file selection not working properly on iOS.\n- Improved AltStore integration on iOS and fixed signatures not being passed to the IPA file.\n- Added multiple profiles on desktop through `--profile=<name>`.\n- Added multiple languages and an architecture check to the Windows installer.\n- Improved automatic updates, installation, and removal on Windows.",
+      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-ios-aarch64-unsigned.ipa",
+      "size": 78459536
     }
   ],
   "news": []
