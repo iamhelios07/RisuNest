@@ -140,8 +140,7 @@ fn stopped_helper_rolls_back_when_the_replacement_cannot_be_started() {
 
     assert!(result.recv_timeout(Duration::from_millis(250)).is_err());
     assert_old_install(&fixture.install);
-    // Both Task Scheduler calls start Windows PowerShell, which takes about
-    // 22 s per start on Windows ARM runners.
+    // Allow bounded time for parent exit and rollback on slow runners.
     let error = result
         .recv_timeout(Duration::from_secs(120))
         .unwrap()
@@ -242,8 +241,7 @@ fn helper_waits_for_the_parent_update_lock_handoff_before_replacement() {
     assert_old_install(&fixture.install);
     drop(lock);
 
-    // Task Scheduler calls each start Windows PowerShell, which can take
-    // about 22 s per start on Windows ARM runners.
+    // Allow bounded time for startup failure and rollback after the lock handoff.
     let error = result
         .recv_timeout(Duration::from_secs(120))
         .unwrap()
@@ -276,8 +274,7 @@ fn helper_waits_for_owner_release_and_restores_files_when_restart_fails() {
     assert_old_install(&fixture.install);
     owner.unlock().unwrap();
 
-    // Task Scheduler calls each start Windows PowerShell, which can take
-    // about 22 s per start on Windows ARM runners.
+    // Allow bounded time for startup failure and rollback after owner release.
     let error = result
         .recv_timeout(Duration::from_secs(120))
         .unwrap()
