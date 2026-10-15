@@ -992,11 +992,12 @@ fn legacy_restore_keeps_the_decoded_size_limit() {
             let limits = RestoreLimits {
                 max_encoded_block_bytes: u32::MAX as u64,
                 max_decoded_block_bytes: limit,
+                ..Default::default()
             };
             let (expected, _) = assert_same_outcome(&format!("{kind} limit {limit}"), &wire, limits);
             assert_eq!(expected.outcome.is_ok(), accepted, "{kind} limit {limit}");
             if let Err(error) = expected.outcome {
-                assert_eq!(error.code, "invalid-input");
+                assert_eq!(error.code, "payload-too-large");
                 assert!(error.message.contains("limit exceeded"), "{error}");
             }
         }
@@ -1015,7 +1016,7 @@ fn legacy_restore_keeps_the_decoded_size_limit() {
             RecordingSink::default(),
         );
         let error = run.outcome.unwrap_err();
-        assert_eq!(error.code, "invalid-input", "{decoder:?}");
+        assert_eq!(error.code, "payload-too-large", "{decoder:?}");
         assert_eq!(error.message, "decoded legacy RisuSave limit exceeded", "{decoder:?}");
         assert_eq!(read.load(Ordering::Acquire), LEGACY_RISU_SAVE_PREFIX.len() as u64 + 1);
     }
@@ -1072,7 +1073,7 @@ fn reference_parse_and_stage_legacy<R: Read>(
 ) -> Result<ParsedCounts, NativeJobError> {
     let remaining = reader.total.saturating_sub(reader.completed);
     if remaining > limits.max_decoded_block_bytes {
-        return Err(invalid("decoded legacy RisuSave limit exceeded"));
+        return Err(limit_error("decoded legacy RisuSave limit exceeded"));
     }
     reader.set_stage(JobStage::DecodingDatabase)?;
     let source = RemainingSourceReader { reader, remaining };
@@ -1096,7 +1097,7 @@ fn reference_parse_and_stage_compressed_legacy<R: Read>(
 ) -> Result<ParsedCounts, NativeJobError> {
     let remaining = reader.total.saturating_sub(reader.completed);
     if remaining > limits.max_encoded_block_bytes {
-        return Err(invalid("encoded legacy RisuSave limit exceeded"));
+        return Err(limit_error("encoded legacy RisuSave limit exceeded"));
     }
     reader.set_stage(JobStage::DecodingDatabase)?;
     let source = RemainingSourceReader { reader, remaining };

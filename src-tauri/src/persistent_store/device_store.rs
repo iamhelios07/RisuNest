@@ -278,6 +278,8 @@ fn sequence(value: &str) -> StoreResult<Sequence> {
 
 pub(crate) struct DeviceStore {
     pub(super) connection: Connection,
+    pub(super) plugin_writes: plugin_values::sessions::WriteSessions,
+    pub(super) plugin_read_epoch: String,
 }
 
 impl DeviceStore {
@@ -302,7 +304,7 @@ impl DeviceStore {
                 })
             }
         }
-        Ok(Self { connection })
+        Ok(Self { connection, plugin_writes: Default::default(), plugin_read_epoch: Uuid::new_v4().to_string() })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

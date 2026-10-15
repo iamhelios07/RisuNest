@@ -195,7 +195,6 @@ export class ArchiveWriter {
         if (this.active) fail('invalidData');
         const encoded = archiveName(name);
         if (this.names.has(name)) fail('duplicate');
-        if (this.names.size >= 200000 || this.nameBytes + encoded.length > 64 * 1024 * 1024) fail('tooMany');
         if (size != null) u32(size);
         this.names.add(name); this.nameBytes += encoded.length;
         const origin = this.position;

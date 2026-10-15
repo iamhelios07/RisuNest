@@ -181,11 +181,32 @@ test('an unset upstream plugin storage block is written as an empty object', asy
     }
     assert.throws(() => new JsonScan(() => {}).end(), error => error.code === 'truncated');
 });
-test('string limits follow the importer: 8 MiB in character records, block-sized elsewhere', async () => {
+test('record limits count UTF-8 and bound each field and message independently', async () => {
     const large = 'x'.repeat(8 * 1024 * 1024 + 1);
     await scanDatabase(sourceOf(database({ root: { large } })).stream(), references());
     await scanDatabase(sourceOf(database({ presets: [{ large }] })).stream(), references());
-    await assert.rejects(scanDatabase(sourceOf(database({ character: { large } })).stream(), references()), error => error.code === 'recordTooLarge');
+    await scanDatabase(sourceOf(database({ character: { large } })).stream(), references());
+    const checkRecord = text => {
+        const scan = new JsonScan(() => {}, { maxString: 64 });
+        const bytes = encoder.encode(text);
+        for (let offset = 0; offset < bytes.length; offset += 7) scan.write(bytes.subarray(offset, offset + 7));
+        scan.end();
+    };
+    for (const value of [
+        { field: 'x'.repeat(62) },
+        { field: Array(10).fill('가') },
+        { first: 'x'.repeat(40), second: 'y'.repeat(40) },
+        { chats: [{ message: [{ data: 'x'.repeat(40) }, { data: 'y'.repeat(40) }] }] },
+    ]) checkRecord(JSON.stringify(value));
+    for (const text of [
+        JSON.stringify({ field: '가'.repeat(22) }),
+        JSON.stringify({ ['가'.repeat(22)]: 0 }),
+        JSON.stringify({ field: Array(20).fill('aa') }),
+        JSON.stringify({ field: Array(12).fill('가') }),
+        '{"field":' + ' '.repeat(64) + '"x"}',
+        JSON.stringify({ message: [{ first: 'x'.repeat(40), second: 'y'.repeat(40) }] }),
+        '{"field":"' + '\\u0061'.repeat(11) + '"}',
+    ]) assert.throws(() => checkRecord(text), error => error.code === 'recordTooLarge');
 });
 test('cold storage exports only restorable archived chats and reports what it skips', async () => {
     const [plugin, settings, corrupt, nested, scalar] = [1, 2, 3, 4, 5].map(n => '2000000' + n + '-0000-4000-8000-00000000000' + n);

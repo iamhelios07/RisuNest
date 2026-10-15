@@ -716,6 +716,7 @@ await storage.clear();
 
 On the native app `safeLocalStorage` and `getLocalPluginStorage()` are kept in the installation's own device file. RisuNest treats both spaces as follows:
 
+- **Value size** is limited to 512 MiB of UTF-8 bytes after JSON-encoding the stored string. For `getLocalPluginStorage()`, the stored string is the serialized JSON value. An oversized write rejects without replacing the previous value. Large values still need enough WebView memory to construct and read them.
 - **Full backups** always include both spaces, whether or not they sync. Restoring a full backup replaces them with the backup's values.
 - **Sync** carries them only when the user turns on the local plugin data option in RisuNest settings. The option is off by default, applies to both spaces of every plugin, and covers both the sync server and external storage. With it off, each device keeps its own values.
 - **First connection to a sync target that already holds data** clears both spaces for every plugin, including plugins that are no longer installed. With the option on they are then filled from the target; with it off they start empty. Reconnecting to the same target keeps them.

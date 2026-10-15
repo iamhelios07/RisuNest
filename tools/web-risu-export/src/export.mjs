@@ -105,7 +105,7 @@ export async function exportBackup({ source, sink, signal, progress = () => {} }
             if (!path.length) root = Array.isArray(value) ? 'array' : value && typeof value === 'object' ? 'object' : 'scalar';
             if (path.length === 1 && ['character', 'message'].includes(path[0])) chat = true;
             found.visit(path, value);
-        });
+        }, { cold: true });
         await writer.begin('coldstorage_' + key + '.json');
         for await (const bytes of gunzip(compressed, signal)) {
             size += bytes.length;
@@ -157,7 +157,6 @@ export async function exportBackup({ source, sink, signal, progress = () => {} }
             }
             for (const asset of found.assets) refs.assets.add(asset);
             for (const next of found.cold) coldKeys.add(next);
-            if (coldKeys.size + refs.assets.size > 199999) fail('tooMany');
             state.items++; report();
         }
         // Upstream v3 plugin storage values live in cold storage; RisuNest cannot restore them yet.

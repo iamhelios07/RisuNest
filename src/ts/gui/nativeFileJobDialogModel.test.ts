@@ -162,6 +162,11 @@ describe('nativeFileJobDialogModel', () => {
                 code: 'payload-too-large', message: 'synthetic detail', recoveryRequired: false, itemKind: kind,
             } }), 0)
             expect(model.terminal?.reason).toBe(copy.reasonTooLarge.replace('{0}', item))
+            const exported = buildNativeFileJobDialogModel(null, outcome({ kind: 'export', state: 'failed', error: {
+                code: 'payload-too-large', message: 'synthetic detail', recoveryRequired: false, itemKind: kind,
+            } }), 0)
+            expect(exported.terminal?.reason).toBe(kind === 'compatible-database'
+                ? copy.reasonCompatibleDatabaseTooLarge : copy.reasonExportTooLarge.replace('{0}', item))
         }
         expect(failureReason('payload-too-large', 'import', 'commit')).toBe(copy.reasonUnknown)
         expect(failureReason('payload-too-large')).toBe(copy.reasonUnknown)

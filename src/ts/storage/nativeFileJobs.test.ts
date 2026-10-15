@@ -3212,10 +3212,13 @@ describe('native file jobs', () => {
         ])
     })
 
-    it('acknowledges terminal failure even when translating it to an exception', async () => {
+    it.each([
+        { code: 'corrupt-input', message: 'invalid gzip data' },
+        { code: 'payload-too-large', message: 'synthetic record limit', itemKind: 'record' },
+    ])('acknowledges terminal $code failure and preserves its details', async (failure) => {
         const commands: string[] = []
         const failed = status('failed')
-        failed.error = { code: 'corrupt-input', message: 'invalid gzip data' }
+        failed.error = failure
 
         await expect(
             runNativeBlockRisuSaveRestore(
@@ -3236,11 +3239,14 @@ describe('native file jobs', () => {
                     wait: async () => undefined,
                 },
             ),
-        ).rejects.toMatchObject({ code: 'corrupt-input' })
+        ).rejects.toMatchObject(failure)
         expect(commands.at(-1)).toBe('native_file_job_forget')
     })
 
-    it('preserves structured native command errors at the facade boundary', async () => {
+    it.each([
+        { code: 'invalid-source', message: 'desktop source is unavailable' },
+        { code: 'payload-too-large', message: 'synthetic size limit', itemKind: 'backup' },
+    ])('preserves structured $code errors at the facade boundary', async (failure) => {
         await expect(
             runNativeBlockRisuSaveRestore(
                 restoreRuntime(1),
@@ -3249,18 +3255,14 @@ describe('native file jobs', () => {
                 {
                     isTauri: () => true,
                     invoke: async () => {
-                        throw {
-                            code: 'invalid-source',
-                            message: 'desktop source is unavailable',
-                        }
+                        throw failure
                     },
                     wait: async () => undefined,
                 },
             ),
         ).rejects.toMatchObject({
             name: 'NativeFileJobError',
-            code: 'invalid-source',
-            message: 'desktop source is unavailable',
+            ...failure,
         })
     })
 

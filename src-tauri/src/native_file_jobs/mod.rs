@@ -79,6 +79,8 @@ static ANDROID_SPOOL_OWNERSHIP_GATE: Mutex<()> = Mutex::new(());
 pub(crate) struct NativeJobError {
     pub(crate) code: String,
     pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) item_kind: Option<String>,
 }
 
 impl NativeJobError {
@@ -86,7 +88,12 @@ impl NativeJobError {
         Self {
             code: code.to_owned(),
             message: bounded_message(message.as_ref()),
+            item_kind: None,
         }
+    }
+
+    pub(crate) fn too_large(item_kind: &str, message: impl AsRef<str>) -> Self {
+        Self { item_kind: Some(item_kind.to_owned()), ..Self::new("payload-too-large", message) }
     }
 }
 
@@ -1678,8 +1685,8 @@ impl NativeFileJobState {
                 let metadata_bytes = serde_json::to_vec(&(&card, &module))
                     .map_err(|error| NativeJobError::new("invalid-input", error.to_string()))?;
                 if metadata_bytes.len() > content::JSON_CARD_MAX_METADATA_BYTES {
-                    return Err(NativeJobError::new(
-                        "invalid-input",
+                    return Err(NativeJobError::too_large(
+                        "card",
                         "character export metadata exceeds the 128 MiB limit",
                     ));
                 }
@@ -1717,8 +1724,8 @@ impl NativeFileJobState {
                 let metadata_bytes = serde_json::to_vec(&metadata)
                     .map_err(|error| NativeJobError::new("invalid-input", error.to_string()))?;
                 if metadata_bytes.len() > content::JSON_CARD_MAX_METADATA_BYTES {
-                    return Err(NativeJobError::new(
-                        "invalid-input",
+                    return Err(NativeJobError::too_large(
+                        "card",
                         "character export metadata exceeds the 128 MiB limit",
                     ));
                 }
@@ -1969,7 +1976,7 @@ impl NativeFileJobState {
             Err(error) => {
                 let cleanup =
                     cleanup_one_owned_directory(&self.root.join("jobs"), &owned_directory, &job_id);
-                let _ = job.finish_failure(&error.code, &error.message);
+                let _ = job.finish_native_failure(&error);
                 let _ = self.registry.forget(&job_id);
                 return match cleanup {
                     Ok(()) => Err(error),
@@ -2181,7 +2188,7 @@ impl NativeFileJobState {
         if let Err(error) = source_preparation {
             let cleanup =
                 cleanup_one_owned_directory(&self.root.join("jobs"), &owned_directory, &job_id);
-            let _ = job.finish_failure(&error.code, &error.message);
+            let _ = job.finish_native_failure(&error);
             let _ = self.registry.forget(&job_id);
             return match cleanup {
                 Ok(()) => Err(error),
@@ -3051,7 +3058,7 @@ fn finish_worker_outcome(
             let _ = job.finish_cancelled();
         }
         (Err(error), true) => {
-            let _ = job.finish_failure(&error.code, &error.message);
+            let _ = job.finish_native_failure(&error);
         }
     }
 }
@@ -3996,6 +4003,8 @@ pub(crate) struct JobResultSummary {
 pub(crate) struct JobFailure {
     pub(crate) code: String,
     pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) item_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -4418,7 +4427,7 @@ impl JobControl {
         let receipt=status.portable_body_retry.as_mut().ok_or("portable body owner is missing")?;
         receipt.available=!wait.portable_body_retired;
         status.state=if self.is_cancel_requested() {JobState::Cancelled} else {JobState::Failed};
-        status.error=Some(JobFailure {code:failure.code.clone(),message:bounded_message(&failure.message)});
+        status.error=Some(JobFailure {code:failure.code.clone(),message:bounded_message(&failure.message),item_kind:None});
         drop(status);
         while !wait.portable_body_retry_requested && !wait.portable_body_retired {
             wait=self.wait_changed.wait(wait).map_err(|_|"native job wait mutex poisoned")?;
@@ -5116,6 +5125,7 @@ impl JobControl {
                 JobState::Failed,
                 Some(JobFailure {
                     code: "cleanup-failed".to_owned(),
+                    item_kind: None,
                     message: bounded_message(&format!(
                         "{}; cleanup failed: {cleanup}",
                         error.message
@@ -5127,6 +5137,7 @@ impl JobControl {
                 JobState::Failed,
                 Some(JobFailure {
                     code: "cleanup-failed".to_owned(),
+                    item_kind: None,
                     message: bounded_message(&cleanup),
                 }),
                 None,
@@ -5137,6 +5148,7 @@ impl JobControl {
                 Some(JobFailure {
                     code: error.code,
                     message: error.message,
+                    item_kind: error.item_kind,
                 }),
                 None,
             ),
@@ -5220,6 +5232,14 @@ impl JobControl {
     }
 
     pub(crate) fn finish_failure(&self, code: &str, message: &str) -> Result<(), String> {
+        self.finish_failure_with_item(code, message, None)
+    }
+
+    fn finish_native_failure(&self, error: &NativeJobError) -> Result<(), String> {
+        self.finish_failure_with_item(&error.code, &error.message, error.item_kind.as_deref())
+    }
+
+    fn finish_failure_with_item(&self, code: &str, message: &str, item_kind: Option<&str>) -> Result<(), String> {
         if code.is_empty() || code.len() > MAX_CODE_BYTES {
             return Err("native job error code is invalid".to_owned());
         }
@@ -5247,6 +5267,7 @@ impl JobControl {
         status.error = Some(JobFailure {
             code: code.to_owned(),
             message: bounded_message(message),
+            item_kind: item_kind.map(str::to_owned),
         });
         status.prepared_content = None;
         status.publication_attempt = None;
@@ -6063,7 +6084,8 @@ mod tests {
         let error = content::spool_charx_source(&mut source, &spool_path, &|| false)
             .expect_err("raw CharX sources over the container cap must be rejected");
 
-        assert_eq!(error.code, "invalid-input");
+        assert_eq!(error.code, "payload-too-large");
+        assert_eq!(error.item_kind.as_deref(), Some("card"));
         assert!(!spool_path.exists());
     }
 
@@ -8178,6 +8200,16 @@ mod tests {
         assert!(error.message.len() <= MAX_ERROR_MESSAGE_BYTES);
         assert!(!error.message.contains('\n'));
         assert!(status.result.is_none());
+        let oversized = registry.create(JobKind::ExportCompatibleLocalBackup).unwrap();
+        oversized.start(JobPhase::WritingExport).unwrap();
+        oversized.finish_native_failure(&NativeJobError::too_large("compatible-database", "synthetic size limit")).unwrap();
+        let status = serde_json::to_value(oversized.status()).unwrap();
+        assert_eq!(status["error"]["code"], "payload-too-large");
+        assert_eq!(status["error"]["itemKind"], "compatible-database");
+        let content = registry.create(JobKind::PrepareContentImport).unwrap();
+        content.start(JobPhase::ReadingSource).unwrap();
+        content.finish_content_job_inner(Err(NativeJobError::too_large("card", "synthetic size limit")), Ok(()), None).unwrap();
+        assert_eq!(serde_json::to_value(content.status()).unwrap()["error"]["itemKind"], "card");
     }
 
     #[test]
@@ -9294,8 +9326,8 @@ pub(crate) async fn native_content_source_metadata(
             let source = open_job_source(&root, &JobSource::AndroidSpool { token })?;
             const LIMIT: u64 = crate::import_export_jobs::MAX_CONTENT_METADATA_BYTES as u64;
             if source.total_bytes > LIMIT {
-                return Err(NativeJobError::new(
-                    "native-limit",
+                return Err(NativeJobError::too_large(
+                    "content",
                     "Content metadata exceeds 128 MiB",
                 ));
             }
@@ -9306,8 +9338,8 @@ pub(crate) async fn native_content_source_metadata(
                 .read_to_end(&mut bytes)
                 .map_err(|e| NativeJobError::new("invalid-input", e.to_string()))?;
             if bytes.len() as u64 > LIMIT {
-                return Err(NativeJobError::new(
-                    "native-limit",
+                return Err(NativeJobError::too_large(
+                    "content",
                     "Content metadata exceeds 128 MiB",
                 ));
             }
