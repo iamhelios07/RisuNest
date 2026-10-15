@@ -687,6 +687,7 @@ fn stream_legacy_characters<S: TrackedSource>(
     let mut retained = 0;
     let mut batch = Vec::new();
     let mut batch_bytes = 0u64;
+    let mut character_ids = HashSet::new();
     for index in 0..total {
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled while staging legacy database"));
@@ -702,6 +703,7 @@ fn stream_legacy_characters<S: TrackedSource>(
         if upstream_import::exclude_record(&character, excluded) { continue; }
         character = sink.prepare_character(character).map_err(store_error)?;
         if upstream_import::exclude_record(&character, excluded) { continue; }
+        if !prepare_legacy_character(&mut character, &mut character_ids) { continue; }
         retained += 1;
         pocket_features::character(&mut character, &format!("character:{index}"));
         assign_legacy_chat_ids(std::slice::from_mut(&mut character));
@@ -925,7 +927,38 @@ fn assign_legacy_chat_ids(characters: &mut [Value]) {
                 }
             };
             chat.insert("id".to_owned(), Value::String(id));
+            default_name(chat);
         }
+    }
+}
+
+// Upstream RisuAI skips empty character entries and fills a missing character
+// ID and name when it loads a save. A repeated ID gets a new one, since lookups
+// take the first character with that ID.
+fn prepare_legacy_character(value: &mut Value, seen_ids: &mut HashSet<String>) -> bool {
+    let Some(character) = value.as_object_mut() else {
+        return false;
+    };
+    match character.get("chaId").and_then(Value::as_str) {
+        Some(id) if !id.is_empty() && seen_ids.insert(id.to_owned()) => {}
+        _ => {
+            let id = loop {
+                let candidate = uuid::Uuid::new_v4().to_string();
+                if seen_ids.insert(candidate.clone()) {
+                    break candidate;
+                }
+            };
+            character.insert("chaId".to_owned(), Value::String(id));
+        }
+    }
+    default_name(character);
+    true
+}
+
+// The persistent store requires a name, which upstream RisuAI shows as empty when absent.
+fn default_name(record: &mut Map<String, Value>) {
+    if !record.get("name").is_some_and(Value::is_string) {
+        record.insert("name".to_owned(), Value::String(String::new()));
     }
 }
 
@@ -2042,6 +2075,7 @@ impl<'de> Visitor<'de> for CharacterVisitor<'_> {
                 "character block name does not match chaId",
             ));
         }
+        default_name(&mut detail);
         self.0.sink.put_character_detail(
             self.0.staging_id,
             &Value::Object(detail),
@@ -2231,6 +2265,7 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
             },
         };
         detail.insert("id".into(), Value::String(conversation_id.clone()));
+        default_name(&mut detail);
         let mut normalized_detail = Value::Object(detail);
         pocket_features::chat(&mut normalized_detail, &self.0.fallback);
         let recent_at = normalized_detail
@@ -3958,11 +3993,11 @@ mod tests {
             true,
             "char-1",
             &json!({
-                "type":"character", "chaId":"char-1", "name":"Imported",
+                "type":"character", "chaId":"char-1",
                 "chats":[null, {"id":7, "name":"Chat", "message":[{
                     "role":"char", "data":"second", "chatId":"message-1",
                     "swipes":["first", null, "second"], "swipeId":2
-                }]}, "not a chat", {"id":"chat-2", "name":"Second", "bindedPersona":null,
+                }]}, "not a chat", {"id":"chat-2", "bindedPersona":null,
                     "savedToggleValues":{"toggle_a":"1", "other":"x"}, "message":[]}]
             }),
         );
@@ -3986,6 +4021,8 @@ mod tests {
         assert_eq!(message["swipes"], json!(["first", null, "second"]));
         assert_eq!(chats[1]["savedToggleValues"], json!({"toggle_a":"1"}));
         assert!(chats[1].get("bindedPersona").is_none());
+        assert_eq!(restored["characters"][0]["name"], "");
+        assert_eq!(chats[1]["name"], "");
     }
 
     #[test]

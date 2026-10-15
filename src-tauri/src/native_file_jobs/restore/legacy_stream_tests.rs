@@ -336,6 +336,9 @@ fn normalized_characters(characters: &[Value]) -> Vec<Value> {
         .iter()
         .cloned()
         .map(|mut character| {
+            if character.get("chaId").and_then(Value::as_str).is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()) {
+                character["chaId"] = json!("generated");
+            }
             if let Some(chats) = character.get_mut("chats").and_then(Value::as_array_mut) {
                 for chat in chats {
                     if chat
@@ -876,7 +879,11 @@ fn legacy_restore_normalizes_shapes_pocketrisu_stores_or_loads() {
             { "id": "second", "savedToggleValues": null, "message": [{ "role": "char", "swipes": ["only"] }] }
         ]
     }));
-    let mut entries = vec![entry("characters", MessagePackValue::Array(vec![character]))];
+    let unnamed = messagepack_from_json(&json!({
+        "name": null, "type": "character", "chats": [{ "id": "unnamed", "message": [] }]
+    }));
+    let duplicate = messagepack_from_json(&json!({ "chaId": "pocket", "name": "Copy", "type": "character", "chats": [] }));
+    let mut entries = vec![entry("characters", MessagePackValue::Array(vec![MessagePackValue::Nil, character, unnamed, duplicate]))];
     for key in ["botPresets", "modules", "loadouts", "plugins", "pluginCustomStorage", "disableToggleBinding", "defaultToggleValues", "defaultToggleUnsetKeys"] {
         entries.push(entry(key, MessagePackValue::Nil));
     }
@@ -903,6 +910,13 @@ fn legacy_restore_normalizes_shapes_pocketrisu_stores_or_loads() {
         ]));
         assert_eq!(root["personas"].as_array().unwrap().len(), 3);
         let characters = actual.sink.characters.lock().unwrap();
+        assert_eq!(characters.len(), 3);
+        assert_eq!(characters[0]["chaId"], "pocket");
+        assert!(uuid::Uuid::parse_str(characters[1]["chaId"].as_str().unwrap()).is_ok());
+        assert_eq!(characters[1]["name"], "");
+        assert_eq!(characters[1]["chats"][0]["name"], "");
+        assert!(uuid::Uuid::parse_str(characters[2]["chaId"].as_str().unwrap()).is_ok());
+        assert_eq!(characters[2]["name"], "Copy");
         let chats = characters[0]["chats"].as_array().unwrap();
         assert_eq!(chats.len(), 2);
         assert_eq!(chats[0]["id"], "7");
@@ -1188,13 +1202,23 @@ fn reference_stage_legacy_database<R: Read>(
         Value::Object(root) => root,
         _ => return Err(invalid("legacy MessagePack database must be an object")),
     };
-    let mut characters = match root.shift_remove("characters") {
+    let characters = match root.shift_remove("characters") {
         Some(Value::Array(characters)) => characters,
         _ => return Err(invalid("legacy MessagePack characters must be an array")),
     };
-    for (index, character) in characters.iter_mut().enumerate() {
-        pocket_features::character(character, &format!("character:{index}"));
-    }
+    let character_total = characters.len() as u64;
+    let mut character_ids = HashSet::new();
+    let mut characters: Vec<Value> = characters
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut character)| {
+            if !prepare_legacy_character(&mut character, &mut character_ids) {
+                return None;
+            }
+            pocket_features::character(&mut character, &format!("character:{index}"));
+            Some(character)
+        })
+        .collect();
     assign_legacy_chat_ids(&mut characters);
     for key in NULLABLE_ROOT_COLLECTIONS {
         if root.get(key).is_some_and(Value::is_null) {
@@ -1225,7 +1249,6 @@ fn reference_stage_legacy_database<R: Read>(
     root.entry("pluginCustomStorage".to_owned())
         .or_insert_with(|| Value::Object(Map::new()));
 
-    let character_total = characters.len() as u64;
     reader.counts.characters_total = Some(character_total);
     reader.counts.presets = presets.len() as u64;
     let mut start = 0;
