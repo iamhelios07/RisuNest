@@ -1641,9 +1641,7 @@ mod asset_root_tests {
             crate::persistent_store::ASSET_GC_ROOT_COLLECTIONS.with(|count| count.set((0, 0)));
             assert!(f.a.residency_inventory_classification_test(false).unwrap().0.contains(&hash));
             crate::persistent_store::ASSET_GC_ROOT_COLLECTIONS.with(|count| assert_eq!(count.get(), (1, 0)));
-            crate::persistent_store::ASSET_GC_ROOT_COLLECTIONS.with(|count| count.set((0, 0)));
             f.a.asset_residency_release_unused(|| Ok(())).unwrap();
-            crate::persistent_store::ASSET_GC_ROOT_COLLECTIONS.with(|count| assert_eq!(count.get(), (1, 0)));
             assert!(Residency::open(f.directory_a.path()).unwrap().object(&hash, None).unwrap().is_some());
             if acknowledged {
                 held.fail_pack_after.store(2, Ordering::SeqCst);

@@ -36,6 +36,7 @@ use crate::publication_upload::{
 
 pub(crate) struct PersistentStoreState {
     store: Mutex<Option<PersistentStore>>,
+    status_store: Mutex<Option<(String, PersistentStore)>>,
     snapshot_operations: Mutex<()>,
     renderer_gate: Arc<RendererGate>,
     archive_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -195,6 +196,18 @@ impl PersistentStoreState {
         with_store_mutex_admitted(self, operation, PersistentStore::open_native_job_store)
     }
 
+    pub(crate) fn with_status_job_store<T>(&self, operation: impl FnOnce(&PersistentStore) -> T) -> StoreResult<T> {
+        let permit = self.admit_renderer_operation()?;
+        let mut cached = self.status_store.lock().map_err(|_| renderer_gate_error())?;
+        with_store_mutex_admitted(self, &permit, |store| {
+            if cached.as_ref().is_none_or(|(instance, _)| instance != &store.gc_instance) {
+                *cached = Some((store.gc_instance.clone(), store.open_native_job_store()?));
+            }
+            Ok(())
+        })?;
+        Ok(operation(&cached.as_ref().unwrap().1))
+    }
+
     pub(crate) fn acquire_cleanup_maintenance(&self, timeout: std::time::Duration) -> StoreResult<DeviceMaintenanceGuard> {
         let deadline = std::time::Instant::now() + timeout;
         let mut state = self.renderer_gate.state.lock().map_err(|_| renderer_gate_error())?;
@@ -213,6 +226,7 @@ impl PersistentStoreState {
             state = waited.0;
         }
         drop(state);
+        self.status_store.lock().map_err(|_| renderer_gate_error())?.take();
         self.store.lock().map_err(|_| renderer_gate_error())?.take();
         Ok(maintenance)
     }
@@ -221,6 +235,7 @@ impl PersistentStoreState {
         let maintenance = self
             .try_acquire_renderer_maintenance()?
             .ok_or_else(renderer_gate_error)?;
+        self.status_store.lock().map_err(|_| renderer_gate_error())?.take();
         // No new operation can enter between draining and closing the store.
         // Reopening after the guard is released refreshes the connection after
         // native restore and discards leases owned by the previous renderer.
@@ -303,6 +318,7 @@ impl Default for PersistentStoreState {
     fn default() -> Self {
         Self {
             store: Mutex::new(None),
+            status_store: Mutex::new(None),
             snapshot_operations: Mutex::new(()),
             renderer_gate: Arc::new(RendererGate::default()),
             archive_operations: Mutex::new(HashMap::new()),
@@ -2455,7 +2471,10 @@ mod tests {
         })
         .unwrap();
 
+        state.with_status_job_store(|store| store.connection.execute_batch("CREATE TEMP TABLE synthetic_status_connection (value INTEGER)")).unwrap().unwrap();
+        assert!(state.status_store.lock().unwrap().is_some());
         let maintenance = state.acquire_device_maintenance().unwrap();
+        assert!(state.status_store.lock().unwrap().is_none());
         assert!(state.store.lock().unwrap().is_none());
         assert!(state.admit_renderer_operation().is_err());
         assert!(state.acquire_device_maintenance().is_err());
@@ -3075,6 +3094,7 @@ mod tests {
             store: Mutex::new(Some(
                 PersistentStore::open(directory.path()).expect("open persistent store"),
             )),
+            status_store: Mutex::new(None),
             snapshot_operations: Mutex::new(()),
             renderer_gate: Arc::new(RendererGate::default()),
             archive_operations: Mutex::new(HashMap::new()),

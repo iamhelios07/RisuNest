@@ -114,6 +114,51 @@ struct Inventory {
     local: BTreeSet<String>,
     release_blocked: bool,
 }
+#[derive(Default)]
+struct InventoryCache {
+    library: Option<crate::asset_repository::migration_gc::AssetRootSet>,
+    roots: Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>,
+    data_version: i64,
+    changes: i64,
+    device_version: i64,
+    device_changes: i64,
+    inventory: Option<Inventory>,
+}
+impl InventoryCache {
+    /// Recheck auxiliary roots and pins under repository exclusion. Only the immutable
+    /// library roots and their resolved inventory survive an unchanged observation.
+    fn current(&mut self, store: &PersistentStore) -> Result<&Inventory> {
+        let read = store.connection.unchecked_transaction()?;
+        let data_version = read.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?;
+        let changes = read.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))?;
+        let library_changed = self.library.is_none() || self.data_version != data_version || self.changes != changes;
+        if library_changed {
+            #[cfg(test)]
+            super::ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| count.set(count.get() + 1));
+            self.library = Some(super::snapshot::collect_asset_roots(&store.connection)?);
+        }
+        let roots = store.collect_auxiliary_asset_gc_roots(true, false, None)?;
+        let device = store.device_store()?.connection();
+        let device_version = device.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?;
+        let device_changes = device.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))?;
+        if self.inventory.is_none() || self.roots != roots
+            || self.data_version != data_version || self.changes != changes
+            || self.device_version != device_version || self.device_changes != device_changes
+            || roots.iter().any(|(_, roots)| !roots.blockers.is_empty()) {
+            let mut complete = vec![("library", self.library.as_ref().unwrap().clone())];
+            complete.extend(roots.iter().cloned());
+            self.inventory = Some(store.residency_inventory_from(
+                PayloadCas::new(&store.repository_root)?, complete, BTreeSet::new(), true)?);
+        }
+        read.commit()?;
+        self.roots = roots;
+        self.data_version = data_version;
+        self.changes = changes;
+        self.device_version = device_version;
+        self.device_changes = device_changes;
+        Ok(self.inventory.as_ref().unwrap())
+    }
+}
 impl ResidencyStatus {
     pub(crate) fn has_remote_or_missing(&self) -> bool {
         self.remote_objects > 0 || self.unavailable_objects > 0
@@ -238,8 +283,9 @@ impl PersistentStore {
         };
         crate::external_storage::lww_residency::remove_connection_sources(&self.repository_root, connection_id, |orphans| {
             let rows = self.connection.unchecked_transaction().map_err(std::io::Error::other)?;
-            for hash in orphans {
-                if cas.stat_object(hash)?.is_some() {
+            let sizes = cas.stat_objects(orphans.iter().map(String::as_str))?;
+            for (hash, size) in orphans.iter().zip(sizes) {
+                if size.is_some() {
                     continue;
                 }
                 if let Some(residency) = &residency {
@@ -529,8 +575,10 @@ impl PersistentStore {
     /// The status, with what moving to `target` would download when one is given, read from
     /// one inventory.
     pub(crate) fn asset_residency_status_for_target(&self, target: Option<&PreviousStorageTarget>) -> Result<ResidencyStatus> {
+        self.residency_status_from(self.residency_status_inventory()?, target)
+    }
+    fn residency_status_from(&self, inventory: Inventory, target: Option<&PreviousStorageTarget>) -> Result<ResidencyStatus> {
         let residency = Residency::open(&self.repository_root)?;
-        let inventory = self.residency_status_inventory()?;
         let cas = PayloadCas::new(&self.repository_root)?;
         let mut connections = Connections::default();
         let (local_bytes, missing) = split_local(&cas, inventory.referenced, &|| Ok(()))?;
@@ -772,12 +820,12 @@ impl PersistentStore {
         let head = client.resolve_identity()?;
         check()?;
         config.endpoint = client.config().endpoint.clone();
-        let inventory = self.residency_inventory(false)?;
-        let candidates = inventory
-            .referenced
-            .difference(&inventory.local)
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut inventory = InventoryCache::default();
+        let candidates = {
+            let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+            let current = inventory.current(self)?;
+            current.referenced.difference(&current.local).cloned().collect::<Vec<_>>()
+        };
         let cas = PayloadCas::new(&self.repository_root)?;
         let mut evicted = 0;
         let mut objects = Vec::new();
@@ -826,7 +874,7 @@ impl PersistentStore {
             check()?;
             progress.stage(Stage::Preparing, 0, None);
             let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-            let fresh = self.residency_inventory(true)?;
+            let fresh = inventory.current(self)?;
             progress.stage(Stage::Deleting, 0, Some(total));
             for (hash, size) in objects {
                 check()?;
@@ -845,8 +893,12 @@ impl PersistentStore {
             }
         }
         progress.stage(Stage::Finalizing, total, None);
-        self.asset_residency_release_unused_cancelled(cancellation, &check)?;
-        let mut status = self.asset_residency_status()?;
+        self.release_unused_with_inventory(cancellation, &check, &mut inventory)?;
+        {
+            let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+            inventory.current(self)?;
+        }
+        let mut status = self.residency_status_from(inventory.inventory.take().unwrap(), None)?;
         check()?;
         status.evicted_bytes = evicted;
         Ok(status)
@@ -862,15 +914,17 @@ impl PersistentStore {
         cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         check: impl Fn() -> Result<()>,
     ) -> Result<()> {
+        self.release_unused_with_inventory(cancellation, &check, &mut InventoryCache::default())
+    }
+    fn release_unused_with_inventory(
+        &self,
+        cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        check: &impl Fn() -> Result<()>,
+        inventory: &mut InventoryCache,
+    ) -> Result<()> {
         let mut residency = Residency::open(&self.repository_root)?;
         let cas = PayloadCas::new(&self.repository_root)?;
-        // Custody the library still uses is kept without asking the server.
-        // What remains is decided again under the mutation lock below.
         let revision = self.revision()?;
-        let used = self.residency_inventory(false)?;
-        if used.release_blocked {
-            return Ok(());
-        }
         let mut after = String::new();
         loop {
             let page = residency.page(&after)?;
@@ -878,17 +932,22 @@ impl PersistentStore {
                 break;
             }
             let mut candidates = std::collections::BTreeMap::<String, Vec<String>>::new();
-            for (cursor, hash, _) in page {
-                check()?;
-                after = cursor.clone();
-                if used.referenced.contains(&hash) || used.local.contains(&hash) {
-                    continue;
+            {
+                let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+                let used = inventory.current(self)?;
+                if used.release_blocked { return Ok(()); }
+                for (cursor, hash, _) in page {
+                    check()?;
+                    after = cursor.clone();
+                    if used.referenced.contains(&hash) || used.local.contains(&hash) {
+                        continue;
+                    }
+                    let context = cursor
+                        .split_once('/')
+                        .ok_or_else(|| SyncError::new("invalid-custody-cursor", 409))?
+                        .0;
+                    candidates.entry(context.to_owned()).or_default().push(hash);
                 }
-                let context = cursor
-                    .split_once('/')
-                    .ok_or_else(|| SyncError::new("invalid-custody-cursor", 409))?
-                    .0;
-                candidates.entry(context.to_owned()).or_default().push(hash);
             }
             for (context, hashes) in candidates {
                 check()?;
@@ -910,26 +969,29 @@ impl PersistentStore {
                     if self.revision()? != revision {
                         return Ok(());
                     }
-                    let inventory = self.residency_inventory(true)?;
+                    let inventory = inventory.current(self)?;
                     if inventory.release_blocked {
                         return Ok(());
                     }
                     let mut objects = Vec::new();
-                    for hash in hashes {
+                    let sizes = cas.stat_objects(hashes.iter().map(String::as_str))?;
+                    let rows = self.connection.unchecked_transaction()?;
+                    for (hash, size) in hashes.into_iter().zip(sizes) {
                         if inventory.referenced.contains(&hash) || inventory.local.contains(&hash) {
                             continue;
                         }
                         let Some(object) = residency.begin_latest_release(&hash, &context)? else {
                             continue;
                         };
-                        if cas.stat_object(&hash)?.is_none() {
-                            self.connection.execute(
+                        if size.is_none() {
+                            rows.execute(
                                 "DELETE FROM asset_objects WHERE object_hash=?1",
                                 [&hash],
                             )?;
                         }
                         objects.push(object);
                     }
+                    rows.commit()?;
                     objects
                 };
                 if objects.is_empty() {
@@ -967,5 +1029,73 @@ impl PersistentStore {
         let local = roots.into_iter().filter(|(label, _)| *label == "server-conflict")
             .flat_map(|(_, roots)| roots.object_hashes).collect();
         Ok((referenced, local))
+    }
+}
+
+#[cfg(test)]
+mod inventory_cache_tests {
+    use super::*;
+    use crate::asset_repository::job_pins::{CasJobKind, CasJobOwner, CasObjectRole, CasReleaseOutcome, DurableCasJob};
+
+    #[test]
+    fn an_operation_reuses_library_roots_but_observes_auxiliary_roots_and_job_pins() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = cas.prepare_bytes(b"synthetic cached inventory body").unwrap();
+        let mut cache = InventoryCache::default();
+        let read = |cache: &mut InventoryCache, store: &PersistentStore| {
+            let _guard = crate::asset_repository::coordinator::lock_repository_mutation().unwrap();
+            cache.current(store).map(|inventory| (inventory.referenced.clone(), inventory.local.clone()))
+        };
+        super::super::ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| count.set(0));
+        assert!(!read(&mut cache, &store).unwrap().0.contains(&payload.content_hash));
+        read(&mut cache, &store).unwrap();
+        assert_eq!(super::super::ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| count.get()), 1);
+
+        let mut archive = snapshot_archive::Archive::open(&store.snapshots_dir).unwrap();
+        let scratch = archive.scratch().unwrap();
+        std::fs::write(&scratch.path, b"synthetic archived bytes").unwrap();
+        let mut roots = crate::asset_repository::migration_gc::AssetRootSet::default();
+        roots.object_hashes.insert(payload.content_hash.clone());
+        let snapshot = archive.insert(&scratch.path, 0, "synthetic", roots).unwrap();
+        drop(archive);
+        assert!(read(&mut cache, &store).unwrap().0.contains(&payload.content_hash));
+        snapshot_archive::Archive::open(&store.snapshots_dir).unwrap().delete(&snapshot.id).unwrap();
+        assert!(!read(&mut cache, &store).unwrap().0.contains(&payload.content_hash));
+        assert_eq!(super::super::ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| count.get()), 1);
+
+        let mut job = DurableCasJob::begin(directory.path(), "synthetic-cache-pin", CasJobKind::DirectAssetOrInlayWrite, CasJobOwner::for_test(), 1).unwrap();
+        let error = read(&mut cache, &store).unwrap_err();
+        assert_eq!(error.code, "asset-jobs-busy");
+        job.pin_existing(&cas, &payload.content_hash, b"synthetic cached inventory body".len() as u64, CasObjectRole::DirectObject).unwrap();
+        job.seal(&mut store, 1).unwrap();
+        assert!(read(&mut cache, &store).unwrap().1.contains(&payload.content_hash));
+        job.release(CasReleaseOutcome::Committed).unwrap();
+        assert!(!read(&mut cache, &store).unwrap().1.contains(&payload.content_hash));
+
+        store.device_store().unwrap().connection().execute(
+            "INSERT INTO external_lww_segments VALUES('synthetic','synthetic','1','1',?1,X'',0)",
+            [serde_json::json!({"assets":[{"contentHash":payload.content_hash}],"reusedAssets":[]}).to_string()],
+        ).unwrap();
+        let (referenced, local) = read(&mut cache, &store).unwrap();
+        assert!(referenced.contains(&payload.content_hash));
+        assert!(!local.contains(&payload.content_hash));
+        let before = (cache.data_version, cache.changes, cache.device_version, cache.device_changes);
+        let mut masked = DurableCasJob::begin(directory.path(), "synthetic-masked-pin", CasJobKind::DirectAssetOrInlayWrite, CasJobOwner::for_test(), 1).unwrap();
+        masked.pin_existing(&cas, &payload.content_hash, payload.byte_size, CasObjectRole::DirectObject).unwrap();
+        masked.seal(&mut store, 1).unwrap();
+        assert!(read(&mut cache, &store).unwrap().1.contains(&payload.content_hash));
+        assert_eq!((cache.data_version, cache.changes, cache.device_version, cache.device_changes), before, "the already registered body changes no database invalidation token");
+        masked.release(CasReleaseOutcome::Committed).unwrap();
+        assert!(!read(&mut cache, &store).unwrap().1.contains(&payload.content_hash));
+        store.device_store().unwrap().connection().execute("DELETE FROM external_lww_segments", []).unwrap();
+
+        store.connection.execute("INSERT INTO plugin_storage (generation,owner,storage_key,byte_size,ordinal,value) VALUES ('synthetic','synthetic','body',0,0,?1)",
+            [serde_json::json!({"object":payload.content_hash}).to_string()]).unwrap();
+        assert!(read(&mut cache, &store).unwrap().0.contains(&payload.content_hash));
+        let other = rusqlite::Connection::open(&store.database_path).unwrap();
+        other.execute("DELETE FROM plugin_storage WHERE generation='synthetic'", []).unwrap();
+        assert!(!read(&mut cache, &store).unwrap().0.contains(&payload.content_hash));
     }
 }
