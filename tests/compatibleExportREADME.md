@@ -86,7 +86,8 @@ are covered. The actual pending-save flush function runs with no pending client
 writes; entering a live-client persistence branch throws.
 
 The Pocket edit/re-save test subsequently executes the current Nest
-`normalizePocketFeatures`, `snapshotResponse`, and `safeStructuredClone` functions.
+`normalizePocketFeatures`, `sanitizeToggleValues`, `snapshotResponse`, and
+`safeStructuredClone` functions.
 It verifies the edited selected body becomes the authoritative candidate on
 reimport.
 
