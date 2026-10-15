@@ -937,6 +937,7 @@ pub(crate) struct PersistentStore {
     device_store: Result<device_store::DeviceStore, StoreError>,
     message_object_roots: MessageObjectRootsCache,
     status_library_roots: Arc<StatusLibraryRoots>,
+    checked_representative_images: Arc<std::sync::Mutex<asset_residency::CheckedRepresentativeImages>>,
 }
 
 /// Disk-backed roots each sweep target last read, kept while neither
@@ -1634,6 +1635,7 @@ impl PersistentStore {
             device_store,
             message_object_roots: MessageObjectRootsCache::default(),
             status_library_roots: Arc::default(),
+            checked_representative_images: Arc::default(),
         };
         // A pending intent may still need its staging generation, so the sweep waits until
         // every intent recovery still runs has settled.
@@ -1664,6 +1666,7 @@ impl PersistentStore {
             device_store,
             message_object_roots: MessageObjectRootsCache::default(),
             status_library_roots: Arc::clone(&self.status_library_roots),
+            checked_representative_images: Arc::clone(&self.checked_representative_images),
         })
     }
 

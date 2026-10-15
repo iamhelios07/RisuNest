@@ -399,8 +399,8 @@ pub(crate) async fn server_sync_lww_drain(app:AppHandle,request:crate::persisten
     logged_blocking("drain",move||within(&LANES.send,|| {let state=app.state::<ServerSyncCommandState>();let (_job,cancelled)=state.claim_transport(&app.state::<crate::native_file_jobs::NativeFileJobState>().admission,"send")?;let mut store=job_store(&app)?;let core=lww_client_cancelled(&store,Some(cancelled))?;let mut next=request;while core.push(&mut store,&next,&generating)?.is_some(){next.request_id=uuid::Uuid::new_v4().to_string();}if !store.lww_read_outbox(next.binding_authority,1)?.entries.is_empty(){return Err(SyncError::new("generation-active",409));}Ok(())})).await
 }
 #[tauri::command]
-pub(crate) async fn server_sync_lww_hydrate(app:AppHandle,request:crate::persistent_store::lww::Header,selected_character_id:Option<String>,representatives_only:Option<bool>)->Result<()> {
-    logged_blocking("hydrate",move|| within(&LANES.hydrate,|| {let state=app.state::<ServerSyncCommandState>();let (_job,cancelled)=state.claim_transport(&app.state::<crate::native_file_jobs::NativeFileJobState>().admission,"hydrate")?;let store=job_store(&app)?;if representatives_only.unwrap_or(false) && store.server_asset_policy()?==super::residency::AssetPolicy::Full{return Ok(());}hydrate_binding_assets(&store,&request,cancelled,selected_character_id.as_deref(),||{})})).await
+pub(crate) async fn server_sync_lww_hydrate(app:AppHandle,request:crate::persistent_store::lww::Header,selected_character_id:Option<String>,representatives_only:Option<bool>,icon_priority:Option<crate::persistent_store::asset_residency::RepresentativeImagePriority>)->Result<()> {
+    logged_blocking("hydrate",move|| within(&LANES.hydrate,|| {let state=app.state::<ServerSyncCommandState>();let (_job,cancelled)=state.claim_transport(&app.state::<crate::native_file_jobs::NativeFileJobState>().admission,"hydrate")?;let store=job_store(&app)?;if representatives_only.unwrap_or(false) && store.server_asset_policy()?==super::residency::AssetPolicy::Full{return Ok(());}hydrate_binding_assets_ordered(&store,&request,cancelled,selected_character_id.as_deref(),icon_priority.as_ref(),||{})})).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_lww_pending_count(app:AppHandle,request:crate::persistent_store::lww::Header)->Result<u64> {
@@ -409,12 +409,15 @@ pub(crate) async fn server_sync_lww_pending_count(app:AppHandle,request:crate::p
 #[tauri::command]
 pub(crate) async fn server_sync_progress()->Vec<super::progress::LaneSnapshot> {LANES.snapshot()}
 pub(crate) fn hydrate_binding_assets(store:&crate::persistent_store::PersistentStore,request:&crate::persistent_store::lww::Header,cancelled:Arc<AtomicBool>,selected_character_id:Option<&str>,on_object_done:impl Fn())->Result<()> {
+    hydrate_binding_assets_ordered(store,request,cancelled,selected_character_id,None,on_object_done)
+}
+pub(crate) fn hydrate_binding_assets_ordered(store:&crate::persistent_store::PersistentStore,request:&crate::persistent_store::lww::Header,cancelled:Arc<AtomicBool>,selected_character_id:Option<&str>,icon_priority:Option<&crate::persistent_store::asset_residency::RepresentativeImagePriority>,on_object_done:impl Fn())->Result<()> {
     let authority=request.binding_authority;
     let check=||{if cancelled.load(Ordering::Acquire){return Err(SyncError::new("cancelled",409));}if store.lww_binding_authority()?!=authority{return Err(SyncError::new("binding-authority-changed",409));}Ok(())};
     check()?;
     match store.server_asset_policy()? {
         super::residency::AssetPolicy::Full => store.hydrate_registered_remote_assets_prioritized(Some(cancelled.clone()),selected_character_id,check,on_object_done),
-        super::residency::AssetPolicy::Remote => store.hydrate_representative_images(Some(cancelled.clone()),selected_character_id,check,on_object_done),
+        super::residency::AssetPolicy::Remote => store.hydrate_representative_images(Some(cancelled.clone()),selected_character_id,icon_priority,check,on_object_done),
     }
 }
 

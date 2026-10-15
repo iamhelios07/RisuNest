@@ -508,6 +508,12 @@ fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
 pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&BTreeSet<String>,
     cancellation:Option<Arc<std::sync::atomic::AtomicBool>>,check:&dyn Fn()->crate::server_sync::Result<()>,
     opened:&mut dyn FnMut(&str,crate::server_sync::residency::HydrationOutcome))->crate::server_sync::Result<Vec<String>> {
+    hydrate_registered_many_scheduled(root,digests,priority,cancellation,check,opened,&mut |_,_|Ok(()))
+}
+pub(crate) fn hydrate_registered_many_scheduled(root:&Path,digests:&[String],priority:&BTreeSet<String>,
+    cancellation:Option<Arc<std::sync::atomic::AtomicBool>>,check:&dyn Fn()->crate::server_sync::Result<()>,
+    opened:&mut dyn FnMut(&str,crate::server_sync::residency::HydrationOutcome),
+    before_group:&mut dyn FnMut(&str,&mut dyn FnMut(&str,crate::server_sync::residency::HydrationOutcome))->crate::server_sync::Result<()>) -> crate::server_sync::Result<Vec<String>> {
     use crate::persistent_store::asset_object_catalog::{AssetObjectRegistration,ASSET_OBJECT_CATALOG_MAX_PAGE};
     use crate::server_sync::residency::HydrationOutcome;
     let cancel=cancellation.map(Cancellation::with_external_flag).unwrap_or_default();
@@ -575,48 +581,58 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&BTr
         #[cfg(test)]
         hydration_tests::crash_point(root,hydration_tests::CrashPoint::AfterRegistration)?;
     }
+    enum Work { Packed(Vec<PackedOutline>), Standalone(Vec<Source>) }
+    let positions=digests.iter().enumerate().map(|(index,hash)|(*hash,index)).collect::<BTreeMap<_,_>>();
+    let rank=|hash:&str|(!priority.contains(hash),positions.get(hash).copied().unwrap_or(usize::MAX));
     let mut groups=Vec::new();
-    for (connection,outlines) in packed {for group in pack_groups(outlines,priority) {groups.push((connection.clone(),group));}}
-    groups.sort_by_key(|(_,group)|!group.iter().any(|outline|priority.contains(&outline.hash)));
-    let (selected,background):(Vec<_>,Vec<_>)=standalone.into_iter().partition(|source:&Source|priority.contains(&source.hash));
-    let mut connections=BTreeMap::new();
-    // Selected standalone bodies precede background pack groups.
-    for (connection,sources) in by_connection(selected) {
-        publisher.checked()?;
-        let connection=source_connection(&mut connections,&connection,&cancel).map_err(remote_error)?;
-        hydrate_standalone(connection,sources,scratch.path(),&publisher,opened)?;
+    for (connection,outlines) in packed {
+        for mut group in pack_groups(outlines,priority) {
+            group.sort_by_key(|outline|rank(&outline.hash));
+            groups.push((rank(&group[0].hash),connection.clone(),Work::Packed(group)));
+        }
     }
-    for (connection,outlines) in groups {
+    for source in standalone {
+        let connection=(source.connection_root.clone(),source.connection_id.clone(),source.library_id.clone());
+        groups.push((rank(&source.hash),connection,Work::Standalone(vec![source])));
+    }
+    groups.sort_by_key(|(rank,_,_)|*rank);
+    let mut scheduled:Vec<(ConnectionKey,Work)>=Vec::new();
+    for (_,connection,work) in groups {
+        match (scheduled.last_mut(),work) {
+            (Some((previous,Work::Standalone(batch))),Work::Standalone(mut sources)) if *previous==connection && priority.contains(&batch[0].hash)==priority.contains(&sources[0].hash)=>batch.append(&mut sources),
+            (_,work)=>scheduled.push((connection,work)),
+        }
+    }
+    let mut connections=BTreeMap::new();
+    for (connection,work) in scheduled {
         publisher.checked()?;
-        // Full sources are read one group at a time, so a hydration never holds every source at once.
-        let mut sources=remote.packed(&connection.2,outlines.iter().map(|outline|outline.hash.as_str())).map_err(hydration_error)?;
-        let mut interner=ObjectInterner::default();
-        let mut group=Vec::with_capacity(outlines.len());
-        for outline in outlines {
-            match sources.remove(&outline.hash) {
-                Some(source) if source.hash==outline.hash && source.connection_root==connection.0 && source.connection_id==connection.1
-                    =>group.push(source.interned(&mut interner)),
-                _=>unavailable.push(outline.hash),
+        let first=match &work { Work::Standalone(sources)=>&sources[0].hash, Work::Packed(outlines)=>&outlines[0].hash };
+        before_group(first,opened)?;
+        match work {
+            Work::Standalone(sources)=>{
+                let connection=source_connection(&mut connections,&connection,&cancel).map_err(remote_error)?;
+                hydrate_standalone(connection,sources,scratch.path(),&publisher,opened)?;
+            }
+            Work::Packed(outlines)=>{
+                // Read full sources one shared-pack group at a time.
+                let mut sources=remote.packed(&connection.2,outlines.iter().map(|outline|outline.hash.as_str())).map_err(hydration_error)?;
+                let mut interner=ObjectInterner::default();
+                let mut group=Vec::with_capacity(outlines.len());
+                for outline in outlines {
+                    match sources.remove(&outline.hash) {
+                        Some(source) if source.hash==outline.hash && source.connection_root==connection.0 && source.connection_id==connection.1
+                            =>group.push(source.interned(&mut interner)),
+                        _=>unavailable.push(outline.hash),
+                    }
+                }
+                drop(sources);
+                if group.is_empty() {continue;}
+                let opened_source=source_connection(&mut connections,&connection,&cancel).map_err(remote_error)?;
+                hydrate_pack_group(root,opened_source,group,scratch.path(),&publisher,opened)?;
             }
         }
-        drop(sources);
-        if group.is_empty() {continue;}
-        let opened_source=source_connection(&mut connections,&connection,&cancel).map_err(remote_error)?;
-        hydrate_pack_group(root,opened_source,group,scratch.path(),&publisher,opened)?;
-    }
-    for (connection,sources) in by_connection(background) {
-        publisher.checked()?;
-        let connection=source_connection(&mut connections,&connection,&cancel).map_err(remote_error)?;
-        hydrate_standalone(connection,sources,scratch.path(),&publisher,opened)?;
     }
     check()?;Ok(unavailable)
-}
-fn by_connection(sources:Vec<Source>)->BTreeMap<ConnectionKey,Vec<Source>> {
-    let mut connections=BTreeMap::<ConnectionKey,Vec<Source>>::new();
-    for source in sources {
-        connections.entry((source.connection_root.clone(),source.connection_id.clone(),source.library_id.clone())).or_default().push(source);
-    }
-    connections
 }
 /// A source connection, opened once for every group a hydration reads through it.
 struct OpenedSource {

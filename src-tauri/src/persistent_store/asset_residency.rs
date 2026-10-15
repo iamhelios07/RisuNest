@@ -217,35 +217,95 @@ fn previous_storage_wanted(
     Ok(wanted)
 }
 
+#[derive(Default)]
+pub(super) struct CheckedRepresentativeImages {
+    generation: String,
+    removal_epoch: u64,
+    removal_source: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    hashes: BTreeSet<String>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepresentativeImagePriority {
+    #[serde(default)]
+    pub(crate) ordered: Vec<String>,
+    #[serde(default)]
+    pub(crate) visible: Vec<String>,
+}
+
 impl PersistentStore {
-    fn representative_image_hashes(&self, selected_character_id: Option<&str>) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    fn representative_image_plan(&self, selected_character_id: Option<&str>, requested: Option<&RepresentativeImagePriority>) -> Result<(Vec<String>, BTreeSet<String>)> {
         let generation = super::active_generation(&self.connection)?;
-        let mut images = BTreeSet::new();
-        let mut priority = BTreeSet::new();
+        let mut aliases = std::collections::BTreeMap::new();
+        let mut characters = std::collections::BTreeMap::new();
         let mut query = self.connection.prepare_cached(
-            "SELECT c.character_id, a.object_hash FROM characters c
+            "SELECT c.character_id, c.image, a.object_hash FROM characters c
              JOIN asset_aliases a ON a.generation=c.generation AND a.kind='asset' AND a.logical_key=c.image
              WHERE c.generation=?1 AND c.trashed=0 AND a.object_hash IS NOT NULL",
         )?;
-        let rows = query.query_map([generation], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let rows = query.query_map([&generation], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
         for row in rows {
-            let (character_id, hash) = row?;
-            if selected_character_id == Some(character_id.as_str()) { priority.insert(hash.clone()); }
-            images.insert(hash);
+            let (id, alias, hash) = row?;
+            characters.insert(id, hash.clone());
+            aliases.insert(alias, hash);
         }
+        let order: Option<String> = self.connection.query_row(
+            "SELECT json_extract(value, '$.characterOrder') FROM root WHERE generation=?1", [&generation], |row| row.get(0),
+        ).optional()?.flatten();
+        let order: Vec<serde_json::Value> = order.map(|order| serde_json::from_str(&order)).transpose()
+            .map_err(|_| SyncError::new("invalid-character-order", 409))?.unwrap_or_default();
+        let mut display = Vec::new();
+        let mut folder_alias = self.connection.prepare_cached(
+            "SELECT object_hash FROM asset_aliases WHERE generation=?1 AND kind='asset' AND logical_key=?2",
+        )?;
+        for item in &order {
+            if let Some(id) = item.as_str() {
+                if let Some(hash) = characters.get(id) { display.push(hash.clone()); }
+            } else {
+                if let Some(alias) = item.get("imgFile").and_then(serde_json::Value::as_str) {
+                    let hash: Option<String> = folder_alias.query_row(rusqlite::params![generation, alias], |row| row.get(0)).optional()?.flatten();
+                    if let Some(hash) = hash { display.push(hash.clone()); aliases.insert(alias.to_owned(), hash); }
+                }
+                if let Some(children) = item.get("data").and_then(serde_json::Value::as_array) {
+                    display.extend(children.iter().filter_map(|id| id.as_str().and_then(|id| characters.get(id))).cloned());
+                }
+            }
+        }
+        let mut priority = BTreeSet::new();
+        let mut images = Vec::new();
+        if let Some(requested) = requested {
+            for alias in &requested.visible {
+                if let Some(hash) = aliases.get(alias) { priority.insert(hash.clone()); images.push(hash.clone()); }
+            }
+            images.extend(requested.ordered.iter().filter_map(|alias| aliases.get(alias)).cloned());
+        }
+        if priority.is_empty() {
+            if let Some(hash) = selected_character_id.and_then(|id| characters.get(id)) { priority.insert(hash.clone()); }
+        }
+        images.extend(display);
+        images.extend(characters.into_values());
+        let mut seen = BTreeSet::new();
+        images.retain(|hash| seen.insert(hash.clone()));
         Ok((images, priority))
+    }
+
+    fn representative_image_hashes(&self, selected_character_id: Option<&str>) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+        let (images, priority) = self.representative_image_plan(selected_character_id, None)?;
+        Ok((images.into_iter().collect(), priority))
     }
 
     pub(crate) fn hydrate_representative_images(
         &self,
         cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         selected_character_id: Option<&str>,
+        requested: Option<&RepresentativeImagePriority>,
         check: impl Fn() -> Result<()>,
         on_object_done: impl Fn(),
     ) -> Result<()> {
         check()?;
         let generation = super::active_generation(&self.connection)?;
-        let (images, priority) = self.representative_image_hashes(selected_character_id)?;
+        let (images, priority) = self.representative_image_plan(selected_character_id, requested)?;
         let check = || {
             check()?;
             if super::active_generation(&self.connection)? != generation {
@@ -253,15 +313,50 @@ impl PersistentStore {
             }
             Ok(())
         };
-        let (_, missing) = split_local(&PayloadCas::new(&self.repository_root)?, images, &check)?;
+        let cas = PayloadCas::new(&self.repository_root)?;
+        let removal_source = cas.removal_epoch();
+        let retained = images.iter().cloned().collect::<BTreeSet<_>>();
+        let mut missing = Vec::new();
+        {
+            let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+            let epoch = removal_source.load(std::sync::atomic::Ordering::Acquire);
+            let mut cache = self.checked_representative_images.lock().map_err(|_| std::io::Error::other("checked-images-poisoned"))?;
+            if cache.generation != generation || cache.removal_epoch != epoch { cache.hashes.clear(); }
+            cache.generation = generation.clone();
+            cache.removal_source = Some(std::sync::Arc::clone(&removal_source));
+            cache.removal_epoch = epoch;
+            cache.hashes.retain(|hash| retained.contains(hash));
+            let unchecked = images.iter().filter(|hash| !cache.hashes.contains(*hash)).cloned().collect::<Vec<_>>();
+            for page in unchecked.chunks(HOLDER_PAGE) {
+                check()?;
+                for (hash, size) in page.iter().zip(cas.stat_objects(page.iter().map(String::as_str))?) {
+                    if size.is_some() { cache.hashes.insert(hash.clone()); } else { missing.push(hash.clone()); }
+                }
+            }
+        }
         if missing.is_empty() { return check(); }
-        // An icon no storage holds is skipped and left to the data check, which reports it.
+        // An icon no storage holds remains retryable and is reported by the data check.
         let held = RemoteHolders::open(&self.repository_root)?.held(&missing)?;
-        let missing = missing.into_iter().zip(held).filter_map(|(hash, held)| held.then_some(hash)).collect::<Vec<_>>();
+        missing = missing.into_iter().zip(held).filter_map(|(hash, held)| held.then_some(hash)).collect();
         if missing.is_empty() { return check(); }
         let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
-        // One whose last holder went away during the pass is skipped the same way.
-        hydration.hydrate_many_outcomes_prioritized(&missing, &priority, &check, |_, _| on_object_done())?;
+        let mut completed = Vec::new();
+        hydration.hydrate_many_outcomes_prioritized(&missing, &priority, &check, |hash, _| {
+            completed.push(hash.to_owned()); on_object_done();
+        })?;
+        check()?;
+        // Recheck completed images under the offload lock before remembering them.
+        let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+        let epoch = removal_source.load(std::sync::atomic::Ordering::Acquire);
+        let mut cache = self.checked_representative_images.lock().map_err(|_| std::io::Error::other("checked-images-poisoned"))?;
+        if cache.removal_epoch != epoch { cache.hashes.clear(); }
+        cache.removal_epoch = epoch;
+        for page in completed.chunks(HOLDER_PAGE) {
+            check()?;
+            for (hash, size) in page.iter().zip(cas.stat_objects(page.iter().map(String::as_str))?) {
+                if size.is_some() { cache.hashes.insert(hash.clone()); }
+            }
+        }
         check()
     }
 

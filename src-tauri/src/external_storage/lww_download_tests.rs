@@ -81,3 +81,27 @@ fn standalone_hydration_settles_successful_siblings_before_returning_a_download_
         for index in [0,2,3] {assert!(cas.stat_object(&sources[index].hash).unwrap().is_some());}
     });
 }
+
+#[test]
+fn standalone_connections_follow_display_rank_before_background_work() {
+    let f=CycleFixture::new();
+    let provider=Arc::new(DownloadProvider::new(4,&[]));
+    let mut sources=sources(&f,&provider,4);
+    sources[1].connection_id="other-receiver".into();
+    register(f.directory_b.path(),&sources[1]).unwrap();
+    let first=connection(&f,provider.clone(),None);
+    let mut second=connection(&f,provider.clone(),None);
+    second.stored.id="other-receiver".into();
+    let _first=install_test_source_connection(f.directory_b.path(),Arc::new(first)).unwrap();
+    let _second=install_test_source_connection(f.directory_b.path(),Arc::new(second)).unwrap();
+    let hashes=sources.iter().map(|source|source.hash.clone()).collect::<Vec<_>>();
+    let priority=hashes[..3].iter().cloned().collect();
+    let mut completed=Vec::new();
+    let unavailable=hydrate_registered_many(f.directory_b.path(),&hashes,&priority,None,&||Ok(()),&mut |hash,_|completed.push(hash.to_owned())).unwrap();
+    assert!(unavailable.is_empty());
+    assert_eq!(completed,hashes);
+    let cas=crate::asset_repository::PayloadCas::new(f.directory_b.path()).unwrap();
+    for (index,source) in sources.iter().enumerate() {
+        assert_eq!(cas.read_object(&source.hash).unwrap().unwrap(),format!("synthetic standalone hydration {index}").into_bytes());
+    }
+}
