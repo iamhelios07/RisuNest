@@ -17,7 +17,7 @@ import { recordNativeLogError, setNativeLogFileEnabled } from "./nativeLog";
 import { registerRuntimeErrorHandlers } from "./runtimeErrors";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure } from "./stores.svelte";
-import { keepPluginsOffForThisStart, loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
+import { afterPluginsStarted, keepPluginsOffForThisStart, loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertToast, alertTOS, waitAlert } from "./alert";
 import { backgroundErrorMessage } from "./storage/backgroundErrorMessage";
 import { applyHubSelection, characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
@@ -801,21 +801,19 @@ export async function loadData() {
         await transition('format-update', language.risuNest.startup.data)
         performance.mark('boot:cold-storage-ready')
         await transition('plugins', language.risuNest.startup.plugins)
-        let pluginsLoaded = excluded('plugins')
-        try {
-            if (!pluginsLoaded) await loadPlugins()
-            pluginsLoaded = true
-        } catch (error) {
-            console.error(error)
-        }
-        if (pluginsLoaded && recoveredNativeRestoreJobs.length > 0) {
-            try {
-                await acknowledgeRecoveredNativeRestores(recoveredNativeRestoreJobs)
-            }
-            catch (error) {
-                console.error('Native restore acknowledgement failed', error)
+        if (recoveredNativeRestoreJobs.length > 0) {
+            if (excluded('plugins')) {
+                try { await acknowledgeRecoveredNativeRestores(recoveredNativeRestoreJobs) }
+                catch (error) { console.error('Native restore acknowledgement failed', error) }
+            } else {
+                const stop = afterPluginsStarted(async () => {
+                    try { await acknowledgeRecoveredNativeRestores(recoveredNativeRestoreJobs); stop() }
+                    catch (error) { console.error('Native restore acknowledgement failed', error) }
+                })
             }
         }
+        try { if (!excluded('plugins')) await loadPlugins() }
+        catch (error) { console.error(error) }
         performance.mark('boot:plugins-ready')
         if (!isTauri && !excluded('account') && getDatabase().account) {
             await transition('account-data', language.risuNest.startup.account)

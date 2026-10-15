@@ -1,3 +1,4 @@
+import type { PluginStorageWriteCheck } from '../plugins/pluginStorageProtection'
 import { captureMaterializedCharacter, diffMaterializedCharacter, diffRecordCollection, recordCollections, diffFields } from './persistentUnitCapture'
 import { isTauri } from '../platform'
 import { Mutex } from '../mutex'
@@ -1673,6 +1674,7 @@ export class SaveCoordinator {
     mutatePersistentPluginStorage(
         reason: string,
         mutations: readonly PluginStorageMutation[],
+        check?: PluginStorageWriteCheck,
     ): Promise<void> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
@@ -1707,10 +1709,16 @@ export class SaveCoordinator {
                 liveBeforeCommit === null
                     ? null
                     : capturePluginMutationScope(liveBeforeCommit, committedMutations)
+            const clearOwners = new Set(committedMutations.filter(mutation => mutation.type === 'clear').map(mutation => mutation.owner))
+            const clearedKeys = check && clearOwners.size
+                ? (await Promise.all([...clearOwners].map(owner => this.dependencies.store.queryPluginStorage(owner))))
+                    .flatMap(catalog => catalog.items) : []
+            check?.validate()
             const committed = await this.commitRoutine({
                 expectedRevision: revision,
                 pluginStorage: committedMutations,
             })
+            check?.committed(clearedKeys)
             this.currentRevision = committed.revision
             this.dirtyGeneration++
             if (baseline !== null) {
@@ -4993,7 +5001,7 @@ export class SaveCoordinator {
         }
     }
 
-    commitPersistentUnitIntent(reason: string, unitMutations: readonly PersistentUnitMutation[], conversations: readonly ConversationMutation[] = [], wholeMessages: readonly WholeMessageIntent[] = [], onCommitted?: (revision: DataRevision) => Promise<void>): Promise<DataRevision> {
+    commitPersistentUnitIntent(reason: string, unitMutations: readonly PersistentUnitMutation[], conversations: readonly ConversationMutation[] = [], wholeMessages: readonly WholeMessageIntent[] = [], onCommitted?: (revision: DataRevision) => Promise<void>, check?: PluginStorageWriteCheck): Promise<DataRevision> {
         this.assertPersistentMutationAllowed()
         const mutations = canonicalClone([...unitMutations])
         const ranges = canonicalClone([...conversations])
@@ -5010,7 +5018,7 @@ export class SaveCoordinator {
                         start: 0, deleteCount: metadata?.value.totalMessages ?? 0, messages: target.messages })
                 }
                 return { unitMutations: mutations, conversations: [...ranges, ...replacements] }
-            }, onCommitted))!
+            }, async revision => { check?.committed(); await onCommitted?.(revision) }, check))!
         })
     }
 
@@ -5029,7 +5037,7 @@ export class SaveCoordinator {
         })
     }
 
-    private async commitUnitIntentAttempts(prepare: (revision: DataRevision) => Promise<PreparedUnitIntent | null>, onCommitted?: (revision: DataRevision) => Promise<void>): Promise<DataRevision | null> {
+    private async commitUnitIntentAttempts(prepare: (revision: DataRevision) => Promise<PreparedUnitIntent | null>, onCommitted?: (revision: DataRevision) => Promise<void>, check?: PluginStorageWriteCheck): Promise<DataRevision | null> {
         while (true) {
             const revision = this.revision
             const prepared = await prepare(revision)
@@ -5037,6 +5045,7 @@ export class SaveCoordinator {
             if (!prepared.unitMutations.length && !prepared.conversations.length) return revision
             let committedRevision: DataRevision | undefined
             try {
+                check?.validate()
                 const result = await this.dependencies.store.commit({ expectedRevision: revision, unitMutations: [...prepared.unitMutations], conversations: [...prepared.conversations] })
                 committedRevision = result.revision
                 this.currentRevision = result.revision

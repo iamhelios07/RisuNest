@@ -1,3 +1,4 @@
+import { configurePluginStartup, pluginStartupState } from 'src/ts/plugins/pluginStartupGate'
 import { get } from 'svelte/store'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -98,6 +99,21 @@ describe('processMultiCommand conversation mutations', () => {
         mocks.sendChat.mockClear()
         mocks.setDatabase.mockClear()
         mocks.session = null
+    })
+
+    it('keeps native commands usable while refusing model commands before conversation edits', async () => {
+        configurePluginStartup(() => true, async () => {})
+        pluginStartupState.set({ phase: 'waiting', since: Date.now(), refused: false })
+        try {
+            await processMultiCommand('/multisend clear|||discarded')
+            expect(mocks.database!.characters[0].chats[0].message.map(message => message.data)).toEqual(['before'])
+            expect(mocks.sendChat).not.toHaveBeenCalled()
+            await processMultiCommand('/send native action')
+            expect(mocks.database!.characters[0].chats[0].message.map(message => message.data)).toEqual(['before', 'native action'])
+        } finally {
+            pluginStartupState.set({ phase: 'released', since: 0, refused: false })
+            configurePluginStartup(() => false, async () => {})
+        }
     })
 
     it('routes send through the matching active conversation session', async () => {

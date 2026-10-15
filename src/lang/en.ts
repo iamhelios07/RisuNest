@@ -1914,6 +1914,15 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        pluginStartup: {
+            delayLabel: 'Delay plugin loading when sync is enabled',
+            delayHelp: 'Plugins load after synchronization completes when the app starts. Turning this off may cause plugin data to be overwritten with older values.',
+            waiting: 'Plugins will load after synchronization.',
+            loadNow: 'Load plugins',
+            syncUnfinished: 'Plugins have not loaded because synchronization did not finish.',
+            requestRefused: 'Try again after plugins load.',
+        },
+
         backgroundDataFailed: 'Some changes to the data could not be completed.',
         scriptTimeout: 'A Lua script took too long and was stopped.',
         localSaveFailure: {

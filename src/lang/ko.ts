@@ -1730,6 +1730,15 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        pluginStartup: {
+            delayLabel: '동기화 사용 시 플러그인 불러오기 지연',
+            delayHelp: '앱을 실행하면 동기화가 완료될 때까지 플러그인을 불러오지 않습니다. 체크를 해제하는 경우 플러그인 데이터가 이전 값으로 덮어씌워질 수 있습니다.',
+            waiting: '동기화가 완료되면 플러그인을 불러옵니다.',
+            loadNow: '플러그인 불러오기',
+            syncUnfinished: '동기화를 마치지 못해 플러그인을 불러오지 않았습니다.',
+            requestRefused: '플러그인을 불러온 뒤 다시 시도해주세요.',
+        },
+
         backgroundDataFailed: '일부 데이터 변경을 완료하지 못했습니다.',
         scriptTimeout: 'Lua 스크립트 실행 시간이 초과되어 중단되었습니다.',
         localSaveFailure: {

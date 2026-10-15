@@ -1,3 +1,4 @@
+import { notifySyncReceiveCompleted } from './bindingChanges'
 import { invoke } from '@tauri-apps/api/core'
 import type { SyncExitDrainAdapter } from '../syncExitCoordinator'
 import type { RetainableReplacementFence } from '../retainableReplacementFence'
@@ -66,6 +67,7 @@ let persistedBinding: BindingContext['state'] | undefined
 let context: BindingContext | undefined
 let error = ''
 let foreground = false
+let heldForCommittedRestore = false
 let replacing = false
 let hydrating: Promise<void> | undefined
 let hydrationPending = false
@@ -286,10 +288,12 @@ const scheduler = createServerSyncScheduler({
         const captured = context
         if (!captured) throw new Error('Sync binding is unavailable')
         let receivedBodies = false
+        let receiveFrontier: string | undefined
         for (;;) {
             captured.signal.throwIfAborted()
             if (captured !== context) throw new Error('Sync binding changed')
-            const request = await during('downloading', () => invoke<LwwStageReceive>('server_sync_lww_pull', { request: header() }))
+            const request = await during('downloading', () => invoke<LwwStageReceive & { receiveFrontier?: string; more?: boolean }>('server_sync_lww_pull', { request: header() }))
+            receiveFrontier ??= request.receiveFrontier
             captured.signal.throwIfAborted()
             // A page is applied under the stage that received it, so reading many pages shows one stage.
             try { await during('downloading', () => applyPersistentLwwReceive(request)) }
@@ -300,7 +304,8 @@ const scheduler = createServerSyncScheduler({
             if ((!foreground || isLibraryFileOperationReserved()) && !completeAvailable) break
             await invoke('server_sync_lww_ack', { request: { bindingAuthority: request.bindingAuthority, requestId: request.requestId } })
             checkContext(captured)
-            if (request.changes.length === 0) break
+            if (request.more === false || (receiveFrontier !== undefined && BigInt(request.progress.cursor) >= BigInt(receiveFrontier))
+                || (request.more === undefined && request.changes.length === 0)) { notifySyncReceiveCompleted(); break }
         }
         if (receivedBodies) continueHydration()
     }),
@@ -334,6 +339,7 @@ const adoptSchedulerAuthority = (c: BindingContext) => {
     scheduler.reset(); error = ''; hydrationError = ''; schedulerAuthority = c.state.targetAuthority
 }
 const transport: SyncBindingTransport = {
+    heldForCommittedRestore: () => heldForCommittedRestore,
     // A registration that cannot join this way is refused here, before the library is read.
     inspectTarget: c => during('preparing', () => invoke('server_sync_lww_inspect', { request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() }, newDevice: c.mode === 'new-device' })),
     pullAvailableState: async (inspected,c) => { const staged = await during('downloading', () => invoke<StagedSyncTarget>('server_sync_lww_stage_target', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } })); bindingStaged = true; return staged },
@@ -350,7 +356,7 @@ const transport: SyncBindingTransport = {
         checkContext(c)
         await pushAvailable(c, true)
     },
-    async resumeBinding(c) { context = c; adoptSchedulerAuthority(c); await invoke('server_sync_lww_activate', { request: header() }); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; hydrationPending = true; await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
+    async resumeBinding(c) { heldForCommittedRestore = false; context = c; adoptSchedulerAuthority(c); await invoke('server_sync_lww_activate', { request: header() }); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; hydrationPending = true; await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
     prepareNewDeviceBinding: (staged,c) => invoke('server_sync_lww_prepare_new_device', { stagingId: staged.stagingId, request: { bindingAuthority: c.state.targetAuthority, requestId: staged.receiveId } }),
     replaceAsNewDevice: (...args) => during('applying', () => replaceNativeSyncBindingAsNewDevice(...args)),
     prepareFreshWriter: (inspected,c) => invoke('server_sync_lww_prepare_fresh_writer', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } }),
@@ -448,7 +454,7 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     disposers.push(() => document.removeEventListener('visibilitychange', visibility))
     disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; foreground = false; hydrationPending = false; representativesPending = false; clearTimeout(representativesTimer); representativesTimer = undefined; hydrationAgain = false; attempt = undefined; clearFinished(); watchSamples() }
     await controller.ensureStatus()
-    if (!resumeBound) return
+    if (!resumeBound || heldForCommittedRestore) return
     const current = await invoke<BindingContext['state']>('pds_lww_binding_state')
     if (current.target.kind === 'server' && status.configured) {
         try { await resumeCurrentServerBinding(current) }
@@ -526,7 +532,7 @@ export function createServerSyncExitDrainAdapter(id = 'server', _fence?: Retaina
         finally { signal.removeEventListener('abort', cancel) }
     }, cancel: async () => { foreground = false; if (hydrating) hydrationPending = true; await scheduler.fence(); await hydrating }, resumeAfterExitCancel: async () => { await updateForeground(document.visibilityState !== 'hidden') } }
 }
-export function holdServerSyncAfterRestore(): void { controller.holdAutomaticSync() }
+export function holdServerSyncAfterRestore(): void { heldForCommittedRestore = true; controller.holdAutomaticSync() }
 export function resumeServerSyncAfterBackup(): void { if (context) void updateForeground(document.visibilityState !== 'hidden') }
 export interface ServerSyncCacheUsage {
   /** cacheBytes plus ledgerBytes. */
