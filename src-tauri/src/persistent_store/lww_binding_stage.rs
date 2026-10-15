@@ -82,6 +82,7 @@ struct ScratchBatches<'c> {
     page_size: i64,
     pages: i64,
     rows: i64,
+    rewritten_bytes: i64,
 }
 
 impl<'c> ScratchBatches<'c> {
@@ -89,7 +90,7 @@ impl<'c> ScratchBatches<'c> {
         let page_size: i64 = db.query_row("PRAGMA page_size", [], |row| row.get(0))?;
         // A commit checkpoints once the WAL holds a batch, so later batches reuse its start.
         db.pragma_update(None, "wal_autocheckpoint", (scratch_batch_limits().1 / page_size).max(1))?;
-        let mut batches = Self { db, tx: None, page_size, pages: 0, rows: 0 };
+        let mut batches = Self { db, tx: None, page_size, pages: 0, rows: 0, rewritten_bytes: 0 };
         batches.open()?;
         Ok(batches)
     }
@@ -97,6 +98,7 @@ impl<'c> ScratchBatches<'c> {
         self.tx = Some(Transaction::new_unchecked(self.db, TransactionBehavior::Immediate)?);
         self.pages = self.page_count()?;
         self.rows = 0;
+        self.rewritten_bytes = 0;
         Ok(())
     }
     fn page_count(&self) -> StoreResult<i64> {
@@ -104,10 +106,12 @@ impl<'c> ScratchBatches<'c> {
     }
     fn tx(&self) -> &Transaction<'c> { self.tx.as_ref().expect("open scratch batch") }
     /// Commits after a row once the batch reaches either bound.
-    fn row(&mut self) -> StoreResult<()> {
+    fn row(&mut self) -> StoreResult<()> { self.written(0) }
+    fn written(&mut self, bytes: i64) -> StoreResult<()> {
         self.rows += 1;
+        self.rewritten_bytes = self.rewritten_bytes.saturating_add(bytes);
         let (rows, bytes) = scratch_batch_limits();
-        if self.rows >= rows || (self.page_count()? - self.pages) * self.page_size >= bytes {
+        if self.rows >= rows || self.rewritten_bytes.saturating_add((self.page_count()? - self.pages).max(0) * self.page_size) >= bytes {
             if let Some(tx) = self.tx.take() { tx.commit()?; }
             self.open()?;
         }
@@ -358,29 +362,43 @@ impl PersistentStore {
             isolated.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
             drop(isolated);
             let id = format!("staging-{}", uuid::Uuid::new_v4());
-            self.connection.execute("ATTACH DATABASE ?1 AS binding_incoming", [path.to_string_lossy().as_ref()])?;
+            let autocheckpoint: i64 = self.connection.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+            self.connection.pragma_update(None, "wal_autocheckpoint", 0)?;
             let copied = (|| -> StoreResult<()> {
-                let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                super::commit::begin_generation(&tx, &id)?;
-                let mut rows = 0;
-                for &(table, _) in GENERATION_TABLES {
-                    rows += tx.query_row(&format!("SELECT count(*) FROM binding_incoming.{table} WHERE generation='incoming'"), [], |row| row.get::<_,i64>(0))? as u64;
-                }
-                progress.begin("copy", Some(rows))?;
-                for &(table, _) in GENERATION_TABLES {
-                    copy_binding_table_observed(&tx, table, &id, &mut || progress.advance())?;
-                }
-                progress.begin("check", Some(rows))?;
-                let catalog_digest = catalog_digest_observed(&tx, &id, &mut || progress.advance())?;
-                tx.execute("INSERT INTO lww_binding_sources VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![header.request_id,id,header.binding_authority.0.to_string(),inspection_id,digest,admitted_upper_ms.0.to_string(),statuses,catalog_digest])?;
-                tx.execute("INSERT INTO lww_binding_source_units SELECT ?1,key,stamp,value,status FROM binding_incoming.lww_binding_source_units WHERE staging_id='incoming'", [&id])?;
-                tx.execute("INSERT INTO lww_binding_stages VALUES(?1,?2,?3,?4,NULL,?5)", params![id,inspection_id,header.request_id,digest,catalog_digest])?;
-                tx.commit()?;
+                self.connection.execute("ATTACH DATABASE ?1 AS binding_incoming", [path.to_string_lossy().as_ref()])?;
+                let copied = (|| -> StoreResult<()> {
+                    let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    super::commit::begin_generation(&tx, &id)?;
+                    let mut rows = 0;
+                    for &(table, _) in GENERATION_TABLES {
+                        rows += tx.query_row(&format!("SELECT count(*) FROM binding_incoming.{table} WHERE generation='incoming'"), [], |row| row.get::<_,i64>(0))? as u64;
+                    }
+                    progress.begin("copy", Some(rows))?;
+                    for &(table, _) in GENERATION_TABLES {
+                        copy_binding_table_observed(&tx, table, &id, &mut || progress.advance())?;
+                    }
+                    progress.begin("check", Some(rows))?;
+                    let catalog_digest = catalog_digest_observed(&tx, &id, &mut || progress.advance())?;
+                    tx.execute("INSERT INTO lww_binding_sources VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![header.request_id,id,header.binding_authority.0.to_string(),inspection_id,digest,admitted_upper_ms.0.to_string(),statuses,catalog_digest])?;
+                    tx.execute("INSERT INTO lww_binding_source_units SELECT ?1,key,stamp,value,status FROM binding_incoming.lww_binding_source_units WHERE staging_id='incoming'", [&id])?;
+                    tx.execute("INSERT INTO lww_binding_stages VALUES(?1,?2,?3,?4,NULL,?5)", params![id,inspection_id,header.request_id,digest,catalog_digest])?;
+                    tx.commit()?;
+                    Ok(())
+                })();
+                let detached = self.connection.execute_batch("DETACH DATABASE binding_incoming");
+                copied?;
+                detached?;
                 Ok(())
             })();
-            let detached = self.connection.execute_batch("DETACH DATABASE binding_incoming");
+            let removed = temporary.close();
+            let checkpoint = if removed.is_ok() {
+                self.connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            } else { Ok(()) };
+            let restored = self.connection.pragma_update(None, "wal_autocheckpoint", autocheckpoint);
             copied?;
-            detached?;
+            removed?;
+            checkpoint?;
+            restored?;
             id
         };
         #[cfg(test)]
@@ -409,8 +427,11 @@ fn project_source(db: &Connection, changes: &super::FrozenRows, version: &str, p
         if pending_detail.as_ref().map(|(id, _)| id) != character.as_ref() {
             if let Some((_, detail)) = pending_detail.take() {
                 super::commit::put_character_detail(tx, "incoming", &detail)?;
+                let bytes: i64 = tx.query_row("SELECT length(CAST(detail AS BLOB)) FROM characters WHERE generation='incoming' AND character_id=?1", [detail["chaId"].as_str().unwrap()], |row| row.get(0))?;
+                batches.written(bytes)?;
             }
         }
+        let tx = batches.tx();
         if !is_device(&key) {
             let hard_delete = key.components()[0] == "exists" && matches!(value, UnitValue::Deleted);
             if parent_status(tx, &key)? == "ready" || hard_delete {
@@ -424,6 +445,11 @@ fn project_source(db: &Connection, changes: &super::FrozenRows, version: &str, p
                     }
                 } else {
                     projection::apply(tx, "incoming", &key, &value)?;
+                    let p = key.components();
+                    if p[0] == "exists" && p[1] == "conversation" {
+                        let bytes: i64 = tx.query_row("SELECT COALESCE(length(CAST(detail AS BLOB)),0) FROM characters WHERE generation='incoming' AND character_id=?1", [&p[2]], |row| row.get(0)).optional()?.unwrap_or(0);
+                        batches.written(bytes)?;
+                    }
                 }
             }
         }
@@ -432,6 +458,8 @@ fn project_source(db: &Connection, changes: &super::FrozenRows, version: &str, p
     }
     if let Some((_, detail)) = pending_detail {
         super::commit::put_character_detail(batches.tx(), "incoming", &detail)?;
+        let bytes: i64 = batches.tx().query_row("SELECT length(CAST(detail AS BLOB)) FROM characters WHERE generation='incoming' AND character_id=?1", [detail["chaId"].as_str().unwrap()], |row| row.get(0))?;
+        batches.written(bytes)?;
     }
     let affected = super::FrozenRows::new()?;
     changes.visit(false, |key, stamp, value, _| {
@@ -444,7 +472,15 @@ fn project_source(db: &Connection, changes: &super::FrozenRows, version: &str, p
         progress.advance()
     })?;
     // Order scopes are known only after this pass, so it reports time rather than work.
-    affected.refresh_orders_observed(batches.tx(), "incoming", &mut || progress.poll())?;
+    affected.visit_order_scopes(&mut |key| {
+        if let Some(key) = key {
+            projection::refresh_orders_charged(db, "incoming", &[key], Some(&mut |bytes| {
+                batches.written(bytes)?;
+                progress.poll()
+            }))?;
+        }
+        progress.poll()
+    })?;
     batches.commit()
 }
 

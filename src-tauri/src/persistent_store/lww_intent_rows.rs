@@ -228,6 +228,13 @@ impl FrozenRows {
     }
 
     pub(in crate::persistent_store) fn refresh_orders_observed(&self, tx: &rusqlite::Transaction<'_>, generation: &str, observe: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+        self.visit_order_scopes(&mut |key| {
+            if let Some(key) = key { super::refresh_orders(tx, generation, &[key])?; }
+            observe()
+        })
+    }
+
+    pub(in crate::persistent_store) fn visit_order_scopes(&self, visit: &mut dyn FnMut(Option<UnitKey>) -> StoreResult<()>) -> StoreResult<()> {
         self.db.execute_batch("CREATE TABLE IF NOT EXISTS scopes(key TEXT PRIMARY KEY); DELETE FROM scopes;")?;
         self.visit(false, |key, _, _, _| {
             let p = key.components();
@@ -246,14 +253,13 @@ impl FrozenRows {
                 _ => None,
             };
             if let Some(scope) = scope { self.db.execute("INSERT OR IGNORE INTO scopes VALUES(?1)", [scope.as_str()])?; }
-            observe()
+            visit(None)
         })?;
         let mut statement = self.db.prepare("SELECT key FROM scopes ORDER BY key")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let key = super::wire(row.get::<_, String>(0)?.try_into())?;
-            super::refresh_orders(tx, generation, &[key])?;
-            observe()?;
+            visit(Some(key))?;
         }
         Ok(())
     }
