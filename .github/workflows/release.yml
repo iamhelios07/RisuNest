@@ -55,6 +55,7 @@ env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
   VITE_RISU_LEGAL_CONFIGURED: "TRUE"
   RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
+  TAURI_RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
 
 jobs:
   source:
