@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { REALM_BLOCKED_URL_PATTERNS } from "../../scripts/realmBlocklist.mjs";
 import { sharedCargoTarget } from "../../scripts/testNative.mjs";
 import { measureEntryCount } from "../legacy-restore/entry-count.mjs";
+import { measurePluginValue } from './plugin-value-driver.mjs';
+import { measurePluginSync, syntheticPluginSyncServer } from './plugin-sync-driver.mjs';
 
 const root = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -150,6 +152,14 @@ async function sourceHashes() {
     "src-tauri/src/native_file_jobs/legacy_backup.rs",
     "src-tauri/src/native_file_jobs/restore.rs",
     "benchmarks/legacy-restore/entry-count.mjs",
+    "benchmarks/device-backup/plugin-values.ts",
+    "benchmarks/device-backup/plugin-value-driver.mjs",
+    "benchmarks/device-backup/plugin-sync-driver.mjs",
+    "src/ts/plugins/pluginDeviceTransfer.ts",
+    "src/ts/plugins/pluginSafeClass.ts",
+    "src-tauri/src/persistent_store/device_store/plugin_values.rs",
+    "src-tauri/src/persistent_store/device_store/plugin_values/text_value.rs",
+    "src-tauri/src/persistent_store/device_store/sections/large_plugin.rs",
   ];
   return Object.fromEntries(
     await Promise.all(
@@ -215,6 +225,7 @@ function within(candidate, parent) {
 async function reuseRun() {
   if (process.argv.length === 2) return null;
   if (process.argv.length === 3 && /^--legacy-entries=(all|20000|50000|100000|200001)$/.test(process.argv[2])) return null;
+  if (process.argv.length === 3 && /^--plugin-values=(all|json|64-string|64-json|256-string|256-json|512-string|512-json)$/.test(process.argv[2])) return null;
   const values = Object.fromEntries(
     process.argv.slice(2).map((argument) => {
       const separator = argument.indexOf("=");
@@ -312,6 +323,7 @@ async function run() {
   if (process.platform !== "win32") throw new Error("Windows is required");
   const reuse = await reuseRun();
   const entryCountArgument = process.argv.find(argument => argument.startsWith('--legacy-entries='));
+  const pluginValueArgument = process.argv.find(argument => argument.startsWith('--plugin-values='));
   if (entryCountArgument && reuse) throw new Error('Entry measurements require a fresh synthetic profile');
   const runId = reuse?.previous.runId ?? randomUUID();
   const directory =
@@ -359,10 +371,6 @@ async function run() {
   let browser;
   let appOutput = "";
   try {
-    const roaming = path.join(directory, "roaming");
-    const local = path.join(directory, "local");
-    if (!reuse)
-      await Promise.all([roaming, local].map((item) => mkdir(item)));
     const knownFolder = await command("powershell.exe", [
       "-NoProfile",
       "-NonInteractive",
@@ -452,7 +460,6 @@ async function run() {
     async function launch() {
       app = spawn(executable, [`--profile=${profileName}`], {
         cwd: directory,
-        env: { ...process.env, APPDATA: roaming, LOCALAPPDATA: local },
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -528,6 +535,71 @@ async function run() {
       process.stdout.write(`synthetic-windows-identity-verified ${runId}\n`);
     }
     await launch();
+    if (pluginValueArgument) {
+      const selected = pluginValueArgument.split('=')[1];
+      const cases = selected === 'all' ? [64, 256, 512].flatMap(size => ['string', 'json'].map(kind => `${size}-${kind}`))
+        : selected === 'json' ? [64, 256, 512].map(size => `${size}-json`) : [selected];
+      report.pluginValues = [];
+      async function retainProfile(suffix) {
+        try { await browser.call('Browser.close'); } catch {}
+        page.close(); browser.close();
+        await stopOwnedApp(app);
+        if (path.dirname(profileDirectory) !== profilesRoot || path.basename(profileDirectory) !== profileName
+          || !within(nativeRoot, profileDirectory) || !within(webview, profileDirectory)) throw new Error('Synthetic profile boundary mismatch');
+        const retainedProfile = `${profileDirectory}.plugin-${suffix}`;
+        await rename(profileDirectory, retainedProfile);
+        return path.join(retainedProfile, 'data');
+      }
+      for (const name of cases) {
+        const [size, kind] = name.split('-');
+        const measurementDirectory = path.join(directory, `plugin-${name}`);
+        await mkdir(measurementDirectory);
+        const measured = await measurePluginValue({
+          mebibytes: Number(size), kind, directory: measurementDirectory,
+          evaluate: expression => evaluate(page, expression),
+          memory: () => memory(page, browser, app.pid, true),
+          save: async value => { report.pluginValue = value; await writeFile(resultPath, JSON.stringify(report, null, 2)); },
+        });
+        report.pluginValues.push(measured);
+        const server = await syntheticPluginSyncServer(process.env.RISUNEST_PLUGIN_SYNC_SERVER ?? path.join(target, 'release', 'risunest-sync-server.exe'), path.join(measurementDirectory, 'sync'));
+        try {
+          measured.sync = [];
+          for (const sender of [true, false]) {
+            const synchronized = await measurePluginSync({
+              config: server.configs[sender ? 0 : 1], sender,
+              evaluate: expression => evaluate(page, expression), memory: () => memory(page, browser, app.pid, true),
+              save: async value => { measured.syncProgress = value; await writeFile(resultPath, JSON.stringify(report, null, 2)); },
+            });
+            measured.sync.push(synchronized);
+            if (sender) {
+              measured.retainedNativeRoot = await retainProfile(`${name}-sender`);
+              await launch();
+            }
+          }
+          const descriptor = { kind, hash: measured.state.hash, codeUnits: measured.state.codeUnits };
+          await evaluate(page, `void globalThis.__pluginValueMeasurement.expect(${JSON.stringify(descriptor)}); true`);
+          measured.peerReadMemory = [];
+          let peer;
+          const deadline = Date.now() + 30 * 60_000;
+          do {
+            peer = await evaluate(page, 'globalThis.__pluginValueMeasurement.state()');
+            measured.peerReadMemory.push(await memory(page, browser, app.pid, true));
+            if (peer.phase === 'failed' || Date.now() > deadline) throw new Error('Synthetic synced plugin verification failed');
+            if (peer.busy) await delay(500);
+          } while (peer.busy);
+          if (peer.phase !== 'verified') throw new Error('Synthetic synced plugin verification incomplete');
+          measured.syncedHash = peer.hash;
+          measured.retainedPeerRoot = await retainProfile(`${name}-receiver`);
+          await writeFile(path.join(measurementDirectory, 'result.json'), JSON.stringify(measured, null, 2));
+          await writeFile(resultPath, JSON.stringify(report, null, 2));
+        } finally { await server.stop(); }
+        if (name !== cases.at(-1)) {
+          await launch();
+        }
+      }
+      report.passed = report.pluginValues.every(result => result.phase === 'verified');
+      return;
+    }
     if (entryCountArgument) {
       const selected = entryCountArgument.split('=')[1];
       const counts = selected === 'all' ? [20_000, 50_000, 100_000, 200_001] : [Number(selected)];

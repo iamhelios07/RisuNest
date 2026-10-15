@@ -4,7 +4,7 @@ pub(crate) mod hypa;
 
 use super::archive::ArchivePreview;
 use super::device_store::plugin_values::{
-    PluginDeviceHydration, PluginDeviceListItem, PluginDeviceMutation,
+    PluginDeviceHydration, PluginDeviceListItem, PluginDeviceMutation, PluginDeviceRead, PluginDeviceRange,
 };
 use super::device_store::sections::{section_from_id, CHOOSABLE_SECTIONS};
 use super::export::ExportedRisuSave;
@@ -336,6 +336,7 @@ impl PersistentStoreState {
         let Some(store) = store.as_mut() else {
             return Ok(None);
         };
+        if let Ok(device) = store.device_store_mut() { device.plugin_writes.expire(); }
         store.purge_retired_batch(limit_rows).map(Some)
     }
 }
@@ -1790,11 +1791,48 @@ pub(crate) fn pds_read_plugin_device_value(
     owner: String,
     space: String,
     key: String,
-) -> Result<Option<String>, StoreError> {
+) -> Result<Option<PluginDeviceRead>, StoreError> {
     logged("pds_read_plugin_device_value", with_store(state, |store| {
         store
             .device_store()?
-            .read_plugin_device_value(&owner, &space, &key)
+            .read_plugin_device_transfer(&owner, &space, &key)
+    }))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_plugin_device_range(
+    state: State<'_, PersistentStoreState>, owner: String, space: String, key: String, version: String, offset: u64,
+) -> Result<PluginDeviceRange, StoreError> {
+    logged("pds_read_plugin_device_range", with_store(state, |store| {
+        store.device_store()?.read_plugin_device_range(&owner, &space, &key, &version, offset)
+    }))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_open_plugin_device_write(
+    state: State<'_, PersistentStoreState>, owner: String, space: String, key: String, encoded_length: u64,
+) -> Result<super::device_store::plugin_values::sessions::OpenedWrite, StoreError> {
+    logged("pds_open_plugin_device_write", with_store_mut(state, |store| {
+        store.device_store_mut()?.open_plugin_device_write(&owner, &space, &key, encoded_length)
+    }))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_append_plugin_device_write(
+    state: State<'_, PersistentStoreState>, owner: String, session_id: String, offset: u64, part: String,
+) -> Result<u64, StoreError> {
+    logged("pds_append_plugin_device_write", with_store_mut(state, |store| {
+        store.device_store_mut()?.append_plugin_device_write(&owner, &session_id, offset, &part)
+    }))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_abort_plugin_device_write(
+    state: State<'_, PersistentStoreState>, owner: String, session_id: String,
+) -> Result<(), StoreError> {
+    logged("pds_abort_plugin_device_write", with_store_mut(state, |store| {
+        store.device_store_mut()?.abort_plugin_device_write(&owner, &session_id);
+        Ok(())
     }))
 }
 
