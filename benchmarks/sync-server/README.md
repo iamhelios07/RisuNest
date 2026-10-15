@@ -1,35 +1,14 @@
 # Synthetic Sync server checks
 
-Runs isolated Android and Windows applications against synthetic Sync daemons. The harnesses never read installed profiles or retain credentials, page content, or request bodies.
+Checks synthetic transfers, TLS, and Android ADB health. The harnesses never read installed profiles or retain credentials, page content, or request bodies.
 
-## Android
+## Android ADB health
 
-Use a disposable synthetic AVD, an owned local ADB server, an agent build, and the isolated application ID. Set `ANDROID_HOME` or pass `--adb=<adb-executable>`. Both runners require the exact emulator serial, AVD name, and ADB port, and reject a different AVD.
-
-After the agent build, create the isolated APK from src-tauri/gen/android:
-
-    ./gradlew.bat :app:assembleX86_64Debug -x :app:rustBuildX86_64Debug
-      '-Pkotlin.incremental=false' '-Pkotlin.compiler.execution.strategy=in-process'
-      -I '../../../benchmarks/sync-server/android-profile.gradle' --offline
-
-Verify its package with aapt dump badging, then run from the repository root:
+Use a disposable synthetic AVD and an owned local ADB server. Set `ANDROID_HOME` or pass `--adb=<adb-executable>`. The probe requires the exact emulator serial, AVD name, and ADB port, and rejects a different AVD.
 
     node benchmarks/sync-server/android-probe.mjs --serial=<emulator-serial> --avd=<synthetic-avd-name> --adb-port=<owned-port>
-    node benchmarks/sync-server/android-runtime.mjs --serial=<emulator-serial> --avd=<synthetic-avd-name> --adb-port=<owned-port>
-    node benchmarks/sync-server/android-runtime.mjs --serial=<emulator-serial> --avd=<synthetic-avd-name> --adb-port=<owned-port> --ui
-    node benchmarks/sync-server/android-runtime.mjs --serial=<emulator-serial> --avd=<synthetic-avd-name> --adb-port=<owned-port> --unresponsive-startup
 
-The probe checks sustained ADB transfer and health. The runtime checks native IPC, Keystore recovery, registration, synchronization, restart, progress UI, and the bounded unresponsive-server case. They do not cover an Android foreground service.
-
-## Windows
-
-Build the application with its isolated Tauri identifier and run:
-
-    $env:CARGO_TARGET_DIR = (Resolve-Path 'src-tauri/target').Path
-    pnpm exec tauri build --debug --no-bundle --config src-tauri/tauri.agent.conf.json --config benchmarks/sync-server/windows-validation.conf.json
-    node benchmarks/sync-server/windows-runtime.mjs
-
-The launcher verifies the executable, identifier, process, profile, and CDP listener before registering a synthetic daemon.
+The probe checks sustained ADB transfer and health. Current application flows are covered by [Sync UI](../sync-ui/README.md) and [device backup](../device-backup/README.md) harnesses.
 
 ## Transfer and TLS measurements
 
