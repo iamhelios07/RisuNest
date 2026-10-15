@@ -1,11 +1,11 @@
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { CATALOG_LIMIT, REPOSITORY, validateCatalog } from "./contracts.mjs";
+import { CATALOG_LIMIT, REPOSITORY, compareVersions, validateCatalog } from "./contracts.mjs";
 import { GitHubReleases } from "./github.mjs";
 import { renderDownloadTable } from "./download-table.mjs";
 import { verifiedJson } from "./publication.mjs";
 
-const files = [["README.md", "en"], ["README.ko.md", "ko"]];
+const files = [["README.md", "en"], ["README.ko.md", "ko"], ["alt-source.json", null]];
 function downloadSection(release, locale) {
   const { product, version, releasePage } = release;
   const link = `[RisuNest${product === "sync" ? " Sync" : ""} v${version}](${releasePage})`;
@@ -37,6 +37,25 @@ export function renderReadme(contents, catalog, locale) {
   if (blocks[0].to > blocks[1].from) throw new Error("overlapping-readme-markers");
   for (const block of blocks.reverse()) contents = contents.slice(0, block.from) + block.text + contents.slice(block.to);
   return contents;
+}
+
+export function renderAltSource(contents, catalog) {
+  validateCatalog(catalog);
+  const release = catalog.products.app?.release;
+  if (!release) throw new Error("readme-product-unpublished:app");
+  const source = JSON.parse(contents);
+  const app = source.apps.find(item => item.bundleIdentifier === "io.github.rsyumi.risunest");
+  if (!app) throw new Error("alt-source-app-missing");
+  const download = release.downloads.find(item => item.os === "ios" && item.format === "ipa");
+  const version = { version: release.version, buildVersion: release.version, date: release.pub_date,
+    localizedDescription: release.localizedNotes.en ?? release.notes,
+    downloadURL: download.url, size: download.size, minOSVersion: "16.4" };
+  app.versions = [version, ...app.versions.filter(item => item.version !== version.version)]
+    .sort((left, right) => compareVersions(right.version, left.version));
+  const latest = app.versions[0];
+  Object.assign(app, { version: latest.version, versionDate: latest.date,
+    versionDescription: latest.localizedDescription, downloadURL: latest.downloadURL, size: latest.size });
+  return JSON.stringify(source, null, 2) + "\n";
 }
 
 export async function loadReadmeCatalog(github, publicKey) {
@@ -81,7 +100,7 @@ export async function updateReadmeDownloads({ github, publicKey }) {
       const blob = await github.request(`/git/blobs/${entry.sha}`);
       if (blob.encoding !== "base64") throw new Error("readme-blob-encoding");
       const contents = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(blob.content, "base64"));
-      const content = renderReadme(contents, catalog, locale);
+      const content = locale ? renderReadme(contents, catalog, locale) : renderAltSource(contents, catalog);
       if (content !== contents) changes.push({ path, mode: entry.mode, type: "blob", content });
     }
     if (!changes.length) return { status: "unchanged", commit: parent };
@@ -89,7 +108,7 @@ export async function updateReadmeDownloads({ github, publicKey }) {
       method: "POST", body: { base_tree: commit.tree.sha, tree: changes },
     });
     const updatedCommit = await github.request("/git/commits", {
-      method: "POST", body: { message: "docs: update README download links for published releases",
+      method: "POST", body: { message: "docs: update README downloads and iOS source for published releases",
         tree: updatedTree.sha, parents: [parent] },
     });
     try {

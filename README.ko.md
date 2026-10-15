@@ -42,6 +42,12 @@ RisuNest는 [RisuAI](https://github.com/kwaroran/RisuAI)를 포크한 AI 채팅 
 - iOS는 서명되지 않은 IPA로 배포하므로 AltStore, Sideloadly 같은 도구로 직접 설치해야 합니다.
 - 직접 빌드하려면 [소스에서 빌드](#소스에서-빌드)를 참고하세요.
 
+AltStore Classic, SideStore, Feather에 [iOS 소스](https://raw.githubusercontent.com/rsyumi/RisuNest/main/alt-source.json)를 추가하면 새 릴리스를 확인할 수 있습니다.
+
+<a href="https://altdirect.app/?url=https://raw.githubusercontent.com/rsyumi/RisuNest/main/alt-source.json"><img src="https://altdirect.app/assets/png/AltSource_Blue.png" alt="Add AltSource via AltDirect" width="200"></a>
+
+[Add to AppDB](https://appdb.to/repos/import?url=https://raw.githubusercontent.com/rsyumi/RisuNest/main/alt-source.json)
+
 ### 빌드 신뢰
 
 - 배포 파일은 신뢰할 수 있는 인증서로 서명되지 않으므로 Windows와 macOS, Android에서 보안 경고가 표시될 수 있습니다.
