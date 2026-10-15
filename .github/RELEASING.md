@@ -136,7 +136,9 @@ commit and push both explicit tag refs together.
 
 After publication, the workflow updates the download sections in `README.md` and
 `README.ko.md`, updates `alt-source.json` with the published iOS version while
-retaining earlier versions, and commits any changes to `main`. With a clean
+retaining earlier versions, and commits any changes to `main`. The iOS
+permissions and minimum iOS version in `alt-source.json` are read from the
+published App release's source commit, so do not edit them by hand. With a clean
 working tree and no unpushed commits, run `git pull --ff-only origin main` from
 your local `main`.
 If you have local-only commits, rebase them onto the updated remote branch before

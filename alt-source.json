@@ -24,15 +24,16 @@
         {
           "version": "1.0.4",
           "buildVersion": "1.0.4",
-          "date": "2026-10-13T17:09:48.862Z",
+          "date": "2026-10-13T17:09:48Z",
           "localizedDescription": "- Improved compatibility with bots, modules, and plugins.\n- Improved Lua, script, and UI performance in long chats.\n- Added a console log viewer.\n- Fixed update links not opening on Android.\n- Fixed a sidebar scrolling issue on iOS.",
           "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-ios-aarch64-unsigned.ipa",
           "size": 78142028,
+          "sha256": "76785d3b7f42d7aef8ca27c8e72d02e903eb632013fd056240be4456167339ca",
           "minOSVersion": "16.4"
         }
       ],
       "version": "1.0.4",
-      "versionDate": "2026-10-13T17:09:48.862Z",
+      "versionDate": "2026-10-13T17:09:48Z",
       "versionDescription": "- Improved compatibility with bots, modules, and plugins.\n- Improved Lua, script, and UI performance in long chats.\n- Added a console log viewer.\n- Fixed update links not opening on Android.\n- Fixed a sidebar scrolling issue on iOS.",
       "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-ios-aarch64-unsigned.ipa",
       "size": 78142028
