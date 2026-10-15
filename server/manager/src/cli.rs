@@ -177,6 +177,12 @@ async fn run(entry: Entry, installer_diagnostics: &mut bool) -> Result<()> {
         #[cfg(windows)]
         ["installer", "register"] => crate::removal::register(&root, &executable),
         #[cfg(windows)]
+        ["installer", "preserve-files"] => crate::removal::preserve_install_baseline(&executable),
+        #[cfg(windows)]
+        ["installer", "resume-removal"] => crate::removal::resume_finalization(&executable),
+        #[cfg(windows)]
+        ["installer", "commit-removal"] => crate::removal::commit_finalization(&executable),
+        #[cfg(windows)]
         ["installer", "obsolete-files", previous] => {
             let removed =
                 crate::removal::remove_obsolete_owned_files(&executable, &PathBuf::from(previous))?;

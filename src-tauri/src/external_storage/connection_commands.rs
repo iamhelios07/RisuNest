@@ -964,6 +964,51 @@ pub(crate) fn external_storage_prepare_renewal(
     })())
 }
 
+#[tauri::command]
+pub(crate) async fn external_storage_change_endpoint(
+    app: AppHandle,
+    state: State<'_, ConnectionCommandState>,
+    connection_id: String,
+    endpoint: String,
+) -> Result<ConnectionResult> {
+    logged("external_storage_change_endpoint", async move {
+        let _cleanup_guard = state.admit()?;
+        let root = connection_root(&app)?;
+        let stored = ConnectionStore::open(&root)?.read(&connection_id)?;
+        let dependencies = connection::dependencies_for_config(&root, &stored.config)?;
+        let key = read_root_key(secrets::repository_key_vault(&root).as_ref(), &stored.root_key_ref).await?;
+        change_endpoint(&root, &stored, endpoint, dependencies, &key, &Cancellation::default()).await
+    }.await)
+}
+
+pub(super) async fn change_endpoint(
+    root: &std::path::Path,
+    stored: &StoredConnection,
+    endpoint: String,
+    dependencies: Dependencies,
+    key: &[u8; 32],
+    cancel: &Cancellation,
+) -> Result<ConnectionResult> {
+    if !matches!(stored.config.provider.as_str(), "webdav" | "s3") {
+        return Err(ProviderError::new(ErrorKind::Unsupported));
+    }
+    let mut config = stored.config.clone();
+    config.endpoint = endpoint.trim().to_owned();
+    let provider = connection::provider_for(&config, dependencies)?;
+    let (handle, capabilities) = provider.open_repository(&config, &SecretRef(stored.credential_ref.clone()),
+        super::contract::OpenMode::Existing, cancel).await?;
+    if handle.repository_id != stored.provider_repository_id
+        || handle.connection_identity != stored.descriptor_locator.connection_identity {
+        return Err(ProviderError::new(ErrorKind::RepositoryMismatch));
+    }
+    require_repository_strategy(&capabilities, stored.descriptor.publication_strategy)?;
+    descriptor::read(root, provider.as_ref(), &handle, &stored.descriptor_locator, &stored.descriptor, key, cancel).await
+        .map_err(|error| if error.kind == ErrorKind::NotFound { ProviderError::new(ErrorKind::RepositoryMismatch) } else { error })?;
+    cancel.check()?;
+    let connection = ConnectionStore::open(root)?.replace_endpoint(stored, config.endpoint)?;
+    Ok(ConnectionResult { connection: connection::summary(&connection), recovery: None })
+}
+
 async fn renew_connection(
     app: &AppHandle,
     connection_id: &str,

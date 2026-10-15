@@ -59,6 +59,7 @@
     const strings = $derived(externalStorageStrings(DBState.db.language))
     let storageState = $state<ExternalStorageState | null>(null)
     let adding = $state(false)
+    let addressConnection = $state<ExternalConnectionSummary | undefined>()
     let renewalConnection = $state<ExternalConnectionSummary | undefined>()
     let unlockConnection = $state<ExternalConnectionSummary | undefined>()
     let unlockKey = $state('')
@@ -252,12 +253,15 @@
     async function onConnected(result: ExternalConnectionResult): Promise<void> {
         busy = false
         adding = false
+        const addressChanged = addressConnection !== undefined
+        addressConnection = undefined
         const renewed = renewalConnection !== undefined
         renewalConnection = undefined
         if (result.recovery) recoveryKey = result.recovery.key
         await refreshExternalStorageProductionState()
         await refresh()
         schedulePoll()
+        if (addressChanged) return
         if (renewed) {
             const job = activeJob(result.connection)
             if (job && externalJobIsPaused(job)) await resumeJob(result.connection, job)
@@ -874,14 +878,14 @@
 
 <SettingGroup id="risunest-external-storage" title={strings.title} description={strings.help}>
     {#snippet actions()}
-        {#if storageState?.supported && !adding && !renewalConnection}<SettingButton disabled={busy} onclick={() => adding = true}>{strings.add}</SettingButton>{/if}
+        {#if storageState?.supported && !adding && !renewalConnection && !addressConnection}<SettingButton disabled={busy} onclick={() => adding = true}>{strings.add}</SettingButton>{/if}
         {#if storageState?.supported !== false}<SettingButton variant="secondary" busy={activeAction === 'refresh'} disabled={busy} onclick={refreshWithHistory}>{strings.refresh}</SettingButton>{/if}
     {/snippet}
 
     {#if !storageState && busy}<p class="placeholder">{strings.loading}</p>
     {:else if storageState && !storageState.supported}<p class="placeholder">{strings.unsupported}</p>
-    {:else if adding || renewalConnection}
-        <ConnectionForm {renewalConnection} {strings} onconnected={onConnected} oncancel={() => { adding = false; renewalConnection = undefined }} onbusychange={value => busy = value} />
+    {:else if adding || renewalConnection || addressConnection}
+        <ConnectionForm {addressConnection} {renewalConnection} {strings} onconnected={onConnected} oncancel={() => { adding = false; renewalConnection = undefined; addressConnection = undefined }} onbusychange={value => busy = value} />
     {:else if storageState}
         {#if !storageState.connections.length}
             <div class="blank">
@@ -965,6 +969,9 @@
                         <SettingToggle showLabel label={strings.makeSyncTarget} disabled={busy} checked={syncRequest[connection.id] ?? syncing} onchange={enabled => setSyncBinding(connection, enabled)} />
                     {/if}
                     <div class="actions">
+                        {#if connection.providerId === 'webdav' || connection.providerId === 's3'}
+                            <SettingButton disabled={busy} onclick={() => addressConnection = connection}>{strings.changeAddress}</SettingButton>
+                        {/if}
                         {#if renewable}<SettingButton disabled={busy} onclick={() => renewalConnection = connection}>{strings.renew}</SettingButton>{/if}
                         {#if lockable}<SettingButton disabled={busy} onclick={() => unlockConnection = connection}>{strings.unlock}</SettingButton>{/if}
                         {#if recheckable && job}<SettingButton disabled={busy} onclick={() => resumeJob(connection, job)}>{strings.recheckPublication}</SettingButton>{/if}

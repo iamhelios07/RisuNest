@@ -16,6 +16,11 @@ use std::{env, fs::OpenOptions, io::Write};
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.len() == 3 && args[0] == "synthetic-profile-check" {
+        assert_eq!(env::var("LOCALAPPDATA").unwrap(), args[1]);
+        assert_eq!(env::var("APPDATA").unwrap(), args[2]);
+        return;
+    }
     if let Ok(log) = env::var("RISUNEST_NSIS_TEST_LOG") {
         let mut file = OpenOptions::new().create(true).append(true).open(log).unwrap();
         writeln!(file, "{}", args.join("|")).unwrap();
@@ -303,6 +308,47 @@ path = "main.rs"
             if (Test-Path -LiteralPath $installed) { Remove-Item -LiteralPath $installed -Recurse -Force }
             Move-Item -LiteralPath $deleted -Destination $installed
         }
+        $missingDrive = ([char[]]'ZYXWVUTSRQPONMLKJIHGFED' | Where-Object { !(Test-Path "$($_):\") } | Select-Object -First 1)
+        if (!$missingDrive) { throw 'An unused drive is required for the missing-drive fixture.' }
+        $unavailable = "$($missingDrive):\synthetic-missing-install"
+        $savedLocation = (Get-ItemProperty $uninstallKey).InstallLocation
+        $savedUninstall = (Get-ItemProperty $uninstallKey).UninstallString
+        try {
+            Set-Item $productKey $unavailable
+            Set-ItemProperty $uninstallKey InstallLocation ('"' + $unavailable + '"')
+            Set-ItemProperty $uninstallKey UninstallString ('"' + $unavailable + '\uninstall.exe"')
+            Run-Installer $fixtureInstaller @('/S', '/NS') 1
+            Run-Installer $fixtureInstaller @('/P', '/NS') 1
+            $directoryLog = Join-Path $testRoot 'missing-drive-directory.txt'
+            $directoryProbe = @"
+Function MissingDriveGUIInit
+  System::Call 'user32::GetWindowLongW(p `$HWNDPARENT, i -20) i .r0'
+  IntOp `$0 `$0 | 0x08080080
+  System::Call 'user32::SetWindowLongW(p `$HWNDPARENT, i -20, i r0)'
+  System::Call 'user32::SetLayeredWindowAttributes(p `$HWNDPARENT, i 0, i 0, i 2)'
+  System::Call 'user32::SetWindowPos(p `$HWNDPARENT, p 0, i -32000, i -32000, i 0, i 0, i 5)'
+FunctionEnd
+"@
+            $directorySource = "!define MUI_CUSTOMFUNCTION_GUIINIT MissingDriveGUIInit`n" + $generated + "`n" + $directoryProbe
+            $directorySource = $directorySource.Replace('Function SkipIfPassive', "Function SkipIfPassive`n  Abort")
+            $directorySource = $directorySource.Replace('Function SkipExistingDirectory', @"
+Function SkipExistingDirectory
+  FileOpen `$0 "$directoryLog" w
+  FileWrite `$0 "`$INSTDIR|`$ExistingNsis"
+  FileClose `$0
+  SetErrorLevel 0
+  Quit
+"@)
+            $directoryInstaller = Compile-Template 'missing-drive-directory' $directorySource
+            Run-Installer $directoryInstaller @('/NS') 0
+            $expectedDefault = Join-Path $env:LOCALAPPDATA $product
+            if ([IO.File]::ReadAllText($directoryLog) -ne "$expectedDefault|") { throw 'Missing-drive recovery did not reach folder selection with the default location.' }
+            if ((Get-Item $productKey).GetValue('') -ne $unavailable) { throw 'Missing-drive refusal modified the registration.' }
+        } finally {
+            Set-Item $productKey $installed
+            Set-ItemProperty $uninstallKey InstallLocation $savedLocation
+            Set-ItemProperty $uninstallKey UninstallString $savedUninstall
+        }
         $permissions = Get-Acl -LiteralPath $installed
         $denied = Get-Acl -LiteralPath $installed
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -356,16 +402,21 @@ path = "main.rs"
             Copy-Item $released $syncInstall -Recurse
             Copy-Item $fake (Join-Path $syncInstall 'uninstall.exe')
             $local = Join-Path $testRoot 'synthetic-local'
+            $roaming = Join-Path $testRoot 'synthetic-roaming'
             $data = Join-Path $local 'RisuNestSyncData'
             $oldManager = Join-Path $syncInstall 'risunest-sync-manager.exe'
             $server = Join-Path $syncInstall 'risunest-sync-server.exe'
             $priorLocal = $env:LOCALAPPDATA
+            $priorRoaming = $env:APPDATA
             $env:LOCALAPPDATA = $local
+            $env:APPDATA = $roaming
             function Invoke-Manager([string[]]$arguments) {
                 $output = & $oldManager --data-dir $data --server $server @arguments 2>&1
                 if ($LASTEXITCODE -ne 0) { throw "Synthetic manager failed ($arguments): $output" }
             }
             try {
+                & $fake synthetic-profile-check $local $roaming
+                if ($LASTEXITCODE -ne 0) { throw 'Child process did not inherit the synthetic profile roots.' }
                 & $server init --data-dir $data | Out-Null
                 if ($LASTEXITCODE -ne 0) { throw 'Released server initialization failed.' }
                 $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
@@ -494,6 +545,7 @@ FunctionEnd
                     & $oldManager --data-dir $data --server $server installer forget-removal | Out-Null
                 }
                 $env:LOCALAPPDATA = $priorLocal
+                $env:APPDATA = $priorRoaming
                 if ($appProfile -and (Test-Path -LiteralPath $appProfile)) { Remove-Item -LiteralPath $appProfile -Recurse -Force }
             }
         }

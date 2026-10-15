@@ -81,12 +81,14 @@ LangString SyncFilesFailed 1042 "RisuNest Sync 프로그램 파일을 모두 제
 !endif
 ; installer delete-data removes the GUI profile unless another registered instance shares it.
 !define RISUNEST_HOOK_OWNS_APP_DATA
+!define RISUNEST_DEFER_UNINSTALL_TEARDOWN
 
 Var SyncFailureMessage
 Var SyncForce
 Var SyncForceOption
 Var SyncDeleteMode
 Var SyncDiagnostic
+Var SyncRemovalResumed
 Var SyncPreviousInstall
 
 !macro SyncSkipMarkerBlanks
@@ -163,6 +165,16 @@ Var SyncPreviousInstall
   ClearErrors
 !macroend
 
+!macro SyncCheckRetryPath suffix failure
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\.risunest-sync-removal${suffix}") i.r0'
+  ${If} $0 != -1
+    IntOp $0 $0 & 0x400
+    ${If} $0 != 0
+      Goto ${failure}
+    ${EndIf}
+  ${EndIf}
+!macroend
+
 !macro NSIS_HOOK_PREINSTALL
   SetDetailsPrint both
   StrCpy $SyncPreviousInstall $ExistingNsis
@@ -173,12 +185,52 @@ Var SyncPreviousInstall
   sync_install_dir_ready:
   !insertmacro CheckInstallDestination
   InitPluginsDir
-  ; An unfinished install keeps its baseline so a retry still removes the files it replaced.
-  IfFileExists "$INSTDIR\risunest-sync-bundle.previous.json" sync_baseline_ready
+  IfFileExists "$INSTDIR\.risunest-sync-removal" 0 sync_install_retry_ready
+  !insertmacro SyncCheckRetryPath "" sync_install_retry_pending
+  !insertmacro SyncCheckRetryPath "\manager.exe" sync_install_retry_pending
+  !insertmacro SyncCheckRetryPath "\manager.exe.new" sync_install_retry_pending
+  !insertmacro SyncCheckRetryPath "\receipt.json" sync_install_retry_pending
+  !insertmacro SyncCheckRetryPath "\receipt.new" sync_install_retry_pending
+  !insertmacro SyncCheckRetryPath "\complete" sync_install_retry_pending
+  !insertmacro SyncCheckRetryPath "\complete.new" sync_install_retry_pending
+  IfFileExists "$INSTDIR\.risunest-sync-removal\complete" 0 sync_install_retry_empty
+  FileOpen $0 "$INSTDIR\.risunest-sync-removal\complete" r
+  FileRead $0 $1
+  FileClose $0
+  StrCmp $1 "true" 0 sync_install_retry_pending
+  IfFileExists "$INSTDIR\risunest-sync-manager.exe" sync_install_retry_pending
+  IfFileExists "$INSTDIR\risunest-sync-manager-background.exe" sync_install_retry_pending
+  IfFileExists "$INSTDIR\risunest-sync-bundle.json" sync_install_retry_pending
   ClearErrors
-  CopyFiles /SILENT "$INSTDIR\risunest-sync-bundle.json" "$INSTDIR\risunest-sync-bundle.previous.json"
-  sync_baseline_ready:
+  Delete "$INSTDIR\.risunest-sync-removal\manager.exe"
+  Delete "$INSTDIR\.risunest-sync-removal\manager.exe.new"
+  Delete "$INSTDIR\.risunest-sync-removal\receipt.json"
+  Delete "$INSTDIR\.risunest-sync-removal\receipt.new"
+  Delete "$INSTDIR\.risunest-sync-removal\complete.new"
+  IfErrors sync_install_retry_pending
+  FindFirst $2 $3 "$INSTDIR\.risunest-sync-removal\*"
+  ${DoWhile} $3 != ""
+    ${If} $3 != "."
+    ${AndIf} $3 != ".."
+    ${AndIf} $3 != "complete"
+      FindClose $2
+      Goto sync_install_retry_pending
+    ${EndIf}
+    FindNext $2 $3
+  ${Loop}
+  FindClose $2
   ClearErrors
+  Delete "$INSTDIR\.risunest-sync-removal\complete"
+  IfErrors sync_install_retry_pending
+  sync_install_retry_empty:
+  ClearErrors
+  RMDir "$INSTDIR\.risunest-sync-removal"
+  IfErrors sync_install_retry_pending sync_install_retry_ready
+  sync_install_retry_pending:
+  StrCpy $0 "retry-pending"
+  StrCpy $1 "removal-finalization-pending"
+  Goto sync_prepare_failed
+  sync_install_retry_ready:
   !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
   StrCpy $R7 ""
   IfFileExists "$INSTDIR\risunest-sync-bundle.json" sync_prepare_existing
@@ -199,7 +251,15 @@ Var SyncPreviousInstall
   StrCmp $0 "0" 0 sync_prepare_failed
   StrCpy $R7 $1 36
   StrLen $2 $R7
-  StrCmp $2 "36" sync_prepare_done sync_prepare_failed
+  StrCmp $2 "36" 0 sync_prepare_failed
+  !ifdef SYNC_INSTALLER_MANAGER
+  nsExec::ExecToStack '"$PLUGINSDIR\risunest-sync-manager.exe" --server "$INSTDIR\risunest-sync-server.exe" installer preserve-files'
+  !else
+  nsExec::ExecToStack '"$INSTDIR\risunest-sync-manager.exe" installer preserve-files'
+  !endif
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" sync_prepare_done sync_prepare_failed
   sync_prepare_failed:
   StrCpy $SyncFailureMessage "$(SyncPrepareFailed)"
   Call SyncCommandError
@@ -302,6 +362,7 @@ Var SyncPreviousInstall
 !macro NSIS_HOOK_PREUNINSTALL
   SetDetailsPrint both
   StrCpy $R7 ""
+  StrCpy $SyncRemovalResumed 0
   ${If} $UpdateMode = 1
     StrCpy $SyncFailureMessage "$(SyncUpdateFailed)"
     DetailPrint "$(SyncUpdate)"
@@ -313,9 +374,53 @@ Var SyncPreviousInstall
   !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
   InitPluginsDir
   StrCpy $SyncFailureMessage "$(SyncRemovePrepareFailed)"
+  StrCpy $R9 "$LOCALAPPDATA\RisuNestSyncData"
+  ReadEnvStr $1 RISUNEST_SYNC_UNINSTALL_DATA_DIR
+  ${If} $1 != ""
+    StrCpy $R9 $1
+  ${EndIf}
+  !insertmacro SyncCheckRetryPath "" sync_retry_invalid
+  !insertmacro SyncCheckRetryPath "\manager.exe" sync_retry_invalid
+  !insertmacro SyncCheckRetryPath "\manager.exe.new" sync_retry_invalid
+  !insertmacro SyncCheckRetryPath "\receipt.json" sync_retry_invalid
+  !insertmacro SyncCheckRetryPath "\receipt.new" sync_retry_invalid
+  !insertmacro SyncCheckRetryPath "\complete" sync_retry_invalid
+  !insertmacro SyncCheckRetryPath "\complete.new" sync_retry_invalid
+  IfFileExists "$INSTDIR\.risunest-sync-removal\complete" 0 sync_retry_receipt
+  FileOpen $0 "$INSTDIR\.risunest-sync-removal\complete" r
+  FileRead $0 $1
+  FileClose $0
+  StrCmp $1 "true" 0 sync_retry_invalid
+  IfFileExists "$INSTDIR\risunest-sync-manager.exe" sync_retry_invalid
+  IfFileExists "$INSTDIR\risunest-sync-manager-background.exe" sync_retry_invalid
+  IfFileExists "$INSTDIR\risunest-sync-bundle.json" sync_retry_invalid
+  StrCpy $SyncRemovalResumed 1
+  Goto sync_uninstall_done
+  sync_retry_receipt:
+  IfFileExists "$INSTDIR\.risunest-sync-removal\receipt.json" 0 sync_retry_not_started
   ClearErrors
+  CopyFiles /SILENT "$INSTDIR\.risunest-sync-removal\manager.exe" "$PLUGINSDIR\risunest-sync-remove.exe"
+  IfErrors sync_retry_invalid
+  nsExec::ExecToStack '"$PLUGINSDIR\risunest-sync-remove.exe" --data-dir "$R9" --server "$INSTDIR\risunest-sync-server.exe" installer resume-removal'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" 0 sync_uninstall_failed
+  StrCpy $SyncRemovalResumed 1
+  Goto sync_uninstall_done
+  sync_retry_invalid:
+  StrCpy $0 "retry-invalid"
+  StrCpy $1 "removal-finalization-invalid"
+  Goto sync_uninstall_failed
+  sync_retry_not_started:
+  Delete "$INSTDIR\.risunest-sync-removal\manager.exe"
+  Delete "$INSTDIR\.risunest-sync-removal\manager.exe.new"
+  Delete "$INSTDIR\.risunest-sync-removal\receipt.new"
+  RMDir "$INSTDIR\.risunest-sync-removal"
+  ClearErrors
+  IfFileExists "$INSTDIR\risunest-sync-manager.exe" 0 sync_uninstall_copy_failed
   CopyFiles /SILENT "$INSTDIR\risunest-sync-manager.exe" "$PLUGINSDIR\risunest-sync-remove.exe"
   IfErrors 0 sync_uninstall_copy_ready
+  sync_uninstall_copy_failed:
   StrCpy $0 "copy-failed"
   StrCpy $1 "removal-helper-copy-failed: $INSTDIR\risunest-sync-manager.exe -> $PLUGINSDIR\risunest-sync-remove.exe"
   Goto sync_uninstall_failed
@@ -418,6 +523,7 @@ Var SyncPreviousInstall
   ${If} $UpdateMode = 1
     Goto sync_uninstall_finished
   ${EndIf}
+  StrCmp $SyncRemovalResumed 1 sync_uninstall_retry_cleanup
   StrCmp $R7 "" sync_uninstall_guard_done
   DetailPrint "$(SyncRemoveFinish)"
   nsExec::ExecToStack '"$PLUGINSDIR\risunest-sync-remove.exe" --data-dir "$R9" --server "$INSTDIR\risunest-sync-server.exe" installer finish "$R7"'
@@ -436,14 +542,39 @@ Var SyncPreviousInstall
   nsExec::ExecToStack '"$PLUGINSDIR\risunest-sync-remove.exe" --data-dir "$R9" --server "$INSTDIR\risunest-sync-server.exe" installer forget-removal'
   Pop $0
   Pop $1
-  StrCmp $0 "0" sync_uninstall_finished
+  StrCmp $0 "0" sync_uninstall_commit
   StrCpy $SyncFailureMessage "$(SyncForgetFailed)"
   Call un.SyncCommandError
   IfSilent +2
     MessageBox MB_OK|MB_ICONSTOP "$SyncFailureMessage"
   SetErrorLevel 1
   Abort "$SyncFailureMessage"
+  sync_uninstall_commit:
+  nsExec::ExecToStack '"$PLUGINSDIR\risunest-sync-remove.exe" --data-dir "$R9" --server "$INSTDIR\risunest-sync-server.exe" installer commit-removal'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" sync_uninstall_retry_cleanup
+  StrCpy $SyncFailureMessage "$(SyncForgetFailed)"
+  Call un.SyncCommandError
+  SetErrorLevel 1
+  Abort "$SyncFailureMessage"
+  sync_uninstall_retry_cleanup:
+  ClearErrors
+  Delete "$INSTDIR\.risunest-sync-removal\manager.exe"
+  Delete "$INSTDIR\.risunest-sync-removal\manager.exe.new"
+  Delete "$INSTDIR\.risunest-sync-removal\receipt.json"
+  Delete "$INSTDIR\.risunest-sync-removal\receipt.new"
+  Delete "$INSTDIR\.risunest-sync-removal\complete.new"
+  IfErrors 0 sync_uninstall_finished
+  SetErrorLevel 1
+  Abort "removal-finalization-cleanup-failed"
   sync_uninstall_finished:
+!macroend
+
+!macro NSIS_HOOK_FINALUNINSTALL
+  Delete "$INSTDIR\.risunest-sync-removal\complete"
+  RMDir "$INSTDIR\.risunest-sync-removal"
+  RMDir "$INSTDIR"
 !macroend
 
 !macro SyncErrorFunction prefix
