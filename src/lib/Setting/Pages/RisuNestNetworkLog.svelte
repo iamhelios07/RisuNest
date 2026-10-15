@@ -6,7 +6,7 @@
     import SettingRow from '../RisuNest/SettingRow.svelte'
     import SettingToggle from '../RisuNest/SettingToggle.svelte'
     import {
-        networkLog, downloadNetworkLog, logSize, parseSsePreview, prettyLogJson,
+        networkLog, downloadNetworkLog, logSize, parseSsePreview, prettyLogJson, groupNetworkLogItems,
         type NetworkLogSettings, type NetworkLogListing, type NetworkLogRecord,
         type LogBodyPage, type LogSide, type LogObservation, type LogArrivals,
     } from 'src/ts/network/networkLog'
@@ -217,11 +217,16 @@
         <select aria-label={t.status} bind:value={status} onchange={filter}><option value="all">{t.all}</option><option value="error">{t.errors}</option><option value="active">{t.active}</option></select>
     </div>
     <div class="mt-3 overflow-hidden rounded-lg border border-darkborderc bg-darkbg">
-        {#each listing?.items ?? [] as item (item.id)}
+        {#each groupNetworkLogItems(listing?.items ?? []) as group (group[0].operationId ?? group[0].id)}
+            <div class="request-group" class:border-l-2={!!group[0].operationId} class:border-selected={!!group[0].operationId}>
+            {#if group[0].operationId}<div class="px-3 pt-2 text-xs text-textcolor2">{t.operation} <span class="font-mono break-all">{group[0].operationId}</span></div>{/if}
+            {#each group as item (item.id)}
             <button class="request-row w-full border-b border-darkborderc/50 px-3 py-3 text-left last:border-b-0" class:request-selected={selected === item.id} onclick={() => select(item.id)} aria-pressed={selected === item.id}>
                 <span class="row-main flex min-w-0 items-center gap-2"><span class="method shrink-0 text-[11px] font-semibold">{item.method}</span><span class="min-w-0 flex-1 truncate text-sm">{item.url}</span><span class="shrink-0 font-mono text-xs" class:text-draculared={item.state === 'error' || (item.status ?? 0) >= 400}>{item.status ?? (item.state === 'active' ? '…' : '×')}</span>{#if item.retained}<Bookmark size={12} class="shrink-0 text-textcolor2"/>{/if}</span>
                 <span class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-textcolor2"><time>{new Date(item.startedAt).toLocaleTimeString()}</time><span>{item.source}</span><span>{item.elapsedMs.toLocaleString()} ms</span><span>{logSize(item.capturedBytes)}</span>{#if item.streamKind}<span>{item.streamKind === 'sse' ? 'SSE' : 'WebSocket'}</span>{/if}{#if item.incomplete}<span>{t.partial}</span>{/if}</span>
             </button>
+            {/each}
+            </div>
         {:else}<div class="px-4 py-10 text-center text-sm text-textcolor2">{t.empty}</div>{/each}
     </div>
     <div class="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-textcolor2">

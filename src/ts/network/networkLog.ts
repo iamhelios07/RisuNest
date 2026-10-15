@@ -16,15 +16,28 @@ export interface LogHeader { name: string; value: string; encoding: string | nul
 export interface LogBody { observedBytes: number; capturedBytes: number; binary: boolean; truncated: boolean; representation: string }
 export interface LogMessage { method: string | null; url: string; status: number | null; headers: LogHeader[]; body: LogBody }
 export interface NetworkLogRecord {
+    operationId?: string | null
     id: string; source: string; startedAt: number; elapsedMs: number; retained: boolean; headerMasking: boolean
     state: string; captureError: string | null; request: LogMessage; response: LogMessage
     streamKind: 'sse' | 'websocket' | null; eventBytes: number
 }
 export interface NetworkLogItem {
+    operationId?: string | null
     id: string; source: string; startedAt: number; elapsedMs: number; retained: boolean; method: string; url: string
     status: number | null; state: string; capturedBytes: number; incomplete: boolean; streamKind: string | null
 }
 export interface NetworkLogListing { items: NetworkLogItem[]; hasMore: boolean; recentBytes: number; retainedBytes: number; warning: string | null }
+
+export function groupNetworkLogItems(items: readonly NetworkLogItem[]): NetworkLogItem[][] {
+    const groups = new Map<string, NetworkLogItem[]>()
+    for (const item of items) {
+        const key = item.operationId ? `operation:${item.operationId}` : `record:${item.id}`
+        const group = groups.get(key)
+        if (group) group.push(item)
+        else groups.set(key, [item])
+    }
+    return [...groups.values()]
+}
 export interface LogBodyPage { text: string; offset: number; nextOffset: number; total: number; binary: boolean }
 export interface LogObservation { elapsedMs: number; side: LogSide; offset: number; length: number; kind: string }
 /** `next` is the position the following SSE page passes back as `from`. */

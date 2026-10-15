@@ -2325,6 +2325,7 @@ export const languageEnglish = {
             networkLogs: "Network logs",
         },
         networkLog: {
+            "operation": "Operation ID",
             readersBusy: "A log is being read. Please try again shortly.",
             "title": "Network logs",
             "recording": "Record network requests",
