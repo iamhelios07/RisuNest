@@ -1097,7 +1097,7 @@ impl DataHealthReader {
     }
 
     pub(crate) fn object_totals(&self) -> StoreResult<crate::portable_backup::ObjectTotals> {
-        crate::portable_backup::registered_object_totals(&self.connection).map_err(scan_failure)
+        crate::portable_backup::registered_object_totals(&self.connection, &self.cas).map_err(scan_failure)
     }
 
     pub(crate) fn scan_objects(
@@ -1135,7 +1135,7 @@ fn scan_failure(error: crate::portable_backup::Error) -> StoreError {
 #[cfg(test)]
 std::thread_local! {
     static ASSET_GC_ROOT_COLLECTIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
-    static ASSET_GC_LIBRARY_ROOT_COLLECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static ASSET_GC_LIBRARY_ROOT_COLLECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ASSET_GC_FINAL_MARKINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -3400,11 +3400,6 @@ impl PersistentStore {
         plugins: Option<&crate::asset_repository::migration_gc::AssetRootSet>,
         library: Option<(&mut Option<AssetGcLibraryRoots>, i64, i64)>,
     ) -> StoreResult<Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>> {
-        use crate::asset_repository::job_pins::{
-            collect_durable_cas_job_roots, collect_durable_cas_job_roots_already_guarded,
-            collect_durable_cas_job_roots_read_only,
-        };
-
         #[cfg(test)]
         ASSET_GC_ROOT_COLLECTIONS.with(|count| {
             let (preliminary, final_checks) = count.get();
@@ -3434,11 +3429,27 @@ impl PersistentStore {
             None => collect_library()?,
         };
         let mut roots = vec![("library", library_roots)];
-        roots.push(("source-preservation",snapshot::collect_preserved_source_roots(self.repository_root())));
+        roots.extend(self.collect_auxiliary_asset_gc_roots(repository_guard_held, read_only, plugins)?);
+        Ok(roots)
+    }
+
+    fn collect_auxiliary_asset_gc_roots(
+        &self, repository_guard_held: bool, read_only: bool,
+        plugins: Option<&crate::asset_repository::migration_gc::AssetRootSet>,
+    ) -> StoreResult<Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>> {
+        use crate::asset_repository::job_pins::{
+            collect_durable_cas_job_roots, collect_durable_cas_job_roots_already_guarded,
+            collect_durable_cas_job_roots_read_only,
+        };
+
+        let mut roots = vec![("source-preservation", snapshot::collect_preserved_source_roots(self.repository_root()))];
         for reader in self.revision_leases.values() {
             roots.push((
                 "library",
-                collect(&reader.connection)?,
+                match plugins {
+                    Some(plugins) => snapshot::collect_asset_roots_with_plugin_cache(&reader.connection, plugins)?,
+                    None => snapshot::collect_asset_roots(&reader.connection)?,
+                },
             ));
         }
         roots.extend(
@@ -3465,15 +3476,15 @@ impl PersistentStore {
             "repair",
             crate::data_health::journal::roots(&self.repository_root)?,
         ));
-        let mut jobs = if read_only {
+        let jobs = if read_only {
             collect_durable_cas_job_roots_read_only(&self.repository_root)
         } else if repository_guard_held {
             collect_durable_cas_job_roots_already_guarded(&self.repository_root)
         } else {
             collect_durable_cas_job_roots(&self.repository_root)
         };
-        jobs.object_hashes.extend(self.external_lww_active_asset_roots()?.object_hashes);
         roots.push(("job", jobs));
+        roots.push(("job", self.external_lww_active_asset_roots()?));
         Ok(roots)
     }
 

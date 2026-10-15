@@ -147,6 +147,14 @@ fn claim_library<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<crate::native_
         .server()
         .map_err(|code| SyncError::new(code, 409))
 }
+fn with_status_store<R: tauri::Runtime, T>(app: &AppHandle<R>, operation: impl FnOnce(&PersistentStore) -> Result<T>) -> Result<T> {
+    if app.state::<ServerSyncCommandState>().cleanup_closed.load(Ordering::Acquire) {
+        return Err(SyncError::new("cleanup-pending", 409));
+    }
+    app.state::<crate::persistent_store::commands::PersistentStoreState>().with_status_job_store(operation)
+        .map_err(|error| SyncError::caused("local-store-unavailable", 503, error.to_string()))?
+}
+
 fn job_store<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PersistentStore> {
     with_store_mut(app.state(), |store| store.open_native_job_store())
         .map_err(|error| SyncError::caused("local-store-unavailable", 503, error.to_string()))
@@ -208,12 +216,12 @@ pub(crate) async fn server_sync_asset_status(
     app: AppHandle,
     target: Option<crate::persistent_store::asset_residency::PreviousStorageTarget>,
 ) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
-    logged_blocking("asset-status", move || job_store(&app)?.asset_residency_status_for_target(target.as_ref())).await
+    logged_blocking("asset-status", move || with_status_store(&app, |store| store.asset_residency_status_for_target(target.as_ref()))).await
 }
 /// How many files only one external storage connection holds, as the status counts them.
 #[tauri::command]
 pub(crate) async fn asset_residency_connection_objects(app: AppHandle, connection_id: String) -> Result<u64> {
-    logged_blocking("asset-status", move || job_store(&app)?.asset_residency_connection_objects(&connection_id)).await
+    logged_blocking("asset-status", move || with_status_store(&app, |store| store.asset_residency_connection_objects(&connection_id))).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_asset_policy(
@@ -343,7 +351,7 @@ fn lww_client_cancelled(store:&PersistentStore,cancelled:Option<Arc<AtomicBool>>
 }
 #[tauri::command]
 pub(crate) async fn server_sync_status(app:AppHandle)->Result<LwwStatus> {
-    logged_blocking("status",move||lww_status(&job_store(&app)?)).await
+    logged_blocking("status",move||with_status_store(&app, lww_status)).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_configure(app:AppHandle,config:super::client::ServerConfig)->Result<()> {
@@ -618,6 +626,29 @@ mod tests {
     fn assert_released(app: &tauri::App<MockRuntime>) {
         assert!(!app.state::<ServerSyncCommandState>().running.load(Ordering::Acquire));
         drop(app.state::<crate::native_file_jobs::NativeFileJobState>().admission.server().unwrap());
+    }
+    #[test]
+    fn status_reuses_its_connection_observes_policy_changes_and_refuses_cleanup() {
+        let (_root, store) = super::super::lww_tests::local();
+        let app = mock_app(store);
+        with_status_store(app.handle(), |store| {
+            store.device_store()?.connection().execute_batch("CREATE TEMP TABLE synthetic_status_connection (value INTEGER); INSERT INTO synthetic_status_connection VALUES(1)")?;
+            Ok(())
+        }).unwrap();
+        with_store(app.state(), |store| store.device_store()?.set_asset_residency_policy(AssetPolicy::Remote)).unwrap();
+        with_status_store(app.handle(), |store| {
+            assert_eq!(store.device_store()?.connection().query_row("SELECT value FROM synthetic_status_connection", [], |row| row.get::<_,i64>(0))?, 1);
+            assert_eq!(serde_json::to_value(lww_status(store)?).unwrap()["assetPolicy"], "remote");
+            Ok(())
+        }).unwrap();
+        let state = app.state::<ServerSyncCommandState>();
+        state.begin_cleanup().unwrap();
+        assert_eq!(with_status_store(app.handle(), |_| Ok(())).unwrap_err().code, "cleanup-pending");
+        state.finish_cleanup().unwrap();
+        with_status_store(app.handle(), |store| {
+            assert_eq!(store.device_store()?.connection().query_row("SELECT count(*) FROM sqlite_temp_schema WHERE name='synthetic_status_connection'", [], |row| row.get::<_,i64>(0))?, 1);
+            Ok(())
+        }).unwrap();
     }
     #[test]
     fn the_sync_status_reports_the_stored_asset_policy() {
