@@ -11,8 +11,12 @@ Use a stable SemVer version and tag a reviewed commit contained in `main`.
 
 For an App release, set the same version in:
 
+- `package.json`
 - `version.json`
+- `src-tauri/Cargo.toml`
 - `src-tauri/tauri.conf.json`
+- `src-tauri/gen/apple/project.yml` (`CFBundleShortVersionString` and `CFBundleVersion`)
+- `src-tauri/gen/apple/risunest_iOS/Info.plist` (both bundle version fields)
 - `release-notes/app/<version>.md`
 
 For a Sync release, set the same version in:
@@ -25,7 +29,9 @@ For a Sync release, set the same version in:
 - `server/manager/gui/src-tauri/tauri.conf.json`
 - `release-notes/sync/<version>.md`
 
-Update every affected lockfile in the same commit. Release notes must begin with a
+Update every affected lockfile in the same commit, including the App dependency
+entries in `tests/native/native/Cargo.lock`, `benchmarks/ios/native/Cargo.lock`,
+and `benchmarks/macos/native/Cargo.lock`. Release notes must begin with a
 Markdown title and contain non-empty `## English` and `## 한국어` sections.
 
 ## Repository configuration
