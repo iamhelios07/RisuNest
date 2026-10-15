@@ -14,7 +14,6 @@ vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
 }))
 vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: f.status, setAssetResidencyPolicy: f.policy, evictLocalAssets: f.evict, cancelLocalAssetCleanup: f.cancel, cancelAssetResidencyOperation: f.cancel }))
 vi.mock('src/ts/storage/sync/serverSyncRegistration', () => ({ parseServerRegistration: () => ({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }) }))
-vi.mock('src/ts/storage/sync/serverSyncRegistrationInbox', () => ({ serverRegistrationInbox: { changed: { subscribe: () => () => {} }, releaseConsumed: vi.fn() } }))
 vi.mock('src/ts/storage/sync/serverSyncQr', () => ({ get canScanServerRegistration() { return f.scan }, createServerQrScanner: () => f.scanner }))
 vi.mock('src/ts/storage/sync/bindingRegistry', () => ({ bindSyncTarget: f.bind }))
 vi.mock('src/ts/storage/sync/bindingNative', () => ({ createNativeSyncBindingBridge: () => ({ state: f.bindingState }) }))
@@ -37,6 +36,7 @@ vi.mock('src/lib/Setting/ExternalStorage/ConnectionForm.svelte', () => ({ defaul
 vi.mock('src/lib/Others/Onboarding/onboardingWeave', () => ({ observeOnboardingWeave: () => () => {} }))
 vi.mock('src/ts/stores.svelte', () => ({ DBState: f.state }))
 import ServerSyncSettings from './ServerSyncSettings.svelte'
+import { serverRegistrationInbox } from 'src/ts/storage/sync/serverSyncRegistrationInbox'
 import { assetCleanupProgress, type AssetCleanupState } from 'src/ts/storage/sync/serverAssetCleanupProgress'
 import type { AssetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency'
 import { assetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency.testSupport'
@@ -46,6 +46,7 @@ import Onboarding from 'src/lib/Others/Onboarding/Onboarding.svelte'
 let component: ReturnType<typeof mount> | undefined
 let host: HTMLDivElement
 beforeEach(() => {
+    serverRegistrationInbox.clear()
     assetCleanupProgress.set(undefined)
     vi.clearAllMocks(); f.native = true; f.scan = false; f.os = 'windows'; f.listeners.clear(); f.view = { status: { configured: false }, paused: false }; host = document.createElement('div'); document.body.append(host)
     for (const mock of [f.disconnect, f.hold, f.release, f.status, f.policy, f.evict, f.cancel, f.checkbox, f.action, f.complete, f.ensure]) mock.mockReset()
@@ -154,6 +155,14 @@ it.each(['', 'server-unreachable', 'clock-skew', 'unauthorized'])('offers no new
     expect(findButton(languageEnglish.lwwSync.newDeviceAction)).toBeUndefined()
 })
 describe('a registration code the server refuses', () => {
+    it.each([false, true])('describes a writer collision for the current connection state (bound=%s)', async bound => {
+        f.view = { status: { configured: true, bound }, paused: true, error: 'writer-collision' }
+        component = mount(ServerSyncSettings, { target: host })
+        await settle()
+        expect(host.querySelector('[role="alert"]')?.textContent).toBe(bound
+            ? languageEnglish.lwwSync.writerCollision : languageEnglish.lwwSync.writerCollisionNotConnected)
+        expect(f.connect).not.toHaveBeenCalled()
+    })
     const usedCodes = ['registration-used', 'registration-integrity', 'registration-not-new']
     it.each(usedCodes.flatMap(error => [{ error, tone: 'settings' as const }, { error, tone: 'onboarding' as const }]))('asks for a new registration code for "$error" in $tone', async ({ error, tone }) => {
         f.view = { status: { configured: true, bound: false }, paused: true, error }
@@ -256,6 +265,15 @@ describe('a registration code the server refuses', () => {
             expect(host.textContent).toContain(languageEnglish.risuNest.serverSync.reviewTitle)
             expect(host.querySelector('[role="alert"]')).toBeNull()
             expect(f.dismiss).toHaveBeenCalledOnce()
+        })
+        it('drops the refusal once a registration link delivers a new code', async () => {
+            component = mount(ServerSyncSettings, { target: host, props: { connectTarget: refusal('registration-used') } })
+            await registration(); click(languageEnglish.risuNest.serverSync.connect); await settle()
+            expect(host.querySelector('[role="alert"]')?.textContent).toBe(languageEnglish.lwwSync.registrationUsed)
+            serverRegistrationInbox.stage('synthetic-new-registration-link')
+            await settle()
+            expect(host.textContent).toContain(languageEnglish.risuNest.serverSync.reviewTitle)
+            expect(host.querySelector('[role="alert"]')).toBeNull()
         })
         it.each(['server-unreachable', 'device-credential-unavailable', 'clock-skew'])('keeps the "%s" connection failure when a new code is read', async error => {
             component = mount(ServerSyncSettings, { target: host, props: { connectTarget: refusal(error) } })

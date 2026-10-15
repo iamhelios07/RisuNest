@@ -10,6 +10,7 @@ const f = vi.hoisted(() => ({
     selectedIndex: 0,
     database: { characters: [{ chaId: 'selected-stable-id' }] },
     invoke: vi.fn(),
+    events: new Map<string, (event: { payload?: unknown }) => void>(),
     install: vi.fn(),
     switchTarget: vi.fn(),
     register: vi.fn(),
@@ -40,7 +41,7 @@ const f = vi.hoisted(() => ({
         & { native: SyncBindingNative; whileAsking<T>(ask: () => Promise<T>): Promise<T> }) | undefined,
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: f.invoke, Channel: class { onmessage = (_value: unknown) => {} } }))
-vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }))
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async (name, listener) => { f.events.set(name, listener); return () => { f.events.delete(name) } }) }))
 vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({ runtime: f.native ? 'tauri' : 'web', os: 'windows' })))
 vi.mock('src/ts/stores.svelte', () => ({ selectedCharID: { subscribe: (run: (value: number) => void) => { run(f.selectedIndex); return () => {} } } }))
 vi.mock('../database.svelte', () => ({ getDatabase: () => f.database }))
@@ -69,7 +70,7 @@ vi.mock('../generatingConversationRegistry', () => ({ generatingConversations: {
 
 let production: typeof import('./serverSyncProduction')
 beforeEach(async () => {
-    vi.resetModules(); vi.clearAllMocks(); vi.useFakeTimers()
+    vi.resetModules(); vi.clearAllMocks(); vi.useFakeTimers(); f.events.clear()
     f.native = true; f.transport = undefined; f.dependencies = undefined; f.generating = []; f.selectedIndex = 0; f.viewport = undefined; f.revision = undefined; f.conversation = null
     f.mobile.mockImplementation(async (_kind: string, operation: (task: object) => Promise<unknown>) => operation({ progress() {}, async dispose() {} }))
     f.flush.mockResolvedValue(undefined)
@@ -793,6 +794,55 @@ describe('production server LWW composition', () => {
         expect(production.getServerSyncController().snapshot().error).toBe('')
         expect(views).toEqual(['registration-used', ''])
     })
+    it.each([false, true, null])('dismisses a late failure only when the attempt stayed unbound (bound=%s)', async bound => {
+        const { bindSyncTarget } = await import('./bindingRegistry')
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        let fail!: () => void
+        vi.mocked(bindSyncTarget).mockImplementation(() => new Promise((_resolve, reject) => { fail = () => reject({ code: 'server-unreachable' }) }))
+        const connecting = production.connectServerSync({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' })
+        const rejected = expect(connecting).rejects.toMatchObject({ code: 'server-unreachable' })
+        await settle()
+        production.dismissServerSyncConnectionFailure()
+        if (bound) f.invoke.mockImplementation(async command => command === 'pds_lww_binding_state' ? bindingContext().state : null)
+        if (bound === null) f.invoke.mockRejectedValue({ code: 'synthetic-status-unavailable' })
+        f.transport!.reportStopped?.({ code: 'server-unreachable' })
+        fail(); await rejected
+        expect(production.getServerSyncController().snapshot().error).toBe(bound === false ? '' : 'server-unreachable')
+        if (bound === false) {
+            vi.mocked(bindSyncTarget).mockRejectedValue({ code: 'registration-used' })
+            await expect(production.completeServerSyncBinding()).rejects.toMatchObject({ code: 'registration-used' })
+            expect(production.getServerSyncController().snapshot().error).toBe('registration-used')
+        }
+    })
+    it('retains notification correlation in native reconnect requests until a socket connects', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        const requests = () => f.invoke.mock.calls.filter(([command]) => command === 'server_sync_notify_start')
+            .map(([, args]) => (args as { operationId?: string }).operationId)
+        const initial = requests()[0]
+        expect(initial).toMatch(/^[0-9a-f-]{36}$/)
+        f.events.get('risu-server-sync-notification')!({ payload: { connected: false } })
+        await vi.advanceTimersByTimeAsync(1000); await settle()
+        expect(requests()).toEqual([initial, initial])
+        f.events.get('risu-server-sync-notification')!({ payload: { connected: true } })
+        f.events.get('risu-server-sync-notification')!({ payload: { connected: false } })
+        await vi.advanceTimersByTimeAsync(1000); await settle()
+        expect(requests()[2]).toMatch(/^[0-9a-f-]{36}$/)
+        expect(requests()[2]).not.toBe(initial)
+    })
+    it('publishes pending device data after its native change event', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        let pending = true
+        const fallback = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_lww_push') { pending = false; return null }
+            return fallback(command, args)
+        })
+        f.events.get('risu-server-sync-device-changed')?.({})
+        await vi.advanceTimersByTimeAsync(2000); await settle()
+        expect(pending).toBe(false)
+    })
     describe('asset storage chosen with the connection', () => {
         const config = { endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }
         const policyCalls = () => f.invoke.mock.calls.filter(([command]) => command === 'server_sync_asset_policy')
@@ -816,7 +866,20 @@ describe('production server LWW composition', () => {
         })
         it.each([false, true])('keeps assets on the server from before the first hydration (new device=%s)', async newDevice => {
             await bindWith(newDevice)
+            const labels: string[] = []
+            const invoke = f.invoke.getMockImplementation()!
+            f.invoke.mockImplementation(async (command, args) => {
+                if (command === (newDevice ? 'server_sync_lww_activate_new_device' : 'server_sync_lww_activate') || command === 'server_sync_asset_policy') {
+                    const progress = production.getServerSyncController().snapshot().progress
+                    if (progress) labels.push(serverSyncProgressView(progress, languageKorean.risuNest.serverSync, Date.now()).label)
+                }
+                return invoke(command, args)
+            })
             await production.connectServerSync(config, newDevice, 'remote'); await settle()
+            expect(labels).toEqual([
+                languageKorean.risuNest.serverSync.progress.applying,
+                languageKorean.risuNest.serverSync.progress.assetPolicy,
+            ])
             expect(policyCalls()).toEqual([['server_sync_asset_policy', { policy: 'remote' }]])
             expect(callOrder(newDevice ? 'server_sync_lww_activate_new_device' : 'server_sync_lww_activate')).toBeLessThan(callOrder('server_sync_asset_policy'))
             expect(callOrder('server_sync_asset_policy')).toBeLessThan(callOrder('server_sync_lww_hydrate'))
@@ -918,8 +981,9 @@ describe('server sync progress', () => {
         const finish = hangingPush([])
         visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
         const controller = production.getServerSyncController()
-        expect(controller.snapshot().progress?.stages).toEqual(['downloading', 'publishing', 'assets'])
-        expect(controller.snapshot().progress?.active).toEqual(['publishing'])
+        const view = serverSyncProgressView(controller.snapshot().progress!, languageKorean.risuNest.serverSync, Date.now())
+        expect(view.label).toBe(languageKorean.risuNest.serverSync.progress.publishing)
+        expect(view.stages.filter(stage => stage.state === 'active').map(stage => stage.label)).toEqual([languageKorean.risuNest.serverSync.stage.publishing])
         expect(progressReads()).toBe(0)
         finish(); await settle()
         expect(controller.snapshot().progress).toBeUndefined()
@@ -1089,11 +1153,11 @@ describe('server sync progress', () => {
         for (let index = 0; index < 3; index++) {
             await vi.advanceTimersByTimeAsync(500); await settle()
             const progress = controller.snapshot().progress!
-            seen.push({ mode: progress.mode, stages: progress.stages, label: serverSyncRoutineView(progress, languageKorean.risuNest.serverSync, false)?.label })
+            seen.push({ mode: progress.mode, label: serverSyncRoutineView(progress, languageKorean.risuNest.serverSync, false)?.label })
             pages.shift()!(); await settle()
             if (index === 0) { expect(controller.snapshot().progress?.active).toEqual(['downloading']); applying(); await settle() }
         }
-        expect(seen).toEqual(Array(3).fill({ mode: 'routine', stages: ['preparing', 'downloading', 'publishing', 'assets'], label: languageKorean.risuNest.serverSync.running }))
+        expect(seen).toEqual(Array(3).fill({ mode: 'routine', label: languageKorean.risuNest.serverSync.running }))
         expect(served).toBeGreaterThanOrEqual(4)
         stop()
     })

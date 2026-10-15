@@ -1,7 +1,7 @@
 export interface ServerSyncSchedulerDependencies {
     push(): Promise<void>
     pull(completeAvailable?: boolean): Promise<void>
-    connect(): Promise<void>
+    connect(operationId: string): Promise<void>
     disconnect(): Promise<void>
     retryClock?(): Promise<void>
     publishHidden?(): Promise<void>
@@ -36,6 +36,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     let pushAgain = false
     let pullAgain = false
     let reconnectAttempt = 0
+    let notificationOperationId: string | undefined
     let sendRetryAttempt = 0
     let blocked = false
     let blockedCode = ''
@@ -103,14 +104,14 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     }
     const connect = () => {
         if (!foreground || blocked || connecting || !available()) return
-        const attempt: Promise<void> = dependencies.connect().then(() => succeeded('connect'), error => { fail(error, 'connect'); socket(false) })
+        const attempt: Promise<void> = dependencies.connect(notificationOperationId ??= crypto.randomUUID()).then(() => succeeded('connect'), error => { fail(error, 'connect'); socket(false) })
             .finally(() => { if (connecting === attempt) connecting = undefined })
         connecting = attempt
     }
     const socket = (value: boolean) => {
         connected = value
         clearTimeout(retryTimer)
-        if (value) reconnectAttempt = 0
+        if (value) { reconnectAttempt = 0; notificationOperationId = undefined }
         else if (foreground && !blocked) {
             void pull().catch(() => {})
             retryTimer = setTimeout(connect, Math.min(30_000, 1000 * 2 ** reconnectAttempt++))
@@ -149,6 +150,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         async foreground(value: boolean, publishPending = false) {
             if (foreground === value) { if (value) await recheckClock(); return }
             foreground = value
+            notificationOperationId = undefined
             clear()
             if (value) { reconnectAttempt = 0; if (!await recheckClock()) { connect(); void pull().catch(() => {}); void push().catch(() => {}) } }
             else {
@@ -174,7 +176,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             await pull(true)
         },
         retry() { blocked = false; blockedCode = ''; sendRetryAttempt = 0; connect(); void pull().catch(() => {}); return push() },
-        reset() { blocked = false; blockedCode = ''; sendRetryAttempt = 0; reconnectAttempt = 0; failedLanes.clear() },
+        reset() { blocked = false; blockedCode = ''; sendRetryAttempt = 0; reconnectAttempt = 0; notificationOperationId = undefined; failedLanes.clear() },
         async waitForIdle() {
             while (sending || receiving || checkingClock) {
                 await Promise.allSettled([sending, receiving, checkingClock])

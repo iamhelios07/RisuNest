@@ -14,7 +14,7 @@ import type { SyncBindingTransport, BindingContext, BindingOutcome, SyncBindingO
 import { createNativeSyncBindingBridge, replaceNativeSyncBinding, replaceNativeSyncBindingAsNewDevice } from './bindingNative'
 import { createServerSyncScheduler, integrityCodes, serverSyncErrorCode } from './serverSyncScheduler'
 import { subscribeLocalPersistentRevision } from '../persistentRevisionEvents'
-import { SERVER_SYNC_REMOTE_HINT_EVENT } from './serverSyncNativeSignals'
+import { SERVER_SYNC_DEVICE_CHANGED_EVENT, SERVER_SYNC_REMOTE_HINT_EVENT } from './serverSyncNativeSignals'
 import { listen } from '@tauri-apps/api/event'
 import { generatingConversations } from '../generatingConversationRegistry'
 import { bindSyncTarget, unbindSyncTarget } from './bindingRegistry'
@@ -87,6 +87,7 @@ let attemptFailed = false
 // Read when a watched attempt starts, so even an attempt that ends before its next read has a start to count from.
 let baseline: Promise<ServerSyncLane[] | undefined> | undefined
 let binding = false
+let connectionAttempt: { dismissed: boolean } | undefined
 // A binding that received the server state it replaces this library with.
 let bindingStaged = false
 let operations = 0
@@ -319,7 +320,7 @@ const scheduler = createServerSyncScheduler({
             await pushAvailable(captured, true)
         })
     }),
-    connect: () => context ? invoke('server_sync_notify_start', { request: header() }) : Promise.resolve(),
+    connect: operationId => context ? invoke('server_sync_notify_start', { request: header(), operationId }) : Promise.resolve(),
     disconnect: async () => { await invoke('server_sync_notify_stop'); await invoke('server_sync_cancel') },
     failed(value) { error = serverSyncErrorCode(value) || 'server-unreachable'; changed() },
     recovered() { if (error && error !== hydrationError) { error = ''; changed() } },
@@ -330,7 +331,7 @@ const scheduler = createServerSyncScheduler({
 const remoteAssetsRequested = (c: BindingContext) => !!requestedRemoteAssets && requestedRemoteAssets.libraryId === c.state.libraryId
 async function keepAssetsRemote(c: BindingContext): Promise<void> {
     requestedRemoteAssets = undefined
-    await setAssetResidencyPolicy('remote')
+    await during('assetPolicy', () => setAssetResidencyPolicy('remote'))
     checkContext(c)
 }
 // Scheduler blocks and errors belong to one binding authority and never carry over to another.
@@ -345,6 +346,7 @@ const transport: SyncBindingTransport = {
     pullAvailableState: async (inspected,c) => { const staged = await during('downloading', () => invoke<StagedSyncTarget>('server_sync_lww_stage_target', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } })); bindingStaged = true; return staged },
     replaceFromTarget: (...args) => during('applying', () => replaceNativeSyncBinding(...args)),
     reportStopped(value) {
+        if (connectionAttempt?.dismissed) return
         const code = serverSyncErrorCode(failures(value)[0])
         if (code !== 'cancelled') { error = code || 'server-unreachable'; changed() }
     },
@@ -356,28 +358,33 @@ const transport: SyncBindingTransport = {
         checkContext(c)
         await pushAvailable(c, true)
     },
-    async resumeBinding(c) { heldForCommittedRestore = false; context = c; adoptSchedulerAuthority(c); await invoke('server_sync_lww_activate', { request: header() }); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; hydrationPending = true; await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
+    async resumeBinding(c) { heldForCommittedRestore = false; context = c; adoptSchedulerAuthority(c); await during('applying', () => invoke('server_sync_lww_activate', { request: header() })); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; hydrationPending = true; await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
     prepareNewDeviceBinding: (staged,c) => invoke('server_sync_lww_prepare_new_device', { stagingId: staged.stagingId, request: { bindingAuthority: c.state.targetAuthority, requestId: staged.receiveId } }),
     replaceAsNewDevice: (...args) => during('applying', () => replaceNativeSyncBindingAsNewDevice(...args)),
     prepareFreshWriter: (inspected,c) => invoke('server_sync_lww_prepare_fresh_writer', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } }),
-    async resumeNewDeviceBinding(preparation,result,c) { await invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }); context = c; adoptSchedulerAuthority(c); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true; await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
+    async resumeNewDeviceBinding(preparation,result,c) { await during('applying', () => invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } })); context = c; adoptSchedulerAuthority(c); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true; await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
 }
 export async function receiveAvailableServerChanges(): Promise<void> { await scheduler.receiveAvailableChanges() }
 export async function configureServerSyncConnection(config: ServerConfig): Promise<void> { await invoke('server_sync_configure', { config }); error = '' }
 // Binding and its initial publication continue while the app is in the background. A failure keeps
 // what native code committed visible, so a binding that stopped after its switch can be resumed.
 async function bindServer(options: SyncBindingOptions = {}): Promise<BindingOutcome> {
+    const currentAttempt = { dismissed: false }
+    connectionAttempt = currentAttempt
     binding = true
     try { return await runWithMobileBackgroundTask('sync', () => bindSyncTarget({ kind: 'server', connectionId: 'server' }, options), undefined, true) }
     catch (value) {
         attemptFailed = true
         const code = serverSyncErrorCode(failures(value)[0])
-        if (code !== 'cancelled') { error = code || 'server-unreachable'; changed() }
-        await controller.ensureStatus().catch(() => {})
+        const statusKnown = await controller.ensureStatus().then(() => true, () => false)
+        const bound = bindingIncomplete || persistedBinding?.target.kind === 'server' || context && !context.signal.aborted
+        if (currentAttempt.dismissed && statusKnown && !bound) { error = ''; hydrationError = ''; changed() }
+        else if (code !== 'cancelled') { error = code || 'server-unreachable'; changed() }
         throw value
     }
     finally {
         binding = false
+        if (connectionAttempt === currentAttempt) connectionAttempt = undefined
         bindingStaged = false
         // What continues after connecting, such as reading back this device's publication, shows as automatic sync.
         if (attempt && !operations && attempt.mode === 'full') { attempt.mode = 'routine'; changed() }
@@ -400,7 +407,9 @@ export async function completeServerSyncBinding(): Promise<void> { await bindSer
 export async function disconnectServerSync(): Promise<void> { await unbindSyncTarget(); context = undefined; await controller.ensureStatus() }
 /** Drops the failure of a connection attempt that was left without connecting. A binding, even a stopped one, keeps it. */
 export function dismissServerSyncConnectionFailure(): void {
-    if (!error || binding || bindingIncomplete || persistedBinding?.target.kind === 'server' || context && !context.signal.aborted) return
+    if (bindingIncomplete || persistedBinding?.target.kind === 'server' || context && !context.signal.aborted) return
+    if (connectionAttempt) connectionAttempt.dismissed = true
+    if (!error) return
     error = ''; hydrationError = ''; changed()
 }
 /** Stops automatic sync until the returned release runs, so an asset download is not refused as busy. */
@@ -448,6 +457,7 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
         void scheduler.conversationOpened().then(continueHydration)
     }))
     disposers.push(await listen(SERVER_SYNC_REMOTE_HINT_EVENT, () => scheduler.remoteHint()))
+    disposers.push(await listen(SERVER_SYNC_DEVICE_CHANGED_EVENT, () => scheduler.localChange()))
     disposers.push(await listen<{ connected: boolean }>('risu-server-sync-notification', event => scheduler.socket(event.payload.connected)))
     const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; error = serverSyncErrorCode(value) || 'server-unreachable'; changed() }) }
     document.addEventListener('visibilitychange', visibility)

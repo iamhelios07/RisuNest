@@ -426,8 +426,8 @@ async fn stop_notification_job<R: tauri::Runtime>(app:&AppHandle<R>)->Result<()>
     Ok(())
 }
 #[tauri::command]
-pub(crate) async fn server_sync_notify_start(app:AppHandle,request:crate::persistent_store::lww::Header)->Result<()> {recorded("notify-start",start_notification_job(app,request).await)}
-async fn start_notification_job<R: tauri::Runtime>(app:AppHandle<R>,request:crate::persistent_store::lww::Header)->Result<()> {
+pub(crate) async fn server_sync_notify_start(app:AppHandle,request:crate::persistent_store::lww::Header,operation_id:Option<uuid::Uuid>)->Result<()> {recorded("notify-start",start_notification_job(app,request,operation_id).await)}
+async fn start_notification_job<R: tauri::Runtime>(app:AppHandle<R>,request:crate::persistent_store::lww::Header,operation_id:Option<uuid::Uuid>)->Result<()> {
     stop_notification_job(&app).await?;
     if app.state::<ServerSyncCommandState>().cleanup_closed.load(Ordering::Acquire){return Err(SyncError::new("cleanup-pending",409));}
     let start=app.state::<ServerSyncCommandState>().begin_notification()?;
@@ -439,7 +439,7 @@ async fn start_notification_job<R: tauri::Runtime>(app:AppHandle<R>,request:crat
     app.state::<ServerSyncCommandState>().install_notification(start,move|guard| tauri::async_runtime::spawn(async move {
         let _guard=guard;
         use tauri::Emitter;
-        let _=super::notification::run(config,move|frame| {let _=events.emit("risu-server-sync-remote-hint",frame);},move|connected| {let _=connection.emit("risu-server-sync-notification",serde_json::json!({"connected":connected}));}).await;
+        let _=super::notification::run(config,operation_id,move|frame| {let _=events.emit("risu-server-sync-remote-hint",frame);},move|connected| {let _=connection.emit("risu-server-sync-notification",serde_json::json!({"connected":connected}));}).await;
     }))
 }
 
@@ -753,7 +753,7 @@ mod tests {
         app.listen("risu-server-sync-notification", move |event| {
             let _ = link_tx.send(serde_json::from_str::<serde_json::Value>(event.payload()).unwrap());
         });
-        tauri::async_runtime::block_on(start_notification_job(app.handle().clone(), request)).unwrap();
+        tauri::async_runtime::block_on(start_notification_job(app.handle().clone(), request, None)).unwrap();
         assert_eq!(link_rx.recv_timeout(WAIT).unwrap(), serde_json::json!({"connected": true}));
         let SeqNotification::Seq { seq: before } = hint_rx.recv_timeout(WAIT).unwrap();
         save(&mut source, &["root", "language"], serde_json::json!("ja"));

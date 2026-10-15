@@ -2061,7 +2061,8 @@ fn read_section_participation(
     })
 }
 
-fn set_section_participation(
+fn set_section_participation<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &PersistentStoreState,
     section: &str,
     participating: bool,
@@ -2071,11 +2072,14 @@ fn set_section_participation(
             message: "unknown device section".to_owned(),
         });
     };
-    with_store_mutex_mut(state, |store| {
-        store
-            .device_store_mut()?
-            .set_section_participating(section, participating)
-    })
+    let changed = with_store_mutex_mut(state, |store| {
+        let device = store.device_store_mut()?;
+        let before = device.section_state(section)?.participating;
+        device.set_section_participating(section, participating)?;
+        Ok(before != participating)
+    })?;
+    if changed { crate::server_sync::events::notify_device_changed(app); }
+    Ok(())
 }
 
 /// Which sections this device currently exchanges with a remote.
@@ -2088,11 +2092,12 @@ pub(crate) fn pds_read_section_participation(
 
 #[tauri::command(async)]
 pub(crate) fn pds_set_section_participating(
+    app: AppHandle,
     state: State<'_, PersistentStoreState>,
     section: String,
     participating: bool,
 ) -> Result<(), StoreError> {
-    logged("pds_set_section_participating", set_section_participation(&state, &section, participating))
+    logged("pds_set_section_participating", set_section_participation(&app, &state, &section, participating))
 }
 
 #[cfg(test)]
@@ -3302,6 +3307,12 @@ mod tests {
     /// row the user changed.
     #[test]
     fn local_data_command_sets_device_sections_participating() {
+        use tauri::Listener;
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+        let changes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = changes.clone();
+        app.listen("risu-server-sync-device-changed", move |_| { received.fetch_add(1, std::sync::atomic::Ordering::Relaxed); });
         let directory = tempdir().unwrap();
         let state = PersistentStoreState::default();
         open_renderer_persistent_store(&state, directory.path()).unwrap();
@@ -3315,14 +3326,17 @@ mod tests {
             vec![("hypa", true), ("local-plugins", false)]
         );
 
-        set_section_participation(&state, "local-plugins", true).unwrap();
+        set_section_participation(app.handle(), &state, "local-plugins", true).unwrap();
+        assert_eq!(changes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        set_section_participation(app.handle(), &state, "local-plugins", true).unwrap();
+        assert_eq!(changes.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(with_store_mutex(&state, |store| Ok(store
             .device_store()?
             .section_state(super::super::device_store::Section::LocalPlugins)?
             .participating))
         .unwrap());
 
-        assert!(set_section_participation(&state, "hypa", false).is_err());
+        assert!(set_section_participation(app.handle(), &state, "hypa", false).is_err());
         assert_eq!(
             read_section_participation(&state)
                 .unwrap()
@@ -3333,7 +3347,7 @@ mod tests {
         );
 
         assert!(matches!(
-            set_section_participation(&state, "library", true),
+            set_section_participation(app.handle(), &state, "library", true),
             Err(StoreError::Validation { .. })
         ));
     }

@@ -93,7 +93,7 @@
         { value: 'remote' as AssetResidencyPolicy, label: copy.residency.remote },
     ])
     const errorCode = (error: unknown) => typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
-    const message = (error: unknown) => serverSyncErrorMessage(error, tone === 'onboarding')
+    const message = (error: unknown) => serverSyncErrorMessage(error, tone === 'onboarding', !!view.status.bound)
     async function readResidency() {
         const read = ++residencyRead
         residencyFailed = false
@@ -209,7 +209,7 @@
         })
         dispose = controller.subscribe(value => { view = value })
         stopWatching = controller.watchProgress()
-        inboxDispose = serverRegistrationInbox.changed.subscribe(() => { const pending = serverRegistrationInbox.take(); if (pending) candidate = pending })
+        inboxDispose = serverRegistrationInbox.changed.subscribe(() => { const pending = serverRegistrationInbox.take(); if (pending) replaceCandidate(pending) })
         void refresh().catch(error => { failure ||= message(error) })
     })
     onDestroy(() => { mounted = false; stopCleanup(); dispose(); stopWatching(); inboxDispose(); scanner.cancel(); serverRegistrationInbox.releaseConsumed() })
