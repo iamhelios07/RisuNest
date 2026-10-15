@@ -33,6 +33,12 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
     steps:
       - uses: actions/checkout@v4
+      - name: Use a temporary directory without symlinked ancestors
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/tests"
+          echo "TMPDIR=$(cd "$RUNNER_TEMP/tests" && pwd -P)" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -51,11 +57,14 @@ jobs:
         with:
           python-version: "3.12"
       - name: Package tested binary
-        run: >-
-          python server/sync/distribution/package.py
-          --binary src-tauri/target/${{ matrix.target }}/release/risunest-sync-server${{ matrix.suffix }}
-          --target ${{ matrix.target }}
-          --output server/sync/distribution/artifacts
+        shell: bash
+        run: |
+          version=$(python -c "import json; print(json.load(open('server/version.json', encoding='utf-8'))['version'])")
+          python server/sync/distribution/package.py \
+            --binary src-tauri/target/${{ matrix.target }}/release/risunest-sync-server${{ matrix.suffix }} \
+            --target ${{ matrix.target }} \
+            --version "$version" \
+            --output server/sync/distribution/artifacts
       - uses: actions/upload-artifact@v4
         with:
           name: risunest-sync-server-${{ matrix.target }}
