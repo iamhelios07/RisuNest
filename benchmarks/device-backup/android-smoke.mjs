@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { measureLegacyRestore } from "../legacy-restore/android-measure.mjs";
+import { measureEntryCount } from "../legacy-restore/entry-count.mjs";
 import { measurePluginValue } from './plugin-value-driver.mjs';
 import { measurePluginSync, syntheticPluginSyncServer } from './plugin-sync-driver.mjs';
 import { execFile, spawn } from "node:child_process";
@@ -22,7 +23,7 @@ const delay = (milliseconds) =>
 const args = runnerOptions(process.argv.slice(2));
 for (const name of Object.keys(args))
   assert.ok(
-    ["adb", "aapt", "adb-port", "serial", "avd", "apk", "output", "health", "peer", "exchange", "legacy-mb", "legacy-encoding", "plugin-values", "sync-server"].includes(name),
+    ["adb", "aapt", "adb-port", "serial", "avd", "apk", "output", "health", "peer", "exchange", "legacy-mb", "legacy-encoding", "legacy-entries", "plugin-values", "sync-server"].includes(name),
     "Unsupported runner option",
   );
 const android = androidTarget(args);
@@ -549,6 +550,46 @@ async function main() {
     } finally {
       await run(['reverse', '--remove', `tcp:${server.port}`], 10_000, true);
       await server.stop();
+    }
+    return;
+  }
+  if (args['legacy-entries']) {
+    assert.ok(!peerPath, 'Entry measurements require a fresh synthetic process');
+    const count = Number(args['legacy-entries']);
+    const directory = path.join(path.dirname(output), `entries-${count}-${randomUUID()}`);
+    await mkdir(directory, { recursive: true });
+    const report = { platform: 'android-emulator', synthetic: true, success: false, apkSha256: sha256, environment, health, avd: avdName, serial };
+    const ownedSources = [];
+    try {
+      report.measurement = await measureEntryCount({ count, directory,
+        evaluate: expression => client.evaluate(expression),
+        prepareSource: async file => {
+          const name = `synthetic-entry-${randomUUID()}.bin`;
+          const temporary = `/data/local/tmp/${name}`;
+          const native = `/data/user/0/${packageName}/files/${name}`;
+          ownedSources.push(native);
+          try {
+            await run(['push', file, temporary], 120_000);
+            await run(['shell', 'run-as', packageName, 'cp', temporary, native], 120_000);
+          } finally { await run(['shell', 'rm', '-f', temporary], 10_000, true); }
+          return native;
+        },
+        memory: async () => {
+          const usage = await client.call('Runtime.getHeapUsage');
+          const status = await run(['shell', 'run-as', packageName, 'cat', `/proc/${pid}/status`]);
+          const rss = /^VmRSS:\s*(\d+)\s+kB$/m.exec(status.stdout);
+          const hwm = /^VmHWM:\s*(\d+)\s+kB$/m.exec(status.stdout);
+          assert.ok(rss && hwm, 'Native memory sample unavailable');
+          return { usedBytes: usage.usedSize, nativeWorkingSetBytes: Number(rss[1]) * 1024, nativePeakWorkingSetBytes: Number(hwm[1]) * 1024 };
+        },
+        save: async measurement => { report.measurement = measurement; await writeFile(output, JSON.stringify(report, null, 2)); },
+      });
+      report.success = true;
+      completed = true;
+      await writeFile(output, JSON.stringify(report, null, 2));
+      console.log(JSON.stringify({ success: true, output }));
+    } finally {
+      for (const file of ownedSources) await run(['shell', 'run-as', packageName, 'rm', '-f', file], 10_000, true);
     }
     return;
   }

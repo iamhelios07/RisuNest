@@ -513,6 +513,7 @@ async function completeRestore() {
 }
 
 async function resume() {
+  await nativeInvoke('pds_open');
   const recovered = await reconcileNativeFileJobsBeforeBootstrap({
     invoke: fileJobDependencies.invoke,
     wait,

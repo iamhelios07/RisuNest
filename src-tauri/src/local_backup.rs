@@ -124,6 +124,7 @@ pub(crate) struct StagedLocalBackupEntry {
 }
 
 pub(crate) trait StrictLocalBackupDatabaseRestore {
+    fn source_validated(&mut self, _bytes: u64, _sha256: &str) {}
     fn restore_database(
         &mut self,
         entry: &StagedLocalBackupEntry,
@@ -169,7 +170,7 @@ pub(crate) fn parse_legacy_local_backup_v1_observed(
 ) -> Result<LegacyLocalBackupParseReport, LocalBackupError> {
     check_cancelled(cancellation)?;
     let staging_directory = prepare_staging_directory(job_staging_root)?;
-    let mut staging_ownership = ParseStagingOwnership::default();
+    let mut staging_ownership = ParseStagingOwnership { directory: Some(staging_directory.clone()) };
     let mut source = TrackedReader::new(reader);
     let mut entries = Vec::new();
     let mut normalized_names = HashSet::new();
@@ -232,7 +233,6 @@ pub(crate) fn parse_legacy_local_backup_v1_observed(
             byte_length,
             cancellation,
             observer,
-            &mut staging_ownership,
         )?;
         if is_database {
             database_index = Some(entries.len());
@@ -247,13 +247,16 @@ pub(crate) fn parse_legacy_local_backup_v1_observed(
         )
     })?;
     check_cancelled(cancellation)?;
+    drop(normalized_names);
     observer.entries_complete(entries.len());
+    let source_sha256 = hex::encode(source.hasher.clone().finalize());
+    database_restore.source_validated(source.bytes_read, &source_sha256);
     database_restore.restore_database(&entries[database_index], &entries)?;
     staging_ownership.release();
 
     Ok(LegacyLocalBackupParseReport {
         source_bytes: source.bytes_read,
-        source_sha256: hex::encode(source.hasher.finalize()),
+        source_sha256,
         entries,
     })
 }
@@ -267,7 +270,7 @@ fn prepare_staging_directory(job_staging_root: &Path) -> Result<PathBuf, LocalBa
         ));
     }
     let staging = root.join("local-backup-v1");
-    fs::create_dir_all(&staging).map_err(LocalBackupError::io)?;
+    fs::create_dir(&staging).map_err(LocalBackupError::io)?;
     let staging = fs::canonicalize(staging).map_err(LocalBackupError::io)?;
     if !staging.starts_with(&root) {
         return Err(LocalBackupError::new(
@@ -285,7 +288,6 @@ fn stage_entry(
     byte_length: u64,
     cancellation: &dyn CancellationProbe,
     observer: &dyn LocalBackupParseObserver,
-    staging_ownership: &mut ParseStagingOwnership,
 ) -> Result<StagedLocalBackupEntry, LocalBackupError> {
     let staged_path = staging_directory.join(format!("{}.entry", uuid::Uuid::new_v4()));
     let mut guard = IncompleteFile::new(staged_path.clone());
@@ -321,7 +323,6 @@ fn stage_entry(
     check_cancelled(cancellation)?;
     output.flush().map_err(LocalBackupError::io)?;
     drop(output);
-    staging_ownership.track(staged_path.clone());
     guard.keep();
     Ok(StagedLocalBackupEntry {
         logical_name,
@@ -354,25 +355,20 @@ impl Drop for IncompleteFile {
     }
 }
 
-#[derive(Default)]
 struct ParseStagingOwnership {
-    paths: Vec<PathBuf>,
+    directory: Option<PathBuf>,
 }
 
 impl ParseStagingOwnership {
-    fn track(&mut self, path: PathBuf) {
-        self.paths.push(path);
-    }
-
     fn release(&mut self) {
-        self.paths.clear();
+        self.directory = None;
     }
 }
 
 impl Drop for ParseStagingOwnership {
     fn drop(&mut self) {
-        for path in self.paths.iter().rev() {
-            let _ = fs::remove_file(path);
+        if let Some(directory) = &self.directory {
+            let _ = fs::remove_dir_all(directory);
         }
     }
 }
@@ -955,12 +951,7 @@ mod tests {
 
         assert_eq!(error.code, LocalBackupErrorCode::TruncatedInput);
         assert_eq!(restore.calls, 0);
-        assert_eq!(
-            fs::read_dir(&staging).expect("read job staging").count(),
-            0,
-            "all completed parser-owned files must be removed",
-        );
-        fs::remove_dir(staging).expect("staging directory has no leaked file descriptors");
+        assert!(!staging.exists(), "all parser-owned staging must be removed");
     }
 
     #[test]
@@ -997,12 +988,7 @@ mod tests {
         .expect_err("strict restore rejection must fail");
 
         assert_eq!(error.code, LocalBackupErrorCode::DatabaseRestore);
-        assert_eq!(
-            fs::read_dir(&staging).expect("read job staging").count(),
-            0,
-            "restore failure must remove every parser-owned file",
-        );
-        fs::remove_dir(staging).expect("staging directory has no leaked file descriptors");
+        assert!(!staging.exists(), "restore failure must remove all parser-owned staging");
     }
 
     #[test]
