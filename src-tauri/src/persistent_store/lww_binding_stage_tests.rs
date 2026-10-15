@@ -527,8 +527,14 @@ fn late_binding_copy_trigger_failure_rolls_back_every_family_and_retries_exactly
     let generation = active_generation(&store.connection).unwrap();
     let clock = serde_json::to_value(store.lww_clock_state().unwrap()).unwrap();
     let source_objects: i64 = store.connection.query_row("SELECT count(*) FROM message_page_objects", [], |row| row.get(0)).unwrap();
+    store.connection.pragma_update(None, "wal_autocheckpoint", 73).unwrap();
     store.connection.execute_batch("CREATE TRIGGER reject_binding_tail BEFORE INSERT ON messages WHEN NEW.generation LIKE 'staging-%' AND NEW.message_index=512 BEGIN SELECT RAISE(ABORT,'synthetic tail failure'); END;").unwrap();
     assert!(store.lww_stage_binding_units(&header,&inspection,&incoming,7.into()).is_err());
+    assert_eq!(store.connection.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_,i64>(0)).unwrap(), 73);
+    assert!(!STAGE_SCRATCH.with(|scratch| scratch.borrow().clone()).unwrap().exists());
+    let wal = std::fs::metadata(format!("{}-wal", store.database_path.display())).map_or(0, |metadata| metadata.len());
+    assert!(wal < 64 << 10, "the main WAL must be checkpointed after the scratch is removed: {wal}");
+    eprintln!("binding_copy main_wal_after_checkpoint={wal}");
     for &(table, _) in GENERATION_TABLES {
         assert_eq!(store.connection.query_row(&format!("SELECT count(*) FROM {table} WHERE generation LIKE 'staging-%'"), [], |row| row.get::<_,i64>(0)).unwrap(),0,"{table}");
     }
@@ -542,6 +548,11 @@ fn late_binding_copy_trigger_failure_rolls_back_every_family_and_retries_exactly
     assert_eq!(store.connection.query_row("SELECT count(*) FROM message_page_objects", [], |row| row.get::<_,i64>(0)).unwrap(),source_objects);
     store.connection.execute_batch("DROP TRIGGER reject_binding_tail").unwrap();
     let stage = store.lww_stage_binding_units(&header,&inspection,&incoming,7.into()).unwrap();
+    assert_eq!(store.connection.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_,i64>(0)).unwrap(), 73);
+    assert!(!STAGE_SCRATCH.with(|scratch| scratch.borrow().clone()).unwrap().exists());
+    let wal = std::fs::metadata(format!("{}-wal", store.database_path.display())).map_or(0, |metadata| metadata.len());
+    assert!(wal < 64 << 10, "the main WAL must be checkpointed after the scratch is removed: {wal}");
+    eprintln!("binding_copy main_wal_after_checkpoint={wal}");
     assert_eq!(store.connection.query_row("SELECT count(*) FROM messages WHERE generation=?1", [&stage.staging_id], |row| row.get::<_,i64>(0)).unwrap(),513);
     assert_eq!(store.lww_stage_binding_units(&header,&inspection,&incoming,7.into()).unwrap(),stage);
     activate(&mut store,&header,&inspection,&stage);
@@ -841,6 +852,55 @@ fn binding_scratch_commits_bounded_batches_so_its_wal_never_holds_the_whole_stag
     assert!(growth(&sizes) > controls as u64, "{}", growth(&sizes));
     assert_eq!(unbatched.source_digest, stage.source_digest);
     assert_eq!(digests(&reference, &unbatched), digests(&store, &stage));
+}
+
+#[test]
+fn binding_rewrites_large_character_rows_with_a_bounded_scratch_wal() {
+    struct Restore((i64, i64), std::time::Duration);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCRATCH_BATCH_LIMITS.with(|limits| limits.set(self.0));
+            REPORT_INTERVAL.with(|interval| interval.set(self.1));
+        }
+    }
+    let _restore = Restore(SCRATCH_BATCH_LIMITS.with(|limits| limits.replace((i64::MAX, 64 << 10))), REPORT_INTERVAL.with(|interval| interval.replace(std::time::Duration::ZERO)));
+    for count in [8, 32] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(dir.path()).unwrap();
+        let ids = (0..count).map(|index| format!("synthetic-{index:03}")).collect::<Vec<_>>();
+        let mut incoming = Vec::new();
+        for id in &ids {
+            incoming.push(change(&["exists", "character", id], json!(true)));
+            incoming.push(change(&["character", id, "desc"], json!("x".repeat(64 << 10))));
+            // The second conversation changes the summary integer's stored width.
+            for conversation in ["first", "second"] {
+                incoming.push(change(&["exists", "conversation", id, conversation], json!(true)));
+            }
+        }
+        let expected = ids.iter().rev().cloned().collect::<Vec<_>>();
+        incoming.push(change(&["order", "characters"], json!(expected)));
+        let (header, inspection) = context(&store);
+        let mut peak = 0;
+        let mut main_after = 0;
+        let stage = store.lww_stage_binding_units_observed(&header, &inspection, &incoming, 7.into(), |progress| {
+            if progress.phase == "project" {
+                STAGE_SCRATCH.with(|scratch| {
+                    if let Some(path) = scratch.borrow().as_ref() {
+                        peak = peak.max(std::fs::metadata(path.join("incoming.sqlite-wal")).map_or(0, |metadata| metadata.len()));
+                    }
+                });
+            }
+            if progress.phase == "check" { main_after += 1; }
+            Ok(())
+        }).unwrap();
+        let stored = catalog(&store, &stage.staging_id);
+        assert_eq!(stored["characters"].as_array().unwrap().iter().map(|character| character["chaId"].as_str().unwrap().to_owned()).collect::<Vec<_>>(), expected);
+        assert!(stored["characters"].as_array().unwrap().iter().all(|character| character["desc"].as_str().unwrap().len() == 64 << 10));
+        assert!(conversation_counts(&store, &stage.staging_id).iter().all(|(_, stored, actual)| *stored == 2 && *actual == 2));
+        assert!(main_after > 0);
+        assert!(peak < 768 << 10, "{count} rewritten character rows reached {peak} scratch WAL bytes");
+        eprintln!("binding_rewrites characters={count} detail_bytes={} scratch_wal_peak={peak}", count * (64 << 10));
+    }
 }
 
 #[test]
