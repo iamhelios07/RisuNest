@@ -2916,5 +2916,6 @@ export const languageKorean = {
         registrationUsedOnboarding: "이미 사용한 등록 코드로는 연결할 수 없습니다. 동기화 서버의 기기 등록에서 새 등록 코드를 만들어 입력해주세요.",
         bindingIncomplete: "연결이 완료되지 않았습니다. 연결하고 동기화를 눌러 연결을 마치세요.",
     },
+    characterSelectionFailed: "캐릭터를 열 수 없습니다. 다시 시도해주세요.",
     navigationBlockedWhileEditingPaused: "편집이 잠시 중단되어 캐릭터를 선택할 수 없습니다.",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>

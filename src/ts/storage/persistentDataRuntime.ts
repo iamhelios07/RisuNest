@@ -748,14 +748,16 @@ export function createPersistentDataRuntime(
         coordinator.assertPersistentMutationAllowed()
         const prepare = options?.prepare
         const normalize = options?.normalize
+        const onRetryExhausted = options?.onRetryExhausted
         if (!prepare) {
             return workingSet.activateCharacter(
                 id,
-                normalize ? { normalize } : undefined,
+                normalize || onRetryExhausted ? { normalize, onRetryExhausted } : undefined,
             )
         }
         return workingSet.activateCharacter(id, {
             normalize,
+            onRetryExhausted,
             async prepare() {
                 const prepared = await prepare()
                 if (!prepared) return null
