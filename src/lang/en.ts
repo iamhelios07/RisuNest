@@ -3103,6 +3103,7 @@ export const languageEnglish = {
         registrationUsedOnboarding: "This registration code was already used, so this device cannot connect with it. Register a new device on the sync server, then enter the new registration code.",
         bindingIncomplete: "The connection was not completed. Press Connect and sync to finish it.",
     },
+    characterSelectionFailed: "The character could not be opened. Please try again.",
     navigationBlockedWhileEditingPaused: "Editing is paused, so a character cannot be selected.",
 } satisfies I18nTranslation;
 

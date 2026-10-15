@@ -29,11 +29,11 @@ vi.mock('../memory/hypamemory', () => ({ HypaProcesser: class {} }))
 
 import { GraphMemClient } from './graphmem'
 
-it('commits a written memory through the session that owns the selected conversation', async () => {
+it.each([undefined, 'null', '{}', '1', '[]'])('writes the first memory over an unset or non-array value %s', async (stored) => {
     const conversation = {
         id: 'conversation',
         message: [],
-        scriptstate: { $graphmem_graph: '[]' },
+        scriptstate: stored === undefined ? {} : { $graphmem_graph: stored },
     } as unknown as Chat
     live.database = {
         characters: [{ chaId: 'character', chatPage: 0, chats: [conversation], defaultVariables: '' }],
