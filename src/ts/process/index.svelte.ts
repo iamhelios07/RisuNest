@@ -1,3 +1,4 @@
+import { pluginStartupGate } from '../plugins/pluginStartupGate'
 import { resolvePinnedConversationPosition } from '../plugins/pinnedConversationPosition'
 import { registerGeneratingConversation } from '../storage/generatingConversationRegistry'
 import { openGenerationRequestPhase } from './generationRequestPhase'
@@ -613,6 +614,7 @@ export async function sendChat(arg:{
     /** A chat-screen send, which may load only recent messages when the device option is on. */
     historyLimit?:boolean
 } = {}, inheritedReservation?: GenerationReservation):Promise<boolean> {
+    if (pluginStartupGate.refuse()) return false
     const authorityEpoch = getPersistentStorageAuthorityEpoch()
     try {
         assertPersistentMutationAllowed(authorityEpoch)

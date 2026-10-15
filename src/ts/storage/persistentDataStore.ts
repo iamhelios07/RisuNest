@@ -488,6 +488,7 @@ export interface LwwReceiveHeader {
 }
 
 export interface LwwApplyResult {
+    pluginStorageChangedKeys?: string[]
     revision: DataRevision
     affectedKeys: string[]
     heldKeys: string[]

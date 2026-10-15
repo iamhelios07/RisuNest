@@ -1,3 +1,4 @@
+import { pluginStartupState, pluginStartupGate } from './pluginStartupGate'
 import { fromStore } from 'svelte/store'
 import { onboardingHold } from '../../lib/Others/Onboarding/onboardingGate'
 import { isTauri } from '../platform'
@@ -69,14 +70,16 @@ export function startDefaultPluginBootstrap(): void {
     started = true
     const onboarding = fromStore(onboardingHold)
     const blocked = fromStore(persistentWorkingSetInputBlocked)
+    const startup = fromStore(pluginStartupState)
     const stop = $effect.root(() => {
         $effect(() => {
             const held = onboarding.current
             const replacing = blocked.current
-            if (!DBState.db.didFirstSetup || held || replacing) return
+            const waiting = startup.current.phase !== 'released'
+            if (!DBState.db.didFirstSetup || held || replacing || waiting) return
             let cancelled = false
             void yieldToUi().then(async () => {
-                if (cancelled) return
+                if (cancelled || !await pluginStartupGate.ensure()) return
                 stop()
                 await installDefaultPlugins()
             }).catch(error => console.error('Default plugin bootstrap failed', error))

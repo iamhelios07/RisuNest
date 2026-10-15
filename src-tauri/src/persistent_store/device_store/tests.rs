@@ -804,6 +804,7 @@ fn device_settings_accept_only_the_assigned_keys() {
             "mcpStdioApprovals",
             "risuNestDeviceSettings",
             "risuNestStartupExclusions",
+            "risuNestPluginSyncSettings",
             "risuNestDefaultPluginsAttempted",
             "risuNestUpdateSettings",
             "risuNestServerSyncRestoreHold",
@@ -1468,6 +1469,7 @@ mod section_exchange {
             "risuNestServerSyncRestoreHold",
             "risu_lastsaved",
             "risuNestDefaultPluginsAttempted",
+            "risuNestPluginSyncSettings",
         ] {
             assert!(!LOCAL_SETTING_KEYS.contains(&key));
             store

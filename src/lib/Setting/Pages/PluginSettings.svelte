@@ -1,4 +1,5 @@
 <script lang="ts">
+    import PluginStartupNotice from 'src/lib/Others/PluginStartupNotice.svelte'
     import { openRisuNestSettingsTab } from "src/ts/setting/risuNestSettingsTabs";
     import { PlusIcon, TrashIcon, LinkIcon, CodeXmlIcon, PowerIcon, PowerOffIcon, ShieldIcon } from "@lucide/svelte";
     import { language } from "src/lang";
@@ -26,6 +27,8 @@
         alertToast(language.resetAllPluginPermissionsDone)
     }
 </script>
+
+<PluginStartupNotice inline />
 
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.plugin}</h2>
 

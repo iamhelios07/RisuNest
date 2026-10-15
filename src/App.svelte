@@ -47,6 +47,7 @@
     import { getStartupExclusions } from './ts/storage/deviceSettings';
     import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
     import SyncExitDialog from './lib/Others/SyncExitDialog.svelte';
+    import PluginStartupNotice from './lib/Others/PluginStartupNotice.svelte';
     import PersistentLocalSaveFailure from './lib/Others/PersistentLocalSaveFailure.svelte';
     import PersistentWorkingSetRecovery from './lib/Others/PersistentWorkingSetRecovery.svelte';
     import { persistentWorkingSetInputBlocked } from './ts/storage/persistentDataRuntime.svelte';
@@ -493,4 +494,7 @@
 </main>
 <SyncExitDialog />
 <PersistentWorkingSetRecovery />
-<PersistentLocalSaveFailure />
+<div class="pointer-events-none fixed right-2 z-[1000] flex max-h-[calc(100dvh-5rem)] flex-col gap-2 overflow-y-auto sm:left-auto sm:w-full sm:max-w-md {$MobileGUI ? 'left-2 top-[72px]' : 'left-14 top-2'} [&>*]:pointer-events-auto">
+    <PersistentLocalSaveFailure />
+    <PluginStartupNotice />
+</div>

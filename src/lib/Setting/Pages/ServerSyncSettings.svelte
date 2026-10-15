@@ -4,7 +4,7 @@
     import { language } from 'src/lang'
     import { alertActionConfirm, alertCheckboxConfirm, alertConfirm } from 'src/ts/alert'
     import { isTauri } from 'src/ts/platform'
-    import { platform as nativePlatform } from '@tauri-apps/plugin-os'
+    import { serverSyncErrorMessage, writerRecoveryCodes, registrationCodes, usedRegistrationCodes } from 'src/ts/storage/sync/serverSyncErrorMessage'
     import { completeServerSyncBinding, connectServerSync, disconnectServerSync, dismissServerSyncConnectionFailure, holdServerSync, retryServerSync, getServerSyncController, getServerSyncCacheUsage, cleanupServerSyncCache, type ServerSyncCacheUsage } from 'src/ts/storage/sync/serverSyncProduction'
     import { parseServerRegistration } from 'src/ts/storage/sync/serverSyncRegistration'
     import { serverRegistrationInbox } from 'src/ts/storage/sync/serverSyncRegistrationInbox'
@@ -14,7 +14,6 @@
     import { assetCleanupProgress, isAssetCleanupRunning } from 'src/ts/storage/sync/serverAssetCleanupProgress'
     import { describeBlockedReason } from 'src/ts/storage/sync/blockedReasonText'
     import type { ServerConfig } from 'src/ts/storage/sync/serverSync'
-    import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import { formatRisuNestStorageBytes as bytes } from 'src/ts/storage/risuNestStorageDashboard'
     import { serverSyncProgressView, serverSyncRoutineView } from 'src/ts/storage/sync/serverSyncProgress'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
@@ -63,10 +62,6 @@
     let stopWatching = () => {}
     let stopCleanup = () => {}
     let mounted = false
-    const writerRecoveryCodes = ['writer-collision', 'equal-stamp-integrity']
-    const registrationCodes = ['unauthorized', 'invalid-device-token', 'server-epoch-changed']
-    // The server refused the registration code itself, so only a new one can connect.
-    const usedRegistrationCodes = ['registration-used', 'registration-integrity', 'registration-not-new']
     // Sync stays stopped by the collision while another connection attempt fails.
     let writerRecovery = $derived(writerRecoveryCodes.includes(view.error) || writerRecoveryCodes.includes(view.blockedCode))
     let connected = $derived(!!view.status.configured && !!view.status.bound)
@@ -97,21 +92,8 @@
         { value: 'full' as AssetResidencyPolicy, label: copy.residency.full },
         { value: 'remote' as AssetResidencyPolicy, label: copy.residency.remote },
     ])
-    const linux = (() => { try { return isTauri && nativePlatform() === 'linux' } catch { return false } })()
     const errorCode = (error: unknown) => typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
-    const message = (error: unknown) => {
-        const token = errorCode(error)
-        if (['clock-skew', 'incoming-clock-skew', 'accepted-clock-correction-required'].includes(token)) return language.lwwSync.clockBlocked
-        if (writerRecoveryCodes.includes(token)) return language.lwwSync.writerCollision
-        if (token === 'unit-too-large') return language.lwwSync.unitTooLarge
-        if (token === 'device-credential-unavailable') return linux ? copy.credentialUnavailableLinux : copy.credentialUnavailable
-        if (registrationCodes.includes(token)) return language.lwwSync.registrationRevoked
-        if (usedRegistrationCodes.includes(token)) return tone === 'onboarding' ? language.lwwSync.registrationUsedOnboarding : language.lwwSync.registrationUsed
-        if (token === PREVIOUS_FILES_DOWNLOAD_FAILED) return language.lwwSync.downloadFailedNotConnected
-        if (token === 'previous-storage-unavailable') return language.lwwSync.previousStorageUnavailable
-        if (token.startsWith('qr-')) return token.includes('permission') ? copy.cameraDenied : copy.cameraUnavailable
-        return copy.errorHelp
-    }
+    const message = (error: unknown) => serverSyncErrorMessage(error, tone === 'onboarding')
     async function readResidency() {
         const read = ++residencyRead
         residencyFailed = false

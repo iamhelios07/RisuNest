@@ -1857,23 +1857,31 @@ pub(crate) fn pds_list_plugin_device_storage(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_plugin_device_sequence(
+    state: State<'_, PersistentStoreState>, owner: String, space: String, key: String,
+) -> Result<String, StoreError> {
+    logged("pds_plugin_device_sequence", with_store(state, |store| store.device_store()?.plugin_device_sequence(&owner, &space, &key)))
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_write_plugin_device_values(
     app: AppHandle,
     state: State<'_, PersistentStoreState>,
     owner: String,
     mutations: Vec<PluginDeviceMutation>,
-) -> Result<(), StoreError> {
+    observations: Option<Vec<super::device_store::plugin_values::PluginDeviceObservation>>,
+) -> Result<Vec<super::device_store::plugin_values::PluginDeviceObservation>, StoreError> {
     logged("pds_write_plugin_device_values", (|| {
-        let changed = with_store_mut(state, |store| {
+        let (changed, observed) = with_store_mut(state, |store| {
             let device = store.device_store_mut()?;
             let before = device.revision()?;
-            device.write_plugin_device_values(&owner, &mutations)?;
-            Ok(device.revision()? != before)
+            let observed = device.write_plugin_device_values_observed(&owner, &mutations, &observations.unwrap_or_default(), super::device_store::plugin_values::text_value::PART_BYTES as u64, super::device_store::plugin_values::text_value::REQUEST_BYTES)?;
+            Ok((device.revision()? != before, observed))
         })?;
         if changed {
             crate::server_sync::events::notify_device_changed(&app);
         }
-        Ok(())
+        Ok(observed)
     })())
 }
 

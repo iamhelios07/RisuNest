@@ -315,3 +315,67 @@ fn a_marked_body_is_stored_again_before_a_write_or_receive_relies_on_it() {
     store.lww_put_object(&control_hash, &control).unwrap();
     assert_eq!(store.external_lww_verified_control_size(&control_hash).unwrap(), Some(control.len() as u64));
 }
+
+
+#[test]
+fn conditional_plugin_local_writes_reject_received_values_deletions_and_staged_payloads() {
+    use device_store::plugin_values::{PluginDeviceMutation as Mutation, PluginDeviceObservation, text_value};
+    let (_dir, mut store) = store();
+    store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins, true).unwrap();
+    let change = |value: &str, time| Change { key: unit_key(&PLUGIN_KEY).unwrap(), stamp: stamp(time), value: inline(&serde_json::json!(value)).unwrap() };
+    receive(&mut store, change("old", 1));
+    let observed = PluginDeviceObservation { space: PLUGIN_KEY[2].into(), key: PLUGIN_KEY[3].into(),
+        sequence: store.device_store().unwrap().plugin_device_sequence(PLUGIN_KEY[1], PLUGIN_KEY[2], PLUGIN_KEY[3]).unwrap() };
+    let staged = store.device_store_mut().unwrap().open_plugin_device_write(PLUGIN_KEY[1], PLUGIN_KEY[2], PLUGIN_KEY[3], 7).unwrap();
+    let id = serde_json::to_value(staged).unwrap()["sessionId"].as_str().unwrap().to_owned();
+    store.device_store_mut().unwrap().append_plugin_device_write(PLUGIN_KEY[1], &id, 0, "stale").unwrap();
+    receive(&mut store, change("remote", 2));
+    let current = store.device_store().unwrap().plugin_device_sequence(PLUGIN_KEY[1], PLUGIN_KEY[2], PLUGIN_KEY[3]).unwrap();
+    assert_ne!(current, observed.sequence);
+    receive(&mut store, change("remote", 2));
+    receive(&mut store, change("remote", 3));
+    assert_eq!(current, store.device_store().unwrap().plugin_device_sequence(PLUGIN_KEY[1], PLUGIN_KEY[2], PLUGIN_KEY[3]).unwrap());
+    for mutation in [Mutation::Set { space: PLUGIN_KEY[2].into(), key: PLUGIN_KEY[3].into(), value: "stale".into() },
+        Mutation::Delete { space: PLUGIN_KEY[2].into(), key: PLUGIN_KEY[3].into() },
+        Mutation::Clear { space: PLUGIN_KEY[2].into() }, Mutation::Staged { session_id: id }] {
+        let failed = store.device_store_mut().unwrap().write_plugin_device_values_observed(PLUGIN_KEY[1], &[
+            Mutation::Set { space: "string".into(), key: "batch-sibling".into(), value: "must roll back".into() }, mutation,
+        ], &[observed.clone()], text_value::PART_BYTES as u64, text_value::REQUEST_BYTES).unwrap_err();
+        assert!(failed.to_string().contains("PLUGIN_STORAGE_STALE"));
+        assert_eq!(plugin_value(&store), Some("remote".into()));
+        assert!(store.device_store().unwrap().read_plugin_device_value(PLUGIN_KEY[1], "string", "batch-sibling").unwrap().is_none());
+        assert!(store.lww_read_outbox(store.lww_binding_authority().unwrap(), 100).unwrap().entries.is_empty());
+    }
+    receive(&mut store, Change { key: unit_key(&PLUGIN_KEY).unwrap(), stamp: stamp(4), value: UnitValue::Deleted });
+    let mutation = Mutation::Set { space: PLUGIN_KEY[2].into(), key: PLUGIN_KEY[3].into(), value: "fresh".into() };
+    assert!(store.device_store_mut().unwrap().write_plugin_device_values_observed(PLUGIN_KEY[1], &[mutation.clone()], &[observed], text_value::PART_BYTES as u64, text_value::REQUEST_BYTES).is_err());
+    assert_eq!(plugin_value(&store), None);
+    let fresh = PluginDeviceObservation { space: PLUGIN_KEY[2].into(), key: PLUGIN_KEY[3].into(),
+        sequence: store.device_store().unwrap().plugin_device_sequence(PLUGIN_KEY[1], PLUGIN_KEY[2], PLUGIN_KEY[3]).unwrap() };
+    let committed = store.device_store_mut().unwrap().write_plugin_device_values_observed(PLUGIN_KEY[1], &[mutation], &[fresh.clone()], text_value::PART_BYTES as u64, text_value::REQUEST_BYTES).unwrap();
+    assert_eq!(committed[0].sequence, fresh.sequence);
+    assert_eq!(plugin_value(&store), Some("fresh".into()));
+    let cleared = store.device_store_mut().unwrap().write_plugin_device_values_observed(PLUGIN_KEY[1],
+        &[Mutation::Clear { space: PLUGIN_KEY[2].into() }], &[], text_value::PART_BYTES as u64, text_value::REQUEST_BYTES).unwrap();
+    assert_eq!(cleared.len(), 1);
+    assert_eq!(cleared[0].key, PLUGIN_KEY[3]);
+    assert_eq!(cleared[0].sequence, fresh.sequence);
+    assert_eq!(plugin_value(&store), None);
+}
+
+#[test]
+fn plugin_local_observations_ignore_nonparticipating_receives_and_fence_a_reopened_connection() {
+    use device_store::plugin_values::{PluginDeviceMutation as Mutation, PluginDeviceObservation, text_value};
+    let (dir, mut store) = store();
+    let sequence = store.device_store().unwrap().plugin_device_sequence(PLUGIN_KEY[1], PLUGIN_KEY[2], PLUGIN_KEY[3]).unwrap();
+    receive(&mut store, Change { key: unit_key(&PLUGIN_KEY).unwrap(), stamp: stamp(1), value: inline(&serde_json::json!("remote")).unwrap() });
+    assert_eq!(sequence, store.device_store().unwrap().plugin_device_sequence(PLUGIN_KEY[1], PLUGIN_KEY[2], PLUGIN_KEY[3]).unwrap());
+    let observed = PluginDeviceObservation { space: PLUGIN_KEY[2].into(), key: PLUGIN_KEY[3].into(), sequence };
+    let mutation = Mutation::Set { space: PLUGIN_KEY[2].into(), key: PLUGIN_KEY[3].into(), value: "local".into() };
+    store.device_store_mut().unwrap().write_plugin_device_values_observed(PLUGIN_KEY[1], &[mutation.clone()], &[observed.clone()], text_value::PART_BYTES as u64, text_value::REQUEST_BYTES).unwrap();
+    assert_eq!(plugin_value(&store), Some("local".into()));
+    drop(store);
+    let mut reopened = PersistentStore::open(dir.path()).unwrap();
+    assert!(reopened.device_store_mut().unwrap().write_plugin_device_values_observed(PLUGIN_KEY[1], &[mutation.clone()], &[observed], text_value::PART_BYTES as u64, text_value::REQUEST_BYTES).is_err());
+    reopened.device_store_mut().unwrap().write_plugin_device_values_observed(PLUGIN_KEY[1], &[mutation], &[], text_value::PART_BYTES as u64, text_value::REQUEST_BYTES).unwrap();
+}

@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { pluginStartupGate } from 'src/ts/plugins/pluginStartupGate'
     import { ScreenshotPreparationError } from 'src/ts/chatScreenshotErrors'
     import { v4 } from 'uuid'
     import { alertConfirm } from 'src/ts/alert'
@@ -389,13 +390,14 @@
     }
 
     async function sendMain(continueResponse:boolean) {
+        const submittedComposer = captureComposerInput()
+        if (!submittedComposer.text.startsWith('/') && pluginStartupGate.refuse()) return
         if($doingChat || sending || rerollBusy){
             return
         }
         const generation = reserveChatGeneration()
         if (!generation) return
         sending = true
-        const submittedComposer = captureComposerInput()
         const submittedInput = submittedComposer.text
         const submittedFiles = [...fileInput]
         let windowed = false
@@ -559,8 +561,9 @@
         let messages = mutationTarget.conversation.message
 
         if(input.startsWith('/')){
+            const refusals = pluginStartupGate.refusalCount
             const commandProcessed = await processMultiCommand(input, undefined, { signal: generation.signal, reservation: generation })
-            if (generation.signal.aborted) return
+            if (generation.signal.aborted || refusals !== pluginStartupGate.refusalCount) return
             context.requireCurrent()
             if(commandProcessed !== false){
                 chatScreenState.clearSubmittedComposer(submittedComposer)
@@ -570,6 +573,7 @@
             messages = mutationTarget.conversation.message
         }
 
+        if (pluginStartupGate.refuse()) return
         for(const file of submittedFiles){
             input += `{{inlayed::${file}}}`
         }
@@ -641,6 +645,7 @@
     }
 
     async function rerollCandidate(expectedLastMessage?: string) {
+        if (pluginStartupGate.refuse()) return
         if ($doingChat || rerollBusy || sending) return
         const generation = reserveChatGeneration()
         if (!generation) return
@@ -833,6 +838,7 @@
     }
 
     async function sendChatMain(continued:boolean = false) {
+        if (pluginStartupGate.refuse()) return
         const generation = reserveChatGeneration()
         if (!generation) return
         try {

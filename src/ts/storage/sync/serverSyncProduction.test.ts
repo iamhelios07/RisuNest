@@ -98,6 +98,49 @@ const openConversation = (conversationId: string) => { f.conversation = { charac
 const callOrder = (command: string) => f.invoke.mock.invocationCallOrder[f.invoke.mock.calls.findIndex(([name]) => name === command)]
 
 describe('production server LWW composition', () => {
+    it('keeps startup closed across an empty intermediate page and projection, then stops at the first frontier', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        await f.transport!.resumeBinding(bindingContext()); await settle()
+        let pulls = 0, finish!: () => void
+        const projected = new Promise<void>(resolve => { finish = resolve })
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command !== 'server_sync_lww_pull') return base(command, args)
+            pulls++
+            if (pulls > 2) throw new Error('receive chased a later frontier')
+            return { ...emptyReceive(), progress: {kind: 'server', cursor: String(pulls)},
+                more: true, receiveFrontier: pulls === 1 ? '2' : '999' }
+        })
+        f.apply.mockImplementation(async request => {
+            if (request.progress.cursor === '2') await projected
+            return { revision: 31, affectedKeys: [], heldKeys: [], deferredKeys: [] }
+        })
+        const { createPluginStartupGate } = await import('../../plugins/pluginStartupGate')
+        let starts = 0
+        const gate = createPluginStartupGate({ enabled: () => true, delay: () => true,
+            context: async () => ({ identity: 'server', bound: true, assertCurrent: async () => {},
+                receive: signal => f.transport!.receiveAvailableChanges!({...bindingContext(), signal}) }),
+            start: async () => { if (await gate.ensure()) starts++ },
+        })
+        expect(await gate.ensure()).toBe(false)
+        await settle(); expect(pulls).toBe(2); expect(starts).toBe(0)
+        finish(); await settle()
+        expect(starts).toBe(1)
+        expect(pulls).toBe(2)
+    })
+
+    it('keeps a recovered committed restore stopped until an explicit resume', async () => {
+        production.holdServerSyncAfterRestore()
+        production.initializeNativeSyncBindings()
+        await production.installServerSyncProduction()
+        visible(true); await settle()
+        expect(f.transport?.heldForCommittedRestore?.()).toBe(true)
+        expect(pullCalls()).toBe(0)
+        expect(f.resumeCurrent).not.toHaveBeenCalled()
+        await f.transport!.resumeBinding(bindingContext())
+        expect(f.transport?.heldForCommittedRestore?.()).toBe(false)
+    })
+
     it.each(['module.bin', 'character.charx'])('waits for external assets with both sync adapters installed before importing %s', async name => {
         vi.stubGlobal('window', new EventTarget())
         vi.stubGlobal('navigator', { onLine: true })

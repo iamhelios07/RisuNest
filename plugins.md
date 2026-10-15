@@ -685,6 +685,28 @@ const deviceId = await Risuai.safeLocalStorage.getItem('device_id');
 - Data should stay on one device
 - Storing device-specific settings
 
+### Storage changes received during synchronization
+
+RisuNest rejects a storage write with a message beginning `PLUGIN_STORAGE_STALE` when synchronization has replaced a key since the running plugin last read or successfully wrote it. This applies to save-specific plugin storage, database-permission writes to `pluginCustomStorage`, and device-local plugin storage when it participates in synchronization. A rejected batch changes nothing. `clear()` rejects when any previously observed key in that storage space has changed remotely.
+
+Read the value again and derive the intended edit from that new value. Do not retry the cached payload after refreshing the observation:
+
+```javascript
+const storage = Risuai.pluginStorage;
+async function changeTheme(theme) {
+    const current = (await storage.getItem('settings')) ?? {};
+    await storage.setItem('settings', { ...current, theme });
+}
+// If this rejects with PLUGIN_STORAGE_STALE, report the failure and let the
+// user retry changeTheme. Keep the requested theme, not the old settings object.
+```
+
+`getItem()` observes missing keys too. A full storage snapshot observes the owner's keys; listing keys or reading the length does not observe their contents. Writes to keys the instance has never read or written remain ordinary blind writes. A received change to an observed key requests a reload of all plugins after ongoing plugin work completes, with the existing 60-second interruption limit. Timer and unload writes receive the same checks.
+
+With synchronization configured, RisuNest delays plugin loading by default until its initial receive completes. Users can load plugins for the current launch or disable the delay in RisuNest's backup and synchronization settings. Runtime stale-write checks still apply. The preference is local to the installation and is not included in portable backups.
+
+These checks cannot detect a remote change that this device has not received yet. A write committed before receive still follows the normal last-writer-wins rule. Avoid automatically republishing an entire cached value at startup, on timers, or during unload. This API does not merge opaque values or preserve a rejected edit automatically.
+
 ### Local Plugin Storage
 
 `getLocalPluginStorage()` is also device-local and follows the same sync rule as `safeLocalStorage`. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. In RisuNest it is confined to your plugin, and it is a separate space from `safeLocalStorage`, so clearing one leaves the other alone.

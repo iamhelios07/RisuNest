@@ -1,3 +1,5 @@
+import { advancePluginStorageRemoteChanges, fenceUnknownPluginStorageDrain } from '../plugins/pluginStorageProtection'
+import type { PluginStorageWriteCheck } from '../plugins/pluginStorageProtection'
 import { canonicalJson, canonicalClone } from './saveCoordinatorHelpers'
 import {claimCommittedWorkingSetRecovery, continueCommittedWorkingSetRefresh, hasRetryableCommittedWorkingSetContinuation, rebaseCommittedWorkingSetContinuation, registerCommittedWorkingSetContinuation} from './committedWorkingSetContinuation'
 import { diffRootMutations } from './rootMutation'
@@ -378,7 +380,7 @@ export interface PersistentDataRuntime {
     refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
     drainLwwDeferred(expectedAuthorityEpoch?: number): Promise<void>
-    commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[], projectionObserver?: PersistentUnitIntentProjectionObserver): Promise<void>
+    commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[], projectionObserver?: PersistentUnitIntentProjectionObserver, check?: PluginStorageWriteCheck): Promise<void>
     /** Prepares at the revision the commit expects, through a reader pinned there; `null` commits nothing. */
     commitPreparedUnitIntent(reason: string, prepare: (reader: PersistentRevisionReader) => Promise<PreparedUnitIntent | null>): Promise<DataRevision | null>
 
@@ -455,6 +457,7 @@ export interface PersistentDataRuntime {
     mutatePersistentPluginStorage(
         reason: string,
         mutations: readonly PluginStorageMutation[],
+        check?: PluginStorageWriteCheck,
     ): Promise<void>
     mutatePersistentPresets(
         reason: string,
@@ -1203,6 +1206,14 @@ export function createPersistentDataRuntime(
         if (reopened) void Promise.resolve().then(() => workingSet.activateConversation(reopened))
             .catch((error) => dependencies.onBackgroundError?.(error))
     }
+    const fenceReceivedPluginStorage = (keys: readonly string[]) => {
+        for (const unit of keys) {
+            const [kind, owner, key] = JSON.parse(unit) as string[]
+            if (kind === 'plugin') dependencies.state.onPluginStorageChanged?.(owner, key)
+            else if (kind === 'plugin-local') dependencies.state.onPluginDeviceStorageChanged?.(owner)
+        }
+        advancePluginStorageRemoteChanges(keys)
+    }
     const drainLwwDeferred = async (authorityEpoch = coordinator.storageAuthorityEpoch): Promise<void> => {
         coordinator.assertPersistentMutationAllowed(authorityEpoch)
         if (!dependencies.store.lwwBindingState || !dependencies.store.lwwDrainDeferred) return
@@ -1212,7 +1223,14 @@ export function createPersistentDataRuntime(
             coordinator.assertPersistentMutationAllowed(authorityEpoch)
             const database = dependencies.state.captureWorkingSetDatabase?.()
             const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
-            const result = await dependencies.store.lwwDrainDeferred!({ bindingAuthority: binding.targetAuthority, requestId: crypto.randomUUID(), generating: generating() })
+            let result: LwwApplyResult
+            try {
+                result = await dependencies.store.lwwDrainDeferred!({ bindingAuthority: binding.targetAuthority, requestId: crypto.randomUUID(), generating: generating() })
+            } catch (error) {
+                fenceUnknownPluginStorageDrain()
+                throw error
+            }
+            fenceReceivedPluginStorage(result.pluginStorageChangedKeys ?? result.affectedKeys)
             try {
                 coordinator.assertPersistentMutationAllowed(authorityEpoch)
                 await projectAppliedUnits(result, baseline)
@@ -1283,7 +1301,13 @@ export function createPersistentDataRuntime(
                 const baseline = database && staged.changes.length > 0 ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
                 await store.lwwStageReceive(staged)
                 const header = { bindingAuthority: staged.bindingAuthority, requestId: staged.requestId }
-                const result = await store.lwwApplyReceive({ ...header, generating: generating() })
+                let result: LwwApplyResult
+                try { result = await store.lwwApplyReceive({ ...header, generating: generating() }) }
+                catch (error) {
+                    fenceReceivedPluginStorage(staged.changes.map(change => change.key))
+                    throw error
+                }
+                fenceReceivedPluginStorage(result.pluginStorageChangedKeys ?? result.affectedKeys)
                 try { await projectAppliedUnits(result, baseline) }
                 catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(result.revision, error); throw error }
                 finally { await store.lwwFinishReceive(header) }
@@ -1291,7 +1315,7 @@ export function createPersistentDataRuntime(
             })
         },
         drainLwwDeferred,
-        async commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages, projectionObserver) {
+        async commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages, projectionObserver, check) {
             // Translation reads the effective identity records, so unsaved mirror
             // edits reach them first.
             dependencies.state.beforeCapture?.()
@@ -1301,7 +1325,7 @@ export function createPersistentDataRuntime(
             await coordinator.commitPersistentUnitIntent(reason, translated, conversations, wholeMessages, async (revision) => {
                 try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true, false, projectionObserver) }
                 catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(revision, error); throw error }
-            })
+            }, check)
         },
         async commitPreparedUnitIntent(reason, prepare) {
             dependencies.state.beforeCapture?.()
@@ -1538,8 +1562,8 @@ export function createPersistentDataRuntime(
                 options,
             )
         },
-        mutatePersistentPluginStorage: (reason, mutations) =>
-            coordinator.mutatePersistentPluginStorage(reason, mutations),
+        mutatePersistentPluginStorage: (reason, mutations, check) =>
+            coordinator.mutatePersistentPluginStorage(reason, mutations, check),
         mutatePersistentPresets: (reason, mutate) =>
             coordinator.mutatePersistentPresets(reason, mutate),
         appendPersistentRootModule: (reason, input, signal) =>

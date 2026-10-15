@@ -977,7 +977,36 @@ pub(in crate::persistent_store) fn apply(
     key: &UnitKey,
     value: &UnitValue,
 ) -> StoreResult<()> {
-    apply_value(tx, generation, key, value, false)
+    if key.components()[0] == "plugin-local" {
+        apply_received(tx, generation, key, value).map(|_| ())
+    } else {
+        apply_value(tx, generation, key, value, false)
+    }
+}
+
+pub(in crate::persistent_store) fn apply_received(
+    tx: &Transaction<'_>, generation: &str, key: &UnitKey, value: &UnitValue,
+) -> StoreResult<bool> {
+    let changed = plugin_storage_changed(tx, generation, key, value)?;
+    apply_value(tx, generation, key, value, false)?;
+    let p = key.components();
+    if changed && p[0] == "plugin-local" {
+        plugin_values::advance_remote_sequence(tx, &p[1], &p[2], &p[3])?;
+    }
+    Ok(changed)
+}
+
+fn plugin_storage_changed(tx: &Transaction<'_>, generation: &str, key: &UnitKey, value: &UnitValue) -> StoreResult<bool> {
+    let p = key.components();
+    let current = if p[0] == "plugin-local" {
+        if !plugin_participates(tx)? { return Ok(false); }
+        plugin_unit_value(tx, &p[1], &p[2], &p[3])?
+    } else if p[0] == "plugin" {
+        let mut values = BTreeMap::new();
+        capture_key(tx, generation, key, &mut values)?;
+        values.remove(key).unwrap_or(UnitValue::Deleted)
+    } else { return Ok(false); };
+    Ok(wire(current.identity())? != wire(value.identity())?)
 }
 /// The character whose detail `apply` patches for this key, when the patch
 /// touches nothing else.

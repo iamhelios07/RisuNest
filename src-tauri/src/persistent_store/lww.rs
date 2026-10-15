@@ -242,6 +242,7 @@ pub(crate) struct ApplyReceive {
 pub(crate) struct ApplyResult {
     pub revision: i64,
     pub affected_keys: Vec<UnitKey>,
+    pub plugin_storage_changed_keys: Vec<UnitKey>,
     pub held_keys: Vec<UnitKey>,
     pub deferred_keys: Vec<UnitKey>,
 }
@@ -2386,7 +2387,9 @@ impl PersistentStore {
                         && read_unit(&tx, &change.key)?
                             .is_none_or(|(_, v)| !matches!(v, UnitValue::Deleted));
                     if decision == LwwDecision::ApplyRemote || new_retirement {
-                        projection::apply(&tx, &generation, &change.key, &change.value)?;
+                        if projection::apply_received(&tx, &generation, &change.key, &change.value)? {
+                            result.plugin_storage_changed_keys.push(change.key.clone());
+                        }
                         put_unit(
                             &tx,
                             &change.key,
@@ -2397,7 +2400,9 @@ impl PersistentStore {
                         )?;
                         result.affected_keys.push(change.key.clone());
                     } else if was_unprojected && decision == LwwDecision::Identical {
-                        projection::apply(&tx, &generation, &change.key, &change.value)?;
+                        if projection::apply_received(&tx, &generation, &change.key, &change.value)? {
+                            result.plugin_storage_changed_keys.push(change.key.clone());
+                        }
                         result.affected_keys.push(change.key.clone());
                     }
                     let local_pending: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM lww_requests receipt JOIN lww_outbox pending ON pending.version=receipt.request_id WHERE receipt.request_id=?1 AND pending.key=?2 AND pending.stamp=?3 AND pending.value=?4)",params![id,change.key.as_str(),serde_json::to_string(&change.stamp)?,serde_json::to_string(&change.value)?],|row|row.get(0))?;

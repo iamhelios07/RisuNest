@@ -195,7 +195,7 @@ export function persistentDataRuntimeModule() {
 
 export function pluginsModule() {
     return {
-        keepPluginsOffForThisStart: vi.fn(), loadPlugins: vi.fn(), loadPluginsAfterAuthoritativeRestore: vi.fn(),
+        keepPluginsOffForThisStart: vi.fn(), afterPluginsStarted: vi.fn(() => () => {}), loadPlugins: vi.fn(), loadPluginsAfterAuthoritativeRestore: vi.fn(),
     } satisfies Partial<typeof import('./plugins/plugins.svelte')>
 }
 
