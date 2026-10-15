@@ -567,7 +567,6 @@
       if (this.active) fail("invalidData");
       const encoded = archiveName(name);
       if (this.names.has(name)) fail("duplicate");
-      if (this.names.size >= 2e5 || this.nameBytes + encoded.length > 64 * 1024 * 1024) fail("tooMany");
       if (size != null) u32(size);
       this.names.add(name);
       this.nameBytes += encoded.length;
@@ -2984,19 +2983,22 @@
   // src/scan.mjs
   var COLD_HEADER = "COLDSTORAGE";
   var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  var MAX_STRING = 8 * 1024 * 1024;
+  var MAX_STRING = 64 * 1024 * 1024;
   var MAX_BLOCK = 1024 * 1024 * 1024;
   var MAX_REFERENCE = 64 * 1024;
   var MAX_HELD_PLUGIN_STORAGE = 64 * 1024;
   var EMPTY_PLUGIN_STORAGE = Uint8Array.of(11, 0, 13, ...encoder.encode("pluginStorage"), 2, 0, 0, 0, ...encoder.encode("{}"));
   var JsonScan = class {
-    constructor(visit, { maxString = MAX_STRING, blank = false } = {}) {
+    constructor(visit, { maxString = MAX_STRING, blank = false, cold = false } = {}) {
       this.visit = visit;
       this.stack = [];
       this.rootDone = false;
       this.pending = 0;
       this.maxString = maxString;
       this.blank = blank;
+      this.cold = cold;
+      this.receivedBytes = 0;
+      this.previousScalar = null;
       this.decoder = new TextDecoder("utf-8", { fatal: true });
       this.tokenizer = new Tokenizer({ stringBufferSize: 64 * 1024 });
       this.tokenizer.onToken = (token) => {
@@ -3004,11 +3006,18 @@
         this.token(token);
       };
     }
-    token({ token, value }) {
+    token({ token, value, offset }) {
+      this.checkScalarEnd(offset);
+      if (token === tokenType_default.STRING && encoder.encode(JSON.stringify(value)).length > this.maxString) fail("recordTooLarge");
+      if ([tokenType_default.STRING, tokenType_default.NUMBER, tokenType_default.TRUE, tokenType_default.FALSE, tokenType_default.NULL].includes(token)) this.previousScalar = offset;
+      for (const container of this.stack) {
+        if (container.bounded && offset - container.start + 1 > this.maxString) fail("recordTooLarge");
+      }
       const frame = this.stack.at(-1);
       if (frame?.state === "colon") {
         if (token !== tokenType_default.COLON) fail("invalidData");
         frame.state = "value";
+        frame.valueStart = offset + 1;
         return;
       }
       if (frame?.state === "comma") {
@@ -3038,19 +3047,23 @@
       }
       if (!frame && this.rootDone) fail("invalidData");
       const path = frame ? [...frame.path, frame.object ? frame.key : frame.index++] : [];
+      const recordStart = frame?.object ? frame.valueStart : offset;
+      if (this.previousScalar !== null) this.previousScalar = recordStart;
       if (frame) frame.state = "comma";
       else this.rootDone = true;
       if (token === tokenType_default.LEFT_BRACE || token === tokenType_default.LEFT_BRACKET) {
         if (this.stack.length >= 256) fail("invalidData");
         const object = token === tokenType_default.LEFT_BRACE;
         this.visit(path, object ? {} : []);
-        this.stack.push({ path, object, state: object ? "keyOrEnd" : "valueOrEnd", index: 0 });
+        const relative = this.cold && path[0] === "character" ? path.slice(1) : path;
+        const streamed = relative.length === 0 || relative.length === 1 && (relative[0] === "chats" || this.cold && relative[0] === "message") || relative[0] === "chats" && typeof relative[1] === "number" && (relative.length === 2 || relative.length === 3 && relative[2] === "message");
+        this.stack.push({ path, object, state: object ? "keyOrEnd" : "valueOrEnd", index: 0, start: recordStart, bounded: !streamed });
       } else if ([tokenType_default.STRING, tokenType_default.NUMBER, tokenType_default.TRUE, tokenType_default.FALSE, tokenType_default.NULL].includes(token)) {
-        if (typeof value === "string" && value.length > this.maxString) fail("recordTooLarge");
         this.visit(path, value);
       } else fail("invalidData");
     }
     write(bytes) {
+      this.receivedBytes += bytes.length;
       this.pending += bytes.length;
       if (this.pending > this.maxString + 256 * 1024) fail("recordTooLarge");
       try {
@@ -3066,11 +3079,16 @@
         const tail = this.decoder.decode();
         if (tail) this.tokenizer.write(tail);
         this.tokenizer.end();
+        this.checkScalarEnd(this.receivedBytes);
       } catch (error) {
         if (error instanceof ExportError) throw error;
         fail("invalidData");
       }
       if (this.stack.length || !this.rootDone && !this.blank) fail("truncated");
+    }
+    checkScalarEnd(offset) {
+      if (this.previousScalar !== null && offset - this.previousScalar > this.maxString) fail("recordTooLarge");
+      this.previousScalar = null;
     }
   };
   function references() {
@@ -3081,7 +3099,8 @@
       cold.add(key);
     }
     function visitPluginStorage(path, value) {
-      if (path.length === 2 && path[0] === "_coldplugin" && typeof value === "string" && value) pluginCold.add(value);
+      if (typeof value !== "string" || !value) return;
+      if (path.length === 2 && path[0] === "_coldplugin" || path.length === 1 && path[0] === "_coldpluginIndex") pluginCold.add(value);
     }
     return {
       assets,
@@ -3102,7 +3121,6 @@
         if (!value.startsWith("assets/")) return;
         if (["customBackground", "userIcon", "image", "icon", "imgFile"].includes(key) || key === "img" && path.at(-3) === "characterOrder" || key === "uri" && path.includes("ccAssets") || parent === "files" && path.includes("vits") || key === 1 && ["emotionImages", "additionalAssets", "assets"].includes(path.at(-3))) {
           assets.add(value);
-          if (assets.size + cold.size > 199999) fail("tooMany");
         }
       }
     };
@@ -3246,7 +3264,6 @@
         if (![0, 1, 2, 4, 5, 7, 9, 10, 11].includes(type)) fail("unsupported");
         if (expected.has(type) && expected.get(type) !== name) fail("invalidData");
         names.add(name);
-        if (names.size > 2e5) fail("tooMany");
         const header = new Uint8Array(7 + nameLength);
         header.set(head);
         header.set(label, 3);
@@ -3379,7 +3396,6 @@
         if (!batch.length) break;
         if (batch.some((key) => typeof key !== "string")) fail("invalidName");
         all.push(...batch);
-        if (all.length > 2e5) fail("tooMany");
         last = batch.at(-1);
         if (batch.length < 512) break;
       } while (true);
@@ -3636,7 +3652,6 @@
             const key = fromHex(name);
             if (key?.startsWith("assets/")) assets.push(key);
           }
-          if (assets.length + cold.length > 199999) fail("tooMany");
         }
       }
       if (this.mode !== "opfs") {
@@ -3644,7 +3659,6 @@
         assets.push(...(await db?.keys(this.signal) ?? []).filter((key) => key.startsWith("assets/")));
       }
       const inlays = await this.inlays?.keys(this.signal) ?? [];
-      if (assets.length + cold.length + inlays.length > 199999) fail("tooMany");
       return { assets: assets.sort(), cold: cold.sort(), inlays: inlays.sort() };
     }
     async database() {
@@ -3819,7 +3833,7 @@
         if (!path.length) root = Array.isArray(value) ? "array" : value && typeof value === "object" ? "object" : "scalar";
         if (path.length === 1 && ["character", "message"].includes(path[0])) chat = true;
         found.visit(path, value);
-      });
+      }, { cold: true });
       await writer.begin("coldstorage_" + key + ".json");
       for await (const bytes of gunzip(compressed, signal3)) {
         size += bytes.length;
@@ -3878,7 +3892,6 @@
         }
         for (const asset of found.assets) refs.assets.add(asset);
         for (const next of found.cold) coldKeys.add(next);
-        if (coldKeys.size + refs.assets.size > 199999) fail("tooMany");
         state.items++;
         report();
       }
@@ -4014,7 +4027,6 @@
       truncated: "A saved file ended unexpectedly. Export was stopped.",
       recordTooLarge: "A database block or record exceeds the supported import limits.",
       entryTooLarge: "A single backup entry exceeds 4 GiB minus 1 byte.",
-      tooMany: "This backup exceeds the importer’s entry or filename limits.",
       quota: "Not enough browser storage for the temporary backup. Free space or use Chrome or Edge.",
       denied: "File or storage access was denied. Check browser permissions and retry.",
       outputUnavailable: "This browser does not provide a supported file output method.",
@@ -4081,7 +4093,6 @@
       truncated: "저장된 파일이 중간에 끊겼습니다. 내보내기가 중지되었습니다.",
       recordTooLarge: "DB 블록 또는 레코드가 지원하는 복원 크기를 초과합니다.",
       entryTooLarge: "개별 백업 항목이 4 GiB에서 1바이트를 뺀 크기를 초과합니다.",
-      tooMany: "복원할 수 있는 항목 수 또는 파일 이름 크기를 초과합니다.",
       quota: "임시 백업을 만들 브라우저 저장 공간이 부족합니다. 공간을 확보하거나 Chrome 또는 Edge를 사용해주세요.",
       denied: "파일 또는 저장소 접근이 거부되었습니다. 브라우저 권한을 확인하고 다시 시도해주세요.",
       outputUnavailable: "이 브라우저에서 지원하는 파일 저장 방법이 없습니다.",

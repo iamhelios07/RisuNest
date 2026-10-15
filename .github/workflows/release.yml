@@ -291,6 +291,7 @@ jobs:
           printf '%s\n' "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin" >> "$GITHUB_PATH"
           xcodebuild -version
       - run: pnpm install --frozen-lockfile
+      - run: pnpm ios:test:portable-source
       - name: Run Rust test inventory in an iOS simulator
         shell: bash
         run: bash scripts/ios-native-tests.sh

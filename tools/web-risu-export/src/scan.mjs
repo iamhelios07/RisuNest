@@ -93,9 +93,11 @@ export function references() {
     const assets = new Set(), cold = new Set(), pluginCold = new Set();
     let token = '';
     function addCold(key) { if (!UUID.test(key)) fail('invalidCold'); cold.add(key); }
-    // Upstream v3 plugin storage keeps each value in cold storage under pluginCustomStorage._coldplugin.
+    // Count referenced plugin cold items without reading their unsupported contents.
     function visitPluginStorage(path, value) {
-        if (path.length === 2 && path[0] === '_coldplugin' && typeof value === 'string' && value) pluginCold.add(value);
+        if (typeof value !== 'string' || !value) return;
+        if ((path.length === 2 && path[0] === '_coldplugin')
+            || (path.length === 1 && path[0] === '_coldpluginIndex')) pluginCold.add(value);
     }
     return {
         assets, cold, pluginCold, visitPluginStorage,

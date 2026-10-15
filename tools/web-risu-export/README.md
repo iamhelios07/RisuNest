@@ -28,7 +28,7 @@ For a self-hosted web RisuAI origin that keeps data in the browser, use the cons
 - An interrupted or failed export is not a complete backup. A database the exporter cannot read stops the export. Referenced assets or archived chats that cannot be found, archived chats that cannot be read, and inlays in an unsupported format are skipped and counted, and the rest of the backup is completed.
 - Only archived chats referenced by the database are exported. Cold storage files nothing refers to are unused by RisuAI and are left out. RisuAI v3 plugin storage keeps its values in cold storage; RisuNest cannot restore those yet, so they are skipped and counted.
 - Inlays saved before RisuAI recorded an inlay type are exported as images. An unset plugin storage block, which RisuAI writes as an empty block, is written as an empty object so RisuNest 1.0.4 and earlier can restore it.
-- Strings in character records, including chats, are limited to 8 MiB as in RisuNest; other blocks are limited only by the 1 GiB decoded block limit.
+- Individual character fields and messages are limited to 64 MiB of serialized UTF-8 JSON. Database blocks have a 1 GiB decoded limit.
 - Backups include saved settings and may contain credentials. Keep the file private. The exporter does not upload backup data or print record contents.
 - Source data is not migrated, rewritten, or deleted. Account authentication may refresh its login token. Firefox cleanup removes only this tool's temporary files and their folder.
 

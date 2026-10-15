@@ -46,13 +46,14 @@ test('current release block layout discovers assets and cold references across c
     }
 });
 test('raw and compressed legacy message-pack databases preserve reference discovery', async () => {
-    const packed = msgpack({ characters: [{ image: 'assets/old.png', chats: [{ message: [{ data: COLD_HEADER + coldId }] }] }], characterOrder: [{ img: 'assets/folder.png' }], botPresets: [{ image: 'assets/preset.png' }] });
+    const packed = msgpack({ pluginCustomStorage: { _coldpluginIndex: coldId }, characters: [{ image: 'assets/old.png', chats: [{ message: [{ data: COLD_HEADER + coldId }] }] }], characterOrder: [{ img: 'assets/folder.png' }], botPresets: [{ image: 'assets/preset.png' }] });
     for (const format of [7, 8, 9]) {
         const bytes = Buffer.concat([Buffer.from('\0RISUSAVE\0'), Buffer.from([format]), format === 7 ? packed : gzipSync(packed)]);
         const refs = references();
         await scanDatabase(fragmented(bytes, 2), refs);
         assert.deepEqual([...refs.assets].sort(), ['assets/folder.png', 'assets/old.png', 'assets/preset.png']);
         assert.deepEqual([...refs.cold], [coldId]);
+        assert.deepEqual([...refs.pluginCold], [coldId]);
         await assert.rejects(scanDatabase(fragmented(bytes, 2), references(), undefined, undefined, 32), error => error.code === 'recordTooLarge');
     }
 });
@@ -209,9 +210,9 @@ test('record limits count UTF-8 and bound each field and message independently',
     ]) assert.throws(() => checkRecord(text), error => error.code === 'recordTooLarge');
 });
 test('cold storage exports only restorable archived chats and reports what it skips', async () => {
-    const [plugin, settings, corrupt, nested, scalar] = [1, 2, 3, 4, 5].map(n => '2000000' + n + '-0000-4000-8000-00000000000' + n);
+    const [plugin, settings, corrupt, nested, scalar, index] = [1, 2, 3, 4, 5, 6].map(n => '2000000' + n + '-0000-4000-8000-00000000000' + n);
     const db = database({
-        pluginStorage: { _coldplugin: { synthetic: plugin } },
+        pluginStorage: { _coldplugin: { synthetic: plugin, duplicate: plugin }, _coldpluginIndex: index },
         character: { coldstorage: coldId, coldStoragedChats: [settings, corrupt, scalar], chats: [{ message: [{ data: COLD_HEADER + nested }] }] }
     });
     // The rejected payload is larger than the output buffer, so its rollback rewinds flushed bytes.
@@ -233,8 +234,9 @@ test('cold storage exports only restorable archived chats and reports what it sk
     assert.deepEqual([...entries.keys()].sort(), ['archived.png', 'coldstorage_' + coldId + '.json', 'coldstorage_' + nested + '.json', 'database.risudat']);
     assert.deepEqual(JSON.parse(entries.get('coldstorage_' + nested + '.json')), [{ role: 'char', data: 'archived message' }]);
     assert.equal(result.bytes, sink.bytes.length);
-    assert.deepEqual(result.skipped, { missingAssets: 0, missingCold: 0, unreadableCold: 3, pluginCold: 1, unsupportedInlays: 0 });
+    assert.deepEqual(result.skipped, { missingAssets: 0, missingCold: 0, unreadableCold: 3, pluginCold: 2, unsupportedInlays: 0 });
     assert(!requested.includes(plugin));
+    assert(!requested.includes(index));
 });
 test('an output failure while writing an archived chat stops the export instead of skipping it', async () => {
     const db = database({ character: { coldstorage: coldId } });
