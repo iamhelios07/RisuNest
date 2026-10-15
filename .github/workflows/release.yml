@@ -1093,7 +1093,7 @@ jobs:
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - name: Update README downloads from the published catalog
+      - name: Update README downloads and iOS source from the published catalog
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/release/readme.mjs

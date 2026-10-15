@@ -42,6 +42,12 @@ Download [RisuNest v1.0.4](https://github.com/rsyumi/RisuNest/releases/tag/app-v
 - iOS builds are distributed as unsigned IPAs and must be sideloaded using tools such as AltStore or Sideloadly.
 - To build from source yourself, see [Building from Source](#building-from-source).
 
+Add the [iOS source](https://raw.githubusercontent.com/rsyumi/RisuNest/main/alt-source.json) to AltStore Classic, SideStore, or Feather to receive release updates:
+
+<a href="https://altdirect.app/?url=https://raw.githubusercontent.com/rsyumi/RisuNest/main/alt-source.json"><img src="https://altdirect.app/assets/png/AltSource_Blue.png" alt="Add AltSource via AltDirect" width="200"></a>
+
+[Add to AppDB](https://appdb.to/repos/import?url=https://raw.githubusercontent.com/rsyumi/RisuNest/main/alt-source.json)
+
 ### Build Integrity & Security
 
 - Release binaries are not signed with a trusted certificate, so Windows, macOS, and Android may display security warnings.

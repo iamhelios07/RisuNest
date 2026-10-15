@@ -1,0 +1,42 @@
+{
+  "name": "RisuNest",
+  "identifier": "io.github.rsyumi.risunest.source",
+  "sourceURL": "https://raw.githubusercontent.com/rsyumi/RisuNest/main/alt-source.json",
+  "subtitle": "RisuNest for iOS",
+  "description": "Unsigned iOS releases of RisuNest. Sign and install with your preferred sideloading app.",
+  "website": "https://github.com/rsyumi/RisuNest",
+  "iconURL": "https://raw.githubusercontent.com/rsyumi/RisuNest/main/src-tauri/icons/128x128@2x.png",
+  "apps": [
+    {
+      "name": "RisuNest",
+      "bundleIdentifier": "io.github.rsyumi.risunest",
+      "developerName": "RisuNest contributors",
+      "localizedDescription": "An AI chat application with multiple providers, characters, themes, plugins, and advanced memory systems.",
+      "iconURL": "https://raw.githubusercontent.com/rsyumi/RisuNest/main/src-tauri/icons/128x128@2x.png",
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSCameraUsageDescription": "Scan a QR code you choose to connect RisuNest.",
+          "NSLocalNetworkUsageDescription": "Connect to a local AI provider or RisuNest sync server that you choose."
+        }
+      },
+      "versions": [
+        {
+          "version": "1.0.4",
+          "buildVersion": "1.0.4",
+          "date": "2026-10-13T17:09:48.862Z",
+          "localizedDescription": "- Improved compatibility with bots, modules, and plugins.\n- Improved Lua, script, and UI performance in long chats.\n- Added a console log viewer.\n- Fixed update links not opening on Android.\n- Fixed a sidebar scrolling issue on iOS.",
+          "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-ios-aarch64-unsigned.ipa",
+          "size": 78142028,
+          "minOSVersion": "16.4"
+        }
+      ],
+      "version": "1.0.4",
+      "versionDate": "2026-10-13T17:09:48.862Z",
+      "versionDescription": "- Improved compatibility with bots, modules, and plugins.\n- Improved Lua, script, and UI performance in long chats.\n- Added a console log viewer.\n- Fixed update links not opening on Android.\n- Fixed a sidebar scrolling issue on iOS.",
+      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-ios-aarch64-unsigned.ipa",
+      "size": 78142028
+    }
+  ],
+  "news": []
+}
