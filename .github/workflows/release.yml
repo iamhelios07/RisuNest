@@ -790,7 +790,9 @@ jobs:
             'update_helper/helper_recovers_the_live_server_when_its_parent_does_not_exit',
             'update_helper/helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server',
             'update_helper/installer_guard_records_restart_failure_after_accepted_corrupt_server_start',
-            'manual_start/manual_start_is_independent_of_login_and_survives_registration_changes'
+            'manual_start/manual_start_is_independent_of_login_and_survives_registration_changes',
+            'windows_platform/existing_task_ownership_and_update_schedule_remain_compatible',
+            'windows_platform/gui_autostart_preserves_the_command_and_existing_value_semantics'
           )
           $logDirectory = Join-Path $env:RUNNER_TEMP 'sync-update-tests'
           New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
