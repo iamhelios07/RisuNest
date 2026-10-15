@@ -1,7 +1,7 @@
 import { withLibraryFileSelection } from './libraryFileOperation'
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { join } from '@tauri-apps/api/path'
-import { iosStagingPath } from './nativePaths'
+import { iosStagingPath, nativeRoots } from './nativePaths'
 import { mkdir, remove, writeFile } from '@tauri-apps/plugin-fs'
 import { isTauriIOS } from '../platform'
 import { backupSourceCopyFailure } from './backupSourceCopyFailure'
@@ -111,6 +111,8 @@ export async function pickIOSFile(
     signal?: AbortSignal,
 ): Promise<IOSPickedFile | null> {
     return withLibraryFileSelection(async () => {
+        if (signal?.aborted) throw cancelled()
+        await nativeRoots()
         if (signal?.aborted) throw cancelled()
         const result = await invoke<IOSPickedFile & { cancelled: boolean }>(
             'plugin:ios-native|pick_file',

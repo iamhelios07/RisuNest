@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 import type { Channel } from '@tauri-apps/api/core'
 const { invoke, alertError, waitAlert } = vi.hoisted(() => ({ invoke: vi.fn(), alertError: vi.fn(), waitAlert: vi.fn() }))
-vi.mock('@tauri-apps/api/core', async original => ({ ...(await original<typeof import('@tauri-apps/api/core')>()), invoke } satisfies typeof import('@tauri-apps/api/core')))
+vi.mock('@tauri-apps/api/core', async original => ({ ...(await original<typeof import('@tauri-apps/api/core')>()),
+    invoke: ((command, ...args) => command === 'app_paths_roots' ? Promise.resolve({ data: '/owned' }) : invoke(command, ...args)) as typeof import('@tauri-apps/api/core').invoke,
+} satisfies typeof import('@tauri-apps/api/core')))
 vi.mock('../alert', () => ({ alertError, waitAlert }))
 vi.mock('../gui/nativeFileJobDialogModel', () => ({ failureReason: (code: string) => `reason:${code}` }))
 import { exportIOSFile, pickIOSFile, getIOSPublication, pickIOSBackupSource, materializeIOSBackupSource, reportInterruptedIOSBackupSources } from './iosFiles'
@@ -175,7 +177,7 @@ describe('iOS file publication', () => {
         expect(isLibraryFileOperationReserved()).toBe(true)
         window.dispatchEvent(new Event('focus'))
         document.dispatchEvent(new Event('visibilitychange'))
-        await Promise.resolve()
+        await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('plugin:ios-native|pick_file'))
         expect(isLibraryFileOperationReserved()).toBe(true)
         finish({ cancelled: true })
         expect(await selected).toBeNull()
