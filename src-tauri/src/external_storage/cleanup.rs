@@ -563,12 +563,29 @@ async fn run_owned(
                 }
                 let mut protected = view.protected_jobs();
                 protected.push(request.job_id.to_owned());
-                owner.set_delete_in_flight(true);
-                let removed = leases::control_request(cancel, context.provider.cleanup_incomplete_objects(
-                    context.repository, &protected, request.limits.per_run - sent, cancel,
-                )).await?;
-                owner.set_delete_in_flight(false);
-                outcome.deleted_objects = outcome.deleted_objects.saturating_add(removed);
+                let mut cursor = None;
+                loop {
+                    if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
+                        outcome.stop_reason = reason;
+                        break;
+                    }
+                    if let Some(reason) = recheck(context, owner, view, &before, &jobs, cancel).await? {
+                        outcome.stop_reason = reason;
+                        break;
+                    }
+                    let page = leases::control_request(cancel, context.provider.cleanup_incomplete_objects(
+                        context.repository, &protected, cursor.as_deref(), request.limits.per_run - sent,
+                        &|deleting| owner.set_delete_in_flight(deleting), cancel,
+                    )).await?;
+                    sent = sent.saturating_add(page.removed as usize);
+                    outcome.deleted_objects = outcome.deleted_objects.saturating_add(page.removed);
+                    cursor = page.next_cursor;
+                    if cursor.is_none() { break; }
+                    if sent >= request.limits.per_run {
+                        outcome.stop_reason = StopReason::Limit;
+                        break;
+                    }
+                }
             }
             GcStore::open(context.root)?.set_last_reachable_bytes(context.connection_id, marked.reachable_bytes)?;
         }
@@ -1755,6 +1772,34 @@ pub(super) mod tests {
             owner.release_all(&h.context()).await;
             assert_eq!(h.run().await.unwrap().deleted_objects,1);
             assert!(!h.provider.holds("unfinished-pack"));
+        });
+    }
+
+    #[test]
+    fn incomplete_scan_timeout_releases_protection_but_uncertain_delete_retains_it() {
+        runtime().block_on(async {
+            tokio::time::pause();
+            let h = Harness::new();
+            h.provider.seed("unfinished-pack", ObjectRole::Pack, Vec::new());
+            h.provider.state.lock().unwrap().incomplete_cleanup_delay = Some(Duration::from_secs(61));
+            assert_eq!(h.run().await.unwrap_err().kind, ErrorKind::Transient);
+            assert!(h.provider.holds("unfinished-pack"));
+            assert!(h.provider.objects_with_role(ObjectRole::Lease).is_empty());
+            h.provider.state.lock().unwrap().incomplete_cleanup_delay = Some(Duration::from_secs(31));
+            h.provider.state.lock().unwrap().incomplete_cleanup_empty_pages = 2;
+            let started = tokio::time::Instant::now();
+            assert_eq!(h.run().await.unwrap().deleted_objects, 1);
+            assert!(started.elapsed() > Duration::from_secs(60));
+            assert!(!h.provider.holds("unfinished-pack"));
+            h.provider.state.lock().unwrap().incomplete_cleanup_delay = None;
+            h.provider.state.lock().unwrap().incomplete_cleanup_empty_pages = 0;
+
+            h.provider.seed("unfinished-lost", ObjectRole::Pack, Vec::new());
+            h.provider.fail_delete("unfinished-lost", DeleteFault::AppliedThenLost);
+            assert_eq!(h.run().await.unwrap_err().kind, ErrorKind::Transient);
+            assert!(!h.provider.holds("unfinished-lost"));
+            assert!(!h.provider.objects_with_role(ObjectRole::Lease).is_empty());
+            assert_eq!(h.run().await.unwrap().stop_reason, StopReason::Lease);
         });
     }
 

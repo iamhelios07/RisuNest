@@ -412,9 +412,86 @@ fn cleanup_removes_only_unprotected_zero_byte_starters_after_rechecking() {
             let provider = adapter(dependencies().dependencies);
             let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
             let protected = if case == 1 { vec!["job-1".to_owned()] } else { vec![] };
-            let removed = provider.cleanup_incomplete_objects(&handle, &protected, 10, &Cancellation::default()).await.unwrap();
+            let removed = provider.cleanup_incomplete_objects(&handle, &protected, None, 10, &|_| {}, &Cancellation::default()).await.unwrap().removed;
             assert_eq!(removed, u64::from(case == 0 || case == 4), "case {case}");
             assert_eq!(server.requests.lock().unwrap().iter().filter(|request|method_of(request)=="DELETE").count() as u64, removed);
+        }
+    });
+}
+
+#[test]
+fn incomplete_cleanup_resumes_past_release_and_asset_pages_without_skipping_shifted_assets() {
+    runtime().block_on(async {
+        let tag = job_tag("old-job", 0);
+        let owner = release(777, &tag);
+        let first = json!({"id": 880, "name": "pack-first", "size": 0, "state": "starter"});
+        let shifted = json!({"id": 881, "name": "pack-shifted", "size": 0, "state": "starter"});
+        let retained = (0..api::ASSET_PAGE_SIZE - 1).map(|id| asset(id as u64 + 1000, "pack-kept", 4, None)).collect::<Vec<_>>();
+        let page_with = |starter: &serde_json::Value| std::iter::once(starter.clone()).chain(retained.iter().cloned()).collect::<Vec<_>>();
+        let mut replies = existing_repository_replies();
+        replies.push(reply(200, json!((0..api::RELEASE_PAGE_SIZE).map(|id| release(id as u64 + 1, "foreign")).collect::<Vec<_>>())));
+        replies.extend([
+            reply(200, json!([owner.clone()])),
+            reply(200, json!((0..api::ASSET_PAGE_SIZE).map(|id| asset(id as u64 + 1, "pack-uploaded", 4, None)).collect::<Vec<_>>())),
+            reply(200, json!([owner.clone()])), reply(200, json!(page_with(&first))),
+            reply(200, owner.clone()), reply(200, first), reply(204, json!(null)),
+            reply(200, json!([owner.clone()])), reply(200, json!(page_with(&shifted))),
+            reply(200, owner.clone()), reply(200, shifted), reply(204, json!(null)),
+            reply(200, json!([owner])), reply(200, json!(retained)),
+        ]);
+        let server = github_server(replies);
+        let provider = adapter(dependencies().dependencies);
+        let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
+        let cancel = Cancellation::default();
+        let mut cursor = None;
+        let mut removed = 0;
+        let mut pages = 0;
+        loop {
+            let page = crate::external_storage::leases::control_request(&cancel,
+                provider.cleanup_incomplete_objects(&handle, &[], cursor.as_deref(), 10, &|_| {}, &cancel)).await.unwrap();
+            pages += 1;
+            removed += page.removed;
+            cursor = page.next_cursor;
+            if cursor.is_none() { break; }
+            assert!(pages < 6);
+        }
+        assert_eq!((pages, removed), (5, 2));
+        let requests = server.requests.lock().unwrap();
+        let asset_pages = requests.iter().filter(|request| head_line(request).contains("/releases/777/assets?"))
+            .map(|request| {
+                let target = head_line(request).split_whitespace().nth(1).unwrap();
+                server.url.join(target).unwrap().query_pairs().find(|(key, _)| key == "page").unwrap().1.into_owned()
+            }).collect::<Vec<_>>();
+        assert_eq!(asset_pages, ["1", "2", "2", "2"], "deletions must not skip assets shifted into page 2");
+        let deleted = requests.iter().filter(|request| method_of(request) == "DELETE")
+            .map(|request| head_line(request).to_owned()).collect::<Vec<_>>();
+        assert_eq!(deleted.len(), 2);
+        assert!(deleted[0].contains("/assets/880 "));
+        assert!(deleted[1].contains("/assets/881 "));
+    });
+}
+
+#[test]
+fn incomplete_cleanup_marks_only_a_sent_delete_as_uncertain() {
+    runtime().block_on(async {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for fail_at_delete in [false, true] {
+            let tag = job_tag("old-job", 0);
+            let owner = release(777, &tag);
+            let starter = json!({"id": 880, "name": "pack-first", "size": 0, "state": "starter"});
+            let mut replies = existing_repository_replies();
+            if fail_at_delete {
+                replies.extend([reply(200, json!([owner.clone()])), reply(200, json!([starter.clone()])),
+                    reply(200, owner), reply(200, starter)]);
+            }
+            replies.push(Reply::Lost);
+            let server = github_server(replies);
+            let provider = adapter(dependencies().dependencies);
+            let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
+            let deleting = AtomicBool::new(false);
+            assert!(provider.cleanup_incomplete_objects(&handle, &[], None, 10,
+                &|active| deleting.store(active, Ordering::SeqCst), &Cancellation::default()).await.is_err());
+            assert_eq!(deleting.load(Ordering::SeqCst), fail_at_delete);
         }
     });
 }

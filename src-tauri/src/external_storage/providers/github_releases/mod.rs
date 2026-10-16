@@ -924,63 +924,73 @@ impl Provider for GithubReleases {
         &'a self,
         repository: &'a RepositoryHandle,
         protected_jobs: &'a [String],
+        cursor: Option<&'a str>,
         limit: usize,
+        deleting: &'a (dyn Fn(bool) + Send + Sync),
         cancel: &'a Cancellation,
-    ) -> ProviderFuture<'a, u64> {
+    ) -> ProviderFuture<'a, IncompleteCleanupPage> {
         Box::pin(async move {
+            cancel.check()?;
+            if limit == 0 { return Err(ProviderError::new(ErrorKind::Unsupported)); }
             let context = self.context(repository)?;
-            let mut removed = 0;
-            let mut page = 1;
-            while removed < limit as u64 {
-                cancel.check()?;
-                let releases = self.releases_page(context, page, cancel).await?;
-                let exhausted = releases.len() < api::RELEASE_PAGE_SIZE;
-                for release in releases {
-                    let prefix=format!("{}-",context.tag_prefix);
-                    let Some((batch,sequence))=release.tag_name.strip_prefix(&prefix).and_then(|tag|tag.rsplit_once('-')) else {continue;};
-                    let owned=batch==api::LEASE_BATCH || batch.strip_prefix(api::JOB_BATCH_PREFIX).is_some_and(|hash|
-                        hash.len()==16 && hash.bytes().all(|byte|byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
-                    if !release.draft || !owned || sequence.parse::<u32>().ok().is_none_or(|value|value.to_string()!=sequence)
-                        || protected_jobs.iter().any(|job| {
-                            let tag = context.tag(&api::batch_key(ObjectRole::Pack, job), 0);
-                            release.tag_name.starts_with(tag.strip_suffix('0').unwrap_or(&tag))
-                        }) { continue; }
-                    // Collect before deleting: page-numbered assets shift after removal.
-                    let mut candidates = Vec::new();
-                    let mut asset_page = 1;
-                    loop {
-                        let assets = self.assets_page(context, release.id, asset_page, cancel).await?;
-                        let complete = assets.len() < api::ASSET_PAGE_SIZE;
-                        candidates.extend(assets.into_iter().filter(|asset| asset.state == "starter"
-                            && asset.size == 0 && api::removable_asset(&asset.name)));
-                        if complete || candidates.len() >= limit - removed as usize { break; }
-                        asset_page += 1;
-                    }
-                    if candidates.is_empty() { continue; }
-                    let response=self.send(self.request(context,Method::GET,context.release_url(release.id)?,ProviderOperation::Metadata),cancel).await?;
-                    if response.status==404 {continue;}
-                    let owner:ReleaseView=self.decode(response,cancel).await?;
-                    if owner.id!=release.id || owner.tag_name!=release.tag_name || !owner.draft {continue;}
-                    for asset in candidates {
-                        if removed >= limit as u64 { return Ok(removed); }
-                        let response = self.send(self.request(context, Method::GET,
-                            context.asset_url(asset.id)?, ProviderOperation::Metadata), cancel).await?;
-                        if response.status == 404 { continue; }
-                        let current: AssetView = self.decode(response, cancel).await?;
-                        if current.id != asset.id || current.name != asset.name
-                            || current.state != "starter" || current.size != 0 { continue; }
-                        let response = self.send(self.request(context, Method::DELETE,
-                            context.asset_url(asset.id)?, ProviderOperation::Delete), cancel).await?;
-                        match response.status {
-                            204 | 404 => removed += 1,
-                            status => return Err(api::classify(status, &response.headers, self.now())),
-                        }
+            let (page, mut index, mut asset_page, asset_index) = parse_cursor(cursor)?;
+            if asset_index != 0 { return Err(corrupt()); }
+            let releases = self.releases_page(context, page, cancel).await?;
+            let next_release = |index: usize| -> Result<Option<String>> {
+                if index < releases.len() { Ok(Some(format!("{page}:{index}:1:0"))) }
+                else if releases.len() == api::RELEASE_PAGE_SIZE {
+                    Ok(Some(format!("{}:0:1:0", page.checked_add(1).ok_or_else(corrupt)?)))
+                } else { Ok(None) }
+            };
+            while index < releases.len() {
+                let release = &releases[index];
+                let prefix = format!("{}-", context.tag_prefix);
+                let owned = release.tag_name.strip_prefix(&prefix).and_then(|tag| tag.rsplit_once('-'))
+                    .is_some_and(|(batch, sequence)| {
+                        let owned = batch == api::LEASE_BATCH || batch.strip_prefix(api::JOB_BATCH_PREFIX).is_some_and(|hash|
+                            hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+                        owned && sequence.parse::<u32>().ok().is_some_and(|value| value.to_string() == sequence)
+                    });
+                if !release.draft || !owned || protected_jobs.iter().any(|job| {
+                    let tag = context.tag(&api::batch_key(ObjectRole::Pack, job), 0);
+                    release.tag_name.starts_with(tag.strip_suffix('0').unwrap_or(&tag))
+                }) { index += 1; asset_page = 1; continue; }
+                let assets = self.assets_page(context, release.id, asset_page, cancel).await?;
+                let next_cursor = if assets.len() == api::ASSET_PAGE_SIZE {
+                    Some(format!("{page}:{index}:{}:0", asset_page.checked_add(1).ok_or_else(corrupt)?))
+                } else { next_release(index + 1)? };
+                let candidates = assets.iter().filter(|asset| asset.state == "starter"
+                    && asset.size == 0 && api::removable_asset(&asset.name)).collect::<Vec<_>>();
+                if candidates.is_empty() { return Ok(IncompleteCleanupPage { removed: 0, next_cursor }); }
+                let response = self.send(self.request(context, Method::GET, context.release_url(release.id)?, ProviderOperation::Metadata), cancel).await?;
+                if response.status == 404 { return Ok(IncompleteCleanupPage { removed: 0, next_cursor: next_release(index + 1)? }); }
+                let owner: ReleaseView = self.decode(response, cancel).await?;
+                if owner.id != release.id || owner.tag_name != release.tag_name || !owner.draft {
+                    return Ok(IncompleteCleanupPage { removed: 0, next_cursor: next_release(index + 1)? });
+                }
+                let mut removed = 0;
+                for asset in candidates {
+                    if removed >= limit as u64 { break; }
+                    let response = self.send(self.request(context, Method::GET,
+                        context.asset_url(asset.id)?, ProviderOperation::Metadata), cancel).await?;
+                    if response.status == 404 { continue; }
+                    let current: AssetView = self.decode(response, cancel).await?;
+                    if current.id != asset.id || current.name != asset.name
+                        || current.state != "starter" || current.size != 0 { continue; }
+                    let request = self.request(context, Method::DELETE, context.asset_url(asset.id)?, ProviderOperation::Delete);
+                    cancel.check()?;
+                    deleting(true);
+                    let response = self.send(request, cancel).await?;
+                    match response.status {
+                        204 | 404 => { deleting(false); removed += 1; }
+                        status => return Err(api::classify(status, &response.headers, self.now())),
                     }
                 }
-                if exhausted { break; }
-                page = page.checked_add(1).ok_or_else(corrupt)?;
+                // Deletion shifts numbered asset pages. Revisit this page before advancing.
+                let next_cursor = if removed > 0 { Some(format!("{page}:{index}:{asset_page}:0")) } else { next_cursor };
+                return Ok(IncompleteCleanupPage { removed, next_cursor });
             }
-            Ok(removed)
+            Ok(IncompleteCleanupPage { removed: 0, next_cursor: next_release(index)? })
         })
     }
 

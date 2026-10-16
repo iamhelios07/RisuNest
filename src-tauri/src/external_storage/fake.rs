@@ -98,6 +98,8 @@ pub(super) struct FakeState {
     reconcile_attempts: Vec<String>,
     metadata_attempts: Vec<String>,
     metadata_delay: Option<std::time::Duration>,
+    pub(super) incomplete_cleanup_delay: Option<std::time::Duration>,
+    pub(super) incomplete_cleanup_empty_pages: usize,
     scripted_pages: Vec<(Collection, Result<ObjectPage>)>,
     inventory_upload_failure: Option<ErrorKind>,
     upload_failure: Option<(usize, ErrorKind)>,
@@ -573,13 +575,25 @@ impl Provider for FakeProvider {
         })
     }
     fn supports_incomplete_cleanup(&self) -> bool { true }
-    fn cleanup_incomplete_objects<'a>(&'a self, _r: &'a RepositoryHandle, _protected: &'a [String], limit: usize, cancel: &'a Cancellation) -> ProviderFuture<'a,u64> {
+    fn cleanup_incomplete_objects<'a>(&'a self, r: &'a RepositoryHandle, _protected: &'a [String], cursor: Option<&'a str>, limit: usize, deleting: &'a (dyn Fn(bool) + Send + Sync), cancel: &'a Cancellation) -> ProviderFuture<'a,IncompleteCleanupPage> {
         Box::pin(async move {
             cancel.check()?;
-            let mut state=self.state.lock().unwrap();
-            let unfinished=state.objects.iter().filter(|(id,(body,_))|id.starts_with("unfinished-") && body.is_empty()).map(|(id,_)|id.clone()).take(limit).collect::<Vec<_>>();
-            for id in &unfinished {state.objects.remove(id);state.roles.remove(id);state.delete_attempts.push(id.clone());}
-            Ok(unfinished.len() as u64)
+            let delay = self.state.lock().unwrap().incomplete_cleanup_delay;
+            if let Some(delay) = delay { tokio::time::sleep(delay).await; }
+            let page = cursor.map(|cursor| cursor.parse::<usize>().map_err(|_| ProviderError::new(ErrorKind::Corrupt))).transpose()?.unwrap_or(0);
+            if page < self.state.lock().unwrap().incomplete_cleanup_empty_pages {
+                return Ok(IncompleteCleanupPage { removed: 0, next_cursor: Some((page + 1).to_string()) });
+            }
+            let unfinished = self.state.lock().unwrap().objects.iter().filter(|(id,(body,_))|
+                id.starts_with("unfinished-") && body.is_empty()).map(|(id,_)|id.clone()).take(limit).collect::<Vec<_>>();
+            for id in &unfinished {
+                let mut locator = locator();
+                locator.object = id.clone();
+                deleting(true);
+                self.delete_object(r, &locator, cancel).await?;
+                deleting(false);
+            }
+            Ok(IncompleteCleanupPage { removed: unfinished.len() as u64, next_cursor: None })
         })
     }
     fn delete_object<'a>(

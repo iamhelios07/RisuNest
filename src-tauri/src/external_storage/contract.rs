@@ -14,6 +14,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub(crate) type Result<T> = std::result::Result<T, ProviderError>;
 pub(crate) type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+#[derive(Default)]
+pub(crate) struct IncompleteCleanupPage {
+    pub removed: u64,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ErrorKind {
@@ -667,14 +673,18 @@ pub(crate) trait Provider: Send + Sync {
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, ()>;
     fn supports_incomplete_cleanup(&self) -> bool { false }
-    /// Removes empty unfinished uploads only while the caller owns cleanup protection.
+    /// Processes one bounded page while the caller owns cleanup protection. Mark a
+    /// deletion in flight immediately before sending it and clear only after its
+    /// completion is confirmed. Read-only failures must not mark a deletion.
     fn cleanup_incomplete_objects<'a>(
         &'a self,
         _repository: &'a RepositoryHandle,
         _protected_jobs: &'a [String],
+        _cursor: Option<&'a str>,
         _limit: usize,
+        _deleting: &'a (dyn Fn(bool) + Send + Sync),
         _cancel: &'a Cancellation,
-    ) -> ProviderFuture<'a, u64> { Box::pin(async { Ok(0) }) }
+    ) -> ProviderFuture<'a, IncompleteCleanupPage> { Box::pin(async { Ok(IncompleteCleanupPage::default()) }) }
     fn delete_empty_container<'a>(
         &'a self,
         _repository: &'a RepositoryHandle,
