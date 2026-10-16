@@ -3,22 +3,26 @@ import 'src/ts/stores.svelte'
 import { afterEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { get } from 'svelte/store'
-import { language } from 'src/lang'
+import { changeLanguage, language } from 'src/lang'
+import { languageKorean } from 'src/lang/ko'
 import { settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
 import { activeRisuNestSettingsTab } from 'src/ts/setting/risuNestSettingsTabs'
 import { configurePluginStartup, pluginStartupGate, pluginStartupState } from 'src/ts/plugins/pluginStartupGate'
 import PluginStartupNotice from './PluginStartupNotice.svelte'
 
 let component: ReturnType<typeof mount> | undefined
+let inlineComponent: ReturnType<typeof mount> | undefined
 afterEach(async () => {
     if (component) await unmount(component)
-    component = undefined
+    if (inlineComponent) await unmount(inlineComponent)
+    component = inlineComponent = undefined
     document.body.replaceChildren()
     pluginStartupState.set({ phase: 'released', refused: false, since: 0 })
     configurePluginStartup(() => false, async () => {})
     settingsOpen.set(false)
     activeRisuNestSettingsTab.set(null)
     vi.useRealTimers()
+    changeLanguage('en')
 })
 async function render() {
     component = mount(PluginStartupNotice, { target: document.body })
@@ -41,6 +45,16 @@ it('waits one second, announces a refusal immediately, and hides after release',
     expect(document.querySelector('aside')).toBeNull()
 })
 
+it('uses the language loaded after the app mounted', async () => {
+    vi.useFakeTimers()
+    pluginStartupState.set({ phase: 'waiting', refused: false, since: Date.now() })
+    await render()
+    changeLanguage('ko')
+    await vi.advanceTimersByTimeAsync(1000); await tick()
+    expect(document.querySelector('[role="status"]')?.textContent).toBe(languageKorean.risuNest.pluginStartup.waiting)
+    expect(document.querySelector('aside button')?.textContent).toBe(languageKorean.risuNest.pluginStartup.loadNow)
+})
+
 it('shows failure actions immediately and opens the sync tab', async () => {
     pluginStartupState.set({ phase: 'failed', refused: false, since: Date.now(), error: { code: 'unauthorized' }, target: 'server' })
     await render()
@@ -54,4 +68,14 @@ it('shows failure actions immediately and opens the sync tab', async () => {
     expect(get(SettingsMenuIndex)).toBe(17)
     activeRisuNestSettingsTab.set('sync'); await tick()
     expect([...document.querySelectorAll('button')].some(button => button.textContent === language.risuNest.tabs.sync)).toBe(false)
+})
+
+it('leaves the plugin settings page to its inline notice', async () => {
+    pluginStartupState.set({ phase: 'failed', refused: false, since: Date.now(), error: { code: 'unauthorized' }, target: 'server' })
+    await render()
+    inlineComponent = mount(PluginStartupNotice, { target: document.body, props: { inline: true } })
+    await tick()
+    expect(document.querySelectorAll('aside')).toHaveLength(1)
+    await unmount(inlineComponent); inlineComponent = undefined; await tick()
+    expect(document.querySelectorAll('aside')).toHaveLength(1)
 })

@@ -4,7 +4,8 @@
     import { language } from 'src/lang'
     import { alertActionConfirm, alertCheckboxConfirm, alertConfirm } from 'src/ts/alert'
     import { isTauri } from 'src/ts/platform'
-    import { serverSyncErrorMessage, writerRecoveryCodes, registrationCodes, usedRegistrationCodes } from 'src/ts/storage/sync/serverSyncErrorMessage'
+    import { serverSyncErrorMessage, writerRecoveryCodes, usedRegistrationCodes } from 'src/ts/storage/sync/serverSyncErrorMessage'
+    import { serverSyncStatusView } from 'src/ts/storage/sync/syncStatusView'
     import { completeServerSyncBinding, connectServerSync, disconnectServerSync, dismissServerSyncConnectionFailure, holdServerSync, retryServerSync, getServerSyncController, getServerSyncCacheUsage, cleanupServerSyncCache, type ServerSyncCacheUsage } from 'src/ts/storage/sync/serverSyncProduction'
     import { parseServerRegistration } from 'src/ts/storage/sync/serverSyncRegistration'
     import { serverRegistrationInbox } from 'src/ts/storage/sync/serverSyncRegistrationInbox'
@@ -69,14 +70,7 @@
     let storedPolicy = $derived(view.status.assetPolicy ?? residency?.policy)
     // A connected device keeps its registration input folded until a code is needed again.
     let codeShown = $derived(!view.status.bound || !!view.error || !!failure || !!candidate || codeOpen)
-    let status = $derived.by((): { label: string; tone: 'idle' | 'connected' | 'working' | 'paused' | 'attention' } => {
-        if (view.progress || (connected && view.running)) return { label: copy.running, tone: 'working' }
-        if (!connected) return { label: copy.disconnected, tone: view.bindingIncomplete ? 'attention' : 'idle' }
-        if (registrationCodes.includes(view.error)) return { label: copy.registrationRequired, tone: 'attention' }
-        if (view.error) return { label: view.paused ? copy.blocked : copy.ready, tone: 'attention' }
-        if (view.paused) return { label: copy.paused, tone: 'paused' }
-        return { label: copy.ready, tone: 'connected' }
-    })
+    let status = $derived(serverSyncStatusView(view))
     // Automatic sync shows one bar as soon as it has anything to move, and keeps it finished for a moment.
     let shown = $derived(view.progress ?? view.finished)
     let summary = $derived(shown?.mode === 'routine' ? serverSyncRoutineView(shown, copy, !view.progress) : undefined)

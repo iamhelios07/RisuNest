@@ -41,6 +41,7 @@
     import { language } from "../../lang";
     import isEqual from "lodash/isEqual";
     import SidebarAvatar from "./SidebarAvatar.svelte";
+    import SyncStatusButton from "./SyncStatusButton.svelte";
     import BaseRoundedButton from "../UI/BaseRoundedButton.svelte";
     import { getCharacterIndexObject, selectSingleFile } from "src/ts/util";
     import { v4 } from "uuid";
@@ -476,6 +477,7 @@
   <ShellIcon />
   <span class="text-xs">{language.playground.playground}</span>
 </button>
+<SyncStatusButton variant="menu" />
 </div>
 {:else}
 <div
@@ -842,6 +844,7 @@
       >
     </div>
   </div>
+  <SyncStatusButton variant="slot" />
   {#if DBState.db.hamburgerButtonBottom}
   <div class="border-t border-t-selected w-full relative text-white ">
     {#if menuMode === 1}
