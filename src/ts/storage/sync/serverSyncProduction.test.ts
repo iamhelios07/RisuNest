@@ -479,12 +479,19 @@ describe('production server LWW composition', () => {
         const { RepresentativeImageList } = await import('../../ui/representativeImagePriority')
         const list = new RepresentativeImageList()
         try {
+            const lastSuccessAt = production.getServerSyncController().snapshot().lastSuccessAt
+            list.setOrder(['assets/a.png'])
+            await settle()
+            await vi.advanceTimersByTimeAsync(100)
             list.setOrder(['assets/z.png', 'assets/folder.png', 'assets/a.png'])
             await settle()
+            expect(hydrationCalls()).toHaveLength(0)
+            await vi.advanceTimersByTimeAsync(150)
             expect(hydrationCalls()).toEqual([['server_sync_lww_hydrate', {
                 request: expect.objectContaining({ bindingAuthority: '0' }), selectedCharacterId: 'selected-stable-id', representativesOnly: true,
                 iconPriority: { ordered: ['assets/z.png', 'assets/folder.png', 'assets/a.png'], visible: [] },
             }]])
+            expect(production.getServerSyncController().snapshot().lastSuccessAt).toBe(lastSuccessAt)
         } finally { list.dispose(); await settle() }
     })
     it('coalesces local remote-policy edits and preserves another edit during representative hydration', async () => {
@@ -1268,5 +1275,16 @@ describe('server sync progress', () => {
         expect(controller.snapshot().progress).toBeUndefined()
         expect(controller.snapshot().lastSuccessAt).toBeUndefined()
         expect(controller.snapshot().error).toBe('server-unreachable')
+    })
+    it.each(['resumeBinding', 'resumeNewDeviceBinding'] as const)('clears progress after %s activation fails without recording a successful sync', async method => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const failure = { code: 'server-unreachable', retryable: true }
+        f.invoke.mockRejectedValueOnce(failure)
+        const pending = method === 'resumeBinding'
+            ? f.transport!.resumeBinding(bindingContext())
+            : f.transport!.resumeNewDeviceBinding!({ authorizationId: 'authorization', writerId: 'writer' }, { revision: 1, writerId: 'writer', bindingAuthority: '0' }, bindingContext())
+        await expect(pending).rejects.toBe(failure)
+        f.transport!.reportStopped!(failure)
+        expect(production.getServerSyncController().snapshot()).toMatchObject({ error: 'server-unreachable', progress: undefined, lastSuccessAt: undefined })
     })
 })

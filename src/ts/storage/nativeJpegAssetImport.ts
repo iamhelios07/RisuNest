@@ -5,7 +5,7 @@ import {
     capturePersistentMutationToken,
     getPersistentDataRuntime,
 } from './persistentDataRuntime.svelte'
-import { registerCommittedWorkingSetContinuation } from './committedWorkingSetContinuation'
+import { hasCommittedWorkingSetContinuation, registerCommittedWorkingSetContinuation } from './committedWorkingSetContinuation'
 import {
     isTerminalJob as isTerminal,
     NativeFileJobActivationCommittedError,
@@ -14,7 +14,7 @@ import {
     type NativeFileJobSource,
     type NativeFileJobStatus,
 } from './nativeFileJobs'
-import type { PersistentMutationToken } from './saveCoordinator'
+import { PersistentMutationFencedError, type PersistentMutationToken } from './saveCoordinator'
 import type { PersistentDataRuntime, PersistentDestructiveReplacementFence } from './persistentDataRuntime'
 
 export interface NativeJpegAssetDestination {
@@ -72,6 +72,7 @@ export async function importNativeJpegAsset(
     }
     if (options.signal?.aborted) throw abortError()
 
+    const runtime = dependencies.getRuntime()
     const token = await dependencies.captureMutationToken('native-jpeg-asset-import')
     const fence = await dependencies.acquireFence(token)
     let jobId: string | undefined
@@ -91,6 +92,8 @@ export async function importNativeJpegAsset(
     }
     try {
         if (options.signal?.aborted) throw abortError()
+        // An earlier refresh can release its fence while its continuation still owns recovery.
+        if (hasCommittedWorkingSetContinuation(runtime, runtime.getStorageAuthorityEpoch())) throw new PersistentMutationFencedError()
         const started = await dependencies.invoke('native_file_job_start', {
             request: {
                 kind: 'import-jpeg-asset',
@@ -156,7 +159,6 @@ export async function importNativeJpegAsset(
         if (jobId && !terminalObserved && !(await preventFutureCommit())) {
             retainJobForRecovery = true
             retainFenceForRecovery = true
-            const runtime = dependencies.getRuntime()
             runtime.markCommittedWorkingSetRefreshRequired(fence.revision, error)
             registerCommittedWorkingSetContinuation(fence.revision, runtime, runtime.getStorageAuthorityEpoch(),
                 async () => {
