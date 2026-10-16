@@ -553,7 +553,7 @@ pub fn preserve_install_baseline(server: &Path) -> Result<()> {
     };
     let baseline = install.join(INSTALL_BASELINE);
     safe_path(&baseline)?;
-    if let Some(previous) = existing_install_inventory(&baseline)? {
+    if let Some(previous) = update::previous_owned_files(&baseline)? {
         files.extend(previous);
     }
     files.sort();
@@ -570,13 +570,15 @@ pub fn preserve_install_baseline(server: &Path) -> Result<()> {
 pub(crate) fn include_install_baseline(install: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     let baseline = install.join(INSTALL_BASELINE);
     safe_path(&baseline)?;
-    if let Some(previous) = existing_install_inventory(&baseline)? {
+    if let Some(previous) = update::previous_owned_files(&baseline)? {
         for relative in previous {
             safe_path(&install.join(&relative))?;
             if !files.contains(&relative) {
                 files.push(relative);
             }
         }
+    }
+    if baseline.is_file() {
         files.push(PathBuf::from(INSTALL_BASELINE));
     }
     Ok(())
@@ -1009,6 +1011,33 @@ pub fn forget_registration(root: &Path, server: &Path) -> Result<()> {
 }
 
 fn forget_registration_at(registry: &Path, root: &Path, server: &Path) -> Result<()> {
+    #[cfg(windows)]
+    let finalizing = finalization_directory(server)?
+        .join("receipt.json")
+        .exists();
+    #[cfg(windows)]
+    if finalizing {
+        let receipt = read_finalization(registry, server)?;
+        if receipt.data != root {
+            return Err("removal-registration-conflict".into());
+        }
+        if final_files(&install_directory(server)?)
+            .iter()
+            .any(|file| file.exists())
+        {
+            return Err("removal-finalization-pending".into());
+        }
+    }
+    forget_records_at(registry, root, server)?;
+    #[cfg(windows)]
+    if finalizing {
+        // Released uninstallers finish with forget-removal and do not commit separately.
+        commit_finalization_at(registry, server)?;
+    }
+    Ok(())
+}
+
+fn forget_records_at(registry: &Path, root: &Path, server: &Path) -> Result<()> {
     let path = record_path(registry, root);
     if !path.exists() {
         return Ok(());
@@ -1310,6 +1339,11 @@ mod tests {
             }
             if deleted == 4 {
                 forget_registration_at(&registry, &root, &server).unwrap();
+                assert_eq!(
+                    fs::read(finalization_directory(&server).unwrap().join("complete")).unwrap(),
+                    b"true",
+                    "released uninstallers finish with forget-removal"
+                );
             }
             resume_finalization_at(&registry, &server).unwrap();
             assert!(files.iter().all(|file| !file.exists()));
@@ -1335,6 +1369,11 @@ mod tests {
         let helper = install.join("source-helper");
         fs::write(&helper, b"synthetic helper").unwrap();
         prepare_finalization(&registry, &root, &server, false, &helper).unwrap();
+        assert_eq!(
+            forget_registration_at(&registry, &root, &server).unwrap_err(),
+            "removal-finalization-pending"
+        );
+        assert!(record_path(&registry, &root).exists());
         let receipt = finalization_directory(&server)
             .unwrap()
             .join("receipt.json");
@@ -1346,6 +1385,8 @@ mod tests {
         }] {
             fs::write(&receipt, malformed).unwrap();
             assert!(resume_finalization_at(&registry, &server).is_err());
+            assert!(forget_registration_at(&registry, &root, &server).is_err());
+            assert!(record_path(&registry, &root).exists());
             assert!(files.iter().all(|file| file.exists()));
         }
         let mut altered: serde_json::Value = serde_json::from_slice(&original).unwrap();
@@ -1552,12 +1593,20 @@ mod tests {
         assert_eq!(fs::read(&baseline_path).unwrap(), accumulated);
         fs::write(&marker_path, &current).unwrap();
         fs::write(&baseline_path, b"invalid accumulated inventory").unwrap();
-        assert!(preserve_install_baseline(&server).is_err());
-        assert!(include_install_baseline(install, &mut Vec::new()).is_err());
+        let mut owned = vec![PathBuf::from("server")];
+        include_install_baseline(install, &mut owned).unwrap();
         assert_eq!(
-            fs::read(&baseline_path).unwrap(),
-            b"invalid accumulated inventory"
+            owned,
+            [PathBuf::from("server"), PathBuf::from(INSTALL_BASELINE)]
         );
+        preserve_install_baseline(&server).unwrap();
+        assert_eq!(
+            update::previous_owned_files(&baseline_path)
+                .unwrap()
+                .unwrap(),
+            [PathBuf::from("server")]
+        );
+        assert!(install.join("middle.exe").exists() && install.join("later.exe").exists());
         fs::write(&baseline_path, accumulated).unwrap();
         fs::write(&marker_path, current).unwrap();
         assert!(remove_obsolete_owned_files(&server, &install.join(INSTALL_BASELINE)).unwrap());
@@ -1789,7 +1838,7 @@ mod tests {
     fn an_unfinished_install_baseline_is_removed_with_the_installation() {
         let (_temp, root, server, registry) = fixture();
         let baseline = server.with_file_name(INSTALL_BASELINE);
-        fs::copy(marker(server.parent().unwrap()), &baseline).unwrap();
+        fs::write(&baseline, "synthetic").unwrap();
         let plan = plan_at(&registry, &root, &server, false).unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         remove_planned_files(&plan, Duration::ZERO).unwrap();

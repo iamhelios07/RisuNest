@@ -170,6 +170,8 @@ mod windows {
         );
         assert!(root.join("risunest-sync-instance.json").exists());
         assert!(!root.join("metadata.sqlite").exists());
+        let baseline = install.join("risunest-sync-bundle.previous.json");
+        fs::write(&baseline, "synthetic invalid baseline").unwrap();
         let normal = invoke(&manager, &["uninstall", "--dry-run"]);
         assert!(normal.status.success());
         assert!(!root.join("manager-update").exists());
@@ -250,6 +252,17 @@ mod windows {
             String::from_utf8_lossy(&removed.stderr)
         );
         assert!(!server.exists() && !manager.exists() && !marker.exists());
+        assert!(!baseline.exists());
+        let forgotten = invoke(&copied, &["installer", "forget-removal"]);
+        assert!(
+            forgotten.status.success(),
+            "{}",
+            String::from_utf8_lossy(&forgotten.stderr)
+        );
+        assert_eq!(
+            fs::read(install.join(".risunest-sync-removal/complete")).unwrap(),
+            b"true"
+        );
         assert_eq!(fs::read(&extra).unwrap(), b"synthetic");
         assert_eq!(fs::read(root.join("preserved-data")).unwrap(), b"synthetic");
         assert!(PathBuf::from(&copied).exists());
