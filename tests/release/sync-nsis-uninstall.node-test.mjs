@@ -135,6 +135,7 @@ function writeManagerHook(directory) {
 
 test('Sync NSIS preserves data by default, protects updates, and aborts before binary removal on cleanup failure', { skip }, async () => {
   const directory = mkdtempSync(join(tmpdir(), 'risunest-sync-nsis-runtime-'));
+  let completed = false;
   try {
     const binary = buildManagerStub(directory);
     const hook = writeManagerHook(directory);
@@ -321,9 +322,11 @@ SectionEnd
       assert.equal(existsSync(retry), false, `${boundary}: retry artifacts removed`);
       assert.equal(existsSync(join(location, 'local/RisuNestSyncData')), true, `${boundary}: preserved data`);
     }
+    completed = true;
   } finally {
     assert.equal(dirname(directory), resolve(tmpdir()));
-    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    if (completed) rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    else console.error(`Retained synthetic Sync NSIS fixture: ${directory}`);
   }
 });
 
