@@ -1,5 +1,6 @@
 <script lang="ts">
     import { pluginStartupGate } from 'src/ts/plugins/pluginStartupGate'
+    import { captureChatParserContextSeed, createChatParserContextSeed } from 'src/ts/chatParserContextSeed.svelte'
     import { ScreenshotPreparationError } from 'src/ts/chatScreenshotErrors'
     import { v4 } from 'uuid'
     import { alertConfirm } from 'src/ts/alert'
@@ -1218,11 +1219,21 @@
         )
     }
 
+    const liveParserStoreRevision = $derived.by(() => {
+        void viewportBindingRevision
+        return persistentRuntime.captureSelectedConversationTarget()?.storeRevision ?? null
+    })
+    const boundedLiveParserSeed = $derived.by(() => {
+        void liveParserStoreRevision
+        const current = captureCurrentParserConversation()
+        return current ? createChatParserContextSeed(createBoundedLiveParserContext(current)) : null
+    })
+
     const liveParserProjectionResolver = createSelectedConversationLiveParserProjectionResolver({
         runtime: persistentRuntime,
         maxProjectionMessages: 256,
         captureCurrent: captureCurrentParserConversation,
-        createBoundedContextSeed: createBoundedLiveParserContext,
+        createBoundedContextSeed: (current) => boundedLiveParserSeed ? captureChatParserContextSeed(boundedLiveParserSeed) : createBoundedLiveParserContext(current),
         createCompleteContext: createCompleteLiveParserContext,
         parserSource: (current) =>
             createLiveChatParserSource(DBState.db, current.character, getModuleRegexScripts()),
