@@ -586,7 +586,7 @@ export interface NativeIncompleteRestorePreview {
     unavailableColdKeys: string[]
     characterNames: string[]
     invalidInlays: string[]
-    omissions?: Partial<Record<'data' | 'remote' | 'missing' | 'values' | 'pluginStorage' | 'inlays', number>>
+    omissions?: Partial<Record<'data' | 'remote' | 'missing' | 'values' | 'pluginStorage' | 'inlays' | 'excludedCharacters', number>>
 }
 
 export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
@@ -1539,7 +1539,7 @@ async function runNativeReplacementRestore(
                         if (preview?.unavailableColdKeys.length) warnings.push(language.errors.coldStorageIncompleteRestoreConfirm(preview.characterNames.join(', '), preview.unavailableColdKeys.length, 0))
                         if (preview?.invalidInlays.length) warnings.push(language.portableBackup.invalidInlaysConfirm(preview.invalidInlays.length))
                         if (preview?.omissions) {
-                            for (const key of ['data', 'remote', 'missing', 'values', 'pluginStorage', 'inlays'] as const) {
+                            for (const key of ['data', 'remote', 'missing', 'values', 'pluginStorage', 'inlays', 'excludedCharacters'] as const) {
                                 const count = preview.omissions[key] ?? 0
                                 if (count > 0) warnings.push(language.portableBackup.omittedRestoreData[key](count))
                             }

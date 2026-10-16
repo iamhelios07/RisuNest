@@ -402,11 +402,13 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                             sameTarget(current.target, originalState.target) && current.libraryId === originalState.libraryId
                     } catch { /* Recovery requires a verified unchanged native binding. */ }
                 }
-                if (unchanged) {
+                if (!activatedContext) {
                     try {
-                        if (activationGuard) { await activationGuard.abortUnchanged(); activationGuard = undefined }
-                        if (pluginsFenced) { pluginsFenced = false; await dependencies.plugins.restart() }
-                        if (jobsFenced) { jobsFenced = false; await resumeOld(mode) }
+                        let libraryUnchanged = !activationAttempted
+                        if (unchanged && activationGuard) { await activationGuard.abortUnchanged(); activationGuard = undefined; libraryUnchanged = true }
+                        if (libraryUnchanged && pluginsFenced) { pluginsFenced = false; await dependencies.plugins.restart() }
+                        if (unchanged && libraryUnchanged && jobsFenced) { jobsFenced = false; await resumeOld(mode) }
+                        if (!libraryUnchanged && activationAttempted && resumeActivated) registerFailure(error, resumeAfterRefresh)
                     } catch (recoveryError) {
                         if (activationGuard && activationAttempted && resumeActivated) registerFailure(recoveryError, resumeAfterRefresh)
                         throw new AggregateError([error, recoveryError], 'Sync binding failed while resuming local state')

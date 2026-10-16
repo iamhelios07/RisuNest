@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { language } from '../../lang'
 const restoreAlerts = vi.hoisted(() => ({ confirm: vi.fn(), checkbox: vi.fn() }))
 vi.mock('../alert', () => ({ alertConfirm: restoreAlerts.confirm, alertCheckboxConfirm: restoreAlerts.checkbox }))
 const deviceRestore = vi.hoisted(() => ({ flushDeviceStateBeforeRestore: vi.fn(async () => {}), refreshDeviceStateAfterRestore: vi.fn(async () => {}) }))
@@ -4885,10 +4886,10 @@ it('cancels staged restore and waits for terminal settlement when the fresh prec
     ])
 })
 
-it.each(['both', 'cold', 'inlay'] as const)('cancels default incomplete restore warnings in one dialog: %s', async kind => {
+it.each(['both', 'cold', 'inlay', 'characters'] as const)('cancels default incomplete restore warnings in one dialog: %s', async kind => {
     restoreAlerts.confirm.mockReset().mockResolvedValue(false)
     restoreAlerts.checkbox.mockReset().mockResolvedValue({ confirmed: false, checked: false })
-    const preview = { unavailableColdKeys: kind === 'inlay' ? [] : ['missing'], characterNames: ['Synthetic'], invalidInlays: kind === 'cold' ? [] : ['inlay_aa.risuinlay'] }
+    const preview = { unavailableColdKeys: kind === 'inlay' || kind === 'characters' ? [] : ['missing'], characterNames: ['Synthetic'], invalidInlays: kind === 'cold' || kind === 'characters' ? [] : ['inlay_aa.risuinlay'], omissions: { excludedCharacters: kind === 'characters' ? 3 : 0 } }
     const host = createNativeJobHost([{ ...status('waitingForInput'), phase: 'awaiting-activation', incompleteRestorePreview: preview }, status('cancelled')])
     const acquire = vi.fn()
     await expect(runNativeLegacyLocalBackupRestore(
@@ -4898,6 +4899,10 @@ it.each(['both', 'cold', 'inlay'] as const)('cancels default incomplete restore 
     expect(restoreAlerts.checkbox).toHaveBeenCalledTimes(1)
     expect(restoreAlerts.confirm).not.toHaveBeenCalled()
     expect(restoreAlerts.checkbox).toHaveBeenCalledWith(expect.objectContaining({ requireChecked: true }))
+    const description = restoreAlerts.checkbox.mock.calls[0][0].description
+    if (kind === 'characters') expect(description).toContain(language.portableBackup.omittedRestoreData.excludedCharacters(3))
+    else expect(description).not.toContain(language.portableBackup.omittedRestoreData.excludedCharacters(0))
+    expect(host.commands()).not.toContain('native_file_job_finalize')
 })
 
 describe('native snapshot restore', () => {

@@ -96,6 +96,7 @@ export const languageKorean = {
     
         "invalidInlaysConfirm": (count: number) => `손상된 인레이 ${count}개는 복원되지 않습니다. 계속 복원하시겠습니까?`,
         omittedRestoreData: {
+            excludedCharacters: (count: number) => `그룹 캐릭터 및 임시 캐릭터 ${count}개는 복원되지 않습니다.`,
             data: (count: number) => `지원하지 않는 저장 데이터 ${count}개는 복원되지 않습니다.`,
             remote: (count: number) => `백업 외부에 저장된 데이터 ${count}개는 복원되지 않습니다.`,
             missing: (count: number) => `백업에 없는 저장 데이터 ${count}개는 복원되지 않습니다.`,
