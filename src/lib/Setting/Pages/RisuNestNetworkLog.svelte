@@ -218,7 +218,7 @@
     </div>
     <div class="mt-3 overflow-hidden rounded-lg border border-darkborderc bg-darkbg">
         {#each groupNetworkLogItems(listing?.items ?? []) as group (group[0].operationId ?? group[0].id)}
-            <div class="request-group" class:border-l-2={!!group[0].operationId} class:border-selected={!!group[0].operationId}>
+            <div class="request-group border-b border-darkborderc/50 last:border-b-0" class:operation-group={!!group[0].operationId}>
             {#if group[0].operationId}<div class="px-3 pt-2 text-xs text-textcolor2">{t.operation} <span class="font-mono break-all">{group[0].operationId}</span></div>{/if}
             {#each group as item (item.id)}
             <button class="request-row w-full border-b border-darkborderc/50 px-3 py-3 text-left last:border-b-0" class:request-selected={selected === item.id} onclick={() => select(item.id)} aria-pressed={selected === item.id}>
@@ -286,6 +286,8 @@
     .network-log select { max-width: 100%; min-width: 6.5rem; padding: 0.4rem 0.6rem; border: 1px solid var(--risu-theme-darkborderc); border-radius: 0.375rem; background: var(--risu-theme-darkbg); color: var(--risu-theme-textcolor); font-size: 0.8125rem; }
     .network-log .scope-active { background: var(--risu-theme-darkbutton); color: var(--risu-theme-textcolor); }
     .network-log .request-row { display: block; border-radius: 0; padding: 0.75rem; }
+    /* A shadow, not a border, so grouped rows keep their alignment and a selected row draws one marker. */
+    .network-log .operation-group { box-shadow: inset 2px 0 var(--risu-theme-selected); }
     .network-log .request-selected { background: color-mix(in srgb, var(--risu-theme-selected) 16%, var(--risu-theme-darkbg)); box-shadow: inset 2px 0 var(--risu-theme-textcolor2); }
     .network-log .detail-tab { border-radius: 0; padding: 0.75rem 0.5rem; border-bottom: 2px solid transparent; color: var(--risu-theme-textcolor2); }
     .network-log .tab-active { border-bottom-color: var(--risu-theme-textcolor); color: var(--risu-theme-textcolor); }

@@ -1,3 +1,4 @@
+import { language } from 'src/lang'
 import { configurePluginStartup, pluginStartupState } from 'src/ts/plugins/pluginStartupGate'
 import { get } from 'svelte/store'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -15,6 +16,7 @@ const mocks = vi.hoisted(() => ({
     session: null as ActiveConversationSession | null,
     selectedCharacterIndex: 0,
     sendChat: vi.fn(async () => undefined),
+    alertError: vi.fn(),
     setDatabase: vi.fn(),
 }))
 
@@ -42,6 +44,7 @@ vi.mock('../stores.svelte', async () => {
     }
 })
 vi.mock('../alert', () => ({
+    alertError: mocks.alertError,
     alertInput: vi.fn(async () => ''),
     alertMd: vi.fn(),
     alertNormal: vi.fn(),
@@ -103,15 +106,16 @@ describe('processMultiCommand conversation mutations', () => {
 
     it('keeps native commands usable while refusing model commands before conversation edits', async () => {
         configurePluginStartup(() => true, async () => {})
-        pluginStartupState.set({ phase: 'waiting', since: Date.now(), refused: false })
+        pluginStartupState.set({ phase: 'waiting', since: Date.now() })
         try {
             await processMultiCommand('/multisend clear|||discarded')
             expect(mocks.database!.characters[0].chats[0].message.map(message => message.data)).toEqual(['before'])
             expect(mocks.sendChat).not.toHaveBeenCalled()
+            expect(mocks.alertError).toHaveBeenCalledWith(language.risuNest.pluginStartup.requestRefused)
             await processMultiCommand('/send native action')
             expect(mocks.database!.characters[0].chats[0].message.map(message => message.data)).toEqual(['before', 'native action'])
         } finally {
-            pluginStartupState.set({ phase: 'released', since: 0, refused: false })
+            pluginStartupState.set({ phase: 'released', since: 0 })
             configurePluginStartup(() => false, async () => {})
         }
     })

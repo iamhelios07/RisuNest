@@ -54,7 +54,7 @@ vi.mock('src/ts/storage/sync/external/bridge', () => ({
 }))
 
 import ConnectionForm from './ConnectionForm.svelte'
-import { externalStorageStrings } from './strings'
+import { externalConnectionPlace, externalConnectionTitle, externalStorageStrings } from './strings'
 import { QrScanError } from 'src/ts/ui/qrScanner'
 
 let target: HTMLDivElement
@@ -1226,12 +1226,15 @@ describe('authorization waiting copy and renewal', () => {
 
 
 describe('changing a saved server address', () => {
-    it.each(['webdav', 's3'] as const)('keeps %s editing open on failure and returns only the verified connection', async providerId => {
-        const connection = { id: 'existing', providerId, purpose: 'backup' } as import('src/ts/storage/sync/external/types').ExternalConnectionSummary
+    it.each(['webdav', 's3'] as const)('names the %s connection, keeps editing open on failure and returns only the verified connection', async providerId => {
+        const endpoint = { providerId, authority: 'old.example.invalid', accountHint: 'synthetic', repositoryHint: 'risunest', warnings: [], remoteVerified: true }
+        const connection = { id: 'existing', providerId, purpose: 'backup', endpoint } as import('src/ts/storage/sync/external/types').ExternalConnectionSummary
         const connected = vi.fn()
         state.changeEndpoint.mockRejectedValueOnce({ kind: 'repositoryMismatch' }).mockResolvedValueOnce({ connection })
         component = mount(ConnectionForm, { target, props: { strings, addressConnection: connection, onconnected: connected, oncancel: vi.fn() } })
         await settle()
+        expect(target.textContent).toContain(externalConnectionTitle(strings, connection))
+        expect(target.textContent).toContain(externalConnectionPlace(strings, connection))
         typeInto(labelControl<HTMLInputElement>(strings.endpoint), 'https://new.example/dav')
         await settle()
         button(strings.saveAddress).click()

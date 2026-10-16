@@ -496,10 +496,13 @@
 </main>
 <SyncExitDialog />
 <PersistentWorkingSetRecovery />
-<!-- Open settings place their close button at the top right; the notices start below it. -->
-<div class="pointer-events-none fixed right-2 z-[1000] flex max-h-[calc(100dvh-5rem)] flex-col gap-2 overflow-y-auto sm:left-auto sm:w-full sm:max-w-md {$MobileGUI ? 'left-2 top-[72px]' : 'left-14 top-2'} [&>*]:pointer-events-auto" style:top={$settingsOpen && !$MobileGUI ? `${DBState.db.settingsCloseButtonSize + 16}px` : null}>
+<!-- Open settings place their close button at the top right; the notices start below it. The padding keeps card shadows inside the scroll box. -->
+<div class="pointer-events-none fixed right-0 z-[1000] flex max-h-[calc(100dvh-4rem)] flex-col gap-2 overflow-y-auto px-2 pt-2 pb-4 sm:left-auto sm:w-full sm:max-w-[464px] {$MobileGUI ? 'left-0 top-[64px]' : $settingsOpen ? 'left-0' : 'left-12 top-0'} [&>*]:pointer-events-auto" style:top={$settingsOpen && !$MobileGUI ? `${DBState.db.settingsCloseButtonSize + 8}px` : null}>
     <PersistentLocalSaveFailure />
-    <PluginStartupNotice />
-    <SyncStoppedNotice />
+    <!-- Onboarding shows the sync and plugin state itself. -->
+    {#if didFirstSetup && !$onboardingHold}
+        <PluginStartupNotice />
+        <SyncStoppedNotice />
+    {/if}
 </div>
 <SyncStatusPanel />

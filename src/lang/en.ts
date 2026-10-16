@@ -1924,7 +1924,7 @@ export const languageEnglish = {
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
         pluginStartup: {
-            delayLabel: 'Delay plugin loading when sync is enabled',
+            delayLabel: 'Load plugins after sync',
             delayHelp: 'Plugins load after synchronization completes when the app starts. Turning this off may cause plugin data to be overwritten with older values.',
             waiting: 'Plugins will load after synchronization.',
             loadNow: 'Load plugins',
@@ -1932,6 +1932,7 @@ export const languageEnglish = {
             requestRefused: 'Try again after plugins load.',
         },
         syncStatus: {
+            menuLabel: 'Sync',
             saving: 'Saving',
             saved: 'Saved',
             saveFailed: 'Save failed',
@@ -2331,6 +2332,7 @@ export const languageEnglish = {
             paused: 'Paused',
             registrationRequired: 'New registration code required',
             blocked: 'Automatic sync stopped',
+            failed: 'Sync failed',
             errorHelp:
                 'Sync could not finish. Your edits on this device are unchanged. Try again.',
             "connectRowHelpScan": 'Paste the registration code from the server or scan its QR code. Each device needs its own registration code.',
@@ -2447,7 +2449,7 @@ export const languageEnglish = {
             chatEditPopup: 'Edit chat messages in a popup',
             chatEditPopupHelp: 'Pressing the chat edit button lets you edit the message in a popup.',
             syncStatusUi: 'Show sync UI',
-            syncStatusUiHelp: 'Shows the status icon and overlays that report the sync status. When turned off, it is harder to notice right away when something is waiting for sync or a sync error occurs.',
+            syncStatusUiHelp: 'Shows the sync status icon, and a notice when sync stops or plugins are waiting for sync.',
         },
         textEditor: {
             open: 'Edit in popup',
@@ -2834,6 +2836,7 @@ export const languageEnglish = {
             resultFailedAfterCommit:
                 'The data was imported, but the screen could not be refreshed. Select Refresh screen before making more changes.',
             resultActivationUnresolved: 'The restore result could not be confirmed. Select Refresh screen to check it before making more changes.',
+            resultAssetsIncomplete: 'The data was imported, but some assets could not be imported.',
             errorDetails: 'Error details',
             errorDetailsHide: 'Hide error details',
             copyDetails: 'Copy',
@@ -3119,7 +3122,7 @@ export const languageEnglish = {
         cancelAction: "Cancel",
         clockBlocked: "Sync stopped because the device and remote times differ. Correct the time and try again.",
         writerCollision: "Sync stopped because another device uses the same identity. Register a new device on the sync server, enter the new registration code, then press Connect as new device.",
-        writerCollisionNotConnected: "This device was connected with another registration code. Press Connect as new device to connect.",
+        writerCollisionNotConnected: "This device was connected with another registration code. Press Connect as new device.",
         unitTooLarge: "Sync stopped because an item on this device is too large to send to the server. Make the large item smaller and try again.",
         newDeviceAction: "Connect as new device",
         restoreTitle: "Restore the backup?",

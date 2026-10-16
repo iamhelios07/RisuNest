@@ -287,14 +287,14 @@ it.each(['ollama-cloud', 'plugin', 'gpt35'])('refuses %s before provider selecti
   const previous = mocks.db.aiModel
   mocks.db.aiModel = model
   configurePluginStartup(() => true, async () => {})
-  pluginStartupState.set({ phase: 'waiting', since: Date.now(), refused: false })
+  pluginStartupState.set({ phase: 'waiting', since: Date.now() })
   try {
     await expect(requestChatDataMain({ formated: [], bias: {} }, 'model', new AbortController().signal))
       .resolves.toMatchObject({ type: 'fail', result: language.risuNest.pluginStartup.requestRefused })
     expect(mocks.fetch).not.toHaveBeenCalled()
   } finally {
     mocks.db.aiModel = previous
-    pluginStartupState.set({ phase: 'released', since: 0, refused: false })
+    pluginStartupState.set({ phase: 'released', since: 0 })
     configurePluginStartup(() => false, async () => {})
   }
 })

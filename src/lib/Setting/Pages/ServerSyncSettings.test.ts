@@ -27,7 +27,8 @@ vi.mock('src/ts/gui/nativeFileJobDialogModel', async importOriginal => ({ format
 vi.mock('src/ts/process/templates/templates', () => ({ prebuiltPresets: {} }))
 vi.mock('src/ts/storage/database.svelte', () => ({ setPreset: f.preset }))
 vi.mock('src/ts/storage/nativeFileJobManager', async () => { const { writable } = await import('svelte/store'); return { cancelActiveNativeFileOperation: vi.fn(), dismissNativeFileOperationOutcome: vi.fn(), nativeFileJobHost: writable('dialog'), nativeFileOperation: writable(null), nativeFileOperationOutcome: writable(null) } })
-vi.mock('src/ts/storage/officialAccountMessage', () => ({ isExpectedHubMessage: vi.fn(), resolveExpectedOfficialAccountMessageUrl: vi.fn() }))
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', async () => ({ persistentWorkingSetRefreshRevision: (await import('svelte/store')).readable(null) }))
+vi.mock('src/ts/storage/officialAccountMessage',() => ({ isExpectedHubMessage: vi.fn(), resolveExpectedOfficialAccountMessageUrl: vi.fn() }))
 vi.mock('src/ts/storage/portableBackupFileRouteProduction.svelte', () => ({ restoreBackupFromSystemPicker: vi.fn() }))
 vi.mock('src/ts/storage/risuSaveFileRouteProduction.svelte', () => ({ importRisuSaveFromSystemPicker: vi.fn() }))
 vi.mock('src/ts/storage/sync/external/bridge', () => ({ getExternalStorageBridge: () => ({}) }))
@@ -1045,14 +1046,16 @@ describe('layout', () => {
         { name: 'connected', view: { status: { configured: true, bound: true }, paused: false, error: '' }, label: sync.ready, tone: 'connected' },
         { name: 'running', view: { status: { configured: true, bound: true }, paused: false, running: true, error: '' }, label: sync.running, tone: 'working' },
         { name: 'paused', view: { status: { configured: true, bound: true }, paused: true, error: '' }, label: sync.paused, tone: 'paused' },
-        { name: 'stopped by an error', view: { status: { configured: true, bound: true }, paused: true, error: 'unit-too-large' }, label: sync.blocked, tone: 'attention' },
+        { name: 'failing and retrying', view: { status: { configured: true, bound: true }, paused: false, error: 'server-unreachable' }, label: sync.failed, tone: 'failed', notice: 'info' },
+        { name: 'stopped by an error', view: { status: { configured: true, bound: true }, paused: true, error: 'unit-too-large' }, label: sync.blocked, tone: 'attention', notice: 'danger' },
         { name: 'revoked', view: { status: { configured: true, bound: true }, paused: true, error: 'unauthorized' }, label: sync.registrationRequired, tone: 'attention' },
-    ])('labels the connection state when $name', async ({ view, label, tone }) => {
+    ])('labels the connection state when $name', async ({ view, label, tone, notice }) => {
         f.view = view
         component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
         await settle()
         expect(statusText()).toBe(label)
         expect(host.querySelector('[data-tone]')?.getAttribute('data-tone')).toBe(tone)
+        if (notice) expect(host.querySelector('[data-notice][role]')?.getAttribute('data-notice')).toBe(notice)
     })
     it('leaves the section heading and the sync storage to the settings page', async () => {
         const cache = { totalBytes: 2, cacheBytes: 1, protectedBytes: 0, reclaimableBytes: 1, ledgerBytes: 1, databaseBytes: 0, blockedReason: null }

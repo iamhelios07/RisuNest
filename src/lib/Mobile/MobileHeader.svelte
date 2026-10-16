@@ -8,7 +8,7 @@
     import SyncStatusButton from "../SideBars/SyncStatusButton.svelte";
 
 </script>
-{#snippet status()}<div class="ml-auto flex shrink-0"><SyncStatusButton variant="header" /></div>{/snippet}
+{#snippet status()}<div class="-mr-2.5 ml-auto flex shrink-0"><SyncStatusButton variant="header" /></div>{/snippet}
 <div class="w-full px-4 h-16 border-b border-b-darkborderc bg-darkbg flex justify-start items-center gap-2" data-mobile-header>
     {#if $settingsOpen}
         <button aria-label={language.goback} onclick={() => {

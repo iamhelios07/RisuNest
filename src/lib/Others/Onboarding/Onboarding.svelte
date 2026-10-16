@@ -50,6 +50,7 @@
         isExpectedHubMessage,
         resolveExpectedOfficialAccountMessageUrl,
     } from 'src/ts/storage/officialAccountMessage'
+    import { persistentWorkingSetRefreshRevision } from 'src/ts/storage/persistentDataRuntime.svelte'
     import { restoreBackupFromSystemPicker } from 'src/ts/storage/portableBackupFileRouteProduction.svelte'
     import { importRisuSaveFromSystemPicker } from 'src/ts/storage/risuSaveFileRouteProduction.svelte'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
@@ -144,6 +145,10 @@
         && $nativeFileOperationOutcome.status.portableBodyRetry?.pending === true
         && $nativeFileOperationOutcome.status.portableBodyRetry.available === true
         && !$nativeFileOperationOutcome.status.portableBodyRetry.sourceRequired)
+    // The restored data is in place, so the reader can move on unless the screen still waits for a refresh or the result is unknown.
+    const committedRecovery = $derived(jobRecoveryRequired
+        && $nativeFileOperationOutcome?.error?.code !== 'activation-outcome-unresolved'
+        && $persistentWorkingSetRefreshRevision === null)
     const jobTicking = $derived(jobShown && job.terminal === null)
     let jobDetailsOpen = $state(false)
     let jobDetailsCopied = $state(false)
@@ -761,18 +766,29 @@
                                 >
                                     {t.import.next}<ArrowRight />
                                 </button>
-                            {:else if bodyRetryAvailable}
-                                <button class="btn" type="button" onclick={() => {
-                                    void retryPortableRestoreBodiesFromOutcome().then(continueAfterImport).catch(() => {})
-                                }}>{strings.retry}</button>
-                            {:else if !jobRecoveryRequired}
-                                <button
-                                    class="btn"
-                                    type="button"
-                                    onclick={dismissNativeFileOperationOutcome}
-                                >
-                                    {strings.risuNest.importDialog.close}
-                                </button>
+                            {:else}
+                                {#if bodyRetryAvailable}
+                                    <button class="btn" type="button" onclick={() => {
+                                        void retryPortableRestoreBodiesFromOutcome().then(continueAfterImport).catch(() => {})
+                                    }}>{strings.retry}</button>
+                                {/if}
+                                {#if committedRecovery}
+                                    <button
+                                        class="btn primary"
+                                        type="button"
+                                        onclick={continueAfterImport}
+                                    >
+                                        {t.import.next}<ArrowRight />
+                                    </button>
+                                {:else if !jobRecoveryRequired}
+                                    <button
+                                        class="btn"
+                                        type="button"
+                                        onclick={dismissNativeFileOperationOutcome}
+                                    >
+                                        {strings.risuNest.importDialog.close}
+                                    </button>
+                                {/if}
                             {/if}
                         {/if}
                     </div>

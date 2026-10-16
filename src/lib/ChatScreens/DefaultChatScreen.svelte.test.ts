@@ -756,7 +756,7 @@ it('reports a reroll whose tail could not be reopened as failed', async () => {
 
 it('refuses send and regenerate while plugins wait, retaining the draft and conversation', async () => {
     configurePluginStartup(() => true, async () => {})
-    pluginStartupState.set({ phase: 'waiting', since: Date.now(), refused: false })
+    pluginStartupState.set({ phase: 'waiting', since: Date.now() })
     try {
         const input = type('Keep this draft')
         const before = JSON.parse(JSON.stringify(DBState.db.characters[0].chats[0].message))
@@ -767,10 +767,10 @@ it('refuses send and regenerate while plugins wait, retaining the draft and conv
         expect(DBState.db.characters[0].chats[0].message).toEqual(before)
         expect(mocks.generate).not.toHaveBeenCalled()
         expect(mocks.trigger).not.toHaveBeenCalled()
-        expect(get(pluginStartupState).refused).toBe(true)
+        expect(mocks.error.mock.calls).toEqual([[language.risuNest.pluginStartup.requestRefused], [language.risuNest.pluginStartup.requestRefused]])
         expect(document.querySelector<HTMLButtonElement>('.button-icon-send')!.disabled).toBe(false)
     } finally {
-        pluginStartupState.set({ phase: 'released', since: 0, refused: false })
+        pluginStartupState.set({ phase: 'released', since: 0 })
         configurePluginStartup(() => false, async () => {})
     }
 })

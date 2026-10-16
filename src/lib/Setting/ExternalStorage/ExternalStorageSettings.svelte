@@ -946,9 +946,6 @@
                         <SettingToggle showLabel label={strings.makeSyncTarget} disabled={busy} checked={syncRequest[connection.id] ?? syncing} onchange={enabled => setSyncBinding(connection, enabled)} />
                     {/if}
                     <div class="actions">
-                        {#if connection.providerId === 'webdav' || connection.providerId === 's3'}
-                            <SettingButton disabled={busy} onclick={() => addressConnection = connection}>{strings.changeAddress}</SettingButton>
-                        {/if}
                         {#if renewable}<SettingButton disabled={busy} onclick={() => renewalConnection = connection}>{strings.renew}</SettingButton>{/if}
                         {#if lockable}<SettingButton disabled={busy} onclick={() => unlockConnection = connection}>{strings.unlock}</SettingButton>{/if}
                         {#if recheckable && job}<SettingButton disabled={busy} onclick={() => resumeJob(connection, job)}>{strings.recheckPublication}</SettingButton>{/if}
@@ -957,6 +954,9 @@
                         {:else if syncTarget}<SettingButton variant={remedy ? 'secondary' : 'primary'} disabled={busy} onclick={() => syncNow(connection)}>{strings.runSync}</SettingButton>{/if}
                         {#if job && externalJobIsActive(job)}<SettingButton variant="secondary" onclick={() => cancelJob(job)}>{strings.cancel}</SettingButton>{/if}
                         {#if job && unfinishedRestore(job)}<SettingButton variant="secondary" disabled={busy} onclick={() => stopRestore(job)}>{strings.stopRestore}</SettingButton>{/if}
+                        {#if connection.providerId === 'webdav' || connection.providerId === 's3'}
+                            <SettingButton variant="secondary" disabled={busy} onclick={() => addressConnection = connection}>{strings.changeAddress}</SettingButton>
+                        {/if}
                     </div>
                 </div>
 

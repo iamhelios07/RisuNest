@@ -19,7 +19,7 @@ afterEach(async () => {
     component = undefined
     document.body.replaceChildren()
     syncStatus.set(null)
-    pluginStartupState.set({ phase: 'released', refused: false, since: 0 })
+    pluginStartupState.set({ phase: 'released', since: 0 })
     settingsOpen.set(false)
     activeRisuNestSettingsTab.set(null)
     DBState.db.risunestSyncStatusUi = true
@@ -36,7 +36,7 @@ async function show(source: SyncStatusSource | null) {
     await tick()
 }
 const notice = () => document.querySelector('[data-sync-stopped]')
-const close = () => [...notice()!.querySelectorAll('button')].find(button => button.textContent?.trim() === language.close)!.click()
+const close = () => notice()!.querySelector<HTMLButtonElement>(`button[aria-label="${language.close}"]`)!.click()
 
 it('shows a stop once until its cause changes or a sync succeeds', async () => {
     component = mount(SyncStoppedNotice, { target: document.body })
@@ -66,11 +66,11 @@ it('shows a stop once until its cause changes or a sync succeeds', async () => {
 })
 
 it('leaves the stop to the plugin notice while plugins wait and omits the open settings tab', async () => {
-    pluginStartupState.set({ phase: 'waiting', refused: false, since: Date.now(), target: 'server' })
+    pluginStartupState.set({ phase: 'waiting', since: Date.now(), target: 'server' })
     component = mount(SyncStoppedNotice, { target: document.body })
     await show(server({ error: 'unauthorized' }))
     expect(notice()).toBeNull()
-    pluginStartupState.set({ phase: 'released', refused: false, since: 0 }); await tick()
+    pluginStartupState.set({ phase: 'released', since: 0 }); await tick()
     expect(notice()?.querySelector('p')?.textContent).toBe(language.risuNest.serverSync.registrationRequired)
 
     const settings = [...notice()!.querySelectorAll('button')].find(button => button.textContent?.trim() === language.risuNest.tabs.sync)!
@@ -78,7 +78,7 @@ it('leaves the stop to the plugin notice while plugins wait and omits the open s
     expect(get(settingsOpen)).toBe(true)
     expect(get(SettingsMenuIndex)).toBe(17)
     activeRisuNestSettingsTab.set('sync'); await tick()
-    expect([...notice()!.querySelectorAll('button')].map(button => button.textContent?.trim())).toEqual([language.close])
+    expect([...notice()!.querySelectorAll('button')].map(button => button.getAttribute('aria-label'))).toEqual([language.close])
 })
 
 it('reports an external connection that needs the user', async () => {

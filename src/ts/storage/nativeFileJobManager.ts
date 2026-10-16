@@ -11,6 +11,7 @@ import {
     NativeFileJobActivationCommittedError,
     NativeFileJobActivationUnresolvedError,
     NativeFileJobError,
+    PORTABLE_BODIES_INCOMPLETE,
     resolveNativeFileJobStage,
     portableBodyRetryRequest,
     retryNativePortableRestoreBodies,
@@ -111,7 +112,7 @@ export function recordRecoveredNativeFileOperation(status: NativeFileJobStatus):
         }
         const cause = new NativeFileJobError(status.error?.code ?? 'restore-failed', status.error?.message ?? 'Restore failed')
         return {...outcome, status, state: status.state === 'cancelled' ? 'cancelled' : 'failed',
-            error: outcomeError(outcome.kind, status.activationRevision === undefined ? cause : new NativeFileJobActivationCommittedError(status.activationRevision, cause))}
+            error: outcomeError(outcome.kind, status.activationRevision === undefined ? cause : new NativeFileJobActivationCommittedError(status.activationRevision, cause, pendingBodies ? PORTABLE_BODIES_INCOMPLETE : undefined))}
     })
 }
 

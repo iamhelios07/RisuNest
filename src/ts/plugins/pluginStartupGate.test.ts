@@ -37,7 +37,7 @@ describe('plugin initial receive gate', () => {
         const failure = new Error('synthetic plugin load failure')
         const log = vi.spyOn(console, 'error').mockImplementation(() => {})
         configurePluginStartup(() => true, async () => { throw failure })
-        pluginStartupGate.state.set({ phase: 'waiting', refused: false, since: 1 })
+        pluginStartupGate.state.set({ phase: 'waiting', since: 1 })
         try {
             notifySyncBindingChanged()
             await vi.waitFor(() => expect(log).toHaveBeenCalledWith('Plugin startup failed', failure))
@@ -47,7 +47,7 @@ describe('plugin initial receive gate', () => {
         } finally {
             configurePluginStartup(() => false, async () => {})
             pluginStartupGate.invalidate()
-            pluginStartupGate.state.set({ phase: 'released', refused: false, since: 0 })
+            pluginStartupGate.state.set({ phase: 'released', since: 0 })
             log.mockRestore()
         }
     })
@@ -59,7 +59,7 @@ describe('plugin initial receive gate', () => {
         expect(get(gate.state).phase).toBe('waiting')
         expect(h.starts).toBe(0)
         expect(gate.refuse()).toBe(true)
-        expect(get(gate.state).refused).toBe(true)
+        expect(gate.refusalCount).toBe(1)
         receive.resolve()
         await vi.waitFor(() => expect(h.starts).toBe(1))
         expect(h.received).toBe(true)

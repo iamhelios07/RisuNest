@@ -799,7 +799,8 @@ export function buildNativeFileJobDialogModel(
                 ? copy.resultCancelledPartial
                 : copy.resultCancelled
         } else if (outcome.error?.recoveryRequired) {
-            summary = outcome.error.code === 'activation-outcome-unresolved' ? copy.resultActivationUnresolved : copy.resultFailedAfterCommit
+            summary = outcome.error.code === 'activation-outcome-unresolved' ? copy.resultActivationUnresolved
+                : outcome.error.code === 'portable-bodies-incomplete' ? copy.resultAssetsIncomplete : copy.resultFailedAfterCommit
         } else {
             summary = copy.resultFailed
             reason = failureReason(outcome.error?.code ?? '', 'import', outcome.error?.itemKind)

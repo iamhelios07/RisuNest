@@ -712,15 +712,19 @@ export class NativeFileJobError extends Error {
 const isSyncUnavailable = (error: unknown): boolean =>
     typeof error === 'object' && error !== null && 'code' in error && error.code === 'sync-unavailable'
 
+/** The restore committed its data, but some asset bodies are still missing. */
+export const PORTABLE_BODIES_INCOMPLETE = 'portable-bodies-incomplete'
+
 export class NativeFileJobActivationCommittedError extends NativeFileJobError {
     readonly recoveryRequired = true
 
     constructor(
         readonly committedRevision: number,
         readonly cause: unknown,
+        code = 'activation-committed-refresh-failed',
     ) {
         super(
-            'activation-committed-refresh-failed',
+            code,
             `Native restore committed revision ${committedRevision}, but the active app state could not be fully refreshed`,
         )
         this.name = 'NativeFileJobActivationCommittedError'
@@ -1783,7 +1787,7 @@ async function runNativeReplacementRestore(
         }
 
         if (portableAdoptedRevision !== undefined) {
-            throw new NativeFileJobActivationCommittedError(portableAdoptedRevision, new NativeFileJobError(terminal.error?.code ?? 'body-completion-failed',terminal.error?.message ?? 'Portable missing bodies could not be restored'))
+            throw new NativeFileJobActivationCommittedError(portableAdoptedRevision, new NativeFileJobError(terminal.error?.code ?? 'body-completion-failed',terminal.error?.message ?? 'Portable missing bodies could not be restored'), PORTABLE_BODIES_INCOMPLETE)
         }
         const error =
             mutationConflict ??
@@ -1908,16 +1912,16 @@ export function portableBodyRetryRequest(status: NativeFileJobStatus): NativePor
 
 export async function retryNativePortableRestoreBodies(request: NativePortableBodyRetryRequest, options: NativeFileJobOptions = {}, dependencies: NativeFileJobDependencies = productionDependencies): Promise<NativeFileJobResult> {
     try { await invokeNative(dependencies, 'native_portable_retry_restore_bodies', {request}) }
-    catch (error) { throw new NativeFileJobActivationCommittedError(Number(request.activationRevision), error) }
+    catch (error) { throw new NativeFileJobActivationCommittedError(Number(request.activationRevision), error, PORTABLE_BODIES_INCOMPLETE) }
     const terminal = await pollNativeFileJobUntilTerminal(request.jobId, options, dependencies)
     if (terminal.kind !== 'restore-portable-backup' || terminal.restoreAdoptionConfirmed !== true
         || String(terminal.activationRevision) !== request.activationRevision || terminal.activationAuthority !== request.bindingAuthority
         || terminal.deviceSessionId !== request.deviceSessionId || terminal.portableBodyRetry?.stagingId !== request.stagingId
         || terminal.portableBodyRetry.catalogSha256 !== request.catalogSha256) {
-        throw new NativeFileJobActivationCommittedError(Number(request.activationRevision), new NativeFileJobError('portable-body-receipt-mismatch', 'Portable body retry receipt differs'))
+        throw new NativeFileJobActivationCommittedError(Number(request.activationRevision), new NativeFileJobError('portable-body-receipt-mismatch', 'Portable body retry receipt differs'), PORTABLE_BODIES_INCOMPLETE)
     }
     if (terminal.state !== 'succeeded' || !terminal.result || terminal.portableBodyRetry.pending) {
-        throw new NativeFileJobActivationCommittedError(Number(request.activationRevision), new NativeFileJobError(terminal.error?.code ?? 'portable-bodies-incomplete', terminal.error?.message ?? 'Portable missing bodies could not be restored'))
+        throw new NativeFileJobActivationCommittedError(Number(request.activationRevision), new NativeFileJobError(terminal.error?.code ?? 'portable-bodies-incomplete', terminal.error?.message ?? 'Portable missing bodies could not be restored'), PORTABLE_BODIES_INCOMPLETE)
     }
     const warningCodes = mergeWarningCodes(terminal.warningCodes, terminal.result.warningCodes)
     try { await invokeNative(dependencies, 'native_file_job_forget', {jobId: request.jobId}) }
