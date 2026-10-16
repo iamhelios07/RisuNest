@@ -1098,6 +1098,8 @@ Section Uninstall
     ClearErrors
     Delete "$INSTDIR\uninstall.exe"
     ${If} ${Errors}
+      ; _?= runs the uninstaller in place; its caller removes that image after exit.
+      StrCmp $EXEPATH "$INSTDIR\uninstall.exe" sync_uninstall_image_retained
       WriteRegStr ${RISUNEST_UNINSTALL_REG_ROOT} "${UNINSTKEY}" "DisplayName" "${PRODUCTNAME}"
       WriteRegStr ${RISUNEST_UNINSTALL_REG_ROOT} "${UNINSTKEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
       WriteRegStr ${RISUNEST_UNINSTALL_REG_ROOT} "${UNINSTKEY}" "InstallLocation" "$\"$INSTDIR$\""
@@ -1106,6 +1108,7 @@ Section Uninstall
       SetErrorLevel 1
       Abort "removal-uninstaller-delete-failed"
     ${EndIf}
+    sync_uninstall_image_retained:
     !undef RISUNEST_UNINSTALL_REG_ROOT
     !insertmacro NSIS_HOOK_FINALUNINSTALL
   !endif
