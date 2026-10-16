@@ -158,6 +158,34 @@ test('length-prefixed writer backpatches unknown sizes and rejects unsafe or dup
     await assert.rejects(writer.begin('database.risudat'), ExportError);
     await assert.rejects(new ArchiveWriter(new MemorySink()).begin('large', U32_MAX + 1), ExportError);
 });
+test('backup preserves 298000 assets with more than 64 MiB of entry names', async () => {
+    const count = 298000;
+    const prefix = 'synthetic/'.repeat(23);
+    const names = Array.from({ length: count }, (_, i) => prefix + String(i).padStart(6, '0') + '.bin');
+    assert(names.reduce((total, name) => total + Buffer.byteLength(name), 0) > 64 * 1024 * 1024);
+    const db = database();
+    const source = fixtureSource({ db });
+    source.inventory = async () => ({ assets: names.map(name => 'assets/' + name), cold: [], inlays: [] });
+    source.asset = async key => {
+        const index = Number(key.slice(-10, -4));
+        const body = Buffer.alloc(4); body.writeUInt32LE(index);
+        return sourceOf(body);
+    };
+    const sink = new MemorySink();
+    const result = await exportBackup({ source, sink });
+    assert(sink.closed && !sink.aborted);
+    assert.equal(result.items, count + 1);
+    assert.equal(result.bytes, sink.bytes.length);
+    assert.deepEqual(result.skipped, { missingAssets: 0, missingCold: 0, unreadableCold: 0, pluginCold: 0, unsupportedInlays: 0 });
+    const entries = archive(sink.bytes);
+    assert.equal(entries.size, count + 1);
+    assert.deepEqual(entries.get('database.risudat'), db);
+    for (let i = 0; i < count; i++) {
+        assert.equal(entries.get(names[i])?.length, 4);
+        assert.equal(entries.get(names[i]).readUInt32LE(), i);
+    }
+});
+
 test('old base64 inlays decode in bounded chunks with an independent hash', async () => {
     const original = Buffer.alloc(1024 * 1024 + 2, 0xe7);
     const item = inlaySource('id', { name: 'image', ext: 'png', type: 'image', data: 'data:image/png;base64,' + original.toString('base64') });

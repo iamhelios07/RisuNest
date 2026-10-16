@@ -34,6 +34,23 @@ test('read-only IndexedDB adapter enumerates batches and never creates a missing
     assert(!(await indexedDB.databases()).some(db => db.name === absent));
     assert.equal(await IdbStore.open(name, 'missing'), null);
 });
+test('browser inventory keeps 298000 IndexedDB and cached account assets', async () => {
+    const name = 'synthetic-' + crypto.randomUUID();
+    const assets = Array.from({ length: 298000 }, (_, i) => 'assets/' + String(i).padStart(6, '0') + '.png');
+    await seed(name, 'keyvaluepairs', assets.map(key => [key, 0]).concat([['database/database.bin', 0], ['metadata', 0]]));
+    const store = await IdbStore.open(name);
+    try {
+        for (const mode of ['indexeddb', 'account']) {
+            const source = new BrowserSource();
+            Object.assign(source, { mode, local: store, cache: store });
+            assert.deepEqual(await source.inventory(), { assets, cold: [], inlays: [] });
+        }
+    } finally {
+        store.close();
+        indexedDB.deleteDatabase(name);
+    }
+});
+
 test('legacy account adapter sends the pinned protocol and preserves the response as a stream', async () => {
     const requests = [];
     const account = new AccountReader({
