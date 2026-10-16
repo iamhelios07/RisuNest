@@ -914,6 +914,8 @@ const response = await Risuai.nativeFetch('https://api.example.com/data');
 const data = await response.json();
 ```
 
+In RisuNest, start reading a `nativeFetch` response body within 60 seconds, for example with `response.json()`, `response.text()`, or the first `reader.read()`. An unread body expires and a later read fails. Once reading starts, this 60-second limit does not apply to completing the stream. Cancel an unused body with `response.body?.cancel()`.
+
 ### Script Handlers
 
 Modify content at different processing stages:
