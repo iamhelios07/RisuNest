@@ -494,7 +494,8 @@
 </main>
 <SyncExitDialog />
 <PersistentWorkingSetRecovery />
-<div class="pointer-events-none fixed right-2 z-[1000] flex max-h-[calc(100dvh-5rem)] flex-col gap-2 overflow-y-auto sm:left-auto sm:w-full sm:max-w-md {$MobileGUI ? 'left-2 top-[72px]' : 'left-14 top-2'} [&>*]:pointer-events-auto">
+<!-- Open settings place their close button at the top right; the notices start below it. -->
+<div class="pointer-events-none fixed right-2 z-[1000] flex max-h-[calc(100dvh-5rem)] flex-col gap-2 overflow-y-auto sm:left-auto sm:w-full sm:max-w-md {$MobileGUI ? 'left-2 top-[72px]' : 'left-14 top-2'} [&>*]:pointer-events-auto" style:top={$settingsOpen && !$MobileGUI ? `${DBState.db.settingsCloseButtonSize + 16}px` : null}>
     <PersistentLocalSaveFailure />
     <PluginStartupNotice />
 </div>

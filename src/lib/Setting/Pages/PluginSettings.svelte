@@ -28,13 +28,13 @@
     }
 </script>
 
-<PluginStartupNotice inline />
-
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.plugin}</h2>
 
 <span class="text-draculared text-xs mb-4">{language.pluginWarn}</span>
 
 <button type="button" class="text-textcolor2 hover:text-textcolor text-sm underline self-start mb-2" onclick={() => { openRisuNestSettingsTab('plugin-data'); $SettingsMenuIndex = 17 }}>{language.risuNest.pluginData.title}</button>
+
+<PluginStartupNotice inline />
 
 <div class="border-solid border-darkborderc p-2 flex flex-col border-1">
     {#if !DBState.db.plugins || DBState.db.plugins?.length === 0}
