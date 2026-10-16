@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServerSyncScheduler } from './serverSyncScheduler'
+import { createPluginStartupGate } from '../../plugins/pluginStartupGate'
 
 afterEach(() => vi.useRealTimers())
 function fixture() {
@@ -141,6 +142,73 @@ describe('server LWW foreground scheduler', () => {
         release[0](); await available; await fence; expect(fenced).toBe(true)
         await vi.advanceTimersByTimeAsync(120_000); expect(f.pull).toHaveBeenCalledTimes(1)
         f.scheduler.dispose()
+    })
+    it.each(['background', 'file reservation', 'foreground'] as const)('reserves a complete receive for plugin startup with queued hints in %s', async stoppedBy => {
+        const f = fixture()
+        let available = true
+        const pulls: Array<{ complete: boolean; resolve(): void }> = []
+        const scheduler = createServerSyncScheduler({ ...f,
+            automaticSyncAvailable: () => available,
+            pull: complete => new Promise<void>(resolve => { pulls.push({ complete: !!complete, resolve }) }),
+        })
+        let starts = 0
+        const gate = createPluginStartupGate({ enabled: () => true, delay: () => true,
+            context: async () => ({ identity: 'synthetic-binding', bound: true,
+                receive: () => scheduler.receiveAvailableChanges(), assertCurrent: async () => {},
+            }),
+            start: async () => { if (await gate.ensure()) starts++ },
+        })
+        try {
+            await scheduler.foreground(true)
+            scheduler.remoteHint()
+            expect(await gate.ensure()).toBe(false)
+            let secondComplete = false
+            const second = scheduler.receiveAvailableChanges().then(() => { secondComplete = true })
+            pulls[0].resolve()
+            await vi.advanceTimersByTimeAsync(0)
+            expect(pulls.map(pull => pull.complete)).toEqual([false, true])
+            scheduler.remoteHint(); scheduler.remoteHint()
+            expect(starts).toBe(0)
+            expect(secondComplete).toBe(false)
+            expect(pulls).toHaveLength(2)
+            if (stoppedBy === 'background') await scheduler.foreground(false)
+            else if (stoppedBy === 'file reservation') available = false
+            pulls[1].resolve()
+            await second
+            await vi.advanceTimersByTimeAsync(0)
+            expect(starts).toBe(1)
+            expect(secondComplete).toBe(true)
+            expect(pulls.map(pull => pull.complete)).toEqual(stoppedBy === 'foreground' ? [false, true, false] : [false, true])
+            pulls[2]?.resolve()
+            await scheduler.waitForIdle()
+        } finally { scheduler.dispose(); gate.invalidate() }
+    })
+    it.each(['server-unreachable', 'cancelled', 'equal-stamp-integrity'])('keeps an explicit %s receive failure retryable without releasing plugin startup', async code => {
+        const f = fixture()
+        const failure = { code, retryable: code !== 'equal-stamp-integrity' }
+        f.pull.mockRejectedValueOnce(failure)
+        let starts = 0
+        const gate = createPluginStartupGate({ enabled: () => true, delay: () => true,
+            context: async () => ({ identity: 'synthetic-binding', bound: true,
+                receive: () => f.scheduler.receiveAvailableChanges(), assertCurrent: async () => {},
+            }),
+            start: async () => { if (await gate.ensure()) starts++ },
+        })
+        try {
+            expect(await gate.ensure()).toBe(false)
+            await vi.advanceTimersByTimeAsync(0)
+            expect(starts).toBe(0)
+            expect(gate.isWaiting()).toBe(true)
+            expect(f.scheduler.isRunning()).toBe(false)
+            if (code === 'equal-stamp-integrity') {
+                await expect(f.scheduler.receiveAvailableChanges()).rejects.toThrow('Sync is stopped')
+                f.scheduler.reset()
+            }
+            expect(f.failed).toHaveBeenCalledTimes(code === 'cancelled' ? 0 : 1)
+            gate.retry()
+            await vi.advanceTimersByTimeAsync(0)
+            expect(starts).toBe(1)
+        } finally { f.scheduler.dispose(); gate.invalidate() }
     })
     it('stops native integrity errors restored as Error messages', async () => {
         const f=fixture(); f.pull.mockRejectedValueOnce(new Error('equal-stamp-integrity'))

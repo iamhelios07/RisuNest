@@ -33,6 +33,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     let sendRetryTimer: ReturnType<typeof setTimeout> | undefined
     let sending: Promise<void> | undefined
     let receiving: Promise<void> | undefined
+    let completingReceive: Promise<void> | undefined
     let pushAgain = false
     let pullAgain = false
     let reconnectAttempt = 0
@@ -92,10 +93,11 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     const pull = (completeAvailable = false): Promise<void> => {
         clearTimeout(pullTimer)
         if (((!foreground || !available()) && !completeAvailable) || blocked) return Promise.resolve()
+        if (!completeAvailable && completingReceive) { pullAgain = true; return completingReceive }
         if (receiving) { pullAgain = true; return receiving }
         receiving = dependencies.pull(completeAvailable).then(() => succeeded('pull'), error => { fail(error, 'pull'); throw error }).finally(() => {
             receiving = undefined
-            if (pullAgain && foreground) { pullAgain = false; void pull().catch(() => {}) }
+            if (pullAgain && foreground && !completingReceive) { pullAgain = false; void pull().catch(() => {}) }
             else schedulePull()
             dependencies.activity?.()
         })
@@ -169,17 +171,25 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         async conversationOpened() { if (!await recheckClock()) void pull().catch(() => {}) },
         socket,
         flush: push,
-        async receiveAvailableChanges() {
-            if (blocked) throw new Error('Sync is stopped')
-            await receiving
-            if (blocked) throw new Error('Sync is stopped')
-            await pull(true)
+        receiveAvailableChanges() {
+            if (completingReceive) return completingReceive
+            completingReceive = (async () => {
+                if (blocked) throw new Error('Sync is stopped')
+                await receiving
+                if (blocked) throw new Error('Sync is stopped')
+                await pull(true)
+            })().finally(() => {
+                completingReceive = undefined
+                if (pullAgain && foreground) { pullAgain = false; void pull().catch(() => {}) }
+                dependencies.activity?.()
+            })
+            return completingReceive
         },
         retry() { blocked = false; blockedCode = ''; sendRetryAttempt = 0; connect(); void pull().catch(() => {}); return push() },
         reset() { blocked = false; blockedCode = ''; sendRetryAttempt = 0; reconnectAttempt = 0; notificationOperationId = undefined; failedLanes.clear() },
         async waitForIdle() {
-            while (sending || receiving || checkingClock) {
-                await Promise.allSettled([sending, receiving, checkingClock])
+            while (sending || receiving || completingReceive || checkingClock) {
+                await Promise.allSettled([sending, receiving, completingReceive, checkingClock])
             }
         },
         async resumeAutomaticSync() {
@@ -194,8 +204,8 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         isBlocked: () => blocked,
         /** The failure that stopped sync until a retry, or '' while it is not stopped. */
         blockedCode: () => blocked ? blockedCode : '',
-        isRunning: () => !!sending || !!receiving || !!checkingClock,
-        async fence() { foreground = false; pushAgain = false; pullAgain = false; clear(); await disconnect(); await Promise.allSettled([sending, receiving, checkingClock]) },
+        isRunning: () => !!sending || !!receiving || !!completingReceive || !!checkingClock,
+        async fence() { foreground = false; pushAgain = false; pullAgain = false; clear(); await disconnect(); await Promise.allSettled([sending, receiving, completingReceive, checkingClock]) },
         dispose() { foreground = false; clear(); void disconnect().catch(fail) },
     }
 }
