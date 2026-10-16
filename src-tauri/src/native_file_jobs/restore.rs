@@ -2,6 +2,7 @@
 mod upstream_import;
 #[path = "pocket_features.rs"]
 pub(super) mod pocket_features;
+mod historical;
 use super::{
     ImportCounts, JobControl, JobDetail, JobPhase, JobProgress, JobResultSummary, JobStage,
     NativeJobError, OpenedJobSource, StageUnit,
@@ -49,6 +50,8 @@ impl Default for RestoreLimits {
 }
 
 pub(crate) trait ReplacementSink: Send + Sync {
+    fn prepare_activation_receipt(&self, _staging_id: &str, _job: &JobControl, _result: &JobResultSummary) -> StoreResult<Option<String>> { Ok(None) }
+    fn activation_receipt(&self, _staging_id: &str, _authority: &str) -> StoreResult<Option<i64>> { Ok(None) }
     fn begin(&self) -> StoreResult<StagingResult>;
     fn put_root(&self, staging_id: &str, root: &Value) -> StoreResult<()>;
     fn put_presets(&self, staging_id: &str, presets: &[Value]) -> StoreResult<()>;
@@ -134,9 +137,13 @@ pub(crate) trait RestoreControl {
     fn set_phase(&self, phase: JobPhase) -> Result<(), String>;
     fn set_progress(&self, progress: JobProgress) -> Result<(), String>;
     fn set_detail(&self, detail: JobDetail) -> Result<(), String>;
+    fn record_restore_omission(&self, kind: &str, count: u64) -> Result<(), String>;
 }
 
 impl RestoreControl for JobControl {
+    fn record_restore_omission(&self, kind: &str, count: u64) -> Result<(), String> {
+        JobControl::record_restore_omission(self, kind, count)
+    }
     fn is_cancel_requested(&self) -> bool {
         JobControl::is_cancel_requested(self)
     }
@@ -160,6 +167,7 @@ impl RestoreControl for JobControl {
 /// so it offsets the database bytes and keeps the archive's entry count.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RestoreProgressScale {
+    pub(crate) result_source: Option<(u64, String)>,
     pub(crate) spool_directory: Option<PathBuf>,
     pub(crate) reject_cold_references: bool,
     /// Bytes already counted before the database read started.
@@ -329,7 +337,7 @@ fn restore_risu_save_reader<R: Read>(
 }
 
 fn restore_risu_save_reader_controlled<R: Read>(
-    source: R,
+    mut source: R,
     total_bytes: u64,
     expected_revision: i64,
     job: &JobControl,
@@ -350,8 +358,12 @@ fn restore_risu_save_reader_controlled<R: Read>(
     }
     let spool_directory = scale.spool_directory.clone();
     let reject_cold_references = scale.reject_cold_references;
-    let mut reader = TrackedReader::new_with_scale(source, total_bytes, job, scale);
-    let format = read_risu_save_format(&mut reader)?;
+    let mut prefix = [0; 2];
+    source.read_exact(&mut prefix).map_err(|_| invalid_source("could not read database header"))?;
+    let unframed = if is_zlib_header(&prefix) { Some(RisuSaveFormat::HistoricalCompressed) }
+        else { None };
+    let mut reader = TrackedReader::new_with_scale(io::Cursor::new(prefix).chain(source), total_bytes, job, scale);
+    let format = match unframed { Some(format) => format, None => read_risu_save_format(&mut reader)? };
 
     let staging_id = sink.begin().map_err(store_error)?.staging_id;
     let outcome = (|| {
@@ -367,6 +379,9 @@ fn restore_risu_save_reader_controlled<R: Read>(
                 parse_and_stage_compressed_legacy(&mut reader, &staging_id, job, sink, limits)?
             }
             RisuSaveFormat::LegacyStream => {
+                parse_and_stage_compressed_legacy(&mut reader, &staging_id, job, sink, limits)?
+            }
+            RisuSaveFormat::HistoricalCompressed => {
                 parse_and_stage_compressed_legacy(&mut reader, &staging_id, job, sink, limits)?
             }
         };
@@ -394,8 +409,9 @@ fn restore_risu_save_reader_controlled<R: Read>(
         job.set_plugin_value_preview(&staging_id, preview)
             .map_err(|error| job_error(job, error))?;
         let incomplete = sink.incomplete_restore_preview().map_err(store_error)?;
-        let warning_codes = incomplete.warning_codes();
         job.set_incomplete_restore_preview(incomplete).map_err(|error| job_error(job, error))?;
+        let warning_codes = job.status()
+            .incomplete_restore_preview.map(|preview| preview.warning_codes()).unwrap_or_default();
         let activation_revision = job
             .wait_for_restore_finalization()
             .map_err(|error| job_error(job, error))?
@@ -404,25 +420,42 @@ fn restore_risu_save_reader_controlled<R: Read>(
             sink.preserve_active_repositories(&staging_id, activation_revision)
                 .map_err(store_error)?;
         }
-        let revision = sink
-            .commit(&staging_id, activation_revision)
-            .map_err(store_error)?
-            .revision;
-        Ok(JobResultSummary {
+        let mut result = JobResultSummary {
             export_exclusions: None,
-            revision,
-            source_bytes: reader.completed,
-            source_sha256: hex::encode(reader.hasher.finalize()),
+            revision: 0,
+            source_bytes: reader.scale.result_source.as_ref().map_or(reader.completed, |source| source.0),
+            source_sha256: reader.scale.result_source.as_ref().map(|source| source.1.clone()).unwrap_or_else(|| hex::encode(reader.hasher.clone().finalize())),
             source_fingerprint_kind: crate::native_file_jobs::SourceFingerprintKind::WholeFileSha256,
             character_count: parsed.character_count,
             preset_count: parsed.preset_count,
             warning_codes,
             handoff_path: None,
             publication: None,
-        })
+        };
+        let authority = sink.prepare_activation_receipt(&staging_id, job, &result).map_err(store_error)?;
+        result.revision = match sink.commit(&staging_id, activation_revision) {
+            Ok(committed) => committed.revision,
+            Err(error) => {
+                if let Some(authority) = authority.as_deref() {
+                    match sink.activation_receipt(&staging_id, authority) {
+                        Ok(Some(revision)) => {
+                            result.warning_codes.push("cleanup-failed".to_owned());
+                            revision
+                        },
+                        Ok(None) => return Err(store_error(error)),
+                        Err(_) => return Err(NativeJobError::new("activation-outcome-unresolved", "Backup activation requires recovery")),
+                    }
+                } else { return Err(store_error(error)); }
+            }
+        };
+        if let Some(authority) = authority {
+            job.publish_file_activation(&result, authority).map_err(|error| job_error(job, error))?;
+        }
+        Ok(result)
     })();
     match outcome {
         Ok(result) => Ok(result),
+        Err(error) if error.code == "activation-outcome-unresolved" => Err(error),
         Err(error) => match sink.abort(&staging_id) {
             Ok(()) => Err(error),
             Err(StoreError::Validation { message })
@@ -442,6 +475,12 @@ enum RisuSaveFormat {
     LegacyCompressed,
     LegacyStream,
     HistoricalPrefixed,
+    HistoricalCompressed,
+}
+
+pub(super) fn is_zlib_header(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] & 15 == 8 && bytes[0] >> 4 <= 7
+        && u16::from_be_bytes([bytes[0], bytes[1]]) % 31 == 0
 }
 
 fn read_risu_save_format<R: Read>(
@@ -534,8 +573,15 @@ fn parse_and_stage_compressed_legacy<R: Read>(
     reader.set_stage(JobStage::DecodingDatabase)?;
     let spool_directory=reader.scale.spool_directory.clone();
     let source = RemainingSourceReader { reader, remaining };
-    let buffered = BufReader::with_capacity(READ_CHUNK_BYTES, source);
-    let decoder = GzDecoder::new(buffered);
+    let mut buffered = BufReader::with_capacity(READ_CHUNK_BYTES, source);
+    let prefix = buffered.fill_buf().map_err(|error| messagepack_io_error(error, job))?;
+    let decoder = if prefix.starts_with(&[0x1f, 0x8b]) {
+        historical::CompressionReader::Gzip(GzDecoder::new(buffered))
+    } else if is_zlib_header(prefix) {
+        historical::CompressionReader::Zlib(flate2::bufread::ZlibDecoder::new(buffered))
+    } else {
+        historical::CompressionReader::Deflate(flate2::bufread::DeflateDecoder::new(buffered))
+    };
     let decoded = DecodedLimitReader::new(
         decoder,
         limits.max_decoded_block_bytes,
@@ -543,7 +589,12 @@ fn parse_and_stage_compressed_legacy<R: Read>(
         "legacy RisuSave",
     );
     let mut input = BufReader::with_capacity(READ_CHUNK_BYTES, decoded);
-    let database = stream_legacy_database(&mut input, staging_id, job, sink, spool_directory.as_deref())?;
+    let prefix = input.fill_buf().map_err(|error| messagepack_error(rmpv::decode::Error::InvalidMarkerRead(error), job))?;
+    let database = if prefix.first() == Some(&b'{') {
+        historical::json_database(&mut input, staging_id, job, sink, spool_directory.as_deref())?
+    } else {
+        stream_legacy_database(&mut input, staging_id, job, sink, spool_directory.as_deref())?
+    };
     let compressed = input.get_ref().inner.get_ref();
     if !compressed.buffer().is_empty() || compressed.get_ref().remaining != 0 {
         return Err(corrupt("trailing data in legacy RisuSave gzip stream"));
@@ -643,7 +694,7 @@ fn stream_legacy_root_entry<S: TrackedSource>(
             } else { index.to_string() };
             let packed = rmpv::decode::read_value_with_max_depth(input,LEGACY_ROOT_ENTRY_DEPTH-2)
                 .map_err(|error|messagepack_error(error,job))?;
-            let value = match messagepack_to_json(packed)? {
+            let value = match messagepack_to_json(packed, job)? {
                 JsonSlot::Value(value) => Some(value),
                 JsonSlot::Undefined if kind == FieldKind::Array => Some(Value::Null),
                 JsonSlot::Undefined => None,
@@ -654,7 +705,7 @@ fn stream_legacy_root_entry<S: TrackedSource>(
         let prefix = [marker.to_u8()];
         let packed = rmpv::decode::read_value_with_max_depth(&mut prefix.as_slice().chain(&mut *input),LEGACY_ROOT_ENTRY_DEPTH)
             .map_err(|error|messagepack_error(error,job))?;
-        let value = match messagepack_to_json(packed)? { JsonSlot::Value(value)=>Some(value), JsonSlot::Undefined=>None };
+        let value = match messagepack_to_json(packed, job)? { JsonSlot::Value(value)=>Some(value), JsonSlot::Undefined=>None };
         root.put(key,value.as_ref()).map_err(|error|legacy_staging_error(job,error))?;
     }
     Ok(())
@@ -696,12 +747,13 @@ fn stream_legacy_characters<S: TrackedSource>(
         let packed = rmpv::decode::read_value_with_max_depth(input, LEGACY_CHARACTER_DEPTH)
             .map_err(|error| messagepack_error(error, job))?;
         let bytes = decoded_position(input) - start;
-        let mut character = match messagepack_to_json(packed)? {
+        let mut character = match messagepack_to_json(packed, job)? {
             JsonSlot::Value(value) => value,
             JsonSlot::Undefined => Value::Null,
         };
         if upstream_import::exclude_record(&character, excluded) { continue; }
         character = sink.prepare_character(character).map_err(store_error)?;
+        if !sink.expands_cold_payloads() { omit_unavailable_cold(&mut character, job)?; }
         if upstream_import::exclude_record(&character, excluded) { continue; }
         if !prepare_legacy_character(&mut character, &mut character_ids) { continue; }
         retained += 1;
@@ -743,7 +795,7 @@ fn decode_legacy_non_map<B: Read>(
     let packed = rmpv::decode::read_value(&mut marker.as_slice().chain(&mut *input))
         .map_err(|error| messagepack_error(error, job))?;
     require_legacy_end(input, job)?;
-    match messagepack_to_json(packed)? {
+    match messagepack_to_json(packed, job)? {
         JsonSlot::Value(_) => Ok(LegacyDatabase::NotAnObject),
         JsonSlot::Undefined => Err(invalid("legacy MessagePack database cannot be undefined")),
     }
@@ -823,6 +875,12 @@ fn finish_legacy_database<R: Read>(
     }
     if root.kind("pluginCustomStorage").map_err(store_error)?.is_none() {
         root.begin("pluginCustomStorage",FieldKind::Object).map_err(|error|legacy_staging_error(job,error))?;
+    }
+    for marker in ["_coldplugin", "_coldpluginIndex"] {
+        if root.member("pluginCustomStorage", marker).map_err(store_error)?.is_some() {
+            root.remove_member("pluginCustomStorage", marker).map_err(store_error)?;
+            job.record_restore_omission("pluginStorage", 1).map_err(|error| job_error(job, error))?;
+        }
     }
     reader.counts.presets = preset_count;
 
@@ -971,7 +1029,7 @@ fn legacy_chat_id(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn messagepack_to_json(value: MessagePackValue) -> Result<JsonSlot, NativeJobError> {
+fn messagepack_to_json(value: MessagePackValue, job: &JobControl) -> Result<JsonSlot, NativeJobError> {
     match value {
         MessagePackValue::Nil => Ok(JsonSlot::Value(Value::Null)),
         MessagePackValue::Boolean(value) => Ok(JsonSlot::Value(Value::Bool(value))),
@@ -991,33 +1049,41 @@ fn messagepack_to_json(value: MessagePackValue) -> Result<JsonSlot, NativeJobErr
             .into_str()
             .map(|value| JsonSlot::Value(Value::String(value)))
             .ok_or_else(|| corrupt("invalid UTF-8 legacy MessagePack string")),
-        MessagePackValue::Binary(_) => Err(invalid(
-            "binary values are unsupported in a legacy MessagePack database",
-        )),
+        MessagePackValue::Binary(bytes) => Ok(JsonSlot::Value(Value::Object(bytes.into_iter()
+            .enumerate().map(|(index, byte)| (index.to_string(), Value::from(byte))).collect()))),
         MessagePackValue::Array(values) => {
             let mut output = Vec::with_capacity(values.len());
             for value in values {
-                output.push(match messagepack_to_json(value)? {
+                output.push(match messagepack_to_json(value, job)? {
                     JsonSlot::Value(value) => value,
                     JsonSlot::Undefined => Value::Null,
                 });
             }
             Ok(JsonSlot::Value(Value::Array(output)))
         }
-        MessagePackValue::Map(entries) => messagepack_map_to_json(entries),
+        MessagePackValue::Map(entries) => messagepack_map_to_json(entries, job),
         MessagePackValue::Ext(kind, bytes) if kind == 0 && bytes == [0] => Ok(JsonSlot::Undefined),
         MessagePackValue::Ext(-1, bytes) if bytes == [0xff] => Ok(JsonSlot::Value(Value::Null)),
         MessagePackValue::Ext(-1, bytes) => {
-            Ok(JsonSlot::Value(Value::String(timestamp_to_iso(&bytes)?)))
+            match timestamp_to_iso(&bytes) {
+                Ok(value) => Ok(JsonSlot::Value(Value::String(value))),
+                Err(error) if error.code == "unsupported-format" => {
+                    job.record_restore_omission("values", 1).map_err(|error| job_error(job, error))?;
+                    Ok(JsonSlot::Undefined)
+                }
+                Err(error) => Err(error),
+            }
         }
-        MessagePackValue::Ext(kind, _) => Err(unsupported(format!(
-            "unsupported legacy MessagePack extension {kind}"
-        ))),
+        MessagePackValue::Ext(_, _) => {
+            job.record_restore_omission("values", 1).map_err(|error| job_error(job, error))?;
+            Ok(JsonSlot::Undefined)
+        }
     }
 }
 
 fn messagepack_map_to_json(
     entries: Vec<(MessagePackValue, MessagePackValue)>,
+    job: &JobControl,
 ) -> Result<JsonSlot, NativeJobError> {
     let mut indexed = BTreeMap::<u32, (String, Option<Value>)>::new();
     let mut ordinary = serde_json::Map::new();
@@ -1032,7 +1098,7 @@ fn messagepack_map_to_json(
         } else {
             key
         };
-        let value = messagepack_to_json(value)?;
+        let value = messagepack_to_json(value, job)?;
         if let Some(index) = javascript_array_index(&key) {
             indexed.insert(
                 index,
@@ -1209,6 +1275,22 @@ fn has_cold_references(character: &Value) -> bool {
         chat.get("message").and_then(Value::as_array).and_then(|messages| messages.first()).and_then(|message| message.get("data")).and_then(Value::as_str).is_some_and(|data| data.starts_with("\u{ef01}COLDSTORAGE\u{ef01}"))))
 }
 
+fn omit_unavailable_cold(character: &mut Value, job: &dyn RestoreControl) -> Result<(), NativeJobError> {
+    let mut missing = 0;
+    if let Some(object) = character.as_object_mut() {
+        if object.remove("coldstorage").and_then(|value| value.as_str().map(|key| !key.is_empty())).unwrap_or(false) { missing += 1; }
+        object.remove("coldStoragedChats");
+        if let Some(chats) = object.get_mut("chats").and_then(Value::as_array_mut) {
+            for chat in chats {
+                let cold = chat.get("message").and_then(Value::as_array).and_then(|messages| messages.first()).and_then(|message| message.get("data")).and_then(Value::as_str).is_some_and(|data| data.starts_with("\u{ef01}COLDSTORAGE\u{ef01}"));
+                if cold { chat["message"] = Value::Array(vec![]); missing += 1; }
+            }
+        }
+    }
+    if missing > 0 { job.record_restore_omission("missing", missing).map_err(|error| job_error(job, error))?; }
+    Ok(())
+}
+
 fn parse_and_stage<R: Read>(
     reader: &mut TrackedReader<'_, R>,
     staging_id: &str,
@@ -1295,6 +1377,19 @@ fn parse_and_stage<R: Read>(
             continue;
         }
 
+        let interpreted = matches!((block_type, name.as_str()),
+            (0, "config") | (1, "root") | (4, "preset") | (5, "modules") |
+            (9, "plugins") | (10, "loadouts") | (11, "pluginStorage") | (12, "pluginStorageMeta"))
+            || matches!(block_type, 2 | 7);
+        if !interpreted {
+            skip_block(reader, &name, compression, encoded_length, limits, job)?;
+            let kind = if block_type == 6 { "remote" } else if block_type == 12 && name.starts_with("kv:") { "pluginStorage" } else { "data" };
+            job.record_restore_omission(kind, 1).map_err(|error| job_error(job, error))?;
+            reader.counts.blocks += 1;
+            reader.complete_item()?;
+            continue;
+        }
+
         let (mut value, decoded_bytes) = read_block_value(
             reader,
             &name,
@@ -1315,7 +1410,9 @@ fn parse_and_stage<R: Read>(
                 let Value::Object(mut object) = value else {
                     return Err(invalid("root block must be a JSON object"));
                 };
-                directory = Some(parse_directory(object.shift_remove("__directory"))?);
+                if let Some(value) = object.shift_remove("__directory") {
+                    directory = Some(parse_directory(Some(value))?);
+                }
                 root = Some(object);
             }
             2 | 7 => {
@@ -1340,6 +1437,7 @@ fn parse_and_stage<R: Read>(
                     continue;
                 }
                 if reject_cold_references && has_cold_references(&value) { return Err(cold_expansion_required()); }
+                if !sink.expands_cold_payloads() { omit_unavailable_cold(&mut value, job)?; }
                 assign_legacy_chat_ids(std::slice::from_mut(&mut value));
                 character_batch_bytes = character_batch_bytes.saturating_add(decoded_bytes);
                 pocket_features::character(&mut value, &format!("character:{character_count}"));
@@ -1392,16 +1490,7 @@ fn parse_and_stage<R: Read>(
                 }
                 plugin_storage_meta = Some(value);
             }
-            3 | 6 | 8 => {
-                return Err(unsupported(format!(
-                    "block type {block_type} for {name} requires the compatibility parser"
-                )))
-            }
-            _ => {
-                return Err(invalid(format!(
-                    "unsupported block type {block_type} for {name}"
-                )))
-            }
+            _ => unreachable!("uninterpreted blocks were skipped above"),
         }
         reader.counts.blocks += 1;
         reader.complete_item()?;
@@ -1411,58 +1500,44 @@ fn parse_and_stage<R: Read>(
         sink.add_characters(staging_id, &character_batch)
             .map_err(store_error)?;
     }
-    let required = [
-        "preset",
-        "modules",
-        "loadouts",
-        "plugins",
-        "pluginStorage",
-        "config",
-    ];
-    let directory = directory.ok_or_else(|| invalid("missing required block root"))?;
-    for name in required {
-        if !directory.contains(name) || !loaded.contains(name) {
-            return Err(invalid(format!("missing required block {name}")));
+    if let Some(directory) = directory {
+        let missing = directory.difference(&loaded).count() as u64;
+        if missing != 0 {
+            job.record_restore_omission("missing", missing).map_err(|error| job_error(job, error))?;
         }
-    }
-    for name in &directory {
-        if !loaded.contains(name) {
-            return Err(invalid(format!("missing required block {name}")));
-        }
-    }
-    if loaded
-        .iter()
-        .any(|name| name != "root" && !directory.contains(name))
-    {
-        return Err(invalid(
-            "file contains a block not listed by root directory",
-        ));
     }
 
     job.set_phase(JobPhase::StagingDatabase)
         .map_err(|error| job_error(job, error))?;
     reader.report_stage_items(JobStage::FinalizingStaging, 0, None)?;
     let mut root = root.ok_or_else(|| invalid("missing required block root"))?;
-    root.insert(
-        "modules".to_owned(),
-        modules.ok_or_else(|| invalid("missing required block modules"))?,
-    );
-    root.insert(
-        "loadouts".to_owned(),
-        loadouts.ok_or_else(|| invalid("missing required block loadouts"))?,
-    );
-    root.insert(
-        "plugins".to_owned(),
-        plugins.ok_or_else(|| invalid("missing required block plugins"))?,
-    );
-    root.insert(
-        "pluginCustomStorage".to_owned(),
-        plugin_storage.ok_or_else(|| invalid("missing required block pluginStorage"))?,
-    );
+    for (key, separate, default) in [
+        ("modules", modules, Value::Array(Vec::new())),
+        ("loadouts", loadouts, Value::Array(Vec::new())),
+        ("plugins", plugins, Value::Array(Vec::new())),
+        ("pluginCustomStorage", plugin_storage, Value::Object(Map::new())),
+    ] {
+        let value = separate.or_else(|| root.shift_remove(key)).filter(|v| !v.is_null()).unwrap_or(default);
+        root.insert(key.to_owned(), value);
+    }
+    if let Some(Value::Object(storage)) = root.get_mut("pluginCustomStorage") {
+        for marker in ["_coldplugin", "_coldpluginIndex"] {
+            if storage.shift_remove(marker).is_some() {
+                job.record_restore_omission("pluginStorage", 1).map_err(|error| job_error(job, error))?;
+            }
+        }
+    }
     if let Some(meta) = plugin_storage_meta {
         root.insert("pluginStorageMeta".to_owned(), meta);
     }
-    let mut presets = presets.ok_or_else(|| invalid("missing required block preset"))?;
+    let mut presets = match presets {
+        Some(presets) => presets,
+        None => match root.shift_remove("botPresets") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(values)) => values,
+            _ => return Err(invalid("root botPresets must be an array")),
+        },
+    };
     pocket_features::root(&mut root);
     root.shift_remove("account");
     upstream_import::prepare_root(&mut root, &excluded);
@@ -1495,6 +1570,22 @@ fn parse_directory(value: Option<Value>) -> Result<HashSet<String>, NativeJobErr
         directory.insert(name);
     }
     Ok(directory)
+}
+
+fn skip_block<R: Read>(reader: &mut TrackedReader<'_, R>, name: &str, compression: u8, encoded_length: u64, limits: RestoreLimits, job: &dyn RestoreControl) -> Result<(), NativeJobError> {
+    let block = EncodedBlockReader { reader, remaining: encoded_length };
+    let mut buffer = [0u8; READ_CHUNK_BYTES];
+    if compression == 0 {
+        let mut decoded = DecodedLimitReader::new(block, limits.max_decoded_block_bytes, job, name);
+        while decoded.read(&mut buffer).map_err(|error| gzip_io_error(name, error, job))? != 0 {}
+    } else {
+        let decoder = GzDecoder::new(BufReader::with_capacity(READ_CHUNK_BYTES, block));
+        let mut decoded = DecodedLimitReader::new(decoder, limits.max_decoded_block_bytes, job, name);
+        while decoded.read(&mut buffer).map_err(|error| gzip_io_error(name, error, job))? != 0 {}
+        let buffered = decoded.into_inner().into_inner();
+        if !buffered.buffer().is_empty() || buffered.get_ref().remaining != 0 { return Err(corrupt(format!("trailing data in gzip block {name}"))); }
+    }
+    Ok(())
 }
 
 fn read_block_value<R: Read>(
@@ -1836,7 +1927,7 @@ fn read_character_json<R: Read>(reader: &mut R, seed: CharacterSeed<'_>) -> Resu
     let mut chats_to_skip = metadata.chats_count.saturating_sub(1);
     let mut envelope_occurrence = 0;
     let mut wrapped = false;
-    if let Some(key) = metadata.cold_key.filter(|_| seed.sink.expands_cold_payloads()) {
+    if let Some(key) = metadata.cold_key {
         seed.cold_detected.set(true);
         if let Some(path) = seed.sink.cold_payload_path(&key) {
             let mut payload = File::open(path).map_err(|error| staging_io(error, seed.staging_error))?;
@@ -1853,6 +1944,7 @@ fn read_character_json<R: Read>(reader: &mut R, seed: CharacterSeed<'_>) -> Resu
             }
         }
         if !wrapped {
+            if !seed.sink.expands_cold_payloads() { seed.job.record_restore_omission("missing", 1).map_err(<serde_json::Error as de::Error>::custom)?; }
             seed.sink.unavailable_cold_payload(&key, &name).map_err(|error| {
                 *seed.staging_error.borrow_mut() = Some(error);
                 <serde_json::Error as de::Error>::custom("cold payload preview failed")
@@ -2062,10 +2154,8 @@ impl<'de> Visitor<'de> for CharacterVisitor<'_> {
             }
         }
         if detail.get("coldstorage").and_then(Value::as_str).is_some_and(|key| !key.is_empty()) { self.0.cold_detected.set(true); }
-        if self.0.sink.expands_cold_payloads() {
-            detail.remove("coldstorage");
-            detail.remove("coldStoragedChats");
-        }
+        detail.remove("coldstorage");
+        detail.remove("coldStoragedChats");
         let character_id = detail
             .get("chaId")
             .and_then(Value::as_str)
@@ -2231,7 +2321,7 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
                 insert_detail::<A::Error>(&mut detail, self.0.record_bytes.limit, key, value)?;
             }
         }
-        if self.0.sink.expands_cold_payloads() {
+        {
             if let Some(key) = messages.cold_key.take() {
                 let payload = match self.0.sink.cold_payload_path(&key) {
                     Some(path) => read_cold_chat(&path, &self.0).map_err(de::Error::custom)?,
@@ -2249,6 +2339,7 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
                         }
                     }
                 } else {
+                    if !self.0.sink.expands_cold_payloads() { self.0.job.record_restore_omission("missing", 1).map_err(de::Error::custom)?; }
                     self.0.sink.unavailable_cold_payload(&key, self.0.character_name).map_err(|error| {
                         *self.0.staging_error.borrow_mut() = Some(error);
                         de::Error::custom("cold payload preview failed")
@@ -2854,7 +2945,7 @@ fn job_error(job: &dyn RestoreControl, message: String) -> NativeJobError {
 // protocol reports StoreError::Validation as "store-error" (not
 // "invalid-input") and pins its own message texts; TS restore surfaces read
 // these codes.
-fn store_error(error: StoreError) -> NativeJobError {
+pub(super) fn store_error(error: StoreError) -> NativeJobError {
     match error {
         StoreError::RevisionConflict { expected, actual } => NativeJobError::new(
             "revision-conflict",
@@ -2891,6 +2982,8 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
+    include!("restore/resource_measurements.rs");
+
     const MSGPACKR_PARITY_FIXTURE: &str = include_str!(
         "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/msgpackr-parity-v1.json"
     );
@@ -2910,6 +3003,8 @@ mod tests {
     struct StoreSink {
         store: Mutex<PersistentStore>,
         fail_character_batches: bool,
+        record_activation: bool,
+        lose_commit_reply: bool,
         abort_calls: AtomicUsize,
         preserve_calls: AtomicUsize,
         full_character_calls: AtomicUsize,
@@ -2922,6 +3017,15 @@ mod tests {
     }
 
     impl ReplacementSink for StoreSink {
+        fn prepare_activation_receipt(&self, staging_id: &str, job: &JobControl, result: &JobResultSummary) -> StoreResult<Option<String>> {
+            if !self.record_activation { return Ok(None); }
+            super::super::restore_receipts::prepare(&self.store.lock().unwrap(), job, staging_id, result)
+        }
+
+        fn activation_receipt(&self, staging_id: &str, authority: &str) -> StoreResult<Option<i64>> {
+            self.store.lock().unwrap().lww_file_restore_receipt(staging_id, staging_id, authority)
+        }
+
         fn begin(&self) -> StoreResult<StagingResult> {
             self.store.lock().unwrap().replace_begin()
         }
@@ -3064,10 +3168,12 @@ mod tests {
         }
 
         fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
-            self.store
+            let result = self.store
                 .lock()
                 .unwrap()
-                .replace_commit(staging_id, Some(expected_revision))
+                .replace_commit(staging_id, Some(expected_revision))?;
+            if self.lose_commit_reply { return Err(StoreError::Store { message: "Synthetic post-commit cleanup failure".into() }); }
+            Ok(result)
         }
 
         fn abort(&self, staging_id: &str) -> StoreResult<()> {
@@ -3091,6 +3197,8 @@ mod tests {
             StoreSink {
                 store: Mutex::new(store),
                 fail_character_batches: false,
+                record_activation: false,
+                lose_commit_reply: false,
                 abort_calls: AtomicUsize::new(0),
                 preserve_calls: AtomicUsize::new(0),
                 full_character_calls: AtomicUsize::new(0),
@@ -3507,12 +3615,19 @@ mod tests {
     }
 
     fn restore_container_payloads_with_limits(source: &Path, directory: &Path, sink: &mut StoreSink, job: &JobControl, limits: RestoreLimits) -> Result<(JobResultSummary, Value), crate::local_backup::LocalBackupError> {
+        restore_container_payloads_with_key(source, directory, sink, job, limits, None)
+    }
+
+    fn restore_container_payloads_with_key(source: &Path, directory: &Path, sink: &mut StoreSink, job: &JobControl, limits: RestoreLimits, key: Option<&str>) -> Result<(JobResultSummary, Value), crate::local_backup::LocalBackupError> {
         use crate::local_backup::{LocalBackupError, NeverCancelled, PayloadTarget, StagedLocalBackupEntry, StrictLocalBackupDatabaseRestore};
-        struct Restore<'a> { directory: &'a Path, sink: &'a mut StoreSink, job: &'a JobControl, result: Option<JobResultSummary>, payloads: Value, limits: RestoreLimits }
+        struct Restore<'a> { directory: &'a Path, sink: &'a mut StoreSink, job: &'a JobControl, result: Option<JobResultSummary>, payloads: Value, limits: RestoreLimits, key: Option<&'a str> }
         impl StrictLocalBackupDatabaseRestore for Restore<'_> {
             fn restore_database(&mut self, database: &StagedLocalBackupEntry, entries: &[StagedLocalBackupEntry]) -> Result<(), LocalBackupError> {
                 use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
                 use crate::asset_repository::PayloadCas;
+                let plaintext = super::super::legacy_backup::account_encryption::prepare_with_key(entries, database, self.job, |_| {
+                    self.key.map(str::to_owned).ok_or_else(|| NativeJobError::new("fixture-key-required", "Synthetic account key required"))
+                }).map_err(|error| LocalBackupError::database_restore(error.code))?;
                 let cas = PayloadCas::new(self.directory).unwrap();
                 let mut durable = DurableCasJob::begin(self.directory, &self.job.id(), CasJobKind::LocalBackupRestore, crate::asset_repository::job_pins::CasJobOwner::for_test(), 0).unwrap();
                 let payloads = super::super::legacy_backup::prepare_legacy_restore_payloads_with_limits(entries, &cas, &mut durable, &NeverCancelled, &super::super::legacy_backup::NoopPrepareObserver, self.limits)?;
@@ -3525,7 +3640,8 @@ mod tests {
                 });
                 self.sink.cold_payloads = Some(payloads.cold_payloads);
                 durable.seal(&mut self.sink.store.lock().unwrap(), 0).unwrap();
-                self.result = Some(restore_block_risu_save_path_with_limits(database.staged_path.as_ref().unwrap(), 1, self.job, self.sink, self.limits)
+                let path = plaintext.as_ref().map(|file| file.path()).unwrap_or_else(|| database.staged_path.as_deref().unwrap());
+                self.result = Some(restore_block_risu_save_path_with_limits(path, 1, self.job, self.sink, self.limits)
                     .map_err(|error| LocalBackupError::database_restore(error.message))?);
                 durable.release(CasReleaseOutcome::Committed).unwrap();
                 Ok(())
@@ -3534,7 +3650,7 @@ mod tests {
         // Entries are staged in the job's private directory, the only place asset payloads may be staged from.
         let staging = directory.join("native-file-jobs").join("jobs").join(job.id());
         fs::create_dir_all(&staging).unwrap();
-        let mut restore = Restore { directory, sink, job, result: None, payloads: Value::Null, limits };
+        let mut restore = Restore { directory, sink, job, result: None, payloads: Value::Null, limits, key };
         crate::local_backup::parse_legacy_local_backup_v1(&mut File::open(source).unwrap(), &staging, PayloadTarget::JobStaging, &mut restore, &NeverCancelled)?;
         Ok((restore.result.unwrap(), restore.payloads))
     }
@@ -3580,16 +3696,74 @@ mod tests {
     }
 
     #[test]
-    fn cold_streaming_container_rejects_oversized_records_during_preparation() {
-        for nested in [false, true] {
+    fn cold_plugin_payloads_are_omitted_without_rejecting_readable_backups() {
+        for marker in ["_coldplugin", "_coldpluginIndex"] {
+            for corrupt in [false, true] {
+                let (directory, mut sink) = fixture();
+                let mut blocks = valid_blocks();
+                let mut storage = json!({"inline":{"enabled":true}});
+                storage[marker] = if marker == "_coldplugin" { json!({"plugin":"value"}) } else { json!("index") };
+                blocks[5] = block(11, false, "pluginStorage", &storage);
+                let database = directory.path().join("database.risudat");
+                fs::write(&database, save_bytes(blocks)).unwrap();
+                let archive = directory.path().join("plugins.bin");
+                let mut output = File::create(&archive).unwrap();
+                write_container_entry(&mut output, "database.risudat", &database);
+                for (index, value) in [
+                    json!(null), json!(true), json!(42), json!("synthetic"),
+                    json!({"type":"risu-plugin-storage-index","version":1,"entries":[{"k":"plugin","l":"value"}],"trash":[]}),
+                    json!({"character":"x".repeat(192 * 1024)}),
+                    json!([{"message":"x".repeat(192 * 1024)}]),
+                ].into_iter().enumerate() {
+                    let path = directory.path().join(format!("payload-{index}.json"));
+                    fs::write(&path, if corrupt && index == 0 { b"{broken".to_vec() } else { serde_json::to_vec(&value).unwrap() }).unwrap();
+                    let key = match index { 4 => "index".to_owned(), 5 => "value".to_owned(), _ => format!("payload-{index}") };
+                    write_container_entry(&mut output, &format!("coldstorage/{key}.json"), &path);
+                }
+                drop(output);
+                let job = JobRegistry::default().create(JobKind::RestoreLegacyLocalBackup).unwrap();
+                let outcome = restore_container_payloads_with_limits(&archive, directory.path(), &mut sink, &job, RestoreLimits { max_record_bytes: 64 * 1024, ..Default::default() });
+                if corrupt {
+                    assert!(outcome.unwrap_err().message.contains("cold payload is invalid"));
+                    assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+                    continue;
+                }
+                let result = outcome.unwrap().0;
+                assert_eq!(result.warning_codes, vec!["skipped-plugin-storage:1"]);
+                assert_eq!(job.status().incomplete_restore_preview.unwrap().warning_codes(), result.warning_codes);
+                let restored = sink.store.lock().unwrap().materialize(None).unwrap();
+                assert_eq!(restored["pluginCustomStorage"], json!({"inline":{"enabled":true}}));
+                assert_eq!(restored["characters"][0]["chats"][0]["message"][0]["data"], "hello");
+            }
+
+            let (directory, sink) = fixture();
+            let mut database = json!({"characters":[],"botPresets":[],"pluginCustomStorage":{"inline":true}});
+            database["pluginCustomStorage"][marker] = if marker == "_coldplugin" { json!({"plugin":"value"}) } else { json!("index") };
+            let wire = legacy_wire(7, &super::legacy_stream_tests::messagepack_bytes(&super::legacy_stream_tests::messagepack_from_json(&database)));
+            let source = directory.path().join("legacy.risudat");
+            fs::write(&source, wire).unwrap();
+            let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+            let result = restore_risu_save(&source, 1, &job, &sink).unwrap();
+            assert_eq!(result.warning_codes, vec!["skipped-plugin-storage:1"]);
+            assert_eq!(sink.store.lock().unwrap().materialize(None).unwrap()["pluginCustomStorage"], json!({"inline":true}));
+        }
+    }
+
+    #[test]
+    fn cold_streaming_container_rejects_oversized_referenced_records_before_activation() {
+        for (nested, prefix, suffix) in [
+            (false, br#"[{"role":"user","data":""#.as_slice(), b"\"}]".as_slice()),
+            (true, br#"{"character":{"chaId":"char-1","chats":[{"message":[{"data":""#.as_slice(), b"\"}]}]}}".as_slice()),
+            (false, br#"{"savedToggleValues":{"toggle_large":""#.as_slice(), b"\"},\"message\":[]}".as_slice()),
+            (true, br#"{"character":""#.as_slice(), b"\",\"message\":[]}".as_slice()),
+            (false, br#"{""#.as_slice(), b"\":0,\"message\":[]}".as_slice()),
+        ] {
             let (directory, mut sink) = fixture();
             let payload = directory.path().join("oversized.json");
             let mut output = File::create(&payload).unwrap();
-            if nested { output.write_all(br#"{"character":{"chaId":"char-1","chats":[{"message":"#).unwrap(); }
-            output.write_all(br#"[{"role":"user","data":""#).unwrap();
+            output.write_all(prefix).unwrap();
             for _ in 0..3 { output.write_all(&[b'x';64*1024]).unwrap(); }
-            output.write_all(b"\"}]").unwrap();
-            if nested { output.write_all(b"}]}}").unwrap(); }
+            output.write_all(suffix).unwrap();
             drop(output);
             let character = if nested { json!({"chaId":"char-1","chats":[],"coldstorage":"large"}) }
                 else { json!({"chaId":"char-1","chats":[cold_chat("large")]}) };
@@ -3601,9 +3775,8 @@ mod tests {
             drop(output);
             let job = JobRegistry::default().create(JobKind::RestoreLegacyLocalBackup).unwrap();
             let error = restore_container_payloads_with_limits(&archive, directory.path(), &mut sink, &job, RestoreLimits { max_record_bytes: 64 * 1024, ..Default::default() }).unwrap_err();
-            assert!(error.message.contains("cold payload exceeds the record limit"), "{error:?}");
-            assert_eq!(sink.abort_calls.load(Ordering::Acquire), 0, "preparation must reject before replacement staging begins");
-            assert_eq!(sink.incremental_character_calls.load(Ordering::Acquire), 0);
+            assert!(error.message.contains("restore record limit exceeded"), "{error:?}");
+            assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1, "failed staging must be discarded before activation");
             assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
         }
     }
@@ -3824,23 +3997,33 @@ mod tests {
 
     #[test]
     fn a_failure_after_the_library_commit_keeps_the_restored_library() {
-        let (directory, sink) = fixture();
+        for lose_reply in [false, true] {
+        let (directory, mut sink) = fixture();
+        sink.record_activation = true;
+        sink.lose_commit_reply = lose_reply;
         let path = directory.path().join("committed.risudat");
         fs::write(&path, save_bytes(valid_blocks())).unwrap();
-        sink.store.lock().unwrap().device_store().unwrap().connection().execute_batch(
+        if !lose_reply { sink.store.lock().unwrap().device_store().unwrap().connection().execute_batch(
             "CREATE TRIGGER fail_completion BEFORE UPDATE OF complete ON lww_intents
              BEGIN SELECT RAISE(ABORT,'synthetic completion failure'); END;",
-        ).unwrap();
+        ).unwrap(); }
         let registry = JobRegistry::default();
         let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
 
-        let error = restore_block_risu_save_path(&path, 1, &job, &sink).unwrap_err();
-
-        assert_ne!(error.code, "cleanup-failed", "{}", error.message);
-        assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
+        let outcome = restore_block_risu_save_path(&path, 1, &job, &sink);
+        if lose_reply {
+            let result = outcome.unwrap();
+            assert_eq!(result.revision, 2);
+            assert!(result.warning_codes.contains(&"cleanup-failed".to_owned()));
+            assert_eq!(job.status().activation_revision, Some(2));
+        } else {
+            assert_eq!(outcome.unwrap_err().code, "activation-outcome-unresolved");
+        }
+        assert_eq!(sink.abort_calls.load(Ordering::Acquire), 0);
         let store = sink.store.lock().unwrap();
         assert_eq!(store.revision().unwrap(), 2);
         assert_eq!(store.materialize(None).unwrap()["username"], "Imported");
+        }
     }
 
     fn msgpackr_parity_fixture() -> Value {
@@ -4257,17 +4440,26 @@ mod tests {
     }
 
     #[test]
-    fn strict_raw_msgpackr_restore_rejects_unknown_extensions_without_activation() {
-        use base64::Engine;
-
-        let parity = msgpackr_parity_fixture();
-        let payload = base64::engine::general_purpose::STANDARD
-            .decode(parity["unknownExtensionBase64"].as_str().unwrap())
-            .unwrap();
+    fn raw_msgpackr_restore_omits_unknown_extensions_with_warning() {
+        let payload = legacy_stream_tests::messagepack_bytes(&MessagePackValue::Map(vec![
+            ("characters".into(), MessagePackValue::Array(vec![])),
+            ("kept".into(), "readable".into()),
+            ("unknownExtension".into(), MessagePackValue::Ext(42, vec![1])),
+            ("array".into(), MessagePackValue::Array(vec![MessagePackValue::Ext(42, vec![2]), "readable".into()])),
+        ]));
         let bytes = legacy_wire(7, &payload);
 
-        let error = assert_failed_general_restore_preserves_active(&bytes, "extension 42");
-        assert_eq!(error.code, "unsupported-format");
+        let (directory, sink) = fixture();
+        let source = directory.path().join("unknown-extension.risudat");
+        fs::write(&source, bytes).unwrap();
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        let result = restore_risu_save(&source, 1, &job, &sink).unwrap();
+        assert_eq!(result.revision, 2);
+        assert!(result.warning_codes.contains(&"skipped-backup-values:2".to_owned()));
+        let restored = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+        assert!(restored.get("unknownExtension").is_none());
+        assert_eq!(restored["kept"], "readable");
+        assert_eq!(restored["array"], json!([null, "readable"]));
     }
 
     #[test]
@@ -4600,6 +4792,48 @@ mod tests {
     }
 
     #[test]
+    fn released_historical_writers_restore_standalone_and_inside_archives() {
+        let fixture: Value = serde_json::from_str(include_str!("legacy_backup/fixtures/historical-writers.json")).unwrap();
+        let mut projection = None;
+        for format in fixture["formats"].as_array().unwrap() {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(format["bytes"].as_str().unwrap()).unwrap();
+            for mode in ["standalone", "archive", "encrypted"] {
+                let archived = mode != "standalone";
+                let encrypted = mode == "encrypted";
+                let (directory, mut sink) = self::fixture();
+                let source = directory.path().join("historical.risudat");
+                fs::write(&source, &bytes).unwrap();
+                assert_eq!(super::super::backup_source::detect(File::open(&source).unwrap()).unwrap(), super::super::backup_source::BackupSourceFormat::BlockRisuSave);
+                let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+                if archived {
+                    let archive = directory.path().join("historical.bin");
+                    let mut output = File::create(&archive).unwrap();
+                    if encrypted {
+                        let ciphertext = base64::engine::general_purpose::STANDARD.decode(format["encrypted"].as_str().unwrap()).unwrap();
+                        fs::write(&source, ciphertext).unwrap();
+                        let metadata = directory.path().join("metadata");
+                        fs::write(&metadata, br#"{"type":"account","time":1}"#).unwrap();
+                        write_container_entry(&mut output, "encryption.risudat", &metadata);
+                    }
+                    write_container_entry(&mut output, "database.risudat", &source);
+                    drop(output);
+                    restore_container_payloads_with_key(&archive, directory.path(), &mut sink, &job, RestoreLimits::default(), fixture["key"].as_str()).unwrap();
+                } else {
+                    restore_risu_save(&source, 1, &job, &sink).unwrap();
+                }
+                let restored = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+                assert_eq!(restored["username"], fixture["database"]["username"]);
+                assert_eq!(restored["characters"], fixture["database"]["characters"]);
+                assert_eq!(restored["historicalUnknown"], fixture["database"]["historicalUnknown"]);
+                assert_eq!(restored["pluginCustomStorage"], fixture["database"]["pluginCustomStorage"]);
+                assert!(restored.get("account").is_none());
+                if let Some(expected) = &projection { assert_eq!(&restored, expected, "{format}"); }
+                else { projection = Some(restored); }
+            }
+        }
+    }
+
+    #[test]
     fn strict_legacy_format_selection_rejects_ambiguous_and_near_miss_inputs() {
         use base64::Engine;
 
@@ -4608,10 +4842,6 @@ mod tests {
             .decode(parity["payloadBase64"].as_str().unwrap())
             .unwrap();
 
-        assert_failed_general_restore_preserves_active(
-            &payload,
-            "unframed RisuSave input is unsupported",
-        );
         assert_failed_general_restore_preserves_active(
             &gzip(&payload),
             "unframed RisuSave input is unsupported",
@@ -4682,6 +4912,8 @@ mod tests {
         let sink = StoreSink {
             store: Mutex::new(store),
             fail_character_batches: false,
+            record_activation: false,
+            lose_commit_reply: false,
             abort_calls: AtomicUsize::new(0),
             preserve_calls: AtomicUsize::new(0),
             full_character_calls: AtomicUsize::new(0),
@@ -4719,10 +4951,16 @@ mod tests {
     }
 
     #[test]
-    fn strict_restore_rejects_missing_and_duplicate_required_blocks() {
+    fn strict_restore_rejects_duplicate_blocks() {
         let mut missing = valid_blocks();
         missing.pop();
-        assert_failed_restore_preserves_active(&save_bytes(missing), "missing required block");
+        let (directory, sink) = fixture();
+        let source = directory.path().join("missing.risudat");
+        fs::write(&source, save_bytes(missing)).unwrap();
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        let result = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap();
+        assert!(result.warning_codes.contains(&"missing-backup-data:1".to_owned()));
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 2);
 
         let mut duplicate = valid_blocks();
         duplicate.push(block(4, false, "preset", &json!([])));
@@ -4730,12 +4968,19 @@ mod tests {
     }
 
     #[test]
-    fn js_compatible_subset_block_requests_structured_fallback() {
+    fn readable_uninterpreted_blocks_restore_with_warnings() {
+        for (kind, name, warning) in [
+            (3, "standalone-chat", "skipped-backup-data:1"),
+            (6, "remote", "remote-backup-data:1"),
+            (8, "custom-root-component", "skipped-backup-data:1"),
+            (12, "kv:synthetic", "skipped-plugin-storage:1"),
+            (99, "future-content", "skipped-backup-data:1"),
+        ] {
         let mut blocks = valid_blocks();
         blocks.push(block(
-            8,
-            false,
-            "custom-root-component",
+            kind,
+            true,
+            name,
             &json!({ "key": "customField", "data": { "retained": true } }),
         ));
         let (directory, sink) = fixture();
@@ -4745,10 +4990,11 @@ mod tests {
             .create(JobKind::RestoreBlockRisuSave)
             .unwrap();
 
-        let error = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap_err();
-
-        assert_eq!(error.code, "unsupported-format");
-        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+        let result = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap();
+        assert!(result.warning_codes.contains(&warning.to_owned()), "{:?}", result.warning_codes);
+        assert_eq!(job.status().incomplete_restore_preview.unwrap().warning_codes(), vec![warning]);
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 2);
+        }
     }
 
     #[test]
@@ -4765,6 +5011,10 @@ mod tests {
         let mut invalid_gzip = valid_blocks();
         invalid_gzip[2] = raw_block(5, 1, "modules", b"not-gzip");
         assert_failed_restore_preserves_active(&save_bytes(invalid_gzip), "invalid gzip");
+
+        let mut unreadable_unknown = valid_blocks();
+        unreadable_unknown.push(raw_block(99, 1, "future-content", b"not-gzip"));
+        assert_failed_restore_preserves_active(&save_bytes(unreadable_unknown), "invalid gzip");
 
         let mut trailing_garbage = gzip(br#"[{"name":"Module"}]"#);
         trailing_garbage.extend_from_slice(b"garbage");
@@ -4788,9 +5038,6 @@ mod tests {
         unknown_flag[2] = raw_block(5, 2, "modules", b"{}");
         assert_failed_restore_preserves_active(&save_bytes(unknown_flag), "compression flag");
 
-        let mut unknown_type = valid_blocks();
-        unknown_type[2] = raw_block(99, 0, "modules", b"{}");
-        assert_failed_restore_preserves_active(&save_bytes(unknown_type), "block type");
     }
 
     #[test]

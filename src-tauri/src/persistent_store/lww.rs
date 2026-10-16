@@ -884,6 +884,31 @@ impl PersistentStore {
     pub(crate) fn lww_activated_receipt(&self, request_id: &str) -> StoreResult<Option<(i64, String)>> {
         activated_receipt(&self.connection, request_id)
     }
+
+    pub(crate) fn lww_file_restore_receipt(&self, request_id: &str, staging_id: &str, authority: &str) -> StoreResult<Option<i64>> {
+        let row: Option<(String, String, String, bool)> = self.device_store()?.connection().query_row(
+            "SELECT authority,body,digest,complete FROM lww_intents WHERE request_id=?1", [request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        let activated = activated_receipt(&self.connection, request_id)?;
+        let Some((stored_authority, body, digest, complete)) = row else {
+            return if activated.is_some() { Err(error("request-receipt-missing")) } else { Ok(None) };
+        };
+        let Intent::Replacement { staging_id: stage, base_revision, .. } = serde_json::from_str(&body)?
+            else { return Err(error("request-id-integrity")); };
+        if stored_authority != authority || stage != staging_id || risunest_sync_wire::hash(body.as_bytes()) != digest {
+            return Err(error("request-id-integrity"));
+        }
+        let Some((revision, generation)) = activated else { return Err(error("restore-activation-pending")); };
+        let applied_digest: String = self.connection.query_row(
+            "SELECT digest FROM lww_requests WHERE request_id=?1", [request_id], |row| row.get(0),
+        )?;
+        if applied_digest != digest || generation != staging_id || base_revision.checked_add(1) != Some(revision) {
+            return Err(error("request-id-integrity"));
+        }
+        if !complete { return Err(error("restore-activation-pending")); }
+        Ok(Some(revision))
+    }
     pub(crate) fn lww_device_replacement_receipt(
         &self,
         header: &Header,
