@@ -261,7 +261,9 @@ export class BrowserSource {
         }
         if (this.mode !== 'opfs') {
             const db = this.mode === 'account' ? this.cache : this.local;
-            assets.push(...(await db?.keys(this.signal) ?? []).filter(key => key.startsWith('assets/')));
+            for (const key of await db?.keys(this.signal) ?? []) {
+                if (key.startsWith('assets/')) assets.push(key);
+            }
         }
         const inlays = await this.inlays?.keys(this.signal) ?? [];
         return { assets: assets.sort(), cold: cold.sort(), inlays: inlays.sort() };
