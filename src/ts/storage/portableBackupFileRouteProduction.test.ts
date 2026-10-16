@@ -269,11 +269,11 @@ describe('common backup file production route', () => {
             .resolves.toEqual({ ...committed, warningCodes: ['cleanup-failed'] })
         expect(m.portable).toHaveBeenCalledTimes(1)
     })
-    it('discards invalid seekable custody without materializing',async()=>{
+    it.each(['iosScoped', 'savedConflict'] as const)('discards invalid %s custody without materializing',async type=>{
         m.invoke.mockImplementation(async(command)=>{if(command==='native_backup_source_format')throw new Error('invalid-catalog');return true})
-        await expect(restoreBackupFromNativeSource({type:'iosScoped',token:'synthetic-invalid'})).rejects.toThrow('invalid-catalog')
+        await expect(restoreBackupFromNativeSource({type,token:'synthetic-invalid'})).rejects.toThrow('invalid-catalog')
         expect(m.materializeIOS).not.toHaveBeenCalled()
-        expect(m.invoke).toHaveBeenLastCalledWith('native_portable_source_discard',{source:{type:'iosScoped',token:'synthetic-invalid'}})
+        expect(m.invoke).toHaveBeenLastCalledWith('native_portable_source_discard',{source:{type,token:'synthetic-invalid'}})
     })
     it.each(['portable', 'block-risu-save', 'local-backup'])(
         'uses detected %s independently of filename',

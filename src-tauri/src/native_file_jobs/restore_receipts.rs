@@ -213,6 +213,14 @@ mod tests {
         let registry = JobRegistry::default();
         assert!(reconcile_job(&store, &registry, &id).is_err());
         assert!(registry.list().unwrap().is_empty());
+        let failed = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+        let temporary_id = failed.id();
+        failed.status.lock().unwrap().job_id = id.clone();
+        registry.jobs.lock().unwrap().remove(&temporary_id);
+        registry.jobs.lock().unwrap().insert(id.clone(), failed.clone());
+        failed.finish_failure("store-error", "Synthetic accepted commit failure").unwrap();
+        assert!(reconcile_job(&store, &registry, &id).is_err());
+        assert_eq!(registry.status(&id).unwrap().state, JobState::Failed);
         assert_eq!(store.revision().unwrap(), 0);
         connection.execute_batch("DROP TRIGGER reject_restore").unwrap();
         drop(connection);

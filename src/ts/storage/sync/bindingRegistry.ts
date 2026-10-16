@@ -23,15 +23,19 @@ export class SyncBindingUnavailableError extends Error {
     }
 }
 
-export async function prepareBoundLibraryReplacement(options: { confirmedCommittedRestore?: boolean } = {}) {
+export async function prepareBoundLibraryReplacement(options: {
+    confirmedCommittedRestore?: boolean
+    control?<T>(work: Promise<T>, operation: string): Promise<T>
+} = {}) {
     const native = createNativeSyncBindingBridge()
-    const state = await native.state()
+    const control = options.control ?? (<T>(work: Promise<T>) => work)
+    const state = await control(native.state(), 'binding state')
     const transport = state.target.kind === 'none' ? undefined : transports.get(key(state.target))
     if (state.target.kind !== 'none' && (!transport || (!options.confirmedCommittedRestore && !transport.receiveAvailableChanges))) throw new SyncBindingUnavailableError()
     const context = { state, signal: new AbortController().signal }
     const assertUnchanged = async () => {
-        await native.assertAuthority(state)
-        const current = await native.state()
+        await control(native.assertAuthority(state), 'binding verification')
+        const current = await control(native.state(), 'binding state')
         if (current.libraryId !== state.libraryId || JSON.stringify(current.target) !== JSON.stringify(state.target)) {
             throw new Error('Sync binding changed')
         }
@@ -46,7 +50,7 @@ export async function prepareBoundLibraryReplacement(options: { confirmedCommitt
         bound: state.target.kind !== 'none',
         async fence() { await transport?.fenceOldJobs(context); await assertUnchanged() },
         assertAuthority: assertUnchanged,
-        resume: async () => { await transport?.resumeBinding(context) },
+        resume: async (options: {holdAutomaticSync?: boolean} = {}) => { await transport?.resumeBinding({...context, ...options}) },
     }
 }
 

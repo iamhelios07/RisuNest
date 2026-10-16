@@ -142,6 +142,21 @@ describe('production server LWW composition', () => {
         expect(f.transport?.heldForCommittedRestore?.()).toBe(false)
     })
 
+    it('reattaches a restored binding without automatic pull, push or hydration until resumed', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        await f.transport!.fenceOldJobs(bindingContext())
+        production.holdServerSyncAfterRestore()
+        f.invoke.mockClear()
+        await f.transport!.resumeBinding({...bindingContext(), holdAutomaticSync: true})
+        expect(f.transport?.heldForCommittedRestore?.()).toBe(true)
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(f.invoke.mock.calls.some(([command]) => ['server_sync_lww_pull', 'server_sync_lww_push', 'server_sync_lww_hydrate'].includes(command))).toBe(false)
+        await f.transport!.resumeBinding(bindingContext())
+        expect(f.transport?.heldForCommittedRestore?.()).toBe(false)
+        await settle()
+        expect(pullCalls()).toBeGreaterThan(0)
+    })
     it.each(['module.bin', 'character.charx'])('waits for external assets with both sync adapters installed before importing %s', async name => {
         vi.stubGlobal('window', new EventTarget())
         vi.stubGlobal('navigator', { onLine: true })

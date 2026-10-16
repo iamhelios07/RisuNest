@@ -169,10 +169,12 @@ fn read_metadata<T: serde::de::DeserializeOwned>(
     }
     let reader = CancellationReader::new(open_staged(entry)?, cancellation)
         .take(u64::from(MAX_METADATA_BYTES) + 1);
-    let value: Value = serde_json::from_reader(BufReader::new(reader)).map_err(|_| {
-        check_cancelled(cancellation)
-            .err()
-            .unwrap_or_else(|| LocalBackupError::new(super::LocalBackupErrorCode::UnsupportedFormat, "PocketRisu Inlay metadata is unreadable"))
+    let value: Value = serde_json::from_reader(BufReader::new(reader)).map_err(|error| {
+        if let Err(cancelled) = check_cancelled(cancellation) { return cancelled; }
+        match error.io_error_kind() {
+            Some(kind) => LocalBackupError::io(std::io::Error::new(kind, error)),
+            None => invalid("PocketRisu Inlay metadata is unreadable"),
+        }
     })?;
     serde_json::from_value(value).map_err(|_| invalid("PocketRisu Inlay metadata is invalid"))
 }
