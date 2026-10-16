@@ -130,6 +130,7 @@ pub(crate) enum JobSource {
     AndroidSpool { token: String },
     AndroidSeekable { token: String },
     IosScoped { token: String },
+    SavedConflict { token: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -536,7 +537,7 @@ pub(crate) fn open_job_source(
             let path = resolve_spool_source(job_root, token)?;
             open_regular_file_no_follow(&path)
         }
-        JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody requires its bounded probe or exact job claim")),
+        JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody requires its bounded probe or exact job claim")),
     }
 }
 
@@ -561,7 +562,7 @@ fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, Native
     match source {
         JobSource::DesktopPath { path } => resolve_desktop_source(path),
         JobSource::AndroidSpool { token } => resolve_spool_source(job_root, token),
-        JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody has no path authority")),
+        JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody has no path authority")),
     }
 }
 
@@ -1461,6 +1462,7 @@ impl NativeFileJobState {
                 expected_revision,
             } => {
                 let opened_source = match &source {
+                    JobSource::SavedConflict { .. } => None,
                     JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
                     JobSource::AndroidSpool { token } => {
                         parse_android_spool_token(token)?;
@@ -1522,7 +1524,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
+                    JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
                 };
                 let repository_root =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1601,7 +1603,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => { portable_source_custody::ensure_platform_source(&app, &source)?; None },
+                    JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => { portable_source_custody::ensure_platform_source(&app, &source)?; None },
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1802,7 +1804,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
+                    JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1970,7 +1972,7 @@ impl NativeFileJobState {
                 claim_spool_content_source(&self.root, token, &owned_directory, &display_name)
                     .map(|source| source.opened)
             }
-            JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody is not a content source")),
+            JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody is not a content source")),
         };
         let opened_source = match opened_source {
             Ok(source) => source,
@@ -2042,6 +2044,7 @@ impl NativeFileJobState {
             ));
         };
         let opened_source = match &source {
+            JobSource::SavedConflict { .. } => None,
             JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
             JobSource::AndroidSpool { token } => {
                 parse_android_spool_token(token)?;
@@ -2176,7 +2179,7 @@ impl NativeFileJobState {
                     *opened_source = Some(source.opened);
                     Ok(())
                 }
-                JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } if opened_source.is_none() => {
+                JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } if opened_source.is_none() => {
                     *opened_source = Some(portable_source_custody::claim(source, &job_id)?);
                     Ok(())
                 }

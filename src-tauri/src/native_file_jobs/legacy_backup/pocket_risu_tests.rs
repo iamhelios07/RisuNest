@@ -411,13 +411,8 @@ fn pairs_early_sidecars_and_infers_missing_metadata() {
 }
 
 #[test]
-fn rejects_corrupt_metadata_duplicates_and_truncated_payloads() {
+fn rejects_duplicate_metadata_and_truncated_or_oversized_payloads() {
     for entries in [
-        [
-            archive_entry("inlay/a.webp", b"a"),
-            archive_entry("inlay_sidecar/a", b"bad JSON"),
-        ]
-        .concat(),
         [
             archive_entry("inlay/a.webp", b"a"),
             archive_entry("inlay/a.png", b"b"),
@@ -467,10 +462,16 @@ fn unsupported_inlay_shapes_are_counted_without_losing_readable_payloads() {
         archive_entry("inlay/nested/a.webp", b"uninterpreted"),
         archive_entry("inlay/b.webp", b"uninterpreted"),
         archive_entry("inlay_sidecar/b", br#"{"ext":"webp","name":"b","type":"future"}"#),
+        archive_entry("inlay/broken-json", b"{\"data\":"),
+        archive_entry("inlay/broken-data-type", br#"{"ext":"png","name":"Broken","type":"image","data":42}"#),
+        archive_entry("inlay/broken-sidecar.webp", b"ignored"),
+        archive_entry("inlay_sidecar/broken-sidecar", b"bad JSON"),
+        archive_entry("inlay/broken-provenance.webp", b"ignored"),
+        archive_entry("inlay_meta/broken-provenance", b"bad JSON"),
     ].concat(), &NeverCancelled).unwrap();
     assert_eq!(payloads.asset_aliases.len(), 1);
     assert_eq!(payloads.asset_aliases[0].key, "good");
-    assert_eq!(payloads.invalid_inlays.len(), 2);
+    assert_eq!(payloads.invalid_inlays, ["inlay/a.unknown", "inlay/b.webp", "inlay/broken-json", "inlay/broken-data-type", "inlay/broken-sidecar.webp", "inlay/broken-provenance.webp"]);
     assert_eq!(payloads.skipped_inlays, 1);
 }
 

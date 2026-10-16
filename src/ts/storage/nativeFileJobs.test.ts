@@ -3,7 +3,8 @@ const restoreAlerts = vi.hoisted(() => ({ confirm: vi.fn(), checkbox: vi.fn() })
 vi.mock('../alert', () => ({ alertConfirm: restoreAlerts.confirm, alertCheckboxConfirm: restoreAlerts.checkbox }))
 const deviceRestore = vi.hoisted(() => ({ flushDeviceStateBeforeRestore: vi.fn(async () => {}), refreshDeviceStateAfterRestore: vi.fn(async () => {}) }))
 vi.mock('./deviceStateRestore', () => deviceRestore)
-const binding = vi.hoisted(() => ({ prepare: vi.fn() }))
+const binding = vi.hoisted(() => ({ prepare: vi.fn(), invoke: vi.fn() }))
+vi.mock('@tauri-apps/api/core', async original => ({ ...await original<typeof import('@tauri-apps/api/core')>(), invoke: binding.invoke } satisfies typeof import('@tauri-apps/api/core')))
 vi.mock('./sync/bindingRegistry', () => ({prepareBoundLibraryReplacement: binding.prepare}))
 vi.mock('../plugins/apiV3/v3.svelte', () => ({fencePluginExecutionForAuthorityReplacement:async()=>{},invalidatePluginCachesAfterAuthorityReplacement:async()=>{},restartPluginsAfterAuthorityReplacement:async()=>{}}))
 const library = vi.hoisted(() => ({ hasCharacters: vi.fn<() => Promise<boolean>>() }))
@@ -12,6 +13,7 @@ beforeEach(() => {
     library.hasCharacters.mockReset().mockResolvedValue(true)
     restoreAlerts.checkbox.mockReset().mockResolvedValue({confirmed:true,checked:true})
     binding.prepare.mockReset().mockImplementation(async () => ({bound:false,state:{targetAuthority:'1'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{}}))
+    binding.invoke.mockReset()
 })
 
 it.each(['portable', 'block'] as const)('holds the write pause until the actual %s capture, then permits writes during export', async format => {
@@ -250,26 +252,56 @@ describe('native restore response deadlines', () => {
         expect(host.commands()).not.toContain('native_file_job_finalize')
     })
 
-    it('resumes a binding fence that settles after its response deadline', async () => {
+    it('still bounds a native binding state response before activation', async () => {
+        const registry = await vi.importActual<typeof import('./sync/bindingRegistry')>('./sync/bindingRegistry')
+        binding.prepare.mockImplementation(registry.prepareBoundLibraryReplacement)
+        binding.invoke.mockReturnValue(new Promise(() => {}))
+        const restoreClock = clock()
+        const host = createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'},status('cancelled')])
+        const outcome = expect(runNativeBlockRisuSaveRestore(restoreRuntime(8), {type:'desktopPath',path:'synthetic.risudat'}, {}, {...host.dependencies,restoreClock}))
+            .rejects.toMatchObject({code:'restore-control-timeout'})
+        await vi.waitFor(() => expect(binding.invoke).toHaveBeenCalled())
+        restoreClock.expire()
+        await outcome
+        expect(host.commands()).not.toContain('native_file_job_finalize')
+    })
+
+    it.each([['receive', false], ['fence', true]] as const)('allows ongoing binding %s work past the control deadline (hold: %s)', async (phase, hold) => {
         const restoreClock = clock()
         let finish!: () => void
         let waiting = false
-        let blocked = false
-        let completed = false
+        const resumed: boolean[] = []
         const work = new Promise<void>(resolve => { finish = resolve })
-        binding.prepare.mockResolvedValue({bound:false,state:{targetAuthority:'1'},
-            fence:async()=>{waiting=true;await work;blocked=true;completed=true},
-            assertAuthority:async()=>{},resume:async()=>{blocked=false},
+        const registry = await vi.importActual<typeof import('./sync/bindingRegistry')>('./sync/bindingRegistry')
+        const target = {kind:'server' as const, connectionId:'synthetic-long-restore'}
+        binding.invoke.mockImplementation(async command => {
+            if (command !== 'pds_lww_binding_state') throw new Error(`Unexpected native binding command: ${command}`)
+            return {target,targetAuthority:'1',selectionEpoch:'1',libraryId:'synthetic',progress:null}
         })
-        const host = createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'},status('cancelled')])
-        const operation = runNativeBlockRisuSaveRestore(restoreRuntime(8), {type:'desktopPath',path:'synthetic.risudat'}, {}, {...host.dependencies,restoreClock})
-        const outcome = expect(operation).rejects.toMatchObject({code:'restore-control-timeout'})
-        await vi.waitFor(() => expect(waiting).toBe(true))
-        restoreClock.expire()
-        await outcome
-        finish()
-        await vi.waitFor(() => { expect(completed).toBe(true); expect(blocked).toBe(false) })
-        expect(host.commands()).not.toContain('native_file_job_finalize')
+        binding.prepare.mockImplementation(registry.prepareBoundLibraryReplacement)
+        const unsupported = async (): Promise<never> => { throw new Error('Restore must not switch its binding') }
+        const release = registry.registerSyncBindingTransport(target, {
+            inspectTarget: unsupported, pullAvailableState: unsupported,
+            replaceFromTarget: unsupported, publishInitialSharedState: unsupported,
+            receiveAvailableChanges: async () => { if (phase === 'receive') { waiting = true; await work } },
+            fenceOldJobs: async () => { if (phase === 'fence') { waiting = true; await work } },
+            resumeBinding: async context => { resumed.push(context.holdAutomaticSync === true) },
+        })
+        const result = {revision:9,sourceBytes:128,sourceFingerprintKind:'whole-file-sha256' as const,sourceSha256:'f'.repeat(64),characterCount:1,presetCount:0,warningCodes:[]}
+        const host = createNativeJobHost([], {native_file_job_status: () =>
+            host.commands().includes('native_file_job_cancel') ? status('cancelled')
+                : host.commands().includes('native_file_job_finalize') ? status('succeeded', result)
+                : {...status('waitingForInput'),phase:'awaiting-activation'}})
+        try {
+            const operation = runNativeBlockRisuSaveRestore(restoreRuntime(8), {type:'desktopPath',path:'synthetic.risudat'}, {holdServerSyncAfterRestore:hold}, {...host.dependencies,restoreClock})
+            const outcome = operation.then(result => ({result}), error => ({error}))
+            await vi.waitFor(() => expect(waiting).toBe(true))
+            restoreClock.expire()
+            finish()
+            expect(await outcome).toEqual({result})
+            expect(resumed).toEqual([hold])
+            expect(host.commands()).not.toContain('native_file_job_cancel')
+        } finally { finish(); release() }
     })
 })
 
@@ -504,7 +536,7 @@ describe('native file jobs', () => {
             const invoke = async (command: string) => {
                 calls.push(command)
                 if (command === 'native_file_job_start') return { jobId: 'job-1' }
-                if (command === 'native_file_job_status') return statuses.shift()
+                if (command === 'native_file_job_status') return statuses.length ? statuses.shift() : {...status('succeeded', committed), kind:'restore-portable-backup', deviceSessionId:'device-session', activationRevision:4, activationAuthority:'1', restoreAdoptionConfirmed:true}
                 if (command === 'native_portable_select_sections') return undefined
                 if (command === 'native_file_job_finalize') return undefined
                 if (command === 'native_device_backup_recovery_complete') {
@@ -4978,7 +5010,17 @@ describe('native snapshot restore', () => {
     it('reads the activation of a recovered snapshot restore from its job when the status response was lost', async () => {
         const events: string[] = []
         let polls = 0
-        const runtime = restoreRuntime(11)
+        const baseRuntime = restoreRuntime(11)
+        let lifecycle: {beforeRefresh(): Promise<number>; afterRefresh(): Promise<void>}
+        const runtime = {...baseRuntime,
+            setActivatedLibraryRecoveryLifecycle: (_token: unknown, value: typeof lifecycle) => {lifecycle = value},
+            retryCommittedWorkingSetRefresh: async () => {
+                await lifecycle.beforeRefresh()
+                const outcome = await baseRuntime.retryCommittedWorkingSetRefresh()
+                await lifecycle.afterRefresh()
+                return outcome
+            },
+        }
         await expect(runNativeSnapshotRestore(runtime, {snapshotId: 'synthetic-snapshot'}, {
             afterActivationRecovery: async activation => { events.push(`bodies:${activation.stagingId}:${activation.activationRevision}:${activation.bindingAuthority}`) },
         }, {
@@ -4999,7 +5041,7 @@ describe('native snapshot restore', () => {
             },
         })).rejects.toMatchObject({code: 'activation-outcome-unresolved', recoveryRequired: true, cause: {message: 'synthetic lost status response'}})
         expect(events).toEqual([])
-        await continueCommittedWorkingSetRefresh(12, runtime, 2)
+        await retryCommittedWorkingSetRefreshWithContinuation(runtime)
         expect(events).toEqual(['status-read', 'bodies:stage:12:1', 'forgotten'])
     })
 })

@@ -3,7 +3,8 @@ use std::io::{self, BufRead, BufWriter, Seek, SeekFrom, Write};
 
 fn malformed() -> io::Error { io::Error::new(io::ErrorKind::InvalidData, "invalid legacy Inlay JSON") }
 fn parse_error(error: io::Error, cancellation: &dyn CancellationProbe) -> LocalBackupError {
-    if error.kind() == io::ErrorKind::InvalidData { LocalBackupError::new(super::super::LocalBackupErrorCode::UnsupportedFormat, "PocketRisu Inlay data is unreadable") }
+    if let Err(cancelled) = check_cancelled(cancellation) { return cancelled; }
+    if error.kind() == io::ErrorKind::InvalidData { invalid("PocketRisu Inlay data is unreadable") }
     else { super::super::cancellation_io(error, cancellation) }
 }
 fn byte(reader: &mut impl BufRead) -> io::Result<u8> {

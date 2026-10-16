@@ -41,6 +41,7 @@
     import {
         cancelActiveNativeFileOperation,
         dismissNativeFileOperationOutcome,
+        retryPortableRestoreBodiesFromOutcome,
         nativeFileJobHost,
         nativeFileOperation,
         nativeFileOperationOutcome,
@@ -137,6 +138,12 @@
         ),
     )
     const jobShown = $derived(job.open && !job.compact)
+    const jobRecoveryRequired = $derived($nativeFileOperationOutcome?.error?.recoveryRequired === true)
+    const bodyRetryAvailable = $derived($nativeFileOperationOutcome?.status?.kind === 'restore-portable-backup'
+        && $nativeFileOperationOutcome.status.restoreAdoptionConfirmed === true
+        && $nativeFileOperationOutcome.status.portableBodyRetry?.pending === true
+        && $nativeFileOperationOutcome.status.portableBodyRetry.available === true
+        && !$nativeFileOperationOutcome.status.portableBodyRetry.sourceRequired)
     const jobTicking = $derived(jobShown && job.terminal === null)
     let jobDetailsOpen = $state(false)
     let jobDetailsCopied = $state(false)
@@ -284,12 +291,14 @@
     async function runImport(): Promise<void> {
         if (importBusy) return
         importBusy = true
+        const callStartedAt = Date.now()
         try {
-            if (isTauri) await restoreBackupFromSystemPicker({ firstRun: true })
+            if (isTauri) await restoreBackupFromSystemPicker({ firstRun: true,
+                afterCommittedRecovery: async () => { continueAfterImport() },
+            })
             else await importRisuSaveFromSystemPicker()
-        } catch {
-            // Preflight failures happen before the shared operation panel exists.
-            alertError(strings.risuNest.backup.actionFailed)
+        } catch (error) {
+            presentFileOperationError('import', error, callStartedAt)
         } finally {
             importBusy = false
         }
@@ -298,6 +307,7 @@
     function continueAfterImport(): void {
         dismissNativeFileOperationOutcome()
         flow = goToOnboardingState(flow, 'done', 'import')
+        onboardingHold.set(false)
     }
 
     async function copyJobDetails(): Promise<void> {
@@ -751,7 +761,11 @@
                                 >
                                     {t.import.next}<ArrowRight />
                                 </button>
-                            {:else}
+                            {:else if bodyRetryAvailable}
+                                <button class="btn" type="button" onclick={() => {
+                                    void retryPortableRestoreBodiesFromOutcome().then(continueAfterImport).catch(() => {})
+                                }}>{strings.retry}</button>
+                            {:else if !jobRecoveryRequired}
                                 <button
                                     class="btn"
                                     type="button"
