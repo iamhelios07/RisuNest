@@ -105,7 +105,7 @@ describe('persisted server offline startup', () => {
         button(language.risuNest.serverSync.syncNow)!.click(); await settle()
         expect(commands().filter(command => command === 'server_sync_lww_activate')).toHaveLength(2)
         expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_retry', { request: { bindingAuthority: '4', requestId: expect.any(String) } })
-        expect(production.getServerSyncController().snapshot()).toMatchObject({ status: { bound: true }, paused: false, error: '' })
+        await vi.waitFor(() => expect(production.getServerSyncController().snapshot()).toMatchObject({ status: { bound: true }, paused: false, error: '' }))
     })
     it('disconnects the actual persisted binding while activation remains offline, without starting services', async () => {
         await offlineStartup(); await settings()
