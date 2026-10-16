@@ -373,7 +373,11 @@ pub fn create(bases: &[&[u8]], target: &[u8]) -> Result<Recipe> {
         } else {
             searched += 1;
             if searched > MAX_SEARCH_BYTES {
-                return Err(WireError("delta-search-limit"));
+                if target.len() - literal > MAX_PATCH_BYTES {
+                    return Err(WireError("delta-search-limit"));
+                }
+                // Keep useful copies already found and send the unsearched tail literally.
+                break;
             }
             rolling = target.get(position + BLOCK).map(|next| {
                 key.wrapping_sub((target[position] as u64 + 1).wrapping_mul(factor))
