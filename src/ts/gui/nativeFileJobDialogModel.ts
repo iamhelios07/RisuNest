@@ -550,6 +550,8 @@ export function failureReason(code: string, direction: 'import' | 'export' = 'im
         case 'invalid-destination':
         case 'destination-write-failed':
             return copy.reasonDestination
+        case 'destination-busy':
+            return copy.reasonDestinationBusy
         case 'destination-required':
         case 'unsupported-without-destination':
             return copy.reasonPlainJpeg

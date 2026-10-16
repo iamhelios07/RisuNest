@@ -19,10 +19,11 @@ beforeEach(() => {
     binding.invoke.mockReset()
 })
 
-it('selects the Android destination before flushing or starting an export and releases it on preparation failure', async () => {
+it.each(['failed', 'cancelled'])('selects the Android destination first and preserves a %s preparation when release fails', async outcome => {
     const picker = androidSafReservationFixture()
+    picker.failRelease()
     picker.bridge.reserveExport.mockImplementation(() => {})
-    const failure = new Error('synthetic preparation failure')
+    const failure = outcome === 'cancelled' ? new DOMException('cancelled', 'AbortError') : Object.assign(new Error('synthetic preparation failure'), {code: 'store-error'})
     const flushPendingData = vi.fn(async () => {throw failure})
     const invoke = vi.fn(async () => {throw new Error('No native job may start')})
     const exporting = runNativeCompatibleLocalBackupExport(
@@ -36,6 +37,7 @@ it('selects the Android destination before flushing or starting an export and re
     expect(invoke).not.toHaveBeenCalled()
     picker.select(picker.bridge.reserveExport.mock.calls[0][0])
     await rejected
+    expect(failure).toMatchObject({warningCodes: ['partial-destination-may-remain']})
     expect(flushPendingData).toHaveBeenCalled()
     expect(invoke).not.toHaveBeenCalled()
     expect(picker.bridge.releaseExport).toHaveBeenCalled()
@@ -75,6 +77,19 @@ it.each(['portable', 'block'] as const)('holds the write pause until the actual 
     await vi.waitFor(() => expect(paused).toBe(false))
     releaseBodies()
     await expect(operation).resolves.toEqual(result)
+})
+
+it('preserves portable archive preparation failure when the Android reservation release also fails', async () => {
+    const picker = androidSafReservationFixture()
+    picker.failRelease()
+    const failure = Object.assign(new Error('capture failed'), {code: 'store-error'})
+    const runtime = {...restoreRuntime(3), revision: 3, flushPendingData: async () => {},
+        withPausedPersistentWrites: async () => {throw failure}}
+    await expect(runNativeArchiveExport(runtime, {type: 'androidSaf', suggestedName: 'synthetic.risunest'},
+        {library: true, deviceSections: []}, {}, {isTauri: () => true, invoke: async () => {throw new Error('No job')},
+            wait: async () => {}, reserveAndroidDestination: picker.reserve,
+            copyToAndroidSaf: async () => {throw new Error('No handoff')}})).rejects.toBe(failure)
+    expect(failure).toMatchObject({code: 'store-error', warningCodes: ['partial-destination-may-remain']})
 })
 
 describe('local source preservation consent', () => {

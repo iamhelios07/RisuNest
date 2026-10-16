@@ -627,7 +627,7 @@ async function recoverUnclaimedAndroidDestination(
 
 /** Release the reservation without replacing a failed operation's error. */
 export async function withAndroidSafDestination<T>(
-    reservation: AndroidSafDestinationReservation,
+    reservation: Pick<AndroidSafDestinationReservation, 'release'> | undefined,
     operation: () => Promise<T>,
 ): Promise<T> {
     let failed = false
@@ -639,7 +639,7 @@ export async function withAndroidSafDestination<T>(
         originalError = error
         throw error
     } finally {
-        try { await reservation.release() }
+        try { await reservation?.release() }
         catch (cleanupError) {
             if (!failed) throw cleanupError
             // Cleanup must not replace the producer's error, including cancellation.

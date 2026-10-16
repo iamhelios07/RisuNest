@@ -2696,6 +2696,7 @@ export const languageKorean = {
             "reasonExportRevisionConflict": '내보내는 동안 데이터가 변경되었습니다. 다시 내보내세요.',
             "reasonExportStoreError": '저장소 오류로 내보내지 못했습니다. 다시 시도해주세요.',
             "reasonDestination": '선택한 위치에 파일을 저장하지 못했습니다. 다른 위치를 선택해주세요.',
+            "reasonDestinationBusy": '다른 내보내기가 진행 중입니다. 내보내기가 끝난 후 다시 시도해주세요.',
             "reasonPlainJpeg": '캐릭터 카드가 들어 있지 않은 JPEG 파일입니다.',
             "reasonIncompletePublication": '파일을 끝까지 저장하지 못했습니다. 다시 내보내세요.',
             "reasonStorageFull": '저장 공간이 부족합니다. 공간을 확보한 후 다시 시도해주세요.',

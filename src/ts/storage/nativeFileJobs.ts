@@ -19,6 +19,7 @@ import {
     copyNativeExportToAndroidSaf,
     discardAndroidSafSource,
     reserveAndroidSafDestination,
+    withAndroidSafDestination,
     type AndroidSafDestinationReservation,
     type AndroidSafExportKind,
     type AndroidSafDestinationRequest,
@@ -2190,11 +2191,8 @@ async function runNativeManagedExport(
         if (!dependencies.reserveAndroidDestination) throw new NativeFileJobError('unsupported', 'Android SAF destination reservation is unavailable')
         reservation = await dependencies.reserveAndroidDestination(spec.destination.suggestedName, spec.androidSourceKind ?? 'risuSave', options.signal)
     }
-    try {
-        return await runNativeManagedExportToDestination(spec, options, dependencies, reservation)
-    } finally {
-        await reservation?.release()
-    }
+    return withAndroidSafDestination(reservation, () =>
+        runNativeManagedExportToDestination(spec, options, dependencies, reservation))
 }
 
 async function runNativeManagedExportToDestination(
@@ -2590,12 +2588,9 @@ export async function runNativeArchiveExport(
         ? await dependencies.reserveAndroidDestination?.(destination.suggestedName, 'risuSave', options.signal)
         : undefined
     if (destination.type === 'androidSaf' && !reservation) throw new NativeFileJobError('unsupported', 'Android SAF destination reservation is unavailable')
-    try {
-        return await withPausedNativeExport(runtime, 'native-portable-export', options,
-            (revision, observed) => runNativeArchiveExportAtRevision(runtime, revision, destination, selection, {...options, ...observed}, dependencies, reservation))
-    } finally {
-        await reservation?.release()
-    }
+    return withAndroidSafDestination(reservation, () =>
+        withPausedNativeExport(runtime, 'native-portable-export', options,
+            (revision, observed) => runNativeArchiveExportAtRevision(runtime, revision, destination, selection, {...options, ...observed}, dependencies, reservation)))
 }
 
 async function runNativeArchiveExportAtRevision(
