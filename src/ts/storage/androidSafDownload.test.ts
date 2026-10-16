@@ -90,6 +90,10 @@ describe('downloadThroughAndroidSaf', () => {
     it('stops at a failed append without opening the picker', async () => {
         const h = harness(async () => ({ bytes: 1 }))
         const failure = new Error('append failed')
+        h.reservation.bridge.getExportStatus.mockImplementation(async () => h.reservation.bridge.reserveExport.mock.calls.length ? JSON.stringify({
+            requestId: h.reservation.bridge.reserveExport.mock.calls[0][0], state: 'cancelled',
+            warningCodes: ['partial-destination-may-remain'],
+        }) : null)
         h.invoke.mockImplementation(async (command: string) => {
             h.events.push(command)
             if (command === 'native_download_handoff_create') return handoff
@@ -100,6 +104,7 @@ describe('downloadThroughAndroidSaf', () => {
         await expect(downloadThroughAndroidSaf('chat.txt', Uint8Array.of(1), h.dependencies)).rejects.toBe(failure)
 
         expect(h.copy).not.toHaveBeenCalled()
+        expect(failure).toMatchObject({warningCodes: ['partial-destination-may-remain']})
         expect(h.events.at(-1)).toBe('native_download_handoff_cleanup')
     })
 
@@ -128,5 +133,14 @@ describe('downloadThroughAndroidSaf', () => {
 
         expect(errors).toHaveBeenCalledOnce()
         errors.mockRestore()
+    })
+
+    it('removes the handoff even when destination release fails after a successful copy', async () => {
+        const h = harness(async () => ({ bytes: 1 }))
+        const failure = new Error('destination receipt unavailable')
+        h.reservation.bridge.releaseExport.mockRejectedValue(failure)
+
+        await expect(downloadThroughAndroidSaf('a.bin', Uint8Array.of(1), h.dependencies)).rejects.toBe(failure)
+        expect(h.events.at(-1)).toBe('native_download_handoff_cleanup')
     })
 })

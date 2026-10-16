@@ -7,7 +7,7 @@ const bridge = readFileSync(resolve(process.cwd(), 'src-tauri/gen/android/app/sr
 const state = readFileSync(resolve(process.cwd(), 'src-tauri/gen/android/app/src/main/java/io/github/rsyumi/risunest/SafDestinationState.kt'), 'utf8')
 
 describe('Android selected document route', () => {
-    it('passes selected document ownership to the guarded copy cleanup', () => {
+    it('treats picker results as unowned documents during copy cleanup', () => {
         const start = activity.indexOf('private fun onSafDestinationSelected(')
         const route = activity.slice(start, activity.indexOf('\n  private fun ', start + 1))
         const copy = activity.slice(activity.indexOf('private suspend fun copySafSelectedDestination('), activity.indexOf('private fun cleanupUnclaimedSafDestination('))
@@ -16,17 +16,16 @@ describe('Android selected document route', () => {
         expect(activity).toContain('reservedDestination = reservationKind != null')
         expect(route).toContain('copySafSelectedDestination(pending, selectedState)')
         expect(copy).toContain('copySafDestinationOnIo(')
-        expect(copy).toContain('createdDocument = selectedState.reservedDestination')
+        expect(copy).toContain('createdDocument = false')
         expect(cleanup).toMatch(/if \(!createdDocument\) \{\s+return SafDestinationException\([\s\S]+?"partial-destination-may-remain"[\s\S]+?\n  \}\s+val removed = runCatching\(deletePartial\)/)
     })
 
     it('keeps interrupted selected documents and reports possible partial files', () => {
         const start = activity.indexOf('private fun recoverSafDestination(')
         const route = activity.slice(start, activity.indexOf('\n  private fun ', start + 1))
-        const cleanup = activity.slice(activity.indexOf('private fun cleanupOwnedSafDestination('), activity.indexOf('private fun cancelUnclaimedReservedDestination('))
-        expect(route).toContain('cleanupOwnedSafDestination(record)')
-        expect(cleanup).toContain('cleanupReservedSafDestination(record)')
-        expect(state).toContain('record.reservedDestination && runCatching { deleteDocument(uri) }')
+        expect(route).toContain('interruptedSafDestinationWarnings(record)')
+        // No picker response carries proof that this app created its document.
+        expect(activity).not.toContain('DocumentsContract.deleteDocument(')
         expect(state).toContain('else interruptedSafDestinationWarnings()')
     })
 })

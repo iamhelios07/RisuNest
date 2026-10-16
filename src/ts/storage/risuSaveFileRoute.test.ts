@@ -132,6 +132,10 @@ describe('RisuSave picker route', () => {
         deps.platform = () => 'native-android'
         deps.reserveAndroidDestination = picker.reserve
         const failure = new Error('synthetic snapshot failure')
+        picker.bridge.getExportStatus.mockImplementation(async () => picker.bridge.reserveExport.mock.calls.length ? JSON.stringify({
+            requestId: picker.bridge.reserveExport.mock.calls[0][0], state: 'cancelled',
+            warningCodes: ['partial-destination-may-remain'],
+        }) : null)
         deps.withFlushedExport = vi.fn(async () => {throw failure})
         const output = exportRisuSaveFromPicker({}, deps)
         const rejected = expect(output).rejects.toBe(failure)
@@ -139,6 +143,7 @@ describe('RisuSave picker route', () => {
         expect(deps.withFlushedExport).not.toHaveBeenCalled()
         picker.select(picker.bridge.reserveExport.mock.calls[0][0])
         await rejected
+        expect(failure).toMatchObject({warningCodes: ['partial-destination-may-remain']})
         expect(picker.bridge.releaseExport).toHaveBeenCalled()
         expect(deps.copyAndroidExport).not.toHaveBeenCalled()
     })

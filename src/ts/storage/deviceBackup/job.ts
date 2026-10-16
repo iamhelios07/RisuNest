@@ -4,6 +4,7 @@ import {
   acknowledgeAndroidSafExport,
   copyNativeExportToAndroidSaf,
   reserveAndroidSafDestination,
+  withAndroidSafDestination,
   getAndroidSafExportSourceId,
   getAndroidSafExportStatus,
   listenAndroidSafDestinationEvents,
@@ -430,7 +431,7 @@ export function portableAndroidPublicationDependencies(): Pick<
         removeEventListener: (name: string, listener: (event: Event) => void) => window.removeEventListener(name, listener),
       };
       const reservation = await reserveAndroidSafDestination(intent.suggestedName!, "risuSave", undefined, dependencies);
-      try {
+      return withAndroidSafDestination(reservation, async () => {
         await reservation.bind(intent.jobId);
         const copied = await copyNativeExportToAndroidSaf(
           {
@@ -447,9 +448,7 @@ export function portableAndroidPublicationDependencies(): Pick<
           bytes: copied.bytes,
           warningCodes: copied.warningCodes,
         };
-        } finally {
-        await reservation.release();
-      }
+      });
     },
     resumeAndroid: resumeAndroidPortablePublication,
     acknowledgeAndroid: acknowledgeAndroidSafExport,

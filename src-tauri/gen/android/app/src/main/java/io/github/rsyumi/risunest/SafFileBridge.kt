@@ -594,7 +594,9 @@ internal suspend fun copySafDestinationOnIo(
   val baseWarnings = listOf("android-saf-provider-not-atomic")
   var copiedBytes = 0L
   try {
+    checkDestinationCancellation(isCancelled, baseWarnings)
     openSource().use { input ->
+      checkDestinationCancellation(isCancelled, baseWarnings)
       openDestination().use { output ->
         val buffer = ByteArray(bufferBytes)
         while (true) {
