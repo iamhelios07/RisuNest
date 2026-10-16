@@ -1629,6 +1629,7 @@ pub(super) struct ReplacementProof<'a> {
 
 pub(super) fn replace_commit_lww(
     connection: &mut Connection,
+    root: &std::path::Path,
     staging_id: &str,
     header: &super::lww::Header,
     stamp: &risunest_sync_wire::stamp::Stamp,
@@ -1640,7 +1641,7 @@ pub(super) fn replace_commit_lww(
     selection_change: Option<&super::sync_selection::BindingSelectionChange>,
     replacement_proof: Option<ReplacementProof<'_>>,
 ) -> StoreResult<RevisionResult> {
-    let rows = super::lww::FrozenRows::new()?;
+    let rows = super::lww::FrozenRows::new(root)?;
     if target {
         for change in received { rows.insert(super::lww::intent_rows::target_row(change)?)?; }
     } else {
@@ -1648,11 +1649,12 @@ pub(super) fn replace_commit_lww(
             rows.insert(super::lww::intent_rows::replacement_row(key, value, true)?)?;
         }
     }
-    replace_commit_lww_rows(connection, staging_id, header, stamp, digest, &rows, target, received_authority, selection_change, replacement_proof)
+    replace_commit_lww_rows(connection, root, staging_id, header, stamp, digest, &rows, target, received_authority, selection_change, replacement_proof)
 }
 
 pub(super) fn replace_commit_lww_rows(
     connection: &mut Connection,
+    root: &std::path::Path,
     staging_id: &str,
     header: &super::lww::Header,
     stamp: &risunest_sync_wire::stamp::Stamp,
@@ -1685,7 +1687,7 @@ pub(super) fn replace_commit_lww_rows(
     }
     if target {
         super::sync_selection::validate_binding_stage_content(&transaction,staging_id)?;
-        super::lww::validate_binding_source_rows(&transaction,staging_id,header,changes)?;
+        super::lww::validate_binding_source_rows(&transaction,root,staging_id,header,changes)?;
     }
     let active=active_generation(&transaction)?;
     if target {super::lww::preserve_local_root(&transaction,&active,staging_id)?;}

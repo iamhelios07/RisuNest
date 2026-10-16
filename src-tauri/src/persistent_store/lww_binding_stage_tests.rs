@@ -309,7 +309,7 @@ fn uncertain_target_activation_replays_device_intent_without_replacing_later_edi
     let rows=super::super::intent_rows::write(&mut store.device_store_mut().unwrap().connection,&activation.request_id,"target",source.iter().map(super::super::intent_rows::target_row)).unwrap();
     let intent=super::super::Intent::Target{device_revision: super::super::device_revision(store.device_store().unwrap().connection()).unwrap(),staging_id:stage.staging_id.clone(),changes:rows};
     let (stamp,digest)=store.reserve_intent(&activation,&intent).unwrap();
-    let result=commit::replace_commit_lww(&mut store.connection,&stage.staging_id,&activation,&stamp,&digest,&[],true,&source,None,None,None).unwrap();
+    let result=commit::replace_commit_lww(&mut store.connection,&store.repository_root,&stage.staging_id,&activation,&stamp,&digest,&[],true,&source,None,None,None).unwrap();
     drop(store); let mut store=PersistentStore::open(dir.path()).unwrap();
     assert_eq!(store.revision().unwrap(),result.revision);
     assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_receive_rows WHERE status='held'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
@@ -326,9 +326,11 @@ fn target_proof_and_status_corruption_cannot_change_frozen_source_digest() {
     let (header,inspection)=context(&store); let incoming=vec![change(&["character","missing","name"],json!("hidden"))];
     let stage=store.lww_stage_binding_units(&header,&inspection,&incoming,7.into()).unwrap();
     let mut different=incoming.clone(); different[0].stamp.logical=1;
-    assert!(validate_binding_source(&store.connection,&stage.staging_id,&header,&different).is_err());
+    assert!(validate_binding_source(&store.connection,&store.repository_root,&stage.staging_id,&header,&different).is_err());
     store.connection.execute("UPDATE lww_binding_source_units SET status='ready' WHERE staging_id=?1",[&stage.staging_id]).unwrap();
-    assert!(validate_binding_source(&store.connection,&stage.staging_id,&header,&incoming).is_err());
+    assert!(validate_binding_source(&store.connection,&store.repository_root,&stage.staging_id,&header,&incoming).is_err());
+    store.connection.execute("UPDATE lww_binding_source_units SET status='held',key='not-json' WHERE staging_id=?1",[&stage.staging_id]).unwrap();
+    assert!(matches!(validate_binding_source(&store.connection,&store.repository_root,&stage.staging_id,&header,&incoming),Err(crate::persistent_store::StoreError::Validation { .. })));
     assert_eq!(store.connection.query_row("SELECT source_digest FROM lww_binding_sources WHERE staging_id=?1",[&stage.staging_id],|r|r.get::<_,String>(0)).unwrap(),stage.source_digest);
 }
 
@@ -916,7 +918,7 @@ fn streamed_binding_source_digest_matches_the_complete_sorted_input() {
         Ok(())
     }).unwrap();
     assert_eq!(stage.source_digest, expected);
-    let rows = binding_source_rows(&store.connection, &stage.staging_id).unwrap();
+    let rows = binding_source_rows(&store.connection, &store.repository_root, &stage.staging_id).unwrap();
     assert_eq!(source_digest_rows(&rows).unwrap(), expected);
 }
 

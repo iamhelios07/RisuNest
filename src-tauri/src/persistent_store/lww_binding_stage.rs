@@ -1,6 +1,6 @@
 use super::{
     error, is_device, parent_status, projection, put_unit, validate_header, verify, wire, Change,
-    DecimalU64, Header, PersistentStore, StoreResult, UnitValue,
+    DecimalU64, Header, PersistentStore, StoreResult, UnitKey, UnitValue,
 };
 use crate::persistent_store::{message_pages, schema, GENERATION_TABLES};
 use risunest_sync_wire::{
@@ -11,7 +11,7 @@ use risunest_sync_wire::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, io::Write};
+use std::{collections::BTreeSet, io::Write, path::Path};
 
 pub(in crate::persistent_store) const BINDING_STAGE_SCHEMA: &str = r#"CREATE TABLE lww_binding_sources(request_id TEXT PRIMARY KEY,staging_id TEXT NOT NULL UNIQUE,authority TEXT NOT NULL,inspection_id TEXT NOT NULL,source_digest TEXT NOT NULL,admitted_upper_ms TEXT NOT NULL,status_digest TEXT NOT NULL,catalog_digest TEXT NOT NULL);
 CREATE TABLE lww_binding_source_units(staging_id TEXT NOT NULL,key TEXT NOT NULL,stamp TEXT NOT NULL,value TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('ready','held','retired')),PRIMARY KEY(staging_id,key));
@@ -299,7 +299,7 @@ impl PersistentStore {
         validate_inspection(self, header, inspection_id)?;
         let mut progress = StagingObserver::new(&mut observe);
         progress.begin("read", None)?;
-        let changes = super::FrozenRows::new()?;
+        let changes = super::FrozenRows::new(&self.repository_root)?;
         produce(&mut |change| {
             wire(change.stamp.validate())?;
             wire({
@@ -333,7 +333,7 @@ impl PersistentStore {
                 return Err(error("request-id-integrity"));
             }
             progress.begin("check", None)?;
-            validate_binding_source_rows_observed(&self.connection, &id, header, &changes, &mut || progress.advance())?;
+            validate_binding_source_rows_observed(&self.connection, &self.repository_root, &id, header, &changes, &mut || progress.advance())?;
             crate::persistent_store::sync_selection::validate_binding_stage_content_observed(&self.connection, &id, &mut || progress.advance())?;
             progress.flush()?;
             id
@@ -357,7 +357,7 @@ impl PersistentStore {
             })?;
             controls.commit()?;
             progress.begin("project", Some(count * 4))?;
-            project_source(&isolated, &changes, &header.request_id, &mut progress)?;
+            project_source(&isolated, &self.repository_root, &changes, &header.request_id, &mut progress)?;
             let statuses = stored_status_digest_observed(&isolated, "incoming", &mut || progress.advance())?;
             isolated.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
             drop(isolated);
@@ -409,14 +409,14 @@ impl PersistentStore {
     }
 }
 
-fn project_source(db: &Connection, changes: &super::FrozenRows, version: &str, progress: &mut StagingObserver<'_>) -> StoreResult<()> {
+fn project_source(db: &Connection, root: &Path, changes: &super::FrozenRows, version: &str, progress: &mut StagingObserver<'_>) -> StoreResult<()> {
     let mut batches = ScratchBatches::begin(db)?;
     changes.visit(false, |key, stamp, value, _| {
         if !is_device(&key) { put_unit(batches.tx(), &key, &stamp.ok_or_else(|| error("request-id-integrity"))?, &value, version, None)?; }
         batches.row()?;
         progress.advance()
     })?;
-    let mut statement = changes.db.prepare("SELECT key,value FROM rows ORDER BY CASE WHEN json_extract(key,'$[0]')='exists' AND json_extract(key,'$[1]')<>'conversation' THEN 0 WHEN json_extract(key,'$[0]')='archive' THEN 2 WHEN json_extract(key,'$[0]')='exists' THEN 3 WHEN json_extract(key,'$[0]') IN ('conversation','messages') THEN 4 ELSE 1 END,key")?;
+    let mut statement = changes.db.prepare(&format!("SELECT key,value FROM rows ORDER BY {}", super::intent_rows::BINDING_ORDER))?;
     let mut rows = statement.query([])?;
     let mut pending_detail: Option<(String, serde_json::Value)> = None;
     while let Some(row) = rows.next()? {
@@ -461,7 +461,7 @@ fn project_source(db: &Connection, changes: &super::FrozenRows, version: &str, p
         let bytes: i64 = batches.tx().query_row("SELECT length(CAST(detail AS BLOB)) FROM characters WHERE generation='incoming' AND character_id=?1", [detail["chaId"].as_str().unwrap()], |row| row.get(0))?;
         batches.written(bytes)?;
     }
-    let affected = super::FrozenRows::new()?;
+    let affected = super::FrozenRows::new(root)?;
     changes.visit(false, |key, stamp, value, _| {
         let status = if is_device(&key) { "ready" } else { parent_status(batches.tx(), &key)? };
         if status == "ready" && projection::known(&key) && !is_device(&key) {
@@ -553,16 +553,18 @@ pub(in crate::persistent_store) fn is_binding_stage(db: &Connection, staging_id:
     )?)
 }
 
-pub(in crate::persistent_store) fn binding_source_rows(db: &Connection, staging_id: &str) -> StoreResult<super::FrozenRows> {
-    binding_source_rows_observed(db, staging_id, &mut || Ok(()))
+pub(in crate::persistent_store) fn binding_source_rows(db: &Connection, root: &Path, staging_id: &str) -> StoreResult<super::FrozenRows> {
+    binding_source_rows_observed(db, root, staging_id, &mut || Ok(()))
 }
 
-fn binding_source_rows_observed(db: &Connection, staging_id: &str, observe: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<super::FrozenRows> {
-    let frozen = super::FrozenRows::new()?;
+fn binding_source_rows_observed(db: &Connection, root: &Path, staging_id: &str, observe: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<super::FrozenRows> {
+    let frozen = super::FrozenRows::new(root)?;
     let mut statement = db.prepare("SELECT key,stamp,value FROM lww_binding_source_units WHERE staging_id=?1 ORDER BY key")?;
     let mut rows = statement.query([staging_id])?;
     while let Some(row) = rows.next()? {
-        frozen.insert(super::intent_rows::RowText { key: row.get(0)?, stamp: Some(row.get(1)?), value: row.get(2)?, source_override: false })?;
+        let key: String = row.get(0)?;
+        let _: UnitKey = wire(key.clone().try_into())?;
+        frozen.insert(super::intent_rows::RowText { key, stamp: Some(row.get(1)?), value: row.get(2)?, source_override: false })?;
         observe()?;
     }
     Ok(frozen)
@@ -608,17 +610,17 @@ fn stored_status_digest_observed(db: &Connection, staging_id: &str, observe: &mu
     Ok(hex::encode(writer.0.finalize()))
 }
 
-pub(in crate::persistent_store) fn validate_binding_source(db: &Connection, staging_id: &str, header: &Header, received: &[Change]) -> StoreResult<()> {
-    let rows = super::FrozenRows::new()?;
+pub(in crate::persistent_store) fn validate_binding_source(db: &Connection, root: &Path, staging_id: &str, header: &Header, received: &[Change]) -> StoreResult<()> {
+    let rows = super::FrozenRows::new(root)?;
     for change in received { rows.insert(super::intent_rows::target_row(change)?)?; }
-    validate_binding_source_rows(db, staging_id, header, &rows)
+    validate_binding_source_rows(db, root, staging_id, header, &rows)
 }
 
-pub(in crate::persistent_store) fn validate_binding_source_rows(db: &Connection, staging_id: &str, header: &Header, received: &super::FrozenRows) -> StoreResult<()> {
-    validate_binding_source_rows_observed(db, staging_id, header, received, &mut || Ok(()))
+pub(in crate::persistent_store) fn validate_binding_source_rows(db: &Connection, root: &Path, staging_id: &str, header: &Header, received: &super::FrozenRows) -> StoreResult<()> {
+    validate_binding_source_rows_observed(db, root, staging_id, header, received, &mut || Ok(()))
 }
 
-fn validate_binding_source_rows_observed(db: &Connection, staging_id: &str, header: &Header, received: &super::FrozenRows, observe: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+fn validate_binding_source_rows_observed(db: &Connection, root: &Path, staging_id: &str, header: &Header, received: &super::FrozenRows, observe: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
     let source: Option<(String,String,String,String,String)> = db.query_row("SELECT request_id,source_digest,status_digest,authority,inspection_id FROM lww_binding_sources WHERE staging_id=?1", [staging_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional()?;
     let (request_id,digest,expected_status,authority,inspection) = source.ok_or_else(|| error("binding-source-missing"))?;
     let receipt: Option<(String,String,String,String)> = db.query_row("SELECT s.receive_id,s.inspection_id,i.source_authority,s.changes FROM lww_binding_stages s JOIN lww_binding_inspections i USING(inspection_id) WHERE s.staging_id=?1", [staging_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
@@ -629,7 +631,7 @@ fn validate_binding_source_rows_observed(db: &Connection, staging_id: &str, head
         return Err(error("binding-source-association"));
     }
     if request_id != header.request_id || source_digest_rows_observed(received, observe)? != digest
-        || source_digest_rows_observed(&binding_source_rows_observed(db, staging_id, observe)?, observe)? != digest
+        || source_digest_rows_observed(&binding_source_rows_observed(db, root, staging_id, observe)?, observe)? != digest
         || stored_status_digest_observed(db, staging_id, observe)? != expected_status {
         return Err(error("binding-source-integrity"));
     }

@@ -465,6 +465,28 @@ fn assert_device_restore_label(store: &PersistentStore, label: &str) {
 }
 
 #[test]
+fn replacement_scratch_failure_preserves_the_library_and_allows_retry() {
+    let (directory, mut store) = store();
+    let before = store.read_root(None).unwrap();
+    let stage = restore_stage(&mut store, "restored");
+    let header = Header { binding_authority: 0.into(), request_id: "scratch-failure".into() };
+    let scratch = directory.path().join("external-storage").join("scratch");
+    std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+    if scratch.is_dir() { std::fs::remove_dir(&scratch).unwrap(); }
+    std::fs::write(&scratch, b"synthetic unavailable scratch").unwrap();
+    assert!(store.lww_commit_replacement(&header, &stage).is_err());
+    assert_eq!(store.revision().unwrap(), before.revision);
+    assert_eq!(store.read_root(None).unwrap().value, before.value);
+    assert_eq!(store.device_store().unwrap().connection().query_row(
+        "SELECT count(*) FROM lww_intents WHERE request_id=?1", [&header.request_id],
+        |row| row.get::<_,i64>(0)).unwrap(), 0);
+    std::fs::remove_file(&scratch).unwrap();
+    store.lww_commit_replacement(&header, &stage).unwrap();
+    assert_eq!(store.read_root(None).unwrap().value["language"], "restored");
+    assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+}
+
+#[test]
 fn full_restore_library_hypa_and_enabled_plugin_changes_share_stamp_and_receipt() {
     let (_dir, mut store) = store();
     store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins,true).unwrap();
@@ -573,7 +595,7 @@ fn full_restore_rejects_missing_duplicate_and_versioned_device_sections_before_r
 
 #[test]
 fn full_restore_recovers_original_inputs_after_library_and_device_transaction_failures() {
-    for phase in 0..3 {
+    for (phase, scratch_failures) in [(0,0),(1,0),(2,0),(0,1),(1,3),(2,3)] {
         let (dir,mut store)=store();
         store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins,true).unwrap();
         write_restore_device_fixture(&mut store,"old"); clear_outbox(&mut store);
@@ -591,8 +613,33 @@ fn full_restore_recovers_original_inputs_after_library_and_device_transaction_fa
         assert_device_restore_label(&store,"old");
         let reserved=store.lww_clock_state().unwrap().issued.unwrap();
         assert_eq!(store.device_store().unwrap().connection().query_row("SELECT complete FROM lww_intents WHERE request_id=?1",[&header.request_id],|row|row.get::<_,bool>(0)).unwrap(),false);
+        let frozen_rows: i64=store.device_store().unwrap().connection().query_row("SELECT count(*) FROM lww_intent_rows WHERE request_id=?1",[&header.request_id],|row|row.get(0)).unwrap();
+        assert!(frozen_rows>0);
         drop(sections); drop(store);
+        let scratch=dir.path().join("external-storage").join("scratch");
+        if scratch_failures>0 {
+            std::fs::remove_dir(&scratch).unwrap();
+            std::fs::write(&scratch,b"synthetic unavailable scratch").unwrap();
+            for attempt in 1..=scratch_failures {
+                let store=PersistentStore::open(dir.path()).unwrap();
+                assert_eq!(store.revision().unwrap(),if phase==0 {0}else{1});
+                assert_device_restore_label(&store,"old");
+                let device=store.device_store().unwrap().connection();
+                let evidence: (i64,bool,bool)=device.query_row(
+                    "SELECT f.failures,f.quarantined,i.complete FROM lww_intent_failures f JOIN lww_intents i USING(request_id) WHERE request_id=?1",
+                    [&header.request_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+                assert_eq!(evidence,(attempt,attempt==3,false));
+                assert_eq!(device.query_row("SELECT count(*) FROM lww_intent_rows WHERE request_id=?1",[&header.request_id],|row|row.get::<_,i64>(0)).unwrap(),frozen_rows);
+            }
+            std::fs::remove_file(&scratch).unwrap();
+        }
         let mut store=PersistentStore::open(dir.path()).unwrap();
+        if scratch_failures==3 {
+            assert_device_restore_label(&store,"old");
+            let selected=store.lww_quarantined_intents().unwrap().into_iter().find(|intent|intent.request_id==header.request_id).unwrap();
+            assert!(selected.recoverable && !selected.discardable);
+            assert!(store.lww_complete_quarantined_intent(&selected.request_id,&selected.token,store.revision().unwrap()).unwrap());
+        }
         assert_eq!(store.revision().unwrap(),1); assert_device_restore_label(&store,"frozen");
         assert_eq!(read_unit(&store.connection,&unit_key(&["future-unit","frozen"]).unwrap()).unwrap().unwrap().1,original.values().next().unwrap().clone());
         assert_eq!(store.lww_clock_state().unwrap().issued,Some(reserved.clone()));
@@ -601,6 +648,8 @@ fn full_restore_recovers_original_inputs_after_library_and_device_transaction_fa
         let sections=full_device_backup(Some("frozen"));
         assert_eq!(store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&original),&sections.iter().collect::<Vec<_>>()).unwrap().revision,1);
         assert_eq!(store.device_store().unwrap().connection().query_row("SELECT complete FROM lww_intents WHERE request_id=?1",[&header.request_id],|row|row.get::<_,bool>(0)).unwrap(),true);
+        assert!(store.lww_quarantined_intents().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(),0);
     }
 }
 
@@ -2861,6 +2910,7 @@ fn explicit_new_device_recovery_finishes_after_library_activation_without_exposi
         .unwrap();
     let activation = commit::replace_commit_lww(
         &mut store.connection,
+        &store.repository_root,
         &staging,
         &header,
         &stamp,
