@@ -226,20 +226,43 @@ describe('native restore response deadlines', () => {
         expect(host.commands().filter(command => command === 'native_file_job_finalize')).toHaveLength(1)
     })
 
-    it('retains committed recovery when the working set refresh stops responding', async () => {
+    it.each(['flush', 'activation-flush', 'refresh'])('does not time out library-sized %s work', async stage => {
         const restoreClock = clock()
-        let refreshing = false
-        const recovery: number[] = []
+        let entered = false
+        let finish!: () => void
+        let settled = false
+        const work = new Promise<void>(resolve => { finish = resolve })
         const committed = {revision:9,sourceBytes:128,sourceFingerprintKind:'whole-file-sha256' as const,sourceSha256:'f'.repeat(64),characterCount:1,presetCount:0,warningCodes:[]}
         const host = createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'},status('succeeded',committed)])
-        const runtime = restoreRuntime(8, {refresh:async()=>{refreshing=true;await new Promise(()=>{})}, markRefreshRequired:revision=>recovery.push(revision)})
-        const operation = runNativeBlockRisuSaveRestore(runtime, {type:'desktopPath',path:'synthetic.risudat'}, {}, {...host.dependencies,restoreClock})
-        const outcome = expect(operation).rejects.toMatchObject({committedRevision:9,recoveryRequired:true})
-        await vi.waitFor(() => expect(refreshing).toBe(true))
+        const wait = async () => { entered = true; await work }
+        const runtime = restoreRuntime(8, stage === 'refresh' ? {refresh:wait} : {capture:async reason=>{if (stage === 'flush' || reason.endsWith('-activation')) await wait()}})
+        const controller = new AbortController()
+        const phases: string[] = []
+        const operation = runNativeBlockRisuSaveRestore(runtime, {type:'desktopPath',path:'synthetic.risudat'}, {signal:controller.signal,onStatus:value=>phases.push(value.detail?.stage ?? value.phase)}, {...host.dependencies,restoreClock})
+        void operation.then(() => {settled=true}, () => {settled=true})
+        await vi.waitFor(() => expect(entered).toBe(true))
         restoreClock.expire()
+        if (stage === 'refresh') {
+            controller.abort()
+            expect(phases.at(-1)).toBe('refreshing-app')
+        }
+        await Promise.resolve()
+        expect(settled).toBe(false)
+        finish()
+        await expect(operation).resolves.toEqual(committed)
+    })
+
+    it('cancels a pending mutation flush without starting activation', async () => {
+        const controller = new AbortController()
+        let entered = false
+        const host = createNativeJobHost([])
+        const runtime = restoreRuntime(8, {capture:async()=>{entered=true;await new Promise(()=>{})}})
+        const operation = runNativeBlockRisuSaveRestore(runtime, {type:'desktopPath',path:'synthetic.risudat'}, {signal:controller.signal}, host.dependencies)
+        const outcome = expect(operation).rejects.toMatchObject({name:'AbortError'})
+        await vi.waitFor(() => expect(entered).toBe(true))
+        controller.abort()
         await outcome
-        expect(recovery).toContain(9)
-        expect(host.commands()).not.toContain('native_file_job_forget')
+        expect(host.commands()).toEqual([])
     })
 
     it('finishes with the committed result and a warning when plugin follow-up stops responding', async () => {
@@ -257,8 +280,9 @@ describe('native restore response deadlines', () => {
         expect(host.commands()).toContain('native_file_job_forget')
     })
 
-    it('releases a write pause acquired after its response deadline without activating', async () => {
+    it('releases a write pause acquired after cancellation without activating', async () => {
         const restoreClock = clock()
+        const controller = new AbortController()
         let admit!: () => void
         let waiting = false
         let paused = false
@@ -269,10 +293,10 @@ describe('native restore response deadlines', () => {
             release: () => { paused = false; released = true },
         })
         const host = createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'},status('cancelled')])
-        const operation = runNativeBlockRisuSaveRestore(runtime, {type:'desktopPath',path:'synthetic.risudat'}, {}, {...host.dependencies,restoreClock})
-        const outcome = expect(operation).rejects.toMatchObject({code:'restore-control-timeout'})
+        const operation = runNativeBlockRisuSaveRestore(runtime, {type:'desktopPath',path:'synthetic.risudat'}, {signal:controller.signal}, {...host.dependencies,restoreClock})
+        const outcome = expect(operation).rejects.toMatchObject({name:'AbortError'})
         await vi.waitFor(() => expect(waiting).toBe(true))
-        restoreClock.expire()
+        controller.abort()
         await outcome
         admit()
         await vi.waitFor(() => expect(released).toBe(true))

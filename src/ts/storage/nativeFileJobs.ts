@@ -1298,6 +1298,23 @@ async function abortBeforeNativeRestoreStart(
     throw abortError()
 }
 
+function cancellableRestorePreparation<T>(work: Promise<T>, signal?: AbortSignal, lateResult?: (value: T) => Promise<void>): Promise<T> {
+    return new Promise((resolve, reject) => {
+        let cancelled = false
+        const abort = () => { cancelled = true; reject(abortError()) }
+        signal?.addEventListener('abort', abort, { once: true })
+        if (signal?.aborted) abort()
+        work.then(value => {
+            signal?.removeEventListener('abort', abort)
+            if (cancelled) void lateResult?.(value).catch(() => {})
+            else resolve(value)
+        }, error => {
+            signal?.removeEventListener('abort', abort)
+            reject(error)
+        })
+    })
+}
+
 async function runNativeReplacementRestore(
     kind:
         | 'restore-block-risu-save'
@@ -1343,9 +1360,12 @@ async function runNativeReplacementRestore(
         await abortBeforeNativeRestoreStart(source, dependencies)
     }
 
-    const mutationToken = await bounded(runtime.capturePersistentMutationToken(
-        mutationReason, { publishOfficial: false },
-    ), 'mutation flush')
+    const mutationToken = await cancellableRestorePreparation(
+        runtime.capturePersistentMutationToken(mutationReason, { publishOfficial: false }), options.signal,
+    ).catch(async error => {
+        if (options.signal?.aborted) await abortBeforeNativeRestoreStart(source, dependencies)
+        throw error
+    })
     if (options.signal?.aborted) {
         await abortBeforeNativeRestoreStart(source, dependencies)
     }
@@ -1577,14 +1597,14 @@ async function runNativeReplacementRestore(
                             await bounded(flushDeviceStateBeforeRestore(), 'device settings flush')
                         }
                         await bounded(Promise.resolve(options.beforeActivation?.()), 'preparation follow-up')
-                        upstreamPause = await bounded(acquireUpstreamImportPause(runtime, `${mutationReason}-activation`), 'write pause acquisition',
+                        upstreamPause = await cancellableRestorePreparation(acquireUpstreamImportPause(runtime, `${mutationReason}-activation`), options.signal,
                             pause => bounded(pause.abortUnchanged(() => bounded(binding.assertAuthority(), 'binding verification')), 'late write pause release'))
                         replacementFence = upstreamPause.fence
                         await bounded(upstreamBinding.assertAuthority(), 'binding verification')
                     }
                 } catch (error) {
-                    mutationConflict =
-                        error instanceof NativeFileJobError
+                    mutationConflict = options.signal?.aborted && error instanceof Error && error.name === 'AbortError'
+                        ? undefined : error instanceof NativeFileJobError
                             ? error
                             : new NativeFileJobError(
                                   error instanceof NativeRestoreControlTimeout ? error.code : isSyncUnavailable(error) ? 'sync-unavailable' : 'revision-conflict',
@@ -1664,7 +1684,8 @@ async function runNativeReplacementRestore(
                 }
                 terminal = status
                 try {await preparePortableDeviceReceipt(status)} catch(error) {throw new NativeFileJobActivationCommittedError(status.activationRevision,error)}
-                await bounded(replacementFence.refreshCommittedWorkingSet(status.activationRevision), 'working set refresh')
+                options.onStatus?.(syntheticNativeFileJobStatus(status, 'refreshing-app'))
+                await replacementFence.refreshCommittedWorkingSet(status.activationRevision)
                 const plugins = await import('../plugins/apiV3/v3.svelte')
                 await bounded(plugins.invalidatePluginCachesAfterAuthorityReplacement(), 'plugin cache refresh')
                 await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
@@ -1747,7 +1768,7 @@ async function runNativeReplacementRestore(
                 options.onStatus?.(
                     syntheticNativeFileJobStatus(terminal, 'refreshing-app'),
                 )
-                const outcome = await bounded(replacementFence.refreshCommittedWorkingSet(terminal.result.revision), 'working set refresh')
+                const outcome = await replacementFence.refreshCommittedWorkingSet(terminal.result.revision)
                 if (upstreamPause) {
                     const plugins = await import('../plugins/apiV3/v3.svelte')
                     await bounded(plugins.invalidatePluginCachesAfterAuthorityReplacement(), 'plugin cache refresh')
