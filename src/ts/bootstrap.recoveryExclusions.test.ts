@@ -103,6 +103,7 @@ vi.mock('./process/files/inlayProviderImage', async () => (await import('./boots
 import { loadData } from './bootstrap'
 import { language } from 'src/lang'
 import { afterPluginsStarted, keepPluginsOffForThisStart, loadPlugins } from './plugins/plugins.svelte'
+import { pluginStartupGate, configurePluginStartup, setPluginStartupSyncExcluded, retryPluginStartup } from './plugins/pluginStartupGate'
 import { shouldReconcileNativeFileJobs, reconcileNativeFileJobsBeforeBootstrap } from './storage/nativeFileJobRecovery'
 import { alertError, alertNormal, alertToast, alertTOS, waitAlert } from './alert'
 import { invoke } from '@tauri-apps/api/core'
@@ -130,11 +131,41 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+    setPluginStartupSyncExcluded(false)
+    configurePluginStartup(() => false, async () => {})
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
 })
 
 describe('bootstrap recovery exclusions', () => {
+    it.each([false, true])('bypasses excluded sync before plugin startup, preserving plugin exclusion and restore acknowledgement (plugins excluded=%s)', async pluginsExcluded => {
+        startup.native = true
+        startup.exclusions = pluginsExcluded ? ['sync', 'plugins'] : ['sync']
+        vi.mocked(shouldReconcileNativeFileJobs).mockReturnValue(true)
+        vi.mocked(reconcileNativeFileJobsBeforeBootstrap).mockResolvedValue({
+            pendingRestoreAcknowledgements: ['synthetic-restored-job'], pendingOfficialPublications: [], interruptedRestores: [],
+            libraryRestoreCommitted: true, pendingSnapshotBodies: [],
+        })
+        const listeners = new Set<() => void | Promise<void>>()
+        vi.mocked(afterPluginsStarted).mockImplementation(listener => { listeners.add(listener); return () => {listeners.delete(listener)} })
+        let started = 0
+        const load = async () => {
+            if (!await pluginStartupGate.ensure()) return
+            started++
+            for (const listener of listeners) await listener()
+        }
+        configurePluginStartup(() => true, load)
+        vi.mocked(loadPlugins).mockImplementationOnce(load)
+        await loadData()
+        expect(started).toBe(pluginsExcluded ? 0 : 1)
+        expect(invoke).toHaveBeenCalledWith('native_file_job_forget', {jobId:'synthetic-restored-job'})
+        expect(invoke).not.toHaveBeenCalledWith('pds_lww_binding_state', expect.anything())
+        if (!pluginsExcluded) {
+            await retryPluginStartup()
+            expect(started).toBe(2)
+            expect(installServerSyncProduction).toHaveBeenCalledExactlyOnceWith({resumeBound:false})
+        }
+    })
     it.each([true, false])('acknowledges recovered restores after the plugin decision (excluded=%s)', async excluded => {
         startup.native = true
         startup.exclusions = excluded ? ['plugins'] : []

@@ -1876,6 +1876,7 @@ async function runNativeReplacementRestore(
                 await bounded(upstreamBinding!.resume(), 'binding resume')
             } catch {}
         }
+        if (!activationSubmitted) upstreamBinding?.release()
         replacementFence?.release()
         if (uiBlocking) options.onBlockingChange?.(false)
     }

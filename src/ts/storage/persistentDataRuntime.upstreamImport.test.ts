@@ -1,8 +1,10 @@
 import {beforeEach,describe,expect,it,vi} from 'vitest'
 vi.mock('../platform',async()=>(await import('../platform.testSupport')).platformModule({runtime:'tauri',os:'windows'}))
 const plugins=vi.hoisted(()=>({fencePluginExecutionForAuthorityReplacement:vi.fn(async()=>{}),invalidatePluginCachesAfterAuthorityReplacement:vi.fn(async()=>{}),restartPluginsAfterAuthorityReplacement:vi.fn(async()=>{})}))
-const binding=vi.hoisted(()=>({bound:true,state:{targetAuthority:'9007199254740993'},fence:vi.fn(async()=>{}),assertAuthority:vi.fn(async()=>{}),resume:vi.fn(async()=>{})}))
-vi.mock('./sync/bindingRegistry',()=>({prepareBoundLibraryReplacement:async()=>binding}))
+const binding=vi.hoisted(()=>({bound:true,state:{targetAuthority:'9007199254740993'},fence:vi.fn(async()=>{}),assertAuthority:vi.fn(async()=>{}),resume:vi.fn(async()=>{}),release:vi.fn(()=>{})}))
+const bindingBoundary=vi.hoisted(()=>({prepare:vi.fn(),invoke:vi.fn()}))
+vi.mock('./sync/bindingRegistry',async original=>({...await original<typeof import('./sync/bindingRegistry')>(),prepareBoundLibraryReplacement:bindingBoundary.prepare}))
+vi.mock('@tauri-apps/api/core',async original=>({...await original<typeof import('@tauri-apps/api/core')>(),invoke:bindingBoundary.invoke}))
 const alerts=vi.hoisted(()=>({checkbox:vi.fn(async()=>({confirmed:true,checked:true}))}))
 vi.mock('../alert',()=>({alertCheckboxConfirm:alerts.checkbox}))
 vi.mock('../plugins/apiV3/v3.svelte',()=>plugins)
@@ -17,6 +19,9 @@ import {makeDatabase} from './saveCoordinator.testSupport'
 import {runNativeBlockRisuSaveRestore,type NativeFileJobStatus} from './nativeFileJobs'
 import {retryCommittedWorkingSetRefreshWithContinuation} from './committedWorkingSetContinuation'
 import {restoreNativeOfficialAccountCandidate} from './sync/nativeOfficialAccountFlow'
+import {createPluginStartupGate} from '../plugins/pluginStartupGate'
+import {subscribeSyncBindingChanges} from './sync/bindingChanges'
+import {get} from 'svelte/store'
 async function createHarness(officialPublisher?: OfficialRevisionPublisher, captureWorkingSet = false) {
     let database = makeDatabase()
     let durable = structuredClone(database)
@@ -118,8 +123,70 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
     }
 }
 
-beforeEach(()=>{vi.clearAllMocks();library.hasCharacters.mockReset().mockResolvedValue(true);plugins.restartPluginsAfterAuthorityReplacement.mockImplementation(async()=>{});binding.bound=true;binding.fence.mockClear();binding.assertAuthority.mockClear();binding.resume.mockReset();binding.resume.mockImplementation(async()=>{})})
+beforeEach(()=>{vi.clearAllMocks();bindingBoundary.prepare.mockReset().mockResolvedValue(binding);bindingBoundary.invoke.mockReset();library.hasCharacters.mockReset().mockResolvedValue(true);plugins.restartPluginsAfterAuthorityReplacement.mockImplementation(async()=>{});binding.bound=true;binding.fence.mockClear();binding.assertAuthority.mockClear();binding.resume.mockReset();binding.resume.mockImplementation(async()=>{})})
 describe('direct native upstream import publication',()=>{
+    it('releases an abandoned preparation hold even when authority lookup fails, allowing one-time plugin recovery',async()=>{
+        const registry=await vi.importActual<typeof import('./sync/bindingRegistry')>('./sync/bindingRegistry')
+        const target={kind:'server' as const,connectionId:'synthetic-failed-preparation'}
+        const state={target,targetAuthority:'1',selectionEpoch:'1',libraryId:'synthetic',progress:null}
+        let unavailable=false,starts=0
+        bindingBoundary.invoke.mockImplementation(async command=>{if(unavailable)throw new Error('native state unavailable');if(command==='pds_lww_binding_state')return state;throw new Error(command)})
+        bindingBoundary.prepare.mockImplementation(registry.prepareBoundLibraryReplacement)
+        const unsupported=async():Promise<never>=>{throw new Error('Unexpected binding switch')}
+        const unregister=registry.registerSyncBindingTransport(target,{
+            inspectTarget:unsupported,pullAvailableState:unsupported,replaceFromTarget:unsupported,publishInitialSharedState:unsupported,
+            fenceOldJobs:async()=>{},resumeBinding:async()=>{throw new Error('Failed authority check must prevent resume')},receiveAvailableChanges:async()=>{},
+        })
+        const gate=createPluginStartupGate({enabled:()=>true,delay:()=>true,replacementPending:()=>registry.isSyncBindingReplacementPending(),
+            context:async()=>{throw new Error('native state unavailable')},start:async()=>{if(await gate.ensure())starts++},
+        })
+        const stop=subscribeSyncBindingChanges(()=>{if(gate.isWaiting())gate.retry()})
+        plugins.fencePluginExecutionForAuthorityReplacement.mockImplementationOnce(async()=>{unavailable=true;throw new Error('preparation failed')})
+        plugins.restartPluginsAfterAuthorityReplacement.mockImplementation(async()=>{expect(await gate.ensure()).toBe(false)})
+        const h=await createHarness()
+        try {
+            await expect(h.runtime.replacePersistentDatabase(makeDatabase(),'test',{upstreamImport:true})).rejects.toThrow('preparation failed')
+            expect(h.runtime.revision).toBe(1)
+            expect(registry.isSyncBindingReplacementPending()).toBe(false)
+            gate.loadOnce()
+            await vi.waitFor(()=>expect(starts).toBe(1))
+        } finally {stop();unregister()}
+    })
+    it.each(['server','external'] as const)('waits for resumed %s receive before starting plugins on the replacement database',async kind=>{
+        const registry=await vi.importActual<typeof import('./sync/bindingRegistry')>('./sync/bindingRegistry')
+        const target={kind,connectionId:'synthetic-import'}
+        const state={target,targetAuthority:'1',selectionEpoch:'1',libraryId:'synthetic',progress:null}
+        bindingBoundary.invoke.mockImplementation(async command=>{if(command==='pds_lww_binding_state')return state;throw new Error(command)})
+        bindingBoundary.prepare.mockImplementation(registry.prepareBoundLibraryReplacement)
+        let active=true,resumed=false,starts=0
+        let finish!:()=>void
+        const received=new Promise<void>(resolve=>{finish=resolve})
+        const unsupported=async():Promise<never>=>{throw new Error('Unexpected binding switch')}
+        const transport={inspectTarget:unsupported,pullAvailableState:unsupported,replaceFromTarget:unsupported,publishInitialSharedState:unsupported,
+            fenceOldJobs:async()=>{active=false},resumeBinding:async()=>{active=true;resumed=true},
+            receiveAvailableChanges:async()=>{if(!active)throw new Error(kind==='server'?'Sync binding changed':'Sync is stopped');if(resumed)await received},
+        }
+        const unregister=registry.registerSyncBindingTransport(target,transport)
+        const h=await createHarness()
+        const gate=createPluginStartupGate({enabled:()=>true,delay:()=>true,
+            context:async()=>({identity:'synthetic',target:kind,bound:true,replacementPending:registry.isSyncBindingReplacementPending(state),receive:transport.receiveAvailableChanges,assertCurrent:async()=>{}}),
+            start:async()=>{if(await gate.ensure()){expect(h.database.username).toBe('replacement');starts++}},
+        })
+        const stop=subscribeSyncBindingChanges(()=>{if(gate.isWaiting())gate.retry()})
+        plugins.restartPluginsAfterAuthorityReplacement.mockImplementation(async()=>{
+            expect(await gate.ensure()).toBe(false)
+            expect(get(gate.state).phase).toBe('waiting')
+        })
+        try {
+            await expect(h.runtime.replacePersistentDatabase({...makeDatabase(),username:'replacement'},'test',{upstreamImport:true})).resolves.toMatchObject({revision:2})
+            expect(starts).toBe(0)
+            expect(get(gate.state).phase).toBe('waiting')
+            expect(registry.isSyncBindingReplacementPending(state)).toBe(false)
+            finish()
+            await vi.waitFor(()=>expect(starts).toBe(1))
+            expect(get(gate.state).phase).toBe('released')
+        } finally {finish();stop();unregister()}
+    })
     it.each(['preparation','unchanged-write'] as const)('restarts plugins after %s failure even when binding verification is unavailable',async failure=>{
         const h=await createHarness()
         if(failure==='preparation') plugins.fencePluginExecutionForAuthorityReplacement.mockRejectedValueOnce(new Error('preparation failed'))
