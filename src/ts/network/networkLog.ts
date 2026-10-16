@@ -79,17 +79,19 @@ export async function downloadNetworkLog(id: string): Promise<boolean> {
     }
     let exported: {path: string; bytes: number} | undefined
     try {
-        exported = await networkLog<{ path: string; bytes: number }>({ op: 'export', id })
-        const published = isTauriAndroid
-            ? await android!.copyNativeExportToAndroidSaf({ sourcePath: exported.path, suggestedName: name, reservation })
-            : await (await import('../storage/iosFiles')).exportIOSFile({ sourcePath: exported.path, suggestedName: name })
-        if (published.bytes !== exported.bytes) throw new Error('network-log-export-incomplete')
-        return true
+        const publish = async () => {
+            exported = await networkLog<{ path: string; bytes: number }>({ op: 'export', id })
+            const published = isTauriAndroid
+                ? await android!.copyNativeExportToAndroidSaf({ sourcePath: exported.path, suggestedName: name, reservation })
+                : await (await import('../storage/iosFiles')).exportIOSFile({ sourcePath: exported.path, suggestedName: name })
+            if (published.bytes !== exported.bytes) throw new Error('network-log-export-incomplete')
+            return true
+        }
+        return await (android ? android.withAndroidSafDestination(reservation, publish) : publish())
     } catch (error) {
         if ((error as { name?: string })?.name === 'AbortError') return false
         throw error
     } finally {
-        await reservation?.release()
         if (exported) await invoke('native_download_handoff_cleanup', { path: exported.path })
     }
 }

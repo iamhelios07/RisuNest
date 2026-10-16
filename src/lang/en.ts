@@ -2885,6 +2885,7 @@ export const languageEnglish = {
             "reasonExportRevisionConflict": 'The data changed during export. Export again.',
             "reasonExportStoreError": 'A storage error stopped the export. Try again.',
             "reasonDestination": 'The file could not be saved at this location. Choose another location.',
+            "reasonDestinationBusy": 'Another export is in progress. Try again after it finishes.',
             "reasonPlainJpeg": 'This JPEG does not contain a character card.',
             "reasonIncompletePublication": 'The file was not saved completely. Export again.',
             "reasonStorageFull": 'There is not enough storage. Free up space and try again.',

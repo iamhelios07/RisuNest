@@ -784,6 +784,21 @@ internal fun prepareManagedExportAcknowledgement(
   return discardManagedScreenshotSource(appDataRoot, exportId)
 }
 
+internal fun prepareRecoveredRisuSaveAcknowledgement(appDataRoot: File, exportId: String): Boolean {
+  if (!isCanonicalUuidV4(exportId)) return false
+  val source = appDataRoot.resolve("persistent/exports/risusave-$exportId.risudat")
+  val ownership = source.parentFile!!.resolve("risusave-$exportId.lease")
+  if (source.exists()) {
+    val owned = resolveManagedRisuSaveSource(appDataRoot, source.path) ?: return false
+    if (!owned.delete()) return false
+  }
+  if (!ownership.exists()) return true
+  if (!ownership.isFile || ownership.length() > 4_096 ||
+    stringField(runCatching { ownership.readText(Charsets.UTF_8) }.getOrNull() ?: return false, "exportId") != exportId
+  ) return false
+  return ownership.delete()
+}
+
 internal fun requiresRisuSavePublicationProof(
   appDataRoot: File,
   exportId: String,

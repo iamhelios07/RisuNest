@@ -23,6 +23,10 @@ import {
 
 const copy = languageEnglish.risuNest.importDialog
 
+it('explains that a busy Android destination requires waiting for the current export', () => {
+    expect(failureReason('destination-busy', 'export')).toBe(copy.reasonDestinationBusy)
+})
+
 it.each(['activating-database', 'cleaning-up'] as const)('does not present source EOF as completed restoration during %s', phase => {
     const stage = phase === 'cleaning-up' ? 'cleaning-up' : 'activating'
     const model = buildNativeFileJobDialogModel(running({status:status({phase,progress:{completedBytes:100,totalBytes:100,completedItems:1},detail:detail(stage)}),observedStages:[stage]}),null,1000)

@@ -5,6 +5,7 @@ import {
     acknowledgeAndroidSafExport,
     copyNativeExportToAndroidSaf,
     reserveAndroidSafDestination,
+    withAndroidSafDestination,
     type AndroidSafDestinationReservation,
     getAndroidSafExportStatus,
     isAndroidSafDestinationRequestActive,
@@ -219,7 +220,7 @@ class MobileScreenshotArchiveWriter implements ScreenshotArchiveWriter {
         if (this.state === 'closed') return
         if (this.state !== 'open') throw new Error('Mobile screenshot output is being published')
         this.state = 'publishing'
-        this.publication = this.publish().catch((error) => {
+        this.publication = withAndroidSafDestination(this.dependencies.destinationReservation, () => this.publish()).catch((error) => {
             this.publicationError = error
             throw error
         })
@@ -230,14 +231,12 @@ class MobileScreenshotArchiveWriter implements ScreenshotArchiveWriter {
         catch (error) {
             this.state = 'aborted'
             throw error
-        } finally {
-            await this.dependencies.destinationReservation?.release()
         }
     }
 
     abort(): Promise<boolean> {
         if (this.aborting) return this.aborting
-        this.aborting = this.abortOutput().finally(() => this.dependencies.destinationReservation?.release())
+        this.aborting = withAndroidSafDestination(this.dependencies.destinationReservation, () => this.abortOutput())
         return this.aborting
     }
 
@@ -481,8 +480,7 @@ export async function createAndroidScreenshotArchiveWriter(
             warn: dependencies.warn,
         })
     } catch (error) {
-        await reservation.release()
-        throw error
+        return withAndroidSafDestination(reservation, async () => { throw error })
     }
 }
 

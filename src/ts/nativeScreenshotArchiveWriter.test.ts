@@ -169,6 +169,24 @@ describe('native screenshot archive writer', () => {
 })
 
 describe('Android screenshot archive writer', () => {
+    it.each(['open', 'close', 'abort'] as const)('preserves the producer failure when %s also fails to release its reservation', async phase => {
+        const picker = androidSafReservationFixture()
+        picker.failRelease()
+        const {dependencies} = androidHarness()
+        dependencies.reserveDestination = picker.reserve
+        const failure = Object.assign(new Error('producer'), {code: 'producer-failed'})
+        let result: Promise<unknown>
+        if (phase === 'open') {
+            dependencies.invoke.mockRejectedValueOnce(failure)
+            result = createAndroidScreenshotArchiveWriter('synthetic.zip', dependencies)
+        } else {
+            const writer = await createAndroidScreenshotArchiveWriter('synthetic.zip', dependencies)
+            dependencies.invoke.mockRejectedValueOnce(failure)
+            result = phase === 'close' ? writer.close() : writer.abort()
+        }
+        await expect(result).rejects.toBe(failure)
+        expect(failure).toMatchObject({code: 'producer-failed', warningCodes: ['partial-destination-may-remain']})
+    })
     it('does not start a screenshot writer until its destination is selected', async () => {
         const picker = androidSafReservationFixture()
         picker.bridge.reserveExport.mockImplementation(() => {})

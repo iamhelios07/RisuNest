@@ -370,24 +370,33 @@ describe('RisuSave picker route', () => {
             requestId: '55555555-5555-4555-8555-555555555555',
             exportId: '66666666-6666-4666-8666-666666666666',
             sourceKind: 'risuSave',
-            state: 'cancelled',
+            state: 'failed',
+            code: 'destination-interrupted',
+            copyStarted: true,
             publicationPrerequisitesComplete: true,
             warningCodes: ['partial-destination-may-remain'],
         }
-        const acknowledge = vi.fn(() => true)
+        const acknowledge = vi.fn((_requestId: string) => true)
         const onTerminal = vi.fn()
         const onError = vi.fn()
         const disposeListener = vi.fn()
+        let replay!: (event: unknown) => void
 
         const dispose = listenRecovered(onTerminal, onError, {
             getStatus: () => JSON.stringify(terminal),
             acknowledge,
-            listen: vi.fn(() => disposeListener),
+            listen: vi.fn(listener => { replay = listener; return disposeListener }),
             isActive: () => false,
         })
 
         await vi.waitFor(() => expect(onTerminal).toHaveBeenCalledExactlyOnceWith(terminal))
-        expect(acknowledge).toHaveBeenCalledExactlyOnceWith(terminal.requestId)
+        replay(terminal)
+        replay(terminal)
+        const nextTerminal = {...terminal, requestId: '77777777-7777-4777-8777-777777777777'}
+        replay(nextTerminal)
+        await vi.waitFor(() => expect(onTerminal).toHaveBeenLastCalledWith(nextTerminal))
+        expect(onTerminal.mock.calls.filter(([value]) => value.requestId === terminal.requestId)).toHaveLength(1)
+        expect(acknowledge.mock.calls.filter(([id]) => id === terminal.requestId)).toHaveLength(1)
         expect(onError).not.toHaveBeenCalled()
         dispose()
         expect(disposeListener).toHaveBeenCalledOnce()
