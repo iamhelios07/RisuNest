@@ -380,6 +380,9 @@ mod tests {
 
     #[test]
     fn frozen_rows_spill_and_order_large_values_with_a_bounded_cache() {
+        if crate::test_process::run_isolated(concat!(module_path!(), "::frozen_rows_spill_and_order_large_values_with_a_bounded_cache")) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         for count in [16, 64] {
             let frozen = FrozenRows::new(root.path()).unwrap();

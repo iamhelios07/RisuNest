@@ -72,6 +72,8 @@ mod trust_boundary;
 mod command_future_size;
 #[cfg(test)]
 mod test_memory;
+#[cfg(test)]
+mod test_process;
 #[cfg(windows)]
 mod windows_appearance;
 #[cfg(windows)]

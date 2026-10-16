@@ -1451,6 +1451,9 @@ mod tests {
 
     #[test]
     fn explicit_maintenance_retries_an_unadmitted_mutation_with_retry_after() {
+        if crate::test_process::run_isolated(concat!(module_path!(), "::explicit_maintenance_retries_an_unadmitted_mutation_with_retry_after")) {
+            return;
+        }
         let _guard = crate::network_log::TEST_RECORDER_LOCK
             .lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::tempdir().unwrap();
