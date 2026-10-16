@@ -296,6 +296,59 @@ impl PersistentStore {
         Ok((images.into_iter().collect(), priority))
     }
 
+    fn check_representative_image_pages(
+        &self,
+        cas: &PayloadCas,
+        generation: &str,
+        images: &[String],
+        retained: &BTreeSet<String>,
+        page_size: usize,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<Vec<String>> {
+        let removal_source = cas.removal_epoch();
+        let mut pass_epoch = None;
+        let mut offset = 0;
+        let mut missing = Vec::new();
+        loop {
+            check()?;
+            let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+            let current_generation = super::active_generation(&self.connection)?;
+            let epoch = removal_source.load(std::sync::atomic::Ordering::Acquire);
+            let mut cache = self.checked_representative_images.lock().map_err(|_| std::io::Error::other("checked-images-poisoned"))?;
+            if current_generation != generation {
+                cache.hashes.clear();
+                return Err(SyncError::new("binding-authority-changed", 409));
+            }
+            if cache.generation != generation || cache.removal_epoch != epoch { cache.hashes.clear(); }
+            cache.generation = generation.to_owned();
+            cache.removal_source = Some(std::sync::Arc::clone(&removal_source));
+            cache.removal_epoch = epoch;
+            if pass_epoch.is_some_and(|previous| previous != epoch) {
+                // A body from an earlier page may have been removed while the lock was released.
+                offset = 0;
+                missing.clear();
+            }
+            pass_epoch = Some(epoch);
+            if offset == 0 { cache.hashes.retain(|hash| retained.contains(hash)); }
+            if offset == images.len() { return Ok(missing); }
+            let end = (offset + page_size).min(images.len());
+            let page = images[offset..end].iter().filter(|hash| !cache.hashes.contains(*hash)).collect::<Vec<_>>();
+            let sizes = if page.is_empty() { Vec::new() } else { cas.stat_objects(page.iter().map(|hash| hash.as_str()))? };
+            if super::active_generation(&self.connection)? != generation {
+                cache.hashes.clear();
+                return Err(SyncError::new("binding-authority-changed", 409));
+            }
+            if removal_source.load(std::sync::atomic::Ordering::Acquire) != epoch {
+                cache.hashes.clear();
+                continue;
+            }
+            for (hash, size) in page.into_iter().zip(sizes) {
+                if size.is_some() { cache.hashes.insert(hash.clone()); } else { missing.push(hash.clone()); }
+            }
+            offset = end;
+        }
+    }
+
     pub(crate) fn hydrate_representative_images(
         &self,
         cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -307,7 +360,7 @@ impl PersistentStore {
         check()?;
         let generation = super::active_generation(&self.connection)?;
         let (images, priority) = self.representative_image_plan(selected_character_id, requested)?;
-        let check = || {
+        let check_authority = || {
             check()?;
             if super::active_generation(&self.connection)? != generation {
                 return Err(SyncError::new("binding-authority-changed", 409));
@@ -315,50 +368,21 @@ impl PersistentStore {
             Ok(())
         };
         let cas = PayloadCas::new(&self.repository_root)?;
-        let removal_source = cas.removal_epoch();
         let retained = images.iter().cloned().collect::<BTreeSet<_>>();
-        let mut missing = Vec::new();
-        {
-            let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-            let epoch = removal_source.load(std::sync::atomic::Ordering::Acquire);
-            let mut cache = self.checked_representative_images.lock().map_err(|_| std::io::Error::other("checked-images-poisoned"))?;
-            if cache.generation != generation || cache.removal_epoch != epoch { cache.hashes.clear(); }
-            cache.generation = generation.clone();
-            cache.removal_source = Some(std::sync::Arc::clone(&removal_source));
-            cache.removal_epoch = epoch;
-            cache.hashes.retain(|hash| retained.contains(hash));
-            let unchecked = images.iter().filter(|hash| !cache.hashes.contains(*hash)).cloned().collect::<Vec<_>>();
-            for page in unchecked.chunks(HOLDER_PAGE) {
-                check()?;
-                for (hash, size) in page.iter().zip(cas.stat_objects(page.iter().map(String::as_str))?) {
-                    if size.is_some() { cache.hashes.insert(hash.clone()); } else { missing.push(hash.clone()); }
-                }
-            }
-        }
-        if missing.is_empty() { return check(); }
+        let mut missing = self.check_representative_image_pages(&cas, &generation, &images, &retained, HOLDER_PAGE, &check)?;
+        if missing.is_empty() { return check_authority(); }
         // An icon no storage holds remains retryable and is reported by the data check.
         let held = RemoteHolders::open(&self.repository_root)?.held(&missing)?;
         missing = missing.into_iter().zip(held).filter_map(|(hash, held)| held.then_some(hash)).collect();
-        if missing.is_empty() { return check(); }
+        if missing.is_empty() { return check_authority(); }
         let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
         let mut completed = Vec::new();
-        hydration.hydrate_many_outcomes_prioritized(&missing, &priority, &check, |hash, _| {
+        hydration.hydrate_many_outcomes_prioritized(&missing, &priority, &check_authority, |hash, _| {
             completed.push(hash.to_owned()); on_object_done();
         })?;
-        check()?;
         // Recheck completed images under the offload lock before remembering them.
-        let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-        let epoch = removal_source.load(std::sync::atomic::Ordering::Acquire);
-        let mut cache = self.checked_representative_images.lock().map_err(|_| std::io::Error::other("checked-images-poisoned"))?;
-        if cache.removal_epoch != epoch { cache.hashes.clear(); }
-        cache.removal_epoch = epoch;
-        for page in completed.chunks(HOLDER_PAGE) {
-            check()?;
-            for (hash, size) in page.iter().zip(cas.stat_objects(page.iter().map(String::as_str))?) {
-                if size.is_some() { cache.hashes.insert(hash.clone()); }
-            }
-        }
-        check()
+        self.check_representative_image_pages(&cas, &generation, &completed, &retained, HOLDER_PAGE, &check)?;
+        check_authority()
     }
 
     pub(crate) fn asset_object_byte_size(&self, hash: &str) -> super::StoreResult<Option<u64>> {
@@ -1125,6 +1149,98 @@ impl PersistentStore {
         let local = roots.into_iter().filter(|(label, _)| *label == "server-conflict")
             .flat_map(|(_, roots)| roots.object_hashes).collect();
         Ok((referenced, local))
+    }
+}
+
+#[cfg(test)]
+mod representative_image_cache_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn representative_pages_release_the_media_lock_between_stats() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let images = [b"first synthetic icon", b"other synthetic icon"].iter()
+            .map(|bytes| cas.prepare_bytes(*bytes).unwrap().content_hash).collect::<Vec<_>>();
+        let retained = images.iter().cloned().collect();
+        let generation = super::super::active_generation(&store.connection).unwrap();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let media = std::thread::spawn(move || {
+            if start_rx.recv().is_ok() {
+                let guard = crate::asset_repository::coordinator::lock_repository_mutation().unwrap();
+                drop(guard);
+                let _ = done_tx.send(());
+            }
+        });
+        let boundary = Cell::new(0);
+        let result = store.check_representative_image_pages(&cas, &generation, &images, &retained, 1, &|| {
+            boundary.set(boundary.get() + 1);
+            if boundary.get() == 2 {
+                start_tx.send(()).unwrap();
+                done_rx.recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| SyncError::new("media-lock-blocked-between-pages", 500))?;
+            }
+            Ok(())
+        });
+        drop(start_tx);
+        media.join().unwrap();
+        assert!(result.unwrap().is_empty());
+        assert!(boundary.get() >= 2);
+        assert!(store.check_representative_image_pages(&cas, &generation, &images, &retained, 1, &|| Ok(())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn representative_pages_discard_cached_bodies_after_an_intervening_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let first = cas.prepare_bytes(b"first synthetic icon").unwrap();
+        let other = cas.prepare_bytes(b"other synthetic icon").unwrap();
+        let images = vec![first.content_hash.clone(), other.content_hash.clone()];
+        let retained = images.iter().cloned().collect();
+        let generation = super::super::active_generation(&store.connection).unwrap();
+        let boundary = Cell::new(0);
+        let missing = store.check_representative_image_pages(&cas, &generation, &images, &retained, 1, &|| {
+            boundary.set(boundary.get() + 1);
+            if boundary.get() == 2 {
+                let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+                cas.unlink_exact_object(&first.content_hash, first.byte_size, &first.physical_key)?;
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(missing, [first.content_hash.clone()]);
+        let job = store.open_native_job_store().unwrap();
+        assert_eq!(job.check_representative_image_pages(&cas, &generation, &images, &retained, 1, &|| Ok(())).unwrap(), missing);
+        cas.prepare_bytes(b"first synthetic icon").unwrap();
+        assert!(job.check_representative_image_pages(&cas, &generation, &images, &retained, 1, &|| Ok(())).unwrap().is_empty());
+        crate::asset_repository::body_io::reset_body_io();
+        assert!(store.check_representative_image_pages(&cas, &generation, &images, &retained, 1, &|| Ok(())).unwrap().is_empty());
+        assert_eq!(crate::asset_repository::body_io::take_body_io().batch_stat_requests, 0);
+    }
+
+    #[test]
+    fn representative_pages_discard_cached_bodies_after_a_generation_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let images = [b"first synthetic icon", b"other synthetic icon"].iter()
+            .map(|bytes| cas.prepare_bytes(*bytes).unwrap().content_hash).collect::<Vec<_>>();
+        let retained = images.iter().cloned().collect();
+        let generation = super::super::active_generation(&store.connection).unwrap();
+        let boundary = Cell::new(0);
+        let result = store.check_representative_image_pages(&cas, &generation, &images, &retained, 1, &|| {
+            boundary.set(boundary.get() + 1);
+            if boundary.get() == 2 {
+                let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+                store.connection.execute("UPDATE meta SET value='\"replacement-generation\"' WHERE key='activeGeneration'", [])?;
+            }
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().code, "binding-authority-changed");
+        assert!(store.checked_representative_images.lock().unwrap().hashes.is_empty());
     }
 }
 
