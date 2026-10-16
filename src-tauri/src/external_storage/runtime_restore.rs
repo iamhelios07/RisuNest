@@ -1494,6 +1494,12 @@ pub(super) mod tests {
 
     /// A full backup of `source` as it is now, uploaded to a fake repository.
     async fn uploaded_backup(source:&mut PersistentStore,assets:Vec<String>) -> PackagedBackup {
+        uploaded_backup_with_legacy_units(source,assets,Default::default()).await
+    }
+
+    async fn uploaded_backup_with_legacy_units(source:&mut PersistentStore,assets:Vec<String>,
+        legacy_units:std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+    ) -> PackagedBackup {
         use super::super::{fake,journal::{JobIdentity,TransferJournal},packaging,phase_progress::PhaseProgress};
         use std::sync::Arc;
         let source_root=source.repository_root().to_owned();
@@ -1504,6 +1510,11 @@ pub(super) mod tests {
         let capture=source.capture_external_library_from_lease_with_sections("sender",&hydration,&lease.lease,sections,&probe).unwrap();
         let sections=capture.catalog.backup_sections().unwrap();
         let original_units=capture.catalog.original_backup_units().unwrap();
+        let original_units=if legacy_units.is_empty() {original_units} else {
+            let mut units=original_units.units().unwrap().collect::<crate::persistent_store::StoreResult<std::collections::BTreeMap<_,_>>>().unwrap();
+            for (key,value) in legacy_units {assert!(units.insert(key,value).is_none());}
+            units.into()
+        };
         let repository=fake::repository();
         let provider=Arc::new(fake::FakeProvider::new(false));
         let connected=ConnectedRepository {
@@ -2232,15 +2243,33 @@ pub(super) mod tests {
     #[test]
     fn a_backup_holding_units_of_a_character_deleted_before_it_restores_without_them() {
         run(async {
+            use risunest_sync_wire::unit::UnitValue;
+            use std::collections::BTreeMap;
             let directory=tempfile::tempdir().unwrap();
             let root=directory.path();
             let mut store=PersistentStore::open(root).unwrap();
             add_deleted_character(&mut store);
+            let children=[unit_key(&["conversation",DELETED,DELETED_CHAT,"bookmarkNames"]),unit_key(&["exists","conversation",DELETED,DELETED_CHAT])];
+            let legacy_units=children.into_iter().map(|key| {
+                let value:String=store.library_rows().query_row("SELECT value FROM lww_units WHERE key=?1",[key.as_str()],|row|row.get(0)).unwrap();
+                let value:UnitValue=serde_json::from_str(&value).unwrap();
+                assert!(matches!(value,UnitValue::Inline{..}));
+                (key,value)
+            }).collect::<BTreeMap<_,_>>();
             delete_existence(&mut store,&[&["exists","character",DELETED]]);
-            // The units under the deleted character outlive it, so the backup carries them.
-            assert!(live_unit(&store,&["conversation",DELETED,DELETED_CHAT,"bookmarkNames"]));
-            assert!(live_unit(&store,&["exists","conversation",DELETED,DELETED_CHAT]));
-            let backup=uploaded_backup(&mut store,Vec::new()).await;
+            assert!(!live_unit(&store,&["conversation",DELETED,DELETED_CHAT,"bookmarkNames"]));
+            assert!(!live_unit(&store,&["exists","conversation",DELETED,DELETED_CHAT]));
+            // Older backups carried live child units alongside the parent's permanent deletion.
+            let backup=uploaded_backup_with_legacy_units(&mut store,Vec::new(),legacy_units.clone()).await;
+            let stored:risunest_external_storage_format::snapshot::StoredObject=serde_json::from_value(backup.restore_source.clone()).unwrap();
+            let remote=super::super::packaging::RemoteObject::from_stored(&stored,&backup.connected.handle).unwrap();
+            let inspection=tempfile::tempdir().unwrap();
+            let uploaded=snapshot_restore::download_backup_original_units(&remote,inspection.path(),&backup.connected.root_key,
+                backup.provider.as_ref(),&backup.connected.handle,&Cancellation::default()).await.unwrap();
+            let content=super::super::content_store::ContentStore::open(&inspection.path().join("external-storage")).unwrap();
+            let uploaded=uploaded.units(&content).collect::<Result<BTreeMap<_,_>>>().unwrap();
+            for (key,value) in &legacy_units {assert_eq!(uploaded.get(key),Some(value));}
+            assert_eq!(uploaded.get(&unit_key(&["exists","character",DELETED])),Some(&UnitValue::Deleted));
 
             restore_over(root,&mut store,&backup).await.unwrap();
 
