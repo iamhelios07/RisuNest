@@ -143,7 +143,8 @@ export async function loadRisuAccountBackup() {
         const candidate = await decodeRisuSave(buf.buffer)
         const expansion = await expandColdPayloads(candidate, getAccountColdStorageItem)
         if (expansion.unavailableKeys.length > 0) {
-            throw new Error('Account backup cold payloads are unavailable')
+            alertError(language.accountBackupUnavailable)
+            return
         }
         let followupFailed = false
         const outcome = await installAccountBackup(prepareExternalDatabaseImport(candidate), {

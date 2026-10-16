@@ -356,6 +356,7 @@ export async function loadData() {
         const accountStorage = new AccountStorage(isTauri ? {
             ...nativeAccountStorageOptions,
             credentialRouting: {
+                getAccountId: () => nativeOfficialFlow?.getAccountId(),
                 getToken: () => nativeOfficialFlow?.getToken(),
                 reauthenticate: async (loginResult) => {
                     if (!snapshotRequestReauthentication) {

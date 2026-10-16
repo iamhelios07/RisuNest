@@ -1000,6 +1000,7 @@ export const languageEnglish = {
     files: "Files",
     backupConfirm: "Do you really want to save backup?",
     backupLoadConfirm: "Do you really want to load backup? All datas will be lost!",
+    accountBackupUnavailable: "The account backup was not restored because some data could not be retrieved.",
     backupLoadConfirm2: "Your current data will be replaced by the backup. No automatic backup will be created. To keep your current data, cancel and back it up first. Continue?",
     importRisuSave: "Import RisuSave file",
     exportRisuSave: "Export RisuSave file",

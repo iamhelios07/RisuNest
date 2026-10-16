@@ -866,6 +866,7 @@ export const languageKorean = {
     "files": "파일",
     "backupConfirm": "정말로 백업을 저장하시겠습니까?",
     "backupLoadConfirm": "정말로 백업을 불러오시겠습니까? 현재 데이터가 모두 사라집니다!",
+    accountBackupUnavailable: "계정 백업의 일부 데이터를 가져오지 못해 복원하지 않았습니다.",
     "backupLoadConfirm2": "현재 데이터가 백업의 데이터로 교체됩니다. 자동 백업은 만들지 않습니다. 기존 데이터를 보관하려면 취소 후 직접 백업하세요. 계속하시겠습니까?",
     "importRisuSave": "RisuSave 파일 가져오기",
     "exportRisuSave": "RisuSave 파일 내보내기",
