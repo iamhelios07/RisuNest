@@ -70,10 +70,18 @@ export async function downloadNetworkLog(id: string): Promise<boolean> {
         await networkLog({ op: 'export', id, destination })
         return true
     }
-    const exported = await networkLog<{ path: string; bytes: number }>({ op: 'export', id })
+    const android = isTauriAndroid ? await import('../storage/androidSafBridge') : undefined
+    let reservation
+    try { reservation = await android?.reserveAndroidSafDestination(name, 'download') }
+    catch (error) {
+        if ((error as {name?: string})?.name === 'AbortError') return false
+        throw error
+    }
+    let exported: {path: string; bytes: number} | undefined
     try {
+        exported = await networkLog<{ path: string; bytes: number }>({ op: 'export', id })
         const published = isTauriAndroid
-            ? await (await import('../storage/androidSafBridge')).copyNativeExportToAndroidSaf({ sourcePath: exported.path, suggestedName: name })
+            ? await android!.copyNativeExportToAndroidSaf({ sourcePath: exported.path, suggestedName: name, reservation })
             : await (await import('../storage/iosFiles')).exportIOSFile({ sourcePath: exported.path, suggestedName: name })
         if (published.bytes !== exported.bytes) throw new Error('network-log-export-incomplete')
         return true
@@ -81,7 +89,8 @@ export async function downloadNetworkLog(id: string): Promise<boolean> {
         if ((error as { name?: string })?.name === 'AbortError') return false
         throw error
     } finally {
-        await invoke('native_download_handoff_cleanup', { path: exported.path })
+        await reservation?.release()
+        if (exported) await invoke('native_download_handoff_cleanup', { path: exported.path })
     }
 }
 

@@ -1,3 +1,4 @@
+import { androidSafReservationFixture } from '../../../tests/support/androidSafReservation'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
@@ -12,6 +13,7 @@ import * as risuSaveFileRoute from './risuSaveFileRoute'
 
 function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDependencies {
     return {
+        reserveAndroidDestination: androidSafReservationFixture().reserve,
         platform: () => platform,
         runtime: () => ({
             store: {} as never,
@@ -122,6 +124,24 @@ describe('RisuSave picker route', () => {
             ...input,
         })
     }
+
+    it('does not capture or write RisuSave before Android destination selection completes', async () => {
+        const picker = androidSafReservationFixture()
+        picker.bridge.reserveExport.mockImplementation(() => {})
+        const deps = dependencies('native-desktop')
+        deps.platform = () => 'native-android'
+        deps.reserveAndroidDestination = picker.reserve
+        const failure = new Error('synthetic snapshot failure')
+        deps.withFlushedExport = vi.fn(async () => {throw failure})
+        const output = exportRisuSaveFromPicker({}, deps)
+        const rejected = expect(output).rejects.toBe(failure)
+        await vi.waitFor(() => expect(picker.bridge.reserveExport).toHaveBeenCalled())
+        expect(deps.withFlushedExport).not.toHaveBeenCalled()
+        picker.select(picker.bridge.reserveExport.mock.calls[0][0])
+        await rejected
+        expect(picker.bridge.releaseExport).toHaveBeenCalled()
+        expect(deps.copyAndroidExport).not.toHaveBeenCalled()
+    })
 
     it('keeps the managed native file alive through the Android SAF terminal without exposing payload bytes', async () => {
         const deps = dependencies('native-desktop')
@@ -309,6 +329,22 @@ describe('RisuSave picker route', () => {
         expect(retry).toHaveBeenCalledExactlyOnceWith(
             '11111111-1111-4111-8111-111111111111',
         )
+    })
+
+    it.each(['cancelled', 'failed'])('recovers an unstarted RisuSave reservation after %s renderer loss', async (state) => {
+        let saved: unknown = {
+            requestId: '11111111-1111-4111-8111-111111111111',
+            exportId: '11111111-1111-4111-8111-111111111111',
+            sourceKind: 'risuSave', state, copyStarted: false,
+            publicationPrerequisitesComplete: true, warningCodes: [],
+        }
+        const recovered = await risuSaveFileRoute.recoverAndroidRisuSavePublication(JSON.stringify(saved), async (id) => {
+            if (id !== '11111111-1111-4111-8111-111111111111') return false
+            saved = null
+            return true
+        })
+        expect(recovered).toMatchObject({state, copyStarted: false})
+        expect(saved).toBeNull()
     })
 
     it('consumes a replayable RisuSave terminal when a renderer starts again', async () => {

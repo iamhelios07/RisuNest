@@ -298,6 +298,7 @@ private data class PendingSafDestination(
   val sourceKind: SafDestinationSourceKind,
   val source: File?,
   val cancellation: AtomicBoolean,
+  val reservedDestination: Boolean = false,
 )
 
 private data class PendingBackupSource(
@@ -502,6 +503,7 @@ internal fun androidSafDestinationScriptForRecord(
   message = message,
   warningCodes = record.warningCodes,
   publicationPrerequisitesComplete = record.publicationPrerequisitesComplete,
+  copyStarted = record.copyStarted,
 )
 
 internal class PostNotificationsRequestGate(
@@ -747,6 +749,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         safControlBridge = null
         // Releasing waits for a running copy, so it stays off the main thread.
         safScope.launch(Dispatchers.IO) { PortableSourceNative.retireUnclaimed(portableSourceOwner) }
+        cancelUnclaimedReservedDestination()
       },
       destroyView = webView::destroy,
       clearReference = {
@@ -762,6 +765,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
+    if (lifecycleWebView != null) cancelUnclaimedReservedDestination()
     frontendReady.cancel()
     frontendReady = AndroidFrontendReady()
     lifecycleWebView = webView
@@ -1051,11 +1055,15 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       "saf.pickLegacyBackupSource" -> safCommands.pickLegacyBackupSource(args[0])
       "saf.pickContentSource" -> safCommands.pickContentSource(args[0], args[1])
       "saf.copyExport" -> safCommands.copyExport(args[0], args[1], args[2])
+      "saf.reserveExport" -> safCommands.copyExport(args[0], "", args[1], args[2])
+      "saf.copyReservedExport" -> copyReservedExport(args[0], args[1], args[2])
       "saf.cancelSource" -> safCommands.cancelSource(args[0])
       "saf.materializeBackupSource" -> materializeBackupSource(args[0], onProgress)
       else -> withContext(Dispatchers.IO) {
         when (method) {
           "saf.cancelExport" -> safCommands.cancelExport(args[0])
+          "saf.bindExport" -> safCommands.bindExport(args[0], args[1])
+          "saf.releaseExport" -> safCommands.releaseExport(args[0])
           "saf.discardSource" -> safCommands.discardSource(args[0])
           "saf.discardPortableSource" -> PortableSourceNative.discard(args[0])
           "saf.getActiveSourceRequestIds" -> safCommands.getActiveSourceRequestIds()
@@ -1299,8 +1307,16 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       requestId: String,
       sourcePath: String,
       suggestedName: String,
+      reservationKind: String? = null,
     ) {
       if (!isCanonicalUuidV4(requestId)) return
+      if (reservationKind == null && loadSafDestinationState()?.let {
+        it.requestId == requestId && it.reservedDestination
+      } == true) {
+        dispatchSafDestination(destinationTerminalRecord(requestId, requestId, SafDestinationPhase.FAILED,
+          code = "invalid-destination", warningCodes = emptyList()), "Android SAF destination requires its export identity")
+        return
+      }
       if (!safPickerSlot.tryAcquire()) {
         safScope.launch {
           val busy = destinationTerminalRecord(
@@ -1322,19 +1338,20 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         var ownsPersistedState = false
         var sourceKind = SafDestinationSourceKind.RISU_SAVE
         try {
-          val source = withContext(Dispatchers.IO) {
-            resolveManagedExportSource(filesDir, sourcePath)
-          } ?: throw SafDestinationException(
+          if (reservationKind != null && loadSafDestinationState() != null) {
+            throw SafDestinationException("destination-busy", emptyList(), "Another Android SAF destination is pending")
+          }
+          val source = if (reservationKind != null) null else {
+            withContext(Dispatchers.IO) { resolveManagedExportSource(filesDir, sourcePath) }
+              ?: throw SafDestinationException("invalid-source", emptyList(), "Android SAF export source is not an owned native export")
+          }
+          val exportId = if (source == null) requestId else managedExportId(source) ?: throw SafDestinationException(
             "invalid-source",
             emptyList(),
             "Android SAF export source is not an owned native export",
           )
-          val exportId = managedExportId(source) ?: throw SafDestinationException(
-            "invalid-source",
-            emptyList(),
-            "Android SAF export source is not an owned native export",
-          )
-          sourceKind = managedExportSourceKind(source)
+          sourceKind = if (source == null) SafDestinationSourceKind.fromWireName(reservationKind!!)
+            ?: throw IOException("invalid export kind") else managedExportSourceKind(source)
           if (cancellation.get()) {
             throw SafDestinationException(
               "cancelled",
@@ -1352,6 +1369,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             warningCodes = emptyList(),
             updatedAtMillis = System.currentTimeMillis(),
             sourceKind = sourceKind,
+            reservedDestination = reservationKind != null,
+            exportBound = reservationKind == null,
+            copyStarted = reservationKind == null,
           )
           withContext(Dispatchers.IO) { saveSafDestinationState(state) }
           ownsPersistedState = true
@@ -1368,6 +1388,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             sourceKind,
             source,
             cancellation,
+            reservationKind != null,
           )
           safDestinationPicker.launch(safDestinationPickerName(suggestedName, sourceKind))
         } catch (error: SafDestinationException) {
@@ -1407,7 +1428,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     fun cancelExport(requestId: String): Boolean {
       val cancellation = safDestinationCancellations[requestId] ?: return false
       cancellation.set(true)
-      return synchronized(safDestinationStateLock) {
+      val saved = synchronized(safDestinationStateLock) {
         val record = runCatching { safDestinationStateStore.load() }.getOrNull()
           ?.takeIf { it.requestId == requestId && !it.isTerminal() }
           ?: return@synchronized false
@@ -1420,6 +1441,33 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           )
         }.isSuccess
       }
+      if (saved) releaseExport(requestId)
+      return saved
+    }
+
+    fun bindExport(requestId: String, exportId: String): Boolean = synchronized(safDestinationStateLock) {
+      val current = safDestinationStateStore.load() ?: return@synchronized false
+      val bound = bindReservedSafDestination(current, requestId, exportId, System.currentTimeMillis())
+        ?: return@synchronized false
+      safDestinationStateStore.save(bound)
+      true
+    }
+
+    fun releaseExport(requestId: String): Boolean = synchronized(safDestinationStateLock) {
+      val current = safDestinationStateStore.load()?.takeIf {
+        it.requestId == requestId && it.reservedDestination && !it.copyStarted
+      } ?: return@synchronized false
+      if (current.isTerminal()) return@synchronized true
+      if (current.destinationUri == null) return@synchronized false
+      val warnings = cleanupOwnedSafDestination(current)
+      val terminal = current.copy(phase = SafDestinationPhase.CANCELLED, destinationUri = null,
+        code = "cancelled", warningCodes = warnings, publicationPrerequisitesComplete = true,
+        updatedAtMillis = System.currentTimeMillis())
+      safDestinationStateStore.save(terminal)
+      safDestinationCancellations.remove(requestId)
+      safPickerSlot.release()
+      safScope.launch { dispatchSafDestination(terminal, destinationMessage(terminal)) }
+      true
     }
 
     fun cancelSource(requestId: String) {
@@ -1441,7 +1489,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       return destinationJson(record, destinationMessage(record))
     }
 
-    fun getExportSourceId(): String? = loadSafDestinationState()?.exportId
+    fun getExportSourceId(): String? = loadSafDestinationState()?.takeIf { it.exportBound }
+      ?.let { if (it.reservedDestination && !it.copyStarted) it.jobId else it.exportId }
 
     fun markExportPublicationReady(requestId: String): Boolean {
       if (!isCanonicalUuidV4(requestId)) return false
@@ -1690,14 +1739,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
     pendingSafDestination = null
     safScope.launch {
-      val copyContext = currentCoroutineContext()
-      var terminalMessage: String? = null
       val selectedState = try {
         withContext(Dispatchers.IO) {
           claimSafDestinationSelection(pending, uri)
         }
       } catch (error: Exception) {
-        val warnings = cleanupUnclaimedSafDestinationOnIo(uri)
+        val warnings = cleanupUnclaimedSafDestinationOnIo(uri, pending.reservedDestination)
         val failure = destinationTerminalRecord(
           requestId = pending.requestId,
           exportId = pending.exportId,
@@ -1716,7 +1763,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         return@launch
       }
       if (selectedState == null) {
-        val warnings = cleanupUnclaimedSafDestinationOnIo(uri)
+        val warnings = cleanupUnclaimedSafDestinationOnIo(uri, pending.reservedDestination)
         val terminal = withContext(Dispatchers.IO) {
           addSafDestinationWarnings(pending.requestId, warnings)
         }
@@ -1732,6 +1779,53 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         dispatchSafDestination(selectedState, destinationMessage(selectedState))
         return@launch
       }
+      if (selectedState.reservedDestination) {
+        if (selectedState.phase == SafDestinationPhase.CANCELLING) {
+          withContext(Dispatchers.IO) { safCommands.releaseExport(pending.requestId) }
+        } else {
+          runCatching {
+            contentResolver.takePersistableUriPermission(requireNotNull(uri),
+              Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+          }
+          val payload = "{\"requestId\":${jsonString(pending.requestId)}}"
+          lifecycleWebView?.evaluateJavascript("window.dispatchEvent(new CustomEvent('risunest-android-saf-reserved',{detail:$payload}));", null)
+        }
+        return@launch
+      }
+      copySafSelectedDestination(pending, selectedState)
+    }
+  }
+
+  private fun copyReservedExport(requestId: String, sourcePath: String, jobId: String) {
+    safScope.launch {
+      try {
+        val (source, state) = withContext(Dispatchers.IO) {
+          val source = resolveManagedExportSource(filesDir, sourcePath) ?: throw IOException("invalid source")
+          val exportId = managedExportId(source) ?: throw IOException("invalid source")
+          val state = synchronized(safDestinationStateLock) {
+            val current = safDestinationStateStore.load() ?: throw IOException("missing destination")
+            val copying = beginReservedSafCopy(current, requestId, jobId, exportId,
+              managedExportSourceKind(source), System.currentTimeMillis()) ?: throw IOException("destination mismatch")
+            val ready = copying.copy(publicationPrerequisitesComplete = managedExportHasNoPublicationPrerequisites(source))
+            safDestinationStateStore.save(ready)
+            ready
+          }
+          source to state
+        }
+        val cancellation = safDestinationCancellations.computeIfAbsent(requestId) { AtomicBoolean(false) }
+        copySafSelectedDestination(PendingSafDestination(requestId, state.exportId, state.sourceKind,
+          source, cancellation, true), state)
+      } catch (_: Exception) {
+        val failure = destinationTerminalRecord(requestId, requestId, SafDestinationPhase.FAILED,
+          code = "invalid-destination", warningCodes = emptyList())
+        dispatchSafDestination(failure, "Android SAF destination does not match the export")
+      }
+    }
+  }
+
+  private suspend fun copySafSelectedDestination(pending: PendingSafDestination, selectedState: SafDestinationRecord) {
+      val copyContext = currentCoroutineContext()
+      var terminalMessage: String? = null
       val destinationUri = Uri.parse(requireNotNull(selectedState.destinationUri))
       val terminalRecord = try {
         val source = pending.source ?: throw SafDestinationException(
@@ -1745,8 +1839,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             contentResolver.openOutputStream(destinationUri, "wt")
               ?: throw IOException("Android SAF provider did not open the destination")
           },
-          deletePartial = { false },
-          createdDocument = false,
+          deletePartial = { android.provider.DocumentsContract.deleteDocument(contentResolver, destinationUri) },
+          createdDocument = selectedState.reservedDestination,
           isCancelled = { pending.cancellation.get() || !copyContext.isActive },
           onProgress = { copiedBytes ->
             dispatchSafProgress(
@@ -1788,7 +1882,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         terminalMessage = "Android SAF destination copy failed"
         val warnings = if (destinationUri.scheme == ContentResolver.SCHEME_CONTENT) {
           withContext(Dispatchers.IO) {
-            interruptedSafDestinationWarnings()
+            cleanupOwnedSafDestination(selectedState)
           }
         } else {
           emptyList()
@@ -1811,16 +1905,14 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       )
       safPickerSlot.release()
       dispatchSafDestination(publishedRecord, publishedMessage)
-    }
   }
 
   private fun cleanupUnclaimedSafDestination(uri: Uri?) {
     if (uri == null || uri.scheme != ContentResolver.SCHEME_CONTENT) return
-    val terminalRequestId = loadSafDestinationState()
-      ?.takeIf(SafDestinationRecord::isTerminal)
-      ?.requestId
+    val terminalRecord = loadSafDestinationState()?.takeIf(SafDestinationRecord::isTerminal)
+    val terminalRequestId = terminalRecord?.requestId
     safScope.launch {
-      val warnings = cleanupUnclaimedSafDestinationOnIo(uri)
+      val warnings = cleanupUnclaimedSafDestinationOnIo(uri, terminalRecord?.reservedDestination == true)
       val terminal = terminalRequestId?.let { requestId ->
         withContext(Dispatchers.IO) { addSafDestinationWarnings(requestId, warnings) }
       }
@@ -1828,11 +1920,27 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
-  private suspend fun cleanupUnclaimedSafDestinationOnIo(uri: Uri?): List<String> =
+  private suspend fun cleanupUnclaimedSafDestinationOnIo(uri: Uri?, owned: Boolean = false): List<String> =
     withContext(Dispatchers.IO) {
       if (uri == null || uri.scheme != ContentResolver.SCHEME_CONTENT) return@withContext emptyList()
-      interruptedSafDestinationWarnings()
+      if (owned && runCatching {
+        android.provider.DocumentsContract.deleteDocument(contentResolver, uri)
+      }.getOrDefault(false)) emptyList() else interruptedSafDestinationWarnings()
     }
+
+  private fun cleanupOwnedSafDestination(record: SafDestinationRecord): List<String> {
+    return cleanupReservedSafDestination(record) { uri ->
+      android.provider.DocumentsContract.deleteDocument(contentResolver, Uri.parse(uri))
+    }
+  }
+
+  private fun cancelUnclaimedReservedDestination() {
+    val requestId = loadSafDestinationState()
+      ?.takeIf { it.reservedDestination && !it.copyStarted && !it.isTerminal() }?.requestId ?: return
+    safScope.launch(Dispatchers.IO) {
+      safCommands.cancelExport(requestId)
+    }
+  }
 
   private suspend fun finalizeSafDestination(
     record: SafDestinationRecord,
@@ -1883,7 +1991,15 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     warningCodes = warningCodes,
     updatedAtMillis = System.currentTimeMillis(),
     sourceKind = sourceKind,
-  )
+  ).let { terminal ->
+    val previous = loadSafDestinationState()?.takeIf { it.requestId == requestId && it.reservedDestination }
+    if (previous == null) terminal else terminal.copy(
+      exportId = previous.exportId, reservedDestination = true, exportBound = previous.exportBound,
+      copyStarted = previous.copyStarted,
+      jobId = previous.jobId,
+      publicationPrerequisitesComplete = previous.publicationPrerequisitesComplete || !previous.copyStarted,
+    )
+  }
 
   private suspend fun persistTerminalIfPossible(record: SafDestinationRecord): Boolean =
     withContext(Dispatchers.IO) {
@@ -1917,6 +2033,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         bytes = null,
         code = "invalid-destination",
         warningCodes = emptyList(),
+        publicationPrerequisitesComplete = current.reservedDestination && !current.copyStarted,
         updatedAtMillis = System.currentTimeMillis(),
       )
     } else {
@@ -1982,7 +2099,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       ?.takeIf(::isPendingSafDestinationPicker)
       ?: return null
     val cancellation = safDestinationCancellations.computeIfAbsent(record.requestId) {
-      AtomicBoolean(record.phase == SafDestinationPhase.CANCELLING)
+      AtomicBoolean(restoredSafDestinationCancellation(record))
     }
     return PendingSafDestination(
       requestId = record.requestId,
@@ -1990,6 +2107,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       sourceKind = record.sourceKind,
       source = resolveManagedExportById(filesDir, record.exportId),
       cancellation = cancellation,
+      reservedDestination = record.reservedDestination,
     )
   }
 
@@ -2006,7 +2124,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         safScope.launch {
           try {
             val warnings = withContext(Dispatchers.IO) {
-              interruptedSafDestinationWarnings()
+              cleanupOwnedSafDestination(record)
             }
             val wasCancelling = record.phase == SafDestinationPhase.CANCELLING
             val terminal = destinationTerminalRecord(
@@ -2111,6 +2229,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       message = message,
       warningCodes = record.warningCodes,
       publicationPrerequisitesComplete = record.publicationPrerequisitesComplete,
+      copyStarted = record.copyStarted,
     )
 
   private fun destinationMessage(record: SafDestinationRecord): String? = when (record.code) {
