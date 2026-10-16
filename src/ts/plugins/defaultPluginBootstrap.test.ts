@@ -35,7 +35,10 @@ vi.mock('../storage/sync/bindingNative', () => ({ createNativeSyncBindingBridge:
     },
     assertAuthority: async () => {},
 }) }))
-vi.mock('../storage/sync/bindingRegistry', () => ({ getSyncBindingTransport: () => ({ receiveAvailableChanges: state.receive }) }))
+vi.mock('../storage/sync/bindingRegistry', async original => ({
+    ...await original<typeof import('../storage/sync/bindingRegistry')>(),
+    getSyncBindingTransport: () => ({ receiveAvailableChanges: state.receive }),
+}))
 
 import { onboardingHold } from '../../lib/Others/Onboarding/onboardingGate'
 import { persistentWorkingSetInputBlocked } from '../storage/persistentDataRuntime.svelte'

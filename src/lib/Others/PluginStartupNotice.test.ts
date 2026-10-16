@@ -9,6 +9,10 @@ import { DBState, settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
 import { activeRisuNestSettingsTab } from 'src/ts/setting/risuNestSettingsTabs'
 import { configurePluginStartup, pluginStartupState } from 'src/ts/plugins/pluginStartupGate'
 import PluginStartupNotice from './PluginStartupNotice.svelte'
+import { syncStatus, type SyncStatusSource } from 'src/ts/storage/sync/syncStatus'
+import { syncStatusDisplay, type ServerSyncView } from 'src/ts/storage/sync/syncStatusView'
+import { externalStorageStrings } from '../Setting/ExternalStorage/strings'
+import type { ExternalConnectionSummary } from 'src/ts/storage/sync/external/types'
 
 let component: ReturnType<typeof mount> | undefined
 let inlineComponent: ReturnType<typeof mount> | undefined
@@ -18,6 +22,7 @@ afterEach(async () => {
     component = inlineComponent = undefined
     document.body.replaceChildren()
     pluginStartupState.set({ phase: 'released', since: 0 })
+    syncStatus.set(null)
     configurePluginStartup(() => false, async () => {})
     settingsOpen.set(false)
     activeRisuNestSettingsTab.set(null)
@@ -100,4 +105,47 @@ it('leaves the plugin settings page to its inline notice', async () => {
     expect(document.querySelectorAll('aside')).toHaveLength(1)
     await unmount(inlineComponent); inlineComponent = undefined; await tick()
     expect(document.querySelectorAll('aside')).toHaveLength(1)
+})
+
+it.each(['waiting', 'failed'] as const)('carries the stopped sync label and shared error while %s', async phase => {
+    const source: SyncStatusSource = {
+        target: 'server', syncNow: async () => {}, pendingChanges: async () => 0,
+        view: { status: { configured: true, bound: true }, running: false, paused: true, error: 'clock-skew' } as ServerSyncView,
+    }
+    syncStatus.set(source)
+    pluginStartupState.set({ phase, since: Date.now() - 1000, target: 'server' })
+    await render()
+    await vi.waitFor(() => expect(document.querySelector('[role="alert"]')).not.toBeNull())
+    const display = syncStatusDisplay(source, externalStorageStrings(DBState.db.language), false)
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.label)
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.error)
+    expect(labels()).toContain(language.retry)
+})
+
+it('uses shared external unavailable text without printing the internal error', async () => {
+    pluginStartupState.set({ phase: 'failed', since: Date.now(), target: 'external', error: new Error('Sync is unavailable') })
+    await render()
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(externalStorageStrings(DBState.db.language).errorGeneric)
+    expect(document.querySelector('[role="alert"]')?.textContent).not.toContain('Sync is unavailable')
+})
+
+it('carries the external stop label and action text while its own notice is hidden', async () => {
+    const source: SyncStatusSource = {
+        target: 'external', syncNow: async () => {}, refresh: () => {}, syncStopped: false,
+        connection: {id:'synthetic',status:'reauth-required',lastError:{code:'unauthorized',message:'',retryable:false,action:'reauthenticate'}} as ExternalConnectionSummary,
+    }
+    syncStatus.set(source)
+    pluginStartupState.set({phase:'waiting',since:Date.now()-1000,target:'external'})
+    await render()
+    await vi.waitFor(() => expect(document.querySelector('[role="alert"]')).not.toBeNull())
+    const display=syncStatusDisplay(source,externalStorageStrings(DBState.db.language),false)
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.label)
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.error)
+})
+
+it('suppresses the generic server error help under the unfinished notice', async () => {
+    pluginStartupState.set({ phase: 'failed', since: Date.now(), target: 'server', error: new Error('Sync is unavailable') })
+    await render()
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(language.risuNest.pluginStartup.syncUnfinished)
+    expect(document.querySelector('[role="alert"]')?.textContent).not.toContain(language.risuNest.serverSync.errorHelp)
 })

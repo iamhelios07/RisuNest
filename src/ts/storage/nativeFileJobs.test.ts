@@ -8,15 +8,17 @@ const deviceRestore = vi.hoisted(() => ({ flushDeviceStateBeforeRestore: vi.fn(a
 vi.mock('./deviceStateRestore', () => deviceRestore)
 const binding = vi.hoisted(() => ({ prepare: vi.fn(), invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/core', async original => ({ ...await original<typeof import('@tauri-apps/api/core')>(), invoke: binding.invoke } satisfies typeof import('@tauri-apps/api/core')))
-vi.mock('./sync/bindingRegistry', () => ({prepareBoundLibraryReplacement: binding.prepare}))
-vi.mock('../plugins/apiV3/v3.svelte', () => ({fencePluginExecutionForAuthorityReplacement:async()=>{},invalidatePluginCachesAfterAuthorityReplacement:async()=>{},restartPluginsAfterAuthorityReplacement:async()=>{}}))
+vi.mock('./sync/bindingRegistry', async original => ({...await original<typeof import('./sync/bindingRegistry')>(),prepareBoundLibraryReplacement: binding.prepare}))
+const startupPlugins = vi.hoisted(() => ({ restart: vi.fn(async () => {}) }))
+vi.mock('../plugins/apiV3/v3.svelte', () => ({fencePluginExecutionForAuthorityReplacement:async()=>{},invalidatePluginCachesAfterAuthorityReplacement:async()=>{},restartPluginsAfterAuthorityReplacement:startupPlugins.restart}))
 const library = vi.hoisted(() => ({ hasCharacters: vi.fn<() => Promise<boolean>>() }))
 vi.mock('./libraryCharacters', () => ({ hasLibraryCharacters: library.hasCharacters }) satisfies typeof import('./libraryCharacters'))
 beforeEach(() => {
     library.hasCharacters.mockReset().mockResolvedValue(true)
     restoreAlerts.checkbox.mockReset().mockResolvedValue({confirmed:true,checked:true})
-    binding.prepare.mockReset().mockImplementation(async () => ({bound:false,state:{targetAuthority:'1'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{}}))
+    binding.prepare.mockReset().mockImplementation(async () => ({bound:false,state:{targetAuthority:'1'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{},release:()=>{}}))
     binding.invoke.mockReset()
+    startupPlugins.restart.mockReset().mockResolvedValue(undefined)
 })
 
 it.each(['failed', 'cancelled'])('selects the Android destination first and preserves a %s preparation when release fails', async outcome => {
@@ -192,6 +194,103 @@ import {
     retryCommittedWorkingSetRefreshWithContinuation,
 } from './committedWorkingSetContinuation'
 import { createNativeJobHost, restoreRuntime, status } from './nativeFileJobs.testSupport'
+import { createPluginStartupGate } from '../plugins/pluginStartupGate'
+import { subscribeSyncBindingChanges } from './sync/bindingChanges'
+import { get } from 'svelte/store'
+
+it.each((['portable','block'] as const).flatMap(format=>(['preparation','failed','cancelled'] as const).map(failure=>({format,failure}))))('releases an ended $format/$failure hold when binding verification cannot run',async ({format,failure})=>{
+    const registry=await vi.importActual<typeof import('./sync/bindingRegistry')>('./sync/bindingRegistry')
+    const target={kind:'server' as const,connectionId:'synthetic-failed-preparation'}
+    const state={target,targetAuthority:'1',selectionEpoch:'1',libraryId:'synthetic',progress:null}
+    let unavailable=false,starts=0
+    binding.invoke.mockImplementation(async command=>{if(unavailable)throw new Error('native state unavailable');if(command==='pds_lww_binding_state')return state;throw new Error(command)})
+    binding.prepare.mockImplementation(registry.prepareBoundLibraryReplacement)
+    const unsupported=async():Promise<never>=>{throw new Error('Unexpected binding switch')}
+    const unregister=registry.registerSyncBindingTransport(target,{
+        inspectTarget:unsupported,pullAvailableState:unsupported,replaceFromTarget:unsupported,publishInitialSharedState:unsupported,
+        fenceOldJobs:async()=>{},resumeBinding:async()=>{if(unavailable)throw new Error('Failed authority check must prevent resume')},receiveAvailableChanges:async()=>{},
+    })
+    const gate=createPluginStartupGate({enabled:()=>true,delay:()=>true,replacementPending:()=>registry.isSyncBindingReplacementPending(),
+        context:async()=>{throw new Error('native state unavailable')},start:async()=>{if(await gate.ensure())starts++},
+    })
+    const stop=subscribeSyncBindingChanges(()=>{if(gate.isWaiting())gate.retry()})
+    startupPlugins.restart.mockImplementation(async()=>{expect(await gate.ensure()).toBe(false)})
+    const host=createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'},status(failure==='preparation'?'cancelled':failure)],{
+        native_file_job_finalize:()=>{unavailable=true;return 'requested'},
+    })
+    try {
+        const restore=format==='portable'?runNativeArchiveRestore:runNativeBlockRisuSaveRestore
+        let lifecycle: {beforeRefresh():Promise<number>;afterRefresh():Promise<void>} | undefined
+        const runtime={...restoreRuntime(8),setActivatedLibraryRecoveryLifecycle:(_token:unknown,value:NonNullable<typeof lifecycle>)=>{lifecycle=value}}
+        await expect(restore(runtime,{type:'desktopPath',path:'synthetic.risudat'},{
+            choosePortableSections:async()=>({library:true,deviceSections:['hypa','local-plugins','local-settings']}),
+            beforeActivation:async()=>{if(failure==='preparation'){unavailable=true;throw new Error('preparation failed')}},
+        },host.dependencies)).rejects.toThrow()
+        expect(host.commands().includes('native_file_job_finalize')).toBe(failure!=='preparation')
+        if(failure!=='preparation') {
+            expect(registry.isSyncBindingReplacementPending()).toBe(true)
+            await expect(lifecycle!.beforeRefresh()).rejects.toThrow('native state unavailable')
+            expect(registry.isSyncBindingReplacementPending()).toBe(true)
+            unavailable=false
+            expect(await lifecycle!.beforeRefresh()).toBe(8)
+            await lifecycle!.afterRefresh()
+        }
+        expect(registry.isSyncBindingReplacementPending()).toBe(false)
+        gate.loadOnce()
+        await vi.waitFor(()=>expect(starts).toBe(1))
+    } finally {stop();unregister()}
+})
+
+it.each(['portable', 'block'] as const)('starts plugins after a %s restore only when the binding resumes or its receive completes', async format => {
+    const registry = await vi.importActual<typeof import('./sync/bindingRegistry')>('./sync/bindingRegistry')
+    for (const kind of ['server', 'external'] as const) {
+        const target = {kind, connectionId:'synthetic-startup-restore'}
+        const state = {target,targetAuthority:'1',selectionEpoch:'1',libraryId:'synthetic',progress:null}
+        binding.invoke.mockImplementation(async command => {
+            if (command === 'pds_lww_binding_state') return state
+            throw new Error(command)
+        })
+        binding.prepare.mockImplementation(registry.prepareBoundLibraryReplacement)
+        let active = true, held = false, resumed = false, starts = 0, refreshed = false
+        let finish!: () => void
+        const receive = new Promise<void>(resolve => {finish = resolve})
+        const unsupported = async (): Promise<never> => {throw new Error('Unexpected binding switch')}
+        const transport = {
+            inspectTarget:unsupported,pullAvailableState:unsupported,replaceFromTarget:unsupported,publishInitialSharedState:unsupported,
+            fenceOldJobs:async()=>{active=false},
+            heldForCommittedRestore:()=>held,
+            resumeBinding:async(context: {holdAutomaticSync?:boolean})=>{held=kind==='server'&&context.holdAutomaticSync===true;active=true;resumed=true},
+            receiveAvailableChanges:async()=>{if(!active)throw new Error(kind==='server'?'Sync binding changed':'Sync is stopped');if(resumed)await receive},
+        }
+        const unregister = registry.registerSyncBindingTransport(target,transport)
+        const gate = createPluginStartupGate({enabled:()=>true,delay:()=>true,
+            context:async()=>({identity:'synthetic',target:kind,bound:true,heldByRestore:held,
+                replacementPending:registry.isSyncBindingReplacementPending(state),receive:transport.receiveAvailableChanges,assertCurrent:async()=>{}}),
+            start:async()=>{if(await gate.ensure()){expect(resumed&&refreshed).toBe(true);starts++}},
+        })
+        const stop = subscribeSyncBindingChanges(()=>{if(gate.isWaiting())gate.retry()})
+        startupPlugins.restart.mockImplementation(async()=>{
+            expect(await gate.ensure()).toBe(false)
+            expect(get(gate.state).phase).toBe('waiting')
+            expect(starts).toBe(0)
+        })
+        const result = {revision:9,sourceBytes:128,sourceFingerprintKind:format==='portable'?'portable-catalog-sha256' as const:'whole-file-sha256' as const,sourceSha256:'f'.repeat(64),characterCount:1,presetCount:0,warningCodes:[]}
+        const terminal: NativeFileJobStatus = {...status('succeeded',result),...(format==='portable'?{kind:'restore-portable-backup' as const,deviceSessionId:'synthetic',activationRevision:9,activationAuthority:'1',restoreAdoptionConfirmed:true}:{})}
+        const host=createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'},terminal],{
+            native_device_backup_recovery_complete:undefined,pds_open:{revision:9},native_portable_confirm_restore_adoption:undefined,
+        })
+        try {
+            const runtime=restoreRuntime(8,{refresh:()=>{refreshed=true}})
+            const restore=format==='portable'?runNativeArchiveRestore:runNativeBlockRisuSaveRestore
+            await expect(restore(runtime,{type:'desktopPath',path:'synthetic.risudat'},{holdServerSyncAfterRestore:true,choosePortableSections:async()=>({library:true,deviceSections:['hypa','local-plugins','local-settings']})},host.dependencies)).resolves.toEqual(result)
+            expect(registry.isSyncBindingReplacementPending(state)).toBe(false)
+            if(kind==='external') {expect(starts).toBe(0);expect(get(gate.state).phase).toBe('waiting')}
+            finish()
+            await vi.waitFor(()=>expect(starts).toBe(1))
+            expect(get(gate.state).phase).toBe('released')
+        } finally {finish();stop();unregister()}
+    }
+})
 
 describe('native restore response deadlines', () => {
     function clock() {
@@ -4976,7 +5075,7 @@ it.each([
 
 it.each([false, true])('replaces a library that holds no character without asking, bound=%s', async bound => {
     library.hasCharacters.mockResolvedValue(false)
-    binding.prepare.mockImplementation(async () => ({bound,state:{targetAuthority:'1'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{}}))
+    binding.prepare.mockImplementation(async () => ({bound,state:{targetAuthority:'1'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{},release:()=>{}}))
     const result = {revision:18,sourceBytes:128,sourceFingerprintKind:'whole-file-sha256' as const,sourceSha256:'a'.repeat(64),characterCount:1,presetCount:0,warningCodes:[]}
     const host = createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'}, status('succeeded',result)])
     const acquire = vi.fn()
