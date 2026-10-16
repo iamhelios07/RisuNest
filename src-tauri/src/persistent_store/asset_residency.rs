@@ -251,7 +251,8 @@ impl PersistentStore {
             aliases.insert(alias, hash);
         }
         let order: Option<String> = self.connection.query_row(
-            "SELECT json_extract(value, '$.characterOrder') FROM root WHERE generation=?1", [&generation], |row| row.get(0),
+            "SELECT CASE WHEN json_type(value, '$.characterOrder')='array'
+             THEN json_extract(value, '$.characterOrder') END FROM root WHERE generation=?1", [&generation], |row| row.get(0),
         ).optional()?.flatten();
         let order: Vec<serde_json::Value> = order.map(|order| serde_json::from_str(&order)).transpose()
             .map_err(|_| SyncError::new("invalid-character-order", 409))?.unwrap_or_default();

@@ -378,6 +378,28 @@ fn closed_folder_images_are_hydrated_and_retained_with_character_icons() {
 }
 
 #[test]
+fn non_array_character_order_keeps_representatives_available() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let image = put_asset(&mut store, "assets/order-fallback.png", b"synthetic order fallback");
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    add(&mut store, character("order-fallback", &image.key));
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    for order in [Value::Null, json!(false), json!(7), json!("unexpected"), json!({"unexpected": true})] {
+        store.commit(&WorkingSetCommit { expected_revision: store.revision().unwrap(), root_mutations: Some(vec![
+            crate::persistent_store::RootMutation::Set { key: "characterOrder".into(), value: order }
+        ]), ..Default::default() }).unwrap();
+        hydrate(&store).unwrap();
+        assert_eq!(status(&store)["localBytes"], image.size);
+        assert_eq!(store.asset_residency_evict(|| Ok(())).unwrap().evicted_bytes, 0);
+        assert_eq!(cas.read_object(image.object_hash.as_ref().unwrap()).unwrap().unwrap(), b"synthetic order fallback");
+    }
+}
+
+#[test]
 fn visible_images_precede_selected_images_and_follow_display_order_instead_of_hash_order() {
     let server = LocalServerFixture::new();
     let (_root, mut store) = local();
