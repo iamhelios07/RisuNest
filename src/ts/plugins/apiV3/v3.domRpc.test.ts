@@ -241,7 +241,7 @@ describe('Plugin v3 real iframe DOM/RPC bridge', () => {
         mocks.native = false
         mocks.realRestore = false
         pluginStartupGate.invalidate()
-        pluginStartupGate.state.set({phase:'released',refused:false,since:0})
+        pluginStartupGate.state.set({phase:'released',since:0})
         configurePluginStartup(() => false, async () => {})
         doingChat.set(false)
         vi.stubGlobal('ImageBitmap', class {})

@@ -33,6 +33,7 @@ async function open(source: SyncStatusSource) {
     syncStatusPanel.set({ anchor, placement: 'side' })
     await tick()
 }
+const lastSuccess = new Date(0).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 const rows = () => [...document.querySelectorAll('[data-sync-status-panel] dt')].map(term => [term.textContent, term.nextElementSibling?.textContent])
 
 it('lists server rows it knows and reads pending changes when an attempt ends, not on each report', async () => {
@@ -55,7 +56,7 @@ it('lists server rows it knows and reads pending changes when an attempt ends, n
     pendingChanges.mockResolvedValue(0)
     syncStatus.set(server({ lastSuccessAt: 0 })); await tick()
     await vi.waitFor(() => expect(rows().slice(0, 2)).toEqual([
-        [copy.lastSuccess, new Date(0).toLocaleString()],
+        [copy.lastSuccess, lastSuccess],
         [copy.pendingChanges, copy.count.replace('{0}', '0')],
     ]))
     expect(pendingChanges).toHaveBeenCalledTimes(3)
@@ -84,7 +85,7 @@ it('reads external storage again when it opens and shows its last sync without p
     expect(refresh).toHaveBeenCalledTimes(1)
     expect(document.querySelector('[data-sync-status-panel] h2')?.textContent).toBe(externalStorageStrings('en').title)
     expect(rows()).toEqual([
-        [language.risuNest.serverSync.lastSuccess, new Date(0).toLocaleString()],
+        [language.risuNest.serverSync.lastSuccess, lastSuccess],
         [externalStorageStrings('en').thisDevice, language.risuNest.syncStatus.saved],
     ])
 })

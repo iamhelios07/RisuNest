@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
-import { get } from 'svelte/store'
+import { get, type Writable } from 'svelte/store'
 import type { PlatformShape } from 'src/ts/platform.testSupport'
 import type { createNativeJobHost } from 'src/ts/storage/nativeFileJobs.testSupport'
 
@@ -8,6 +8,7 @@ const h = vi.hoisted(() => ({
     platform: { runtime: 'tauri', os: 'windows' } as PlatformShape,
     host: undefined as ReturnType<typeof createNativeJobHost> | undefined,
     runtime: undefined as unknown,
+    refreshRevision: undefined as Writable<unknown> | undefined,
     file: undefined as File | undefined,
     checkbox: vi.fn(),
     confirm: vi.fn(),
@@ -35,7 +36,10 @@ vi.mock('src/ts/storage/sync/bindingRegistry', () => ({
     prepareBoundLibraryReplacement: async () => ({ bound: false, state: { targetAuthority: '1' }, fence: async () => {}, assertAuthority: async () => {}, resume: async () => {} }),
 }))
 vi.mock('src/ts/storage/sync/bindingNative', () => ({ createNativeSyncBindingBridge: () => ({ state: async () => ({ target: { kind: 'none' } }) }) }))
-vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({ getPersistentDataRuntime: () => h.runtime }))
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', async () => {
+    h.refreshRevision = (await import('svelte/store')).writable<unknown>(null)
+    return { getPersistentDataRuntime: () => h.runtime, persistentWorkingSetRefreshRevision: h.refreshRevision }
+})
 vi.mock('src/ts/plugins/apiV3/v3.svelte', () => ({ fencePluginExecutionForAuthorityReplacement: async () => {}, invalidatePluginCachesAfterAuthorityReplacement: async () => {}, restartPluginsAfterAuthorityReplacement: async () => {} }))
 vi.mock('src/ts/plugins/plugins.svelte', () => ({ loadPlugins: async () => {}, loadPluginsAfterAuthoritativeRestore: async () => {} }))
 vi.mock('src/ts/storage/deviceStateRestore', () => ({ flushDeviceStateBeforeRestore: async () => {}, refreshDeviceStateAfterRestore: async () => {} }))
@@ -112,7 +116,7 @@ const asked = () => h.checkbox.mock.calls.length + h.confirm.mock.calls.length >
 
 it.each([
     ['block-risu-save', 'refresh'], ['block-risu-save', 'lost-ack'], ['block-risu-save', 'unchanged'],
-    ['portable', 'refresh'], ['portable', 'lost-ack'], ['portable', 'bodies'],
+    ['portable', 'refresh'], ['portable', 'lost-ack'], ['portable', 'bodies'], ['portable', 'bodies-stuck'],
 ] as const)('recovers the original %s onboarding import after %s without activating twice', async (format, failure) => {
     h.platform = {runtime: 'tauri', os: 'windows'}
     let database = library('Existing', 'existing')
@@ -129,6 +133,7 @@ it.each([
         },
         prepareDatabase: async value => { if (refreshFails) throw Error('Synthetic refresh failure'); return value },
         prepareRoot: async value => { if (refreshFails) throw Error('Synthetic refresh failure'); return value },
+        onWorkingSetRefreshRequired: revision => h.refreshRevision!.set(revision),
     })
     await runtime.initializeActiveWorkingSet(database)
     h.runtime = runtime
@@ -146,7 +151,7 @@ it.each([
             if (!activated) return {...status('waitingForInput'), kind, phase: 'awaiting-activation'}
             if (!resolved && (failure === 'lost-ack' || failure === 'unchanged')) throw {code: 'activation-outcome-unresolved', message: 'Synthetic pending receipt'}
             if (format === 'portable') {
-                const pending = failure === 'bodies' && !bodiesRetried
+                const pending = (failure === 'bodies' && !bodiesRetried) || failure === 'bodies-stuck'
                 return {...status(!adopted ? 'running' : pending ? 'failed' : 'succeeded', adopted && !pending ? result : undefined), kind,
                     phase: adopted ? 'complete' : 'activating-database', activationRevision:result.revision, activationAuthority:'1',
                     deviceSessionId:'synthetic-device', restoreAdoptionConfirmed:adopted,
@@ -159,13 +164,16 @@ it.each([
         native_device_backup_recovery_complete: () => {},
         pds_open: () => ({revision:result.revision}),
         native_portable_confirm_restore_adoption: () => { adopted = true },
-        native_portable_retry_restore_bodies: () => { bodiesRetried = true },
+        native_portable_retry_restore_bodies: () => {
+            if (failure === 'bodies-stuck') throw {code: 'synthetic-body-failure', message: 'Synthetic body failure'}
+            bodiesRetried = true
+        },
         native_file_job_finalize: async () => {
             activated = true
             if (failure !== 'unchanged') {
                 result = {...result, revision: (await storage.store.replaceFromDatabase(library('Restored', 'restored'))).revision}
             }
-            refreshFails = failure === 'refresh' || failure === 'bodies'
+            refreshFails = failure === 'refresh' || failure.startsWith('bodies')
         },
     })
     await chooseImport()
@@ -173,7 +181,10 @@ it.each([
     await tick()
     expect(h.error).not.toHaveBeenCalled()
     expect(get(onboardingHold)).toBe(true)
-    expect([...target.querySelectorAll('button')].some(b => b.textContent?.trim() === language.risuNest.importDialog.close)).toBe(false)
+    const labels = () => [...target.querySelectorAll('button')].map(b => b.textContent?.trim())
+    expect(labels()).not.toContain(language.risuNest.importDialog.close)
+    // The screen still waits for its refresh, so the reader cannot move on yet.
+    expect(labels()).not.toContain(language.risuNest.onboarding.import.next)
     if (failure === 'lost-ack' || failure === 'unchanged') {
         await runtime.retryCommittedWorkingSetRefresh().catch(() => {})
         expect(() => runtime.assertPersistentMutationAllowed()).toThrow()
@@ -183,12 +194,27 @@ it.each([
     refreshFails = false
     await retryCommittedWorkingSetRefreshWithContinuation(runtime)
     await tick()
-    if (failure === 'bodies') {
+    if (failure.startsWith('bodies')) {
         expect(get(onboardingHold)).toBe(true)
         expect(get(nativeFileOperationOutcome)?.status?.portableBodyRetry?.pending).toBe(true)
+        expect(target.textContent).toContain(language.risuNest.importDialog.resultAssetsIncomplete)
+        expect(labels()).toEqual(expect.arrayContaining([language.retry, language.risuNest.onboarding.import.next]))
         const retry = [...target.querySelectorAll('button')].find(b => b.textContent?.trim() === language.retry)
-        expect(retry).toBeDefined()
         retry!.click()
+        if (failure === 'bodies-stuck') {
+            // The failed retry never read a job status, so it cannot offer another retry.
+            await vi.waitFor(() => {
+                const outcome = get(nativeFileOperationOutcome)
+                expect([outcome?.error?.code, outcome?.status]).toEqual(['portable-bodies-incomplete', undefined])
+            })
+            await tick()
+            expect(get(onboardingHold)).toBe(true)
+            expect(target.textContent).toContain(language.risuNest.importDialog.resultAssetsIncomplete)
+            expect(labels()).not.toContain(language.retry)
+            // The data is restored, so the missing assets do not keep the reader in onboarding.
+            const next = [...target.querySelectorAll('button')].find(b => b.textContent?.trim() === language.risuNest.onboarding.import.next)
+            next!.click()
+        }
         await vi.waitFor(() => expect(get(onboardingHold)).toBe(false))
         await tick()
     }

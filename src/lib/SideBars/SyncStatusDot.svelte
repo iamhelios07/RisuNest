@@ -9,6 +9,7 @@
         working: 'bg-primary-500 motion-safe:animate-pulse',
         idle: 'bg-textcolor/40',
         paused: 'border-[1.5px] border-textcolor2',
+        failed: 'bg-textcolor2',
         attention: 'bg-danger-400',
     }
 </script>

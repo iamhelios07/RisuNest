@@ -868,6 +868,16 @@ describe('nativeFileJobDialogModel', () => {
         expect(committed.terminal?.details).toBe(
             '[activation-committed-refresh-failed] refresh exploded',
         )
+
+        const assetsMissing = buildNativeFileJobDialogModel(
+            null,
+            outcome({
+                state: 'failed',
+                error: { code: 'portable-bodies-incomplete', message: 'bodies missing', recoveryRequired: true },
+            }),
+            0,
+        )
+        expect(assetsMissing.terminal?.summary).toBe(copy.resultAssetsIncomplete)
     })
 
     it('maps failure codes to user copy and never shows the code itself', () => {

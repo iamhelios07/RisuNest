@@ -1740,7 +1740,7 @@ export const languageKorean = {
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
         pluginStartup: {
-            delayLabel: '동기화 사용 시 플러그인 불러오기 지연',
+            delayLabel: '동기화 후 플러그인 불러오기',
             delayHelp: '앱을 실행하면 동기화가 완료될 때까지 플러그인을 불러오지 않습니다. 체크를 해제하는 경우 플러그인 데이터가 이전 값으로 덮어씌워질 수 있습니다.',
             waiting: '동기화가 완료되면 플러그인을 불러옵니다.',
             loadNow: '플러그인 불러오기',
@@ -1748,6 +1748,7 @@ export const languageKorean = {
             requestRefused: '플러그인을 불러온 뒤 다시 시도해주세요.',
         },
         syncStatus: {
+            menuLabel: '동기화',
             saving: '저장 중',
             saved: '저장 완료',
             saveFailed: '저장 실패',
@@ -2146,6 +2147,7 @@ export const languageKorean = {
             paused: '일시 중지됨',
             registrationRequired: '새 등록 코드 필요',
             blocked: '자동 동기화 중지됨',
+            failed: '동기화 실패',
             errorHelp:
                 '동기화를 마치지 못했습니다. 이 기기에서 고친 내용은 그대로 있습니다. 다시 시도하세요.',
             "connectRowHelpScan": '서버에서 만든 등록 코드를 붙여넣거나 QR 코드를 스캔하세요. 기기마다 별도의 등록 코드가 필요합니다.',
@@ -2262,7 +2264,7 @@ export const languageKorean = {
             chatEditPopup: '채팅 수정 팝업창 사용',
             chatEditPopupHelp: '채팅 수정 버튼을 누르면 팝업창에서 내용을 수정할 수 있도록 합니다.',
             syncStatusUi: '동기화 UI 표시',
-            syncStatusUiHelp: '동기화 상태를 알려주는 상태 아이콘과 오버레이를 보여줍니다. 사용하지 않으면 동기화를 위해 대기 중인 상황이나 동기화 오류가 있을 때 바로 알기 어려워집니다.',
+            syncStatusUiHelp: '동기화 상태 아이콘을 표시하며, 동기화가 멈추거나 플러그인이 동기화를 기다리는 경우 알림을 표시합니다.',
         },
         textEditor: {
             open: '팝업창에서 수정',
@@ -2612,7 +2614,7 @@ export const languageKorean = {
             stageReadingDatabase: '데이터베이스 읽는 중',
             stageDecodingDatabase: '데이터베이스 해석 중',
             stageRequestingBackupKey: '백업 키 요청 중',
-            stageDecryptingDatabase: '백업 암호 해제 중',
+            stageDecryptingDatabase: '백업 복호화 중',
             stageCleaningUp: '복원 완료, 임시 파일 정리 중',
             stageFinalizingStaging: '설정과 프리셋 저장 중',
             stageAssignPluginValues: '플러그인 값 할당',
@@ -2648,6 +2650,7 @@ export const languageKorean = {
             resultFailedAfterCommit:
                 '데이터는 가져왔지만 화면을 새로 고치지 못했습니다. 다른 변경을 하기 전에 화면 새로 고침을 선택해주세요.',
             resultActivationUnresolved: '복원 결과를 확인하지 못했습니다. 다른 변경을 하기 전에 화면 새로 고침을 선택해 결과를 확인해주세요.',
+            resultAssetsIncomplete: '데이터는 가져왔지만 일부 에셋을 가져오지 못했습니다.',
             errorDetails: '오류 상세',
             errorDetailsHide: '오류 상세 숨기기',
             copyDetails: '복사',
@@ -2932,7 +2935,7 @@ export const languageKorean = {
         cancelAction: "취소",
         clockBlocked: "기기와 원격 간의 시간 차이가 있어 동기화가 중단되었습니다. 시간을 보정한 후 다시 시도해주세요.",
         writerCollision: "중복된 기기로 인해 동기화가 중단되었습니다. 동기화 서버의 기기 등록에서 새 등록 코드를 만들어 입력한 뒤 새 기기로 연결을 누르세요.",
-        writerCollisionNotConnected: "이 기기가 다른 등록 코드로 연결된 기록이 있습니다. 새 기기로 연결을 눌러 연결해주세요.",
+        writerCollisionNotConnected: "이 기기가 다른 등록 코드로 연결된 기록이 있습니다. 새 기기로 연결을 눌러주세요.",
         unitTooLarge: "이 기기에 서버로 보내기에 너무 큰 항목이 있어 동기화가 중단되었습니다. 해당 항목의 크기를 줄인 후 다시 시도해주세요.",
         newDeviceAction: "새 기기로 연결",
         restoreTitle: "백업을 복원하시겠습니까?",

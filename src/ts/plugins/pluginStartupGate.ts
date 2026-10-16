@@ -21,7 +21,6 @@ export interface PluginStartupContext {
 }
 export interface PluginStartupState {
     phase: 'released' | 'waiting' | 'failed'
-    refused: boolean
     error?: unknown
     target?: 'server' | 'external'
     since: number
@@ -33,7 +32,7 @@ export function createPluginStartupGate(dependencies: {
     context(): Promise<PluginStartupContext>
     start(): Promise<unknown>
 }) {
-    const state = writable<PluginStartupState>({ phase: 'released', refused: false, since: 0 })
+    const state = writable<PluginStartupState>({ phase: 'released', since: 0 })
     let attempt = 0
     let refusals = 0
     let controller: AbortController | undefined
@@ -43,7 +42,7 @@ export function createPluginStartupGate(dependencies: {
     let installingDefaults = false
     const release = () => {
         installingDefaults = false
-        if (get(state).phase !== 'released' || get(state).refused) state.set({ phase: 'released', refused: false, since: 0 })
+        if (get(state).phase !== 'released') state.set({ phase: 'released', since: 0 })
     }
     const start = () => { void dependencies.start().catch(error => console.error('Plugin startup failed', error)) }
     const ensure = (options: { installingDefaults?: boolean } = {}): Promise<boolean> => {
@@ -58,14 +57,14 @@ export function createPluginStartupGate(dependencies: {
             let context: PluginStartupContext
             try { context = await dependencies.context() }
             catch (error) {
-                if (current === attempt) state.set({ phase: 'failed', refused: get(state).refused, error, since: Date.now() })
+                if (current === attempt) state.set({ phase: 'failed', error, since: Date.now() })
                 return false
             }
             if (current !== attempt) return false
             if (!context.bound || context.heldByRestore || ready === context.identity) { release(); return true }
             if (controller && !controller.signal.aborted) return false
             const active = controller = new AbortController()
-            state.set({ phase: 'waiting', refused: get(state).refused, since: Date.now(), target: context.target })
+            state.set({ phase: 'waiting', since: Date.now(), target: context.target })
             void (async () => {
                 try {
                     await context.receive(active.signal)
@@ -96,7 +95,6 @@ export function createPluginStartupGate(dependencies: {
         refuse(): boolean {
             if (get(state).phase === 'released' || !dependencies.enabled()) return false
             refusals++
-            state.update(value => ({ ...value, refused: true }))
             return true
         },
         invalidate() {

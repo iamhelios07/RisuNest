@@ -115,7 +115,7 @@
     {@const copy = language.risuNest.serverSync}
     {@const error = failure || display.error}
     <div bind:this={panel} role="dialog" aria-label={language.risuNest.tabs.sync} use:backNavigationLayer={{ close }}
-        class="fixed z-[1000] overflow-y-auto rounded-lg border border-darkborderc bg-darkbg p-4 text-textcolor shadow-lg"
+        class="fixed z-[1000] overflow-y-auto rounded-lg border border-darkborderc bg-darkbg p-4 break-keep text-textcolor shadow-lg"
         style:top={place.top === undefined ? null : `${place.top}px`} style:bottom={place.bottom === undefined ? null : `${place.bottom}px`}
         style:left="{place.left}px" style:right={place.right === undefined ? null : `${place.right}px`} style:width={place.width === undefined ? null : `${place.width}px`} style:max-height="{place.height}px"
         data-sync-status-panel>
@@ -124,12 +124,12 @@
             <StatusBadge label={display.label} tone={display.tone} />
         </div>
         <dl class="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-5 gap-y-1.5 text-[13px] leading-[1.45] [&>dd]:min-w-0 [&>dd]:tabular-nums [&>dt]:whitespace-nowrap [&>dt]:text-textcolor2">
-            {#if display.lastSuccessAt !== undefined}<dt>{copy.lastSuccess}</dt><dd>{new Date(display.lastSuccessAt).toLocaleString()}</dd>{/if}
+            {#if display.lastSuccessAt !== undefined}<dt>{copy.lastSuccess}</dt><dd>{new Date(display.lastSuccessAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</dd>{/if}
             {#if pending !== undefined}<dt>{copy.pendingChanges}</dt><dd>{copy.count.replace('{0}', pending.toLocaleString())}</dd>{/if}
             <dt>{strings.thisDevice}</dt>
             <dd>{saveFailed ? language.risuNest.syncStatus.saveFailed : saving.state ? language.risuNest.syncStatus.saving : language.risuNest.syncStatus.saved}</dd>
         </dl>
-        {#if error}<div class="mt-3"><SettingNotice text={error} /></div>{/if}
+        {#if error}<div class="mt-3"><SettingNotice text={error} tone={!failure && display.tone === 'failed' ? 'info' : 'danger'} /></div>{/if}
         {#if $pluginStartupState.phase !== 'released'}
             <div class="mt-3 border-t border-darkborderc pt-3 text-sm">
                 <p>{$pluginStartupState.phase === 'failed' ? language.risuNest.pluginStartup.syncUnfinished : language.risuNest.pluginStartup.waiting}</p>

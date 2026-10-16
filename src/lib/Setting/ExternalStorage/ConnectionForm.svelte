@@ -35,6 +35,8 @@
     } from 'src/ts/storage/sync/external/types'
     import {
         externalConnectionFolder,
+        externalConnectionPlace,
+        externalConnectionTitle,
         externalEndpointWarning,
         externalErrorMessage,
         externalErrorKind,
@@ -671,7 +673,9 @@
 </script>
 
 {#if addressConnection}
+    {@const place = externalConnectionPlace(strings, addressConnection)}
     <fieldset disabled={busy} class="form sub" data-tone={tone}>
+        <div class="field"><span>{externalConnectionTitle(strings, addressConnection)}</span>{#if place}<small>{place}</small>{/if}</div>
         <label class="field"><span>{strings.endpoint}</span><TextInput bind:value={newEndpoint} /></label>
         {#if error}<p role="alert" class="form-error">{error}</p>{/if}
         <div class="actions">

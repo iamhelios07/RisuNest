@@ -39,3 +39,12 @@ it('offers the status only with a sync binding while the sync UI is turned on', 
     DBState.db.risunestSyncStatusUi = false; await tick()
     expect(document.body.querySelector('button')).toBeNull()
 })
+
+it('labels the sidebar column as sync and names a failing attempt without a stop', async () => {
+    component = mount(SyncStatusButton, { target: document.body, props: { variant: 'menu' } })
+    syncStatus.set(server({ error: 'server-unreachable' })); await tick()
+    const button = document.querySelector<HTMLButtonElement>('button[data-sync-status]')!
+    expect(button.getAttribute('data-sync-status')).toBe('failed')
+    expect(button.getAttribute('aria-label')).toBe(`${language.risuNest.tabs.sync}: ${language.risuNest.serverSync.failed}`)
+    expect(button.textContent?.trim()).toBe(language.risuNest.syncStatus.menuLabel)
+})

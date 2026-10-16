@@ -7,7 +7,7 @@ import { registrationCodes, serverSyncErrorMessage } from './serverSyncErrorMess
 import type { getServerSyncController } from './serverSyncProduction'
 import type { SyncStatusSource } from './syncStatus'
 
-export type SyncStatusTone = 'idle' | 'connected' | 'working' | 'paused' | 'attention'
+export type SyncStatusTone = 'idle' | 'connected' | 'working' | 'paused' | 'failed' | 'attention'
 export type ServerSyncView = ReturnType<ReturnType<typeof getServerSyncController>['snapshot']>
 export interface SyncStatusView {
     label: string
@@ -23,7 +23,8 @@ export function serverSyncStatusView(view: ServerSyncView): SyncStatusView {
     if (view.progress || (connected && view.running)) return { label: copy.running, tone: 'working', stopped: false }
     if (!connected) return { label: copy.disconnected, tone: view.bindingIncomplete ? 'attention' : 'idle', stopped: false }
     if (registrationCodes.includes(view.error)) return { label: copy.registrationRequired, tone: 'attention', stopped: true }
-    if (view.error) return { label: view.paused ? copy.blocked : copy.ready, tone: 'attention', stopped: view.paused }
+    // An error that is still being retried is not a stop.
+    if (view.error) return view.paused ? { label: copy.blocked, tone: 'attention', stopped: true } : { label: copy.failed, tone: 'failed', stopped: false }
     if (view.paused) return { label: copy.paused, tone: 'paused', stopped: false }
     return { label: copy.ready, tone: 'connected', stopped: false }
 }

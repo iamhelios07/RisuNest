@@ -17,7 +17,7 @@
     let { variant }: { variant: 'slot' | 'menu' | 'header' } = $props()
 
     const attention = 'text-[color:color-mix(in_srgb,var(--risu-theme-danger-400)_80%,var(--risu-theme-textcolor))]'
-    const icons = { connected: CloudCheckIcon, working: CloudSyncIcon, idle: CloudOffIcon, paused: CloudIcon, attention: CloudAlertIcon }
+    const icons = { connected: CloudCheckIcon, working: CloudSyncIcon, idle: CloudOffIcon, paused: CloudIcon, failed: CloudAlertIcon, attention: CloudAlertIcon }
     let button = $state<HTMLButtonElement>()
     const display = $derived((DBState.db.risunestSyncStatusUi ?? true) && $syncStatus && syncStatusDisplay($syncStatus, externalStorageStrings(DBState.db.language), $persistentLocalSaveFailure !== null))
     const open = $derived(!!button && $syncStatusPanel?.anchor === button)
@@ -34,7 +34,7 @@
         <button bind:this={button} type="button" class="flex w-full flex-col items-center justify-center gap-1 py-2 {display.tone === 'attention' ? attention : open ? '' : 'text-textcolor2'}"
             aria-label={name} title={name} aria-haspopup="dialog" aria-expanded={open} onclick={toggle} data-sync-status={display.tone}>
             <span class="relative"><Icon /><SyncStatusDot tone={display.tone} class="-right-1 -top-0.5 ring-bgcolor" /></span>
-            <span class="text-xs">{display.label}</span>
+            <span class="text-xs">{language.risuNest.syncStatus.menuLabel}</span>
         </button>
     {:else}
         {@const control = `group relative flex h-11 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-selected ${variant === 'slot' ? 'w-14' : 'w-11'} ${open ? 'bg-selected' : ''} ${display.tone === 'attention' ? attention : 'text-textcolor'}`}

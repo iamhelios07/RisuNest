@@ -290,7 +290,8 @@
 {/snippet}
 
 {#snippet alert()}
-    {#if view.error || failure}<SettingNotice role="alert" text={failure || message({ code: view.error })} />{/if}
+    <!-- An error that is still being retried reads as information, not a failure to act on. -->
+    {#if view.error || failure}{@const retrying = !failure && status.tone === 'failed'}<SettingNotice role={retrying ? 'status' : 'alert'} tone={retrying ? 'info' : 'danger'} text={failure || message({ code: view.error })} />{/if}
 {/snippet}
 
 {#snippet residencyChoices(apply?: (next: AssetResidencyPolicy) => void)}

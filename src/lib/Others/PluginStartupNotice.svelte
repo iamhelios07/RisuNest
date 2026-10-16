@@ -5,6 +5,7 @@
 </script>
 
 <script lang="ts">
+    import XIcon from '@lucide/svelte/icons/x'
     import { language } from 'src/lang'
     import { DBState, settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
     import { openRisuNestSettingsTab, activeRisuNestSettingsTab } from 'src/ts/setting/risuNestSettingsTabs'
@@ -15,8 +16,12 @@
 
     let { inline = false }: { inline?: boolean } = $props()
     let elapsed = $state(false)
+    // Closing holds for the current wait or failure; the next one shows again.
+    let dismissed = $state<{ phase: string; since: number }>()
     const failed = $derived($pluginStartupState.phase === 'failed')
-    const visible = $derived($pluginStartupState.phase !== 'released' && (inline || ($inlineShown === 0 && (elapsed || failed || $pluginStartupState.refused))))
+    const shown = $derived(!dismissed || dismissed.phase !== $pluginStartupState.phase || dismissed.since !== $pluginStartupState.since)
+    // With the sync UI turned off, only plugins that did not load are reported.
+    const visible = $derived($pluginStartupState.phase !== 'released' && (inline || ($inlineShown === 0 && shown && (failed || (elapsed && (DBState.db.risunestSyncStatusUi ?? true))))))
     const error = $derived.by(() => {
         const value = $pluginStartupState.error
         if ($pluginStartupState.target === 'external') return externalErrorMessage(externalStorageStrings(DBState.db.language), value)
@@ -40,22 +45,34 @@
         $SettingsMenuIndex = 17
         $settingsOpen = true
     }
+    function dismiss() {
+        dismissed = { phase: $pluginStartupState.phase, since: $pluginStartupState.since }
+    }
 </script>
 
 {#if visible}
-    <aside class="rounded-lg border bg-darkbg p-3 text-textcolor {inline ? 'mb-2' : 'shadow-lg'} {failed || $pluginStartupState.refused ? 'border-danger-400' : 'border-darkborderc'}" data-plugin-startup>
-        {#if $pluginStartupState.refused}<p role="alert" class="mb-1 font-semibold">{language.risuNest.pluginStartup.requestRefused}</p>{/if}
+    <aside class="rounded-lg border bg-darkbg p-3 break-keep text-textcolor {inline ? 'mb-2' : 'shadow-lg'} {failed ? 'border-danger-400' : 'border-darkborderc'}" data-plugin-startup>
+        <div class="flex items-start gap-2">
+            {#if failed}
+                <div class="min-w-0 flex-1">
+                    <div role="alert"><p class="font-semibold">{language.risuNest.pluginStartup.syncUnfinished}</p>{#if error}<p class="mt-1 whitespace-pre-wrap text-sm text-textcolor/70">{error}</p>{/if}</div>
+                    {#if !($settingsOpen && $SettingsMenuIndex === 17 && $activeRisuNestSettingsTab === 'sync')}
+                        <button type="button" class="-my-2 min-h-11 text-sm text-textcolor2 underline hover:text-textcolor" onclick={settings}>{language.risuNest.tabs.sync}</button>
+                    {/if}
+                </div>
+            {:else}
+                <p role="status" class="min-w-0 flex-1">{language.risuNest.pluginStartup.waiting}</p>
+            {/if}
+            {#if !inline}
+                <button type="button" class="-mr-2 -mt-2 flex size-10 shrink-0 items-center justify-center rounded-md text-textcolor2 transition-colors hover:bg-selected hover:text-textcolor" aria-label={language.close} title={language.close} onclick={dismiss}><XIcon size={18} aria-hidden="true" /></button>
+            {/if}
+        </div>
         {#if failed}
-            <div role="alert"><p>{language.risuNest.pluginStartup.syncUnfinished}</p>{#if error}<p class="mt-1 whitespace-pre-wrap text-sm text-textcolor/70">{error}</p>{/if}</div>
             <div class="mt-2 flex flex-wrap items-center gap-2">
                 <SettingButton onclick={() => void retryPluginStartup()}>{language.retry}</SettingButton>
-                <SettingButton onclick={() => pluginStartupGate.loadOnce()}>{language.risuNest.pluginStartup.loadNow}</SettingButton>
-                {#if !($settingsOpen && $SettingsMenuIndex === 17 && $activeRisuNestSettingsTab === 'sync')}
-                    <button type="button" class="ml-auto min-h-11 text-sm text-textcolor2 underline" onclick={settings}>{language.risuNest.tabs.sync}</button>
-                {/if}
+                <SettingButton variant="secondary" onclick={() => pluginStartupGate.loadOnce()}>{language.risuNest.pluginStartup.loadNow}</SettingButton>
             </div>
         {:else}
-            <p role="status" class={$pluginStartupState.refused ? 'text-sm text-textcolor/70' : ''}>{language.risuNest.pluginStartup.waiting}</p>
             <button type="button" class="-my-2 min-h-11 text-sm underline" onclick={() => pluginStartupGate.loadOnce()}>{language.risuNest.pluginStartup.loadNow}</button>
         {/if}
     </aside>

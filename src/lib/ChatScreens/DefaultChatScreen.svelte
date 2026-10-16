@@ -1,5 +1,6 @@
 <script lang="ts">
     import { pluginStartupGate } from 'src/ts/plugins/pluginStartupGate'
+    import { refuseGenerationWhilePluginsWait } from 'src/ts/plugins/pluginStartupRefusal'
     import { captureChatParserContextSeed, createChatParserContextSeed } from 'src/ts/chatParserContextSeed.svelte'
     import { ScreenshotPreparationError } from 'src/ts/chatScreenshotErrors'
     import { v4 } from 'uuid'
@@ -392,7 +393,7 @@
 
     async function sendMain(continueResponse:boolean) {
         const submittedComposer = captureComposerInput()
-        if (!submittedComposer.text.startsWith('/') && pluginStartupGate.refuse()) return
+        if (!submittedComposer.text.startsWith('/') && refuseGenerationWhilePluginsWait()) return
         if($doingChat || sending || rerollBusy){
             return
         }
@@ -574,7 +575,7 @@
             messages = mutationTarget.conversation.message
         }
 
-        if (pluginStartupGate.refuse()) return
+        if (refuseGenerationWhilePluginsWait()) return
         for(const file of submittedFiles){
             input += `{{inlayed::${file}}}`
         }
@@ -646,7 +647,7 @@
     }
 
     async function rerollCandidate(expectedLastMessage?: string) {
-        if (pluginStartupGate.refuse()) return
+        if (refuseGenerationWhilePluginsWait()) return
         if ($doingChat || rerollBusy || sending) return
         const generation = reserveChatGeneration()
         if (!generation) return
@@ -839,7 +840,7 @@
     }
 
     async function sendChatMain(continued:boolean = false) {
-        if (pluginStartupGate.refuse()) return
+        if (refuseGenerationWhilePluginsWait()) return
         const generation = reserveChatGeneration()
         if (!generation) return
         try {

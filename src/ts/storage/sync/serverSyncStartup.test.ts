@@ -30,7 +30,7 @@ vi.mock('src/ts/plugins/apiV3/v3.svelte', () => ({ fencePluginExecutionForAuthor
 vi.mock('../persistentRevisionEvents', () => ({ subscribeLocalPersistentRevision: () => () => {} }))
 vi.mock('../generatingConversationRegistry', () => ({ generatingConversations: { snapshot: () => [] } }))
 vi.mock('src/ts/alert', () => ({ alertConfirm: async () => false, alertActionConfirm: vi.fn(async () => true), alertCheckboxConfirm: vi.fn(async () => ({ confirmed: true, checked: false })) }))
-vi.mock('@lucide/svelte', () => ({ CheckIcon: () => {}, CloudDownloadIcon: () => {}, HardDriveIcon: () => {}, LoaderCircleIcon: () => {}, TriangleAlertIcon: () => {} }))
+vi.mock('@lucide/svelte', () => ({ CheckIcon: () => {}, CloudDownloadIcon: () => {}, HardDriveIcon: () => {}, InfoIcon: () => {}, LoaderCircleIcon: () => {}, TriangleAlertIcon: () => {} }))
 vi.mock('./serverSyncRegistrationInbox', () => ({ serverRegistrationInbox: { changed: { subscribe: () => () => {} }, releaseConsumed() {}, take: () => undefined } }))
 vi.mock('./serverSyncQr', () => ({ canScanServerRegistration: false, createServerQrScanner: () => ({ cancel() {} }) }))
 vi.mock('./serverAssetResidency', async () => {
