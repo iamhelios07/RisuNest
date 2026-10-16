@@ -597,7 +597,7 @@ fn classify_response(
             "official publication response is not UTF-8",
         )
     })?;
-    if text.is_empty() || text.len() > MAX_REPLACEMENT_STRING_BYTES {
+    if text.len() > MAX_REPLACEMENT_STRING_BYTES {
         return Err(NativeJobError::new(
             "invalid-response",
             "official publication replacement key is invalid",
@@ -637,7 +637,7 @@ fn classify_response(
         session,
         save_date: save_date.to_owned(),
         status,
-        replacement_key: text,
+        replacement_key: if text.is_empty() { DATABASE_KEY.to_owned() } else { text },
         warning,
         reload_session,
     })
@@ -1145,6 +1145,11 @@ mod tests {
         assert_eq!(error.code, "invalid-response");
         assert!(error.message.len() <= 512);
         assert!(!error.message.contains("secret"));
+        let empty_json = classify_response(
+            200, false, true, Some(Vec::new()), "account-1", None, "date",
+        )
+        .unwrap_err();
+        assert_eq!(empty_json.code, "invalid-response");
     }
 
     #[test]
@@ -1393,7 +1398,7 @@ mod tests {
                 body: br#"{"sessionNumber":"server-session"}"#.to_vec(),
             },
             MockResponse {
-                status: 304,
+                status: 200,
                 headers: Vec::new(),
                 body: Vec::new(),
             },
@@ -1415,11 +1420,12 @@ mod tests {
 
         assert!(matches!(
             result,
-            OfficialPublicationAttemptResult::NotModified {
-                status: 304,
+            OfficialPublicationAttemptResult::Written {
+                status: 200,
                 session: Some(ref session),
+                ref replacement_key,
                 ..
-            } if session == "server-session"
+            } if session == "server-session" && replacement_key == DATABASE_KEY
         ));
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);

@@ -127,6 +127,7 @@ import { getDeviceMarkers, initializeDeviceMarkers } from "./storage/deviceMarke
 import {
     configureNativeOfficialAccountFlow,
     createNativeOfficialAccountFlowService,
+    restoreNativeOfficialAccountCandidate,
     type NativeOfficialAccountFlow,
     type NativeOfficialAccountFlowService,
     nativeOfficialAccountKeys,
@@ -417,6 +418,12 @@ export async function loadData() {
             account: accountStorage,
             cold: { readRemote: getAccountColdStorageItem },
             prepareCandidate: prepareDatabaseForPersistence,
+            restoreCandidate: isTauri
+                ? (candidate, expectedRevision, signal) => restoreNativeOfficialAccountCandidate(
+                    runtime, candidate, expectedRevision, signal,
+                    [language.risuNest.backup.officialRestoreInlayWarning],
+                )
+                : undefined,
             markPublished: () => undefined,
             ledger: officialAssetLedger,
             association: createOfficialAssociationMarkers(associationStorage),

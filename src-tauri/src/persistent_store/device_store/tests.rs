@@ -810,6 +810,7 @@ fn device_settings_accept_only_the_assigned_keys() {
             "risuNestServerSyncRestoreHold",
             "official-account.association.v1",
             "official-account.asset-ledger.v1",
+            "official-account.pending-assets.v1",
             "sync-conflict-backups.index.v1",
             "native-file-restore-receipts.v1",
         ]
@@ -820,6 +821,16 @@ fn device_settings_accept_only_the_assigned_keys() {
             .write_setting(key, &serde_json::json!("value"))
             .expect("write an assigned key");
     }
+
+    let pending_key = "official-account.pending-assets.v1";
+    let pending = serde_json::json!({ "accountId": "synthetic-account" });
+    store.write_setting(pending_key, &pending).unwrap();
+    drop(store);
+    let mut store = DeviceStore::open(_directory.path()).expect("reopen device store");
+    assert_eq!(store.read_setting(pending_key).unwrap(), Some(pending));
+    store.remove_setting(pending_key).unwrap();
+    assert_eq!(store.read_setting(pending_key).unwrap(), None);
+    store.write_setting(pending_key, &serde_json::json!("value")).unwrap();
 
     let value = serde_json::json!("value");
     assert!(store.write_setting("mainpage", &value).is_err());
@@ -1466,6 +1477,7 @@ mod section_exchange {
         for key in [
             "official-account.association.v1",
             "official-account.asset-ledger.v1",
+            "official-account.pending-assets.v1",
             "sync-conflict-backups.index.v1",
             "native-file-restore-receipts.v1",
             "risuNestServerSyncRestoreHold",

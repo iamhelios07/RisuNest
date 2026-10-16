@@ -255,6 +255,7 @@ export function nativeOfficialAccountFlowModule() {
     type Flow = typeof import('./storage/sync/nativeOfficialAccountFlow')
     return {
         configureNativeOfficialAccountFlow: vi.fn(),
+        restoreNativeOfficialAccountCandidate: vi.fn<Flow['restoreNativeOfficialAccountCandidate']>(),
         createNativeOfficialAccountFlowService: () => stub<ReturnType<Flow['createNativeOfficialAccountFlowService']>>({ flow: {}, snapshotRequestReauthentication: {} }),
         nativeOfficialAccountKeys: stub<Flow['nativeOfficialAccountKeys']>({ association: 'association', assetLedger: 'asset-ledger' }),
         normalizeNativeOfficialAccountCredential: (value: unknown) => value as ReturnType<Flow['normalizeNativeOfficialAccountCredential']>,
