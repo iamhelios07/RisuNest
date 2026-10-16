@@ -16,6 +16,7 @@ import type {OfficialRevisionPublisher} from './saveCoordinator'
 import {makeDatabase} from './saveCoordinator.testSupport'
 import {runNativeBlockRisuSaveRestore,type NativeFileJobStatus} from './nativeFileJobs'
 import {retryCommittedWorkingSetRefreshWithContinuation} from './committedWorkingSetContinuation'
+import {restoreNativeOfficialAccountCandidate} from './sync/nativeOfficialAccountFlow'
 async function createHarness(officialPublisher?: OfficialRevisionPublisher, captureWorkingSet = false) {
     let database = makeDatabase()
     let durable = structuredClone(database)
@@ -185,6 +186,21 @@ describe('direct native upstream import publication',()=>{
         expect(h.store.replaceFromDatabase).not.toHaveBeenCalled()
         expect(h.database.username).not.toBe('Declined')
     })
+    it.each(['confirmation','before-commit'] as const)('preserves the library when import cancellation arrives during %s',async stage=>{
+        const h=await createHarness()
+        const controller=new AbortController()
+        if(stage==='confirmation') alerts.checkbox.mockImplementationOnce(async()=>{
+            controller.abort()
+            return {confirmed:true,checked:true}
+        })
+        else binding.assertAuthority.mockImplementationOnce(async()=>{controller.abort()})
+        await expect(restoreNativeOfficialAccountCandidate(h.runtime,
+            {...makeDatabase(),username:'Cancelled'},1,controller.signal,[],
+        )).rejects.toMatchObject({name:'AbortError'})
+        expect((await h.store.readRoot()).value.username).not.toBe('Cancelled')
+        expect(h.runtime.revision).toBe(1)
+        expect(h.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+    })
     it.each([true,false])('replaces a library that holds no character without asking, bound=%s',async bound=>{
         binding.bound=bound
         library.hasCharacters.mockResolvedValue(false)
@@ -209,7 +225,9 @@ describe('direct native upstream import publication',()=>{
         expect(()=>h.runtime.markPersistentDataDirty(1)).not.toThrow()
         expect(binding.resume).toHaveBeenCalledOnce()
     })
-    it.each(['refresh','uncertain'] as const)('retains read-only activation and resumes only after strict recovery: %s',async failure=>{
+    it.each([
+        ['refresh',false],['uncertain',false],['refresh',true],['uncertain',true],
+    ] as const)('retains read-only activation and resumes only after strict recovery: %s, account=%s',async(failure,account)=>{
         const h=await createHarness({pin:async()=>({publish:async()=>{},dispose:async()=>{}})})
         const incoming={...makeDatabase(),username:'Imported after recovery'}
         if(failure==='refresh') h.replaceDatabase.mockImplementationOnce(()=>{throw new Error('refresh failed')})
@@ -217,13 +235,17 @@ describe('direct native upstream import publication',()=>{
             h.nativeCommit(database)
             throw new Error('activation result unavailable')
         })
-        await expect(h.runtime.replacePersistentDatabase(incoming,'upstream-import',{upstreamImport:true,publishOfficial:true})).rejects.toThrow()
+        const operation=account
+            ? restoreNativeOfficialAccountCandidate(h.runtime,incoming,1,undefined,[])
+            : h.runtime.replacePersistentDatabase(incoming,'upstream-import',{upstreamImport:true,publishOfficial:true})
+        if(account) await expect(operation).rejects.toMatchObject({code:'activation-outcome-unresolved',recoveryRequired:true})
+        else await expect(operation).rejects.toThrow()
         expect(()=>h.runtime.markPersistentDataDirty(1)).toThrow()
         expect(binding.resume).not.toHaveBeenCalled()
         await expect(retryCommittedWorkingSetRefreshWithContinuation(h.runtime)).resolves.toEqual({kind:'committed',revision:2,projection:'applied'})
         expect(h.database.username).toBe('Imported after recovery')
         expect(binding.resume).toHaveBeenCalledOnce()
-        expect(h.runtime.hasPendingOfficialPublication()).toBe(true)
+        expect(h.runtime.hasPendingOfficialPublication()).toBe(!account)
         await h.runtime.flushPendingDataLocally('recovery-baselines')
         expect(h.store.commit).not.toHaveBeenCalled()
     })

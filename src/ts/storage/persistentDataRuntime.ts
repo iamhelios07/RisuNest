@@ -1478,6 +1478,7 @@ export function createPersistentDataRuntime(
         fenceNavigation: () => workingSet.fenceNavigation(),
         invalidateNavigation: () => workingSet.invalidateNavigation(),
         replacePersistentDatabase: async (database, reason, options) => {
+            options?.signal?.throwIfAborted()
             if (
                 !options?.authoritative &&
                 hasIncompletePersistentWorkingSet(database, workingSetResidency)
@@ -1495,6 +1496,7 @@ export function createPersistentDataRuntime(
                 const binding = await prepareBoundLibraryReplacement()
                 const {acquireUpstreamImportPause, confirmUpstreamLibraryReplacement} = await import('./upstreamReplacement')
                 if (!(await confirmUpstreamLibraryReplacement(binding.bound, options.upstreamImportWarnings, options))) throw new DOMException('Import cancelled', 'AbortError')
+                options.signal?.throwIfAborted()
                 const plugins = await import('../plugins/apiV3/v3.svelte')
                 let pause: Awaited<ReturnType<typeof acquireUpstreamImportPause>>
                 let pluginsFenced = false
@@ -1528,6 +1530,7 @@ export function createPersistentDataRuntime(
                         throw new PersistentMutationFencedError()
                     }
                     await binding?.assertAuthority()
+                    options.signal?.throwIfAborted()
                     const result = await dependencies.store.replaceFromDatabase(candidate, pause.fence.revision, [], options.pluginStorageValues,
                         binding.bound ? {bindingAuthority:binding.state.targetAuthority,requestId:crypto.randomUUID()} : undefined)
                     committed = true

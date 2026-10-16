@@ -265,6 +265,7 @@ describe('AccountStorage structured wire contract', () => {
     it.each([true, false])(
         'publishes JSON warnings on 403 before auth handling (warn header: %s)',
         async (warn) => {
+            mocks.alertLogin.mockResolvedValueOnce(JSON.stringify({ id: 'account-a', token: 'fresh-token', data: {} }))
             mocks.fetchProtectedResource
                 .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 1 })))
                 .mockResolvedValueOnce(
@@ -299,6 +300,7 @@ describe('AccountStorage structured wire contract', () => {
     it.each(['auth-warning', 'reauthentication-needed'] as const)(
         'publishes a native %s warning before returning or retrying',
         async (kind) => {
+            mocks.alertLogin.mockResolvedValueOnce(JSON.stringify({ id: 'account-a', token: 'fresh-token', data: {} }))
             const { AccountStorage, AccountWarning } = await loadStorage()
             const warnings: string[] = []
             const unsubscribe = AccountWarning.subscribe((value) => warnings.push(value))
@@ -879,6 +881,9 @@ describe('AccountStorage structured wire contract', () => {
     })
 
     it('retries an ordinary 403 after login and exposes a warning 403', async () => {
+        const refreshedAccount = { id: 'account-a', token: 'refreshed-token', data: {} }
+        Object.assign(mocks.database.account, { id: refreshedAccount.id })
+        mocks.alertLogin.mockResolvedValueOnce(JSON.stringify(refreshedAccount))
         const retryBody = cancellableResponse(403)
         const warnCancel = vi.fn(() => {
             throw new Error('cancel failed')
@@ -899,12 +904,95 @@ describe('AccountStorage structured wire contract', () => {
             replacementKey: 'assets/retried.png',
         })
         expect(mocks.alertLogin).toHaveBeenCalledOnce()
-        expect(localStorage.getItem('fallbackRisuToken')).toBe('new-token')
+        expect(mocks.database.account).toEqual({ ...refreshedAccount, useSync: true })
+        expect(storage.auth).toBe(refreshedAccount.token)
+        expect(JSON.parse(localStorage.getItem('fallbackRisuToken')!)).toEqual(mocks.database.account)
         await expect(storage.writeItem('assets/b.png', new Uint8Array([2]))).resolves.toEqual({
             kind: 'auth-warning',
         })
         expect(retryBody.cancel).toHaveBeenCalledOnce()
         expect(warnBody.cancel).toHaveBeenCalledOnce()
+    })
+
+    it.each(['', 'not-json', '{}', JSON.stringify({ id: 'account-b', token: 'other-token', data: {} })])(
+        'rejects cancelled, malformed, or different-account web reauthentication without retrying',
+        async (loginResult) => {
+            Object.assign(mocks.database.account, { id: 'account-a' })
+            const previousAccount = structuredClone(mocks.database.account)
+            mocks.alertLogin.mockResolvedValueOnce(loginResult)
+            mocks.fetchProtectedResource.mockResolvedValueOnce(response(null, 403))
+            const { AccountStorage } = await loadStorage()
+
+            await expect(new AccountStorage().readItem('database/database.bin')).rejects.toThrow()
+
+            expect(mocks.database.account).toEqual(previousAccount)
+            expect(localStorage.getItem('fallbackRisuToken')).toBeNull()
+            expect(mocks.fetchProtectedResource).toHaveBeenCalledOnce()
+        },
+    )
+
+    it.each(['logout', 'switch', 'refresh'] as const)(
+        'does not apply a delayed web login after a concurrent %s',
+        async (change) => {
+            Object.assign(mocks.database.account, { id: 'account-a' })
+            let finishLogin!: (result: string) => void
+            mocks.alertLogin.mockReturnValueOnce(new Promise(resolve => { finishLogin = resolve }))
+            mocks.fetchProtectedResource.mockResolvedValueOnce(response(null, 403))
+            const { AccountStorage } = await loadStorage()
+            const read = new AccountStorage().readItem('database/database.bin')
+            const rejected = expect(read).rejects.toThrow('session changed')
+            await vi.waitFor(() => expect(mocks.alertLogin).toHaveBeenCalledOnce())
+            if (change === 'logout') mocks.database.account = undefined!
+            else Object.assign(mocks.database.account, {
+                id: change === 'switch' ? 'account-b' : 'account-a', token: 'concurrent-token',
+            })
+            const currentAccount = structuredClone(mocks.database.account)
+            finishLogin(JSON.stringify({ id: 'account-a', token: 'delayed-token', data: {} }))
+
+            await rejected
+            expect(mocks.database.account).toEqual(currentAccount)
+            expect(localStorage.getItem('fallbackRisuToken')).toBeNull()
+            expect(mocks.fetchProtectedResource).toHaveBeenCalledOnce()
+        },
+    )
+
+    it.each(['switch', 'refresh'] as const)('rejects a web 403 after a concurrent %s before the response arrived', async (change) => {
+        Object.assign(mocks.database.account, { id: 'account-a' })
+        let finishRequest!: (result: Response) => void
+        mocks.fetchProtectedResource.mockReturnValueOnce(new Promise(resolve => { finishRequest = resolve }))
+        const { AccountStorage } = await loadStorage()
+        const read = new AccountStorage().readItem('database/database.bin')
+        const rejected = expect(read).rejects.toThrow('session changed')
+        await vi.waitFor(() => expect(mocks.fetchProtectedResource).toHaveBeenCalledOnce())
+        Object.assign(mocks.database.account, {
+            id: change === 'switch' ? 'account-b' : 'account-a', token: 'other-token',
+        })
+        finishRequest(response(null, 403))
+
+        await rejected
+        expect(mocks.database.account.token).toBe('other-token')
+        expect(mocks.alertLogin).not.toHaveBeenCalled()
+    })
+
+    it('does not install a web credential when a waiting read is aborted', async () => {
+        Object.assign(mocks.database.account, { id: 'account-a' })
+        const previousAccount = structuredClone(mocks.database.account)
+        let finishLogin!: (result: string) => void
+        mocks.alertLogin.mockReturnValueOnce(new Promise(resolve => { finishLogin = resolve }))
+        mocks.fetchProtectedResource.mockResolvedValueOnce(response(null, 403))
+        const { AccountStorage } = await loadStorage()
+        const controller = new AbortController()
+        const read = new AccountStorage().readItem('database/database.bin', { signal: controller.signal })
+        const rejected = expect(read).rejects.toThrow('cancelled')
+        await vi.waitFor(() => expect(mocks.alertLogin).toHaveBeenCalledOnce())
+        controller.abort(new Error('cancelled'))
+        await rejected
+        finishLogin(JSON.stringify({ id: 'account-a', token: 'delayed-token', data: {} }))
+        await Promise.resolve()
+
+        expect(mocks.database.account).toEqual(previousAccount)
+        expect(localStorage.getItem('fallbackRisuToken')).toBeNull()
+        expect(mocks.fetchProtectedResource).toHaveBeenCalledOnce()
     })
 
     it('aborts an asset upload while its ordinary 403 reauthentication is waiting', async () => {
@@ -1338,7 +1426,42 @@ describe('AccountStorage structured wire contract', () => {
         expect(mocks.cache.size).toBe(0)
     })
 
+    it.each([
+        ['database/database.bin', '', 'database/database.bin'],
+        ['database/database.bin', ' \r\n\t', ' \r\n\t'],
+        ['assets/original.png', '', ''],
+        ['assets/original.png', ' \r\n\t', ' \r\n\t'],
+    ])('handles an empty non-JSON write response for %s (%j)', async (key, body, replacementKey) => {
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 81 })))
+            .mockResolvedValueOnce(response(new TextEncoder().encode(body)))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage({ databaseCache: mocks.cachedForage })
+        const bytes = Uint8Array.of(8, 1)
+
+        await expect(storage.writeItem(key, bytes)).resolves.toEqual({
+            kind: 'written',
+            replacementKey,
+        })
+        if (key === 'database/database.bin') {
+            expect(mocks.cache.get(key)).toEqual(bytes)
+            expect(mocks.cache.get(`${key}__date`)).toBe('1725000000123')
+        }
+    })
+
+    it.each(['', ' \r\n\t'])('rejects an empty JSON database write response (%j)', async (body) => {
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 81 })))
+            .mockResolvedValueOnce(response(body, 200, { 'content-type': 'application/json' }))
+        const { AccountStorage } = await loadStorage()
+
+        await expect(new AccountStorage().writeItem('database/database.bin', Uint8Array.of(8, 1)))
+            .rejects.toBeInstanceOf(SyntaxError)
+        expect(mocks.cache.size).toBe(0)
+    })
+
     it('awaits both database cache updates after a successful write', async () => {
+        mocks.alertLogin.mockResolvedValueOnce(JSON.stringify({ id: 'account-a', token: 'fresh-token', data: {} }))
         const pending: Array<() => void> = []
         mocks.cachedForage.setItem.mockImplementation((key: string, value: unknown) => (
             new Promise((resolve) => pending.push(() => {
@@ -1508,6 +1631,7 @@ describe('AccountStorage structured wire contract', () => {
     })
 
     it('cancels an ignored read 403 body before retrying', async () => {
+        mocks.alertLogin.mockResolvedValueOnce(JSON.stringify({ id: 'account-a', token: 'fresh-token', data: {} }))
         const forbidden = cancellableResponse(403)
         mocks.fetchProtectedResource
             .mockResolvedValueOnce(forbidden.response)

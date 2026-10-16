@@ -510,6 +510,7 @@ export interface PreparedUnitIntent {
 }
 
 export interface PersistentReplacementOptions {
+    signal?: AbortSignal
     upstreamImport?: boolean
     upstreamImportWarnings?: string[]
     firstRun?: boolean
