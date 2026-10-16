@@ -369,7 +369,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     }
                     const next = await dependencies.gate.runTransition(async () => {
                         await check(context)
-                        activationAttempted = true
+                        activationAttempted = switchRequired || !!staged
                         return activate()
                     })
                     const nextContext = bindingContext(next, controller.signal, mode)

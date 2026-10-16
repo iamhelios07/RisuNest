@@ -75,6 +75,7 @@ let hydrating: Promise<void> | undefined
 let hydrationPending = false
 let representativesPending = false
 let representativesTimer: ReturnType<typeof setTimeout> | undefined
+let priorityTimer: ReturnType<typeof setTimeout> | undefined
 let hydrationAgain = false
 let hydrationError = ''
 let schedulerAuthority: string | undefined
@@ -86,6 +87,7 @@ const changed = () => { for (const listener of listeners) listener(snapshot()) }
 // have all stopped. Native counts are read only while a view watches it.
 let attempt: ServerSyncAttempt | undefined
 let attemptFailed = false
+let attemptCountsAsSync = false
 // Read when a watched attempt starts, so even an attempt that ends before its next read has a start to count from.
 let baseline: Promise<ServerSyncLane[] | undefined> | undefined
 let binding = false
@@ -150,11 +152,12 @@ const watchSamples = () => {
     else if (!wanted && sampling) { clearInterval(sampling); sampling = undefined }
 }
 /** Shows `stage` as running until `operation` settles. Sending and receiving can run at once. */
-async function during<T>(stage: ServerSyncStage, operation: () => Promise<T>): Promise<T> {
+async function during<T>(stage: ServerSyncStage, operation: () => Promise<T>, countsAsSync = true): Promise<T> {
     // Connecting and downloading every asset show their steps; a routine attempt they join becomes one of them.
     const mode = binding || operations ? 'full' : 'routine'
-    if (!attempt) { attempt = { mode, startedAt: Date.now(), stages: [], active: [], current: stage }; attemptFailed = false; baseline = undefined; remaining.reset(); clearFinished(); watchSamples() }
+    if (!attempt) { attempt = { mode, startedAt: Date.now(), stages: [], active: [], current: stage }; attemptFailed = false; attemptCountsAsSync = false; baseline = undefined; remaining.reset(); clearFinished(); watchSamples() }
     else if (mode === 'full') attempt.mode = mode
+    attemptCountsAsSync ||= countsAsSync
     const entered = attempt
     if (!entered.stages.includes(stage)) entered.stages.push(stage)
     entered.active.push(stage); entered.current = stage
@@ -163,9 +166,9 @@ async function during<T>(stage: ServerSyncStage, operation: () => Promise<T>): P
     finally { entered.active.splice(entered.active.lastIndexOf(stage), 1); if (entered === attempt) changed() }
 }
 const settleAttempt = () => {
-    if (!attempt || scheduler.isRunning() || hydrating || binding || operations) return
+    if (!attempt || attempt.active.length || scheduler.isRunning() || hydrating || binding || operations) return
     const ended = attempt, start = baseline
-    if (!attemptFailed) lastSuccessAt = Date.now()
+    if (!attemptFailed && attemptCountsAsSync) lastSuccessAt = Date.now()
     attempt = undefined
     watchSamples()
     if (!attemptFailed && ended.mode === 'routine' && start) void finish(ended, start)
@@ -215,7 +218,7 @@ function continueHydration(): void {
     representativesPending = false
     hydrationAgain = false
     const iconPriority = readRepresentativeImagePriority()
-    hydrating = during('assets', () => invoke('server_sync_lww_hydrate', { request: header(), selectedCharacterId: selectedCharacterId(), ...(iconPriority ? { iconPriority } : {}), ...(representativesOnly ? { representativesOnly: true } : {}) })).then(() => {
+    hydrating = during('assets', () => invoke('server_sync_lww_hydrate', { request: header(), selectedCharacterId: selectedCharacterId(), ...(iconPriority ? { iconPriority } : {}), ...(representativesOnly ? { representativesOnly: true } : {}) }), !representativesOnly).then(() => {
         if (captured === context && !captured.signal.aborted && hydrationError && error === hydrationError) { error = ''; hydrationError = '' }
     }).catch(value => {
         attemptFailed = true
@@ -362,11 +365,29 @@ const transport: SyncBindingTransport = {
         checkContext(c)
         await pushAvailable(c, true)
     },
-    async resumeBinding(c) { heldForCommittedRestore = c.holdAutomaticSync === true; context = c; adoptSchedulerAuthority(c); await during('applying', () => invoke('server_sync_lww_activate', { request: header() })); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; hydrationPending = true; if (!c.holdAutomaticSync) { await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() } },
+    async resumeBinding(c) {
+        try {
+            heldForCommittedRestore = c.holdAutomaticSync === true; context = c; adoptSchedulerAuthority(c)
+            await during('applying', () => invoke('server_sync_lww_activate', { request: header() })); checkContext(c)
+            if (remoteAssetsRequested(c)) await keepAssetsRemote(c)
+            persistedBinding = c.state; hydrationPending = true
+            if (!c.holdAutomaticSync) { await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() }
+        } catch (value) { attemptFailed = true; throw value }
+        finally { settleAttempt() }
+    },
     prepareNewDeviceBinding: (staged,c) => invoke('server_sync_lww_prepare_new_device', { stagingId: staged.stagingId, request: { bindingAuthority: c.state.targetAuthority, requestId: staged.receiveId } }),
     replaceAsNewDevice: (...args) => during('applying', () => replaceNativeSyncBindingAsNewDevice(...args)),
     prepareFreshWriter: (inspected,c) => invoke('server_sync_lww_prepare_fresh_writer', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } }),
-    async resumeNewDeviceBinding(preparation,result,c) { await during('applying', () => invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } })); context = c; adoptSchedulerAuthority(c); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true; await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
+    async resumeNewDeviceBinding(preparation,result,c) {
+        try {
+            await during('applying', () => invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }))
+            context = c; adoptSchedulerAuthority(c); checkContext(c)
+            if (remoteAssetsRequested(c)) await keepAssetsRemote(c)
+            persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true
+            await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint()
+        } catch (value) { attemptFailed = true; throw value }
+        finally { settleAttempt() }
+    },
 }
 export async function receiveAvailableServerChanges(): Promise<void> { await scheduler.receiveAvailableChanges() }
 export async function configureServerSyncConnection(config: ServerConfig): Promise<void> { await invoke('server_sync_configure', { config }); error = '' }
@@ -464,9 +485,10 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     disposers.push(await listen(SERVER_SYNC_DEVICE_CHANGED_EVENT, () => scheduler.localChange()))
     disposers.push(subscribeRepresentativeImagePriority(() => {
         if (status.assetPolicy !== 'remote') return
-        representativesPending = true
-        continueHydration()
+        clearTimeout(priorityTimer)
+        priorityTimer = setTimeout(() => { priorityTimer = undefined; representativesPending = true; continueHydration() }, 150)
     }))
+    disposers.push(() => { clearTimeout(priorityTimer); priorityTimer = undefined })
     disposers.push(await listen<{ connected: boolean }>('risu-server-sync-notification', event => scheduler.socket(event.payload.connected)))
     const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; error = serverSyncErrorCode(value) || 'server-unreachable'; changed() }) }
     document.addEventListener('visibilitychange', visibility)

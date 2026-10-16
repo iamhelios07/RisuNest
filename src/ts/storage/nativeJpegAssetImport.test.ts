@@ -15,7 +15,7 @@ import type { NativeFileJobActivationCommittedError } from './nativeFileJobs'
 import type { Database } from './database.svelte'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import { capturePersistentPluginStorage, capturePersistentPresets, capturePersistentRoot, createPersistentDataRuntime } from './persistentDataRuntime'
-import { retryCommittedWorkingSetRefreshWithContinuation } from './committedWorkingSetContinuation'
+import { registerCommittedWorkingSetContinuation, retryCommittedWorkingSetRefreshWithContinuation } from './committedWorkingSetContinuation'
 
 function dependencies(statuses: unknown[]): NativeJpegAssetImportDependencies {
     const invoke = vi.fn(async (command: string) => {
@@ -180,7 +180,7 @@ describe('native JPEG asset import', () => {
         expect(acquiredFence.release).toHaveBeenCalledOnce()
     })
 
-    it.each(['success', 'lost-poll', 'no-commit', 'revision-read-failed', 'late-commit', 'unresolved-until-retry'] as const)('reconciles the native revision before releasing the import fence (%s)', async (outcome) => {
+    it.each(['success', 'lost-poll', 'no-commit', 'revision-read-failed', 'late-commit', 'unresolved-until-retry', 'continuation-in-flight'] as const)('reconciles the native revision before releasing the import fence (%s)', async (outcome) => {
         const initial = {
             username: 'User', botPresets: [], pluginCustomStorage: {},
             characters: [{ type: 'character', chaId: 'character-1', name: 'Character', chatPage: 0, chats: [] }],
@@ -223,7 +223,7 @@ describe('native JPEG asset import', () => {
                 if (command === 'native_file_job_start') {
                     // The native job commits the new image at the fenced revision.
                     expect((args as { request: { expectedRevision: number } }).request.expectedRevision).toBe(before)
-                    if (!['no-commit', 'late-commit', 'unresolved-until-retry'].includes(outcome)) await nativeCommit()
+                    if (!['no-commit', 'late-commit', 'unresolved-until-retry', 'continuation-in-flight'].includes(outcome)) await nativeCommit()
                     return { jobId: 'jpeg-job' }
                 }
                 if (command === 'native_file_job_status') {
@@ -238,7 +238,7 @@ describe('native JPEG asset import', () => {
                     }
                 }
                 if (command === 'native_file_job_cancel') {
-                    if (outcome === 'unresolved-until-retry') throw new Error('cancel unavailable')
+                    if (outcome === 'unresolved-until-retry' || outcome === 'continuation-in-flight') throw new Error('cancel unavailable')
                     return outcome === 'late-commit' ? 'tooLate' : outcome === 'no-commit' ? 'requested' : 'terminal'
                 }
                 if (command === 'native_file_job_forget') { forgotten = true; return true }
@@ -248,6 +248,28 @@ describe('native JPEG asset import', () => {
             captureMutationToken: (reason) => runtime.capturePersistentMutationToken(reason),
             acquireFence: (token) => runtime.acquireDestructiveReplacementFence(token),
             getRuntime: () => runtime,
+        }
+
+        if (outcome === 'continuation-in-flight') {
+            let entered!: () => void, finish!: () => void
+            const running = new Promise<void>(resolve => { entered = resolve })
+            const held = new Promise<void>(resolve => { finish = resolve })
+            runtime.markCommittedWorkingSetRefreshRequired(before, new Error('earlier recovery'))
+            registerCommittedWorkingSetContinuation(before, runtime, runtime.getStorageAuthorityEpoch(), async () => { entered(); await held }, undefined, true)
+            const recovery = retryCommittedWorkingSetRefreshWithContinuation(runtime)
+            await running
+            expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+            const nativeCommands = vi.spyOn(deps, 'invoke')
+            try {
+                await expect(importNativeJpegAsset({
+                    source: { type: 'desktopPath', path: 'synthetic-during-recovery.jpg' },
+                    displayName: 'synthetic-during-recovery.jpg',
+                    destination: { kind: 'current-character-image', characterId: 'character-1' },
+                }, {}, deps)).rejects.toMatchObject({ name: 'PersistentMutationFencedError' })
+                expect(nativeCommands).not.toHaveBeenCalled()
+            } finally { finish(); await recovery }
+            expect(() => runtime.assertPersistentMutationAllowed()).not.toThrow()
+            return
         }
 
         const imported = importNativeJpegAsset({
@@ -261,6 +283,13 @@ describe('native JPEG asset import', () => {
             expect(forgotten).toBe(false)
             expect(runtime.pendingWorkingSetRefreshRevision).toBe(before)
             expect(() => runtime.assertPersistentMutationAllowed()).toThrow(/replacement is active/i)
+            const nativeCommands = vi.spyOn(deps, 'invoke')
+            await expect(importNativeJpegAsset({
+                source: { type: 'desktopPath', path: 'synthetic-second.jpg' },
+                displayName: 'synthetic-second.jpg',
+                destination: { kind: 'current-character-image', characterId: 'character-1' },
+            }, {}, deps)).rejects.toThrow(/replacement is active/i)
+            expect(nativeCommands).not.toHaveBeenCalled()
             await expect(runtime.retryCommittedWorkingSetRefresh()).rejects.toThrow(/replacement is active/i)
             await expect(retryCommittedWorkingSetRefreshWithContinuation(runtime)).rejects.toMatchObject({ code: 'native-job-outcome-unknown' })
             expect(() => runtime.assertPersistentMutationAllowed()).toThrow(/replacement is active/i)
