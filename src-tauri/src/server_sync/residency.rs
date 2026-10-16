@@ -507,7 +507,7 @@ pub(crate) fn open_transient_with_check(
     digest: &str,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<Option<TransientBody>> {
-    open_transient_inner(root, scratch_root, digest, check, true)
+    open_transient_inner(root, scratch_root, digest, check, true, None)
 }
 pub(crate) fn open_transient_server_with_check(
     root: &Path,
@@ -515,7 +515,13 @@ pub(crate) fn open_transient_server_with_check(
     digest: &str,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<Option<TransientBody>> {
-    open_transient_inner(root, scratch_root, digest, check, false)
+    open_transient_server_observed(root, scratch_root, digest, check, None)
+}
+pub(crate) fn open_transient_server_observed(
+    root: &Path, scratch_root: &Path, digest: &str, check: &dyn Fn() -> Result<()>,
+    observer: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+) -> Result<Option<TransientBody>> {
+    open_transient_inner(root, scratch_root, digest, check, false, observer)
 }
 fn open_transient_inner(
     root: &Path,
@@ -523,6 +529,7 @@ fn open_transient_inner(
     digest: &str,
     check: &dyn Fn() -> Result<()>,
     allow_external: bool,
+    observer: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
 ) -> Result<Option<TransientBody>> {
     check()?;
     validate_hash(digest)?;
@@ -538,13 +545,19 @@ fn open_transient_inner(
         if !allow_external { return Ok(None); }
         return Ok(crate::external_storage::lww_residency::hydrate(root, digest, check)?.map(|file|TransientBody {body:super::cache::Body::File(file),_directory:None}));
     };
-    open_transient_server_proof_with_check(root, scratch_root, &proof, check)
+    open_transient_server_proof_observed(root, scratch_root, &proof, check, observer)
 }
 pub(crate) fn open_transient_server_proof_with_check(
     root: &Path,
     scratch_root: &Path,
     proof: &RemoteObject,
     check: &dyn Fn() -> Result<()>,
+) -> Result<Option<TransientBody>> {
+    open_transient_server_proof_observed(root, scratch_root, proof, check, None)
+}
+fn open_transient_server_proof_observed(
+    root: &Path, scratch_root: &Path, proof: &RemoteObject, check: &dyn Fn() -> Result<()>,
+    observer: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
 ) -> Result<Option<TransientBody>> {
     check()?;
     let digest = proof.hash.as_str();
@@ -572,10 +585,11 @@ pub(crate) fn open_transient_server_proof_with_check(
         check()?;
         return Ok(Some(TransientBody { body, _directory: Some(directory) }));
     }
-    let client = super::client::ServerClient::new(proof.config.resolve(root)?)?;
+    let mut client = super::client::ServerClient::new(proof.config.resolve(root)?)?;
     #[cfg(test)]
-    let client = { let mut client = client; super::client::attach_test_io(root, &mut client); client };
+    super::client::attach_test_io(root, &mut client);
     client.resolve_identity()?;
+    client.body_download_observer = observer;
     check()?;
     let directory = tempfile::Builder::new().prefix("asset-transient-").tempdir_in(scratch_root)?;
     let cache = super::cache::Cache::open(directory.path())?;

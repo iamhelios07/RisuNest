@@ -231,7 +231,11 @@ fn download_progress_reports_partial_writes_without_counting_retry_bytes_twice()
     use tokio::io::AsyncWriteExt;
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let directory=tempfile::tempdir().unwrap();
-        let phase=super::phase_progress::PhaseProgress::silent();
+        let delivered=std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed_bytes=delivered.clone();
+        let phase=super::phase_progress::PhaseProgress::new(move |reading| {
+            observed_bytes.fetch_max(reading.bytes,std::sync::atomic::Ordering::Relaxed);
+        });
         phase.plan(1,8);
         let progress=super::phase_progress::DownloadProgress::new(&phase);
         let mut sink=SpoolSink::create(&directory.path().join("body"),8).unwrap();
@@ -240,10 +244,12 @@ fn download_progress_reports_partial_writes_without_counting_retry_bytes_twice()
         let mut writer=sink.open(0,8,&cancel).await.unwrap();
         writer.write_all(b"1234").await.unwrap();
         assert_eq!((phase.read().items,phase.read().bytes),(0,4));
+        assert_eq!(delivered.load(std::sync::atomic::Ordering::Relaxed),4);
         drop(writer);
         let mut writer=sink.open(0,8,&cancel).await.unwrap();
         writer.write_all(b"1234").await.unwrap();
         assert_eq!(phase.read().bytes,4);
+        assert_eq!(delivered.load(std::sync::atomic::Ordering::Relaxed),4);
         writer.write_all(b"5678").await.unwrap();
         assert_eq!(phase.read().bytes,8);
         drop(writer);drop(sink);drop(progress);
@@ -251,5 +257,7 @@ fn download_progress_reports_partial_writes_without_counting_retry_bytes_twice()
         let retry=super::phase_progress::DownloadProgress::new(&phase);
         retry.advance(4);retry.commit(8);drop(retry);phase.completed(0);
         assert_eq!((phase.read().items,phase.read().bytes),(1,8));
+        phase.flush();
+        assert_eq!(delivered.load(std::sync::atomic::Ordering::Relaxed),8);
     });
 }

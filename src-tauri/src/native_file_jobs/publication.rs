@@ -147,12 +147,12 @@ pub(super) fn run_job(
                 if job.is_cancel_requested() {
                     return;
                 }
-                if let Err(error) = job.set_progress(JobProgress {
+                if let Err(error) = job.set_export_progress(JobProgress {
                     completed_bytes,
                     total_bytes: None,
                     completed_items: 0,
                     total_items: Some(2),
-                }) {
+                }, completed_bytes, None) {
                     *progress_failure.borrow_mut() = Some(error);
                 }
             },
@@ -176,12 +176,12 @@ pub(super) fn run_job(
     if let Err(error) = job.set_phase(JobPhase::UploadingDatabase) {
         return finish_payload_cleanup(payload, Err(job_control_error(&job, error)));
     }
-    if let Err(error) = job.set_progress(JobProgress {
+    if let Err(error) = job.set_export_progress(JobProgress {
         completed_bytes: payload.bytes,
         total_bytes: Some(payload.bytes.saturating_mul(2)),
         completed_items: 1,
         total_items: Some(2),
-    }) {
+    }, 0, Some(payload.bytes)) {
         return finish_payload_cleanup(payload, Err(job_control_error(&job, error)));
     }
 
@@ -645,12 +645,12 @@ fn classify_response(
 
 fn record_uploaded_bytes(job: &JobControl, added: u64) -> Result<(), String> {
     let progress = job.status().progress;
-    job.set_progress(JobProgress {
+    job.set_export_progress(JobProgress {
         completed_bytes: progress.completed_bytes.saturating_add(added).min(progress.total_bytes.unwrap_or(u64::MAX)),
         total_bytes: progress.total_bytes,
         completed_items: 1,
         total_items: Some(2),
-    })
+    }, progress.completed_bytes.saturating_add(added).min(progress.total_bytes.unwrap_or(u64::MAX)).saturating_sub(progress.total_bytes.unwrap_or(0) / 2), progress.total_bytes.map(|total| total / 2))
 }
 
 struct PublicationPayloadReader {

@@ -22,6 +22,7 @@ pub(crate) struct PhaseProgress {
     planned_items: Arc<AtomicU64>,
     planned_bytes: Arc<AtomicU64>,
     reported: Arc<Mutex<Instant>>,
+    reported_bytes: Arc<AtomicU64>,
     sink: Arc<dyn Fn(PhaseCounters) + Send + Sync>,
 }
 
@@ -52,6 +53,7 @@ impl PhaseProgress {
             planned_bytes: Arc::new(AtomicU64::new(reading.total_bytes)),
             // Far enough back that the first reading reports.
             reported: Arc::new(Mutex::new(Instant::now() - REPORT_INTERVAL)),
+            reported_bytes: Arc::new(AtomicU64::new(reading.bytes)),
             sink: Arc::new(sink),
         })
     }
@@ -122,7 +124,9 @@ impl PhaseProgress {
         if let Ok(mut reported) = self.reported.lock() {
             *reported = Instant::now();
         }
-        (self.sink)(self.read());
+        let reading = self.read();
+        self.reported_bytes.store(reading.bytes, Ordering::Relaxed);
+        (self.sink)(reading);
     }
 
     /// A phase with nothing to do says nothing, rather than replacing what the
@@ -140,12 +144,16 @@ impl PhaseProgress {
             return;
         };
         let now = Instant::now();
-        if now.duration_since(*reported) < REPORT_INTERVAL {
+        let reading = self.read();
+        // Planning zero bytes must not hide the first received chunk if the source then stalls.
+        let first_bytes = reading.bytes > 0 && self.reported_bytes.load(Ordering::Relaxed) == 0;
+        if !first_bytes && now.duration_since(*reported) < REPORT_INTERVAL {
             return;
         }
         *reported = now;
+        self.reported_bytes.store(reading.bytes, Ordering::Relaxed);
         drop(reported);
-        (self.sink)(self.read());
+        (self.sink)(reading);
     }
 }
 

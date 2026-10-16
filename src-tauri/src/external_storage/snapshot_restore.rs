@@ -2146,13 +2146,20 @@ pub(crate) async fn download_packed_body_file(
     hash:&str, length:u64, chunks:Vec<wire::StoredChunk>, stored_packs:Vec<wire::StoredObject>, staging_root:&Path, root_key:&[u8;32],
     provider:&dyn Provider, repository:&RepositoryHandle,cancel:&Cancellation,
 ) -> Result<PathBuf> {
+    download_packed_body_file_observed(hash,length,chunks,stored_packs,staging_root,root_key,provider,repository,&PhaseProgress::silent(),cancel).await
+}
+pub(crate) async fn download_packed_body_file_observed(
+    hash:&str, length:u64, chunks:Vec<wire::StoredChunk>, stored_packs:Vec<wire::StoredObject>, staging_root:&Path, root_key:&[u8;32],
+    provider:&dyn Provider, repository:&RepositoryHandle,progress:&PhaseProgress,cancel:&Cancellation,
+) -> Result<PathBuf> {
     ensure_directory(staging_root)?;
     let mut packs=BTreeMap::new();
     for stored in &stored_packs { let pack=RemoteObject::from_stored(stored,repository)?; packs.insert(pack.object_id.clone(),pack); }
     let entry=CompleteEntry {kind:wire::CatalogEntryKind::Object,key:format!("object/{hash}"),content_sha256:hex::decode(hash).map_err(corrupt)?.try_into().map_err(|_|corrupt("body hash"))?,byte_length:length,chunks};
     // Every caller reads the body out of throwaway staging, so it is placed as scratch.
     let plan=resolve_entries_in(vec![entry],staging_root,None,None,cancel)?;
-    let (_,objects)=turn_over_packs_with(plan,&packs,root_key,staging_root,provider,repository,&PhaseProgress::silent(),Durability::Scratch,cancel).await?;
+    let (_,objects)=turn_over_packs_with(plan,&packs,root_key,staging_root,provider,repository,progress,Durability::Scratch,cancel).await?;
+    progress.flush();
     let body=objects.get(hash).ok_or_else(||corrupt("body missing"))?;
     match &body.source { ObjectSource::File(path)=>Ok(path.clone()), _=>Err(corrupt("body source")) }
 }
@@ -3025,6 +3032,10 @@ mod tests {
             assert_eq!(provider.read_attempts("pack-resume-0"),1,"completed prefix must not consume the next quota window");
             assert_eq!(provider.read_attempts("pack-resume-1"),2);
             assert_eq!(provider.read_attempts("pack-resume-2"),2);
+            let progress=PhaseProgress::silent();
+            let path=download_packed_body_file_observed(&source.hash,source.byte_length,source.chunks.clone(),source.packs.clone(),&stage.join("export-spool"),&root_key,&provider,&repository,&progress,&Cancellation::default()).await.unwrap();
+            assert_eq!(fs::read(path).unwrap(),body);
+            assert_eq!(progress.read().bytes,source.packs.iter().map(|pack|pack.ciphertext_length).sum::<u64>());
         });
     }
 

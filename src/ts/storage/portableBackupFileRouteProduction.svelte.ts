@@ -297,11 +297,6 @@ export async function restoreBackupFromNativeSource(
                                         const selection =
                                             await selectPortableBackupRestore(
                                                 preview,
-                                                {
-                                                    firstRun:
-                                                        options.firstRun ??
-                                                        false,
-                                                },
                                             )
                                         return selection
                                     },

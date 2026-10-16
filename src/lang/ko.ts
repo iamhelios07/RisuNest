@@ -2672,6 +2672,8 @@ export const languageKorean = {
             titleExportBackup: 'RisuNest 백업 내보내기',
             titleExportCompatible: '호환 백업 내보내기',
             stagePreparingExport: '데이터 준비 중',
+            stageDownloadingExport: '파일 다운로드 중',
+            stageVerifyingExport: '백업 파일 확인 중',
             stageWritingExport: '백업 파일 쓰는 중',
             stagePublishingDestination: '선택한 위치에 저장하는 중',
             stageFinalizingExport: '마무리 중',

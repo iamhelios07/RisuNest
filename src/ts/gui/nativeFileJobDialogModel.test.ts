@@ -42,6 +42,20 @@ it('shows dataset publication progress without a terminal outcome or invented co
     expect(model.stages.find(row => row.stage === 'publishing-destination')).toMatchObject({ state: 'active', detail: expect.stringContaining('5') })
 })
 
+it.each(['downloading-export', 'writing-export', 'verifying-export', 'finalizing-export'] as const)('uses only actual %s work even when aggregate bytes are complete', stage => {
+    const current = status({
+        kind: 'export-portable-backup', phase: stage === 'finalizing-export' ? 'finalizing-export' : 'writing-export',
+        progress: { completedBytes: 300, totalBytes: 300, completedItems: 3 },
+        detail: detail(stage, { stageCompleted: stage === 'finalizing-export' ? 0 : 7, stageTotal: undefined, stageUnit: 'bytes' }),
+    })
+    const model = buildNativeFileJobDialogModel(running({ kind: 'export', format: 'library-backup', status: current, observedStages: [stage] }), null, 2000)
+    expect(model.overallPercent).toBeNull()
+    expect(model.indeterminate).toBe(true)
+    expect(model.overallText).toBe(stage === 'finalizing-export' ? '' : formatBytes(7))
+    expect(model.terminal).toBeNull()
+    expect(model.stages.find(row => row.stage === stage)?.state).toBe('active')
+})
+
 it('shows dataset writing item progress while byte size is unknown', () => {
     const current = status({ kind: 'export-dataset', phase: 'writing-export', progress: { completedBytes: 0, completedItems: 2, totalItems: 5 } })
     const model = buildNativeFileJobDialogModel(running({ kind: 'export', format: 'dataset', status: current, observedStages: ['writing-export'] }), null, 2000)
@@ -930,6 +944,7 @@ describe('nativeFileJobDialogModel', () => {
                     kind: 'export-portable-backup',
                     phase: 'writing-export',
                     progress: { completedBytes: 512, totalBytes: 2048, completedItems: 0 },
+                    detail: detail('writing-export', { stageCompleted: 512, stageTotal: undefined, stageUnit: 'bytes' }),
                 }),
                 observedStages: ['preparing-export', 'writing-export'],
             }),
@@ -944,7 +959,9 @@ describe('nativeFileJobDialogModel', () => {
             'writing-export:active',
             'finalizing-export:pending',
         ])
-        expect(model.overallPercent).toBe(25)
+        expect(model.overallPercent).toBeNull()
+        expect(model.overallText).toBe(formatBytes(512))
+        expect(model.indeterminate).toBe(true)
         expect(model.counters).toEqual([])
         expect(model.cancelVisible).toBe(true)
         expect(model.cancelEnabled).toBe(true)
@@ -1125,15 +1142,16 @@ it.each([
         const uploadStatus = status({
             kind: 'official-publication-upload', phase: 'uploading-database',
             progress: { completedBytes: 1_024, totalBytes: 4_096, completedItems: 0 },
+            detail: detail('publishing-destination', { stageCompleted: 256, stageTotal: 2_048, stageUnit: 'bytes' }),
         })
         const upload = buildNativeFileJobDialogModel(running({
             kind: 'export', format: 'library-backup', status: uploadStatus,
             observedStages: ['publishing-destination', resolveNativeFileJobStage(uploadStatus)!],
         }), null, 3_000)
-        expect(upload.overallPercent).toBe(25)
+        expect(upload.overallPercent).toBe(13)
         expect(upload.indeterminate).toBe(false)
         expect(upload.stages.find(stage => stage.stage === 'publishing-destination')).toMatchObject({
-            state: 'active', detail: fillTemplate(copy.overall, formatBytes(1_024), formatBytes(4_096)),
+            state: 'active', detail: fillTemplate(copy.overall, formatBytes(256), formatBytes(2_048)),
         })
         expect(upload.cancelEnabled).toBe(true)
     })

@@ -1385,8 +1385,16 @@ pub(super) mod tests {
             assert_eq!(super::super::lww_residency::packed_source(f.directory_b.path(),&small[0]).unwrap().unwrap().packs,saved.packs);
             f.provider.seed(catalog_id,ObjectRole::Catalog,authentic);
             let frozen=super::super::lww_residency::FrozenBodySource::Packed(saved.clone());
-            let spool=super::super::lww_residency::spool_frozen_remote_body(&frozen,&scratch.join("frozen-destination"),&cancel).await.unwrap();
+            let downloaded=Arc::new(std::sync::atomic::AtomicU64::new(0));let observed=downloaded.clone();
+            let before_missing=f.provider.read_attempts(&old_pack);
+            let spool=super::super::lww_residency::spool_frozen_remote_body_observed(&frozen,&scratch.join("frozen-destination"),&cancel,Some(Arc::new(move |bytes| {
+                assert!(bytes>0);observed.fetch_add(bytes,std::sync::atomic::Ordering::Relaxed);
+            }))).await.unwrap();
+            let received=downloaded.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(received>0,"the refreshed packed source must report downloaded bytes");
+            assert_eq!(f.provider.read_attempts(&old_pack),before_missing+1);
             assert_eq!(std::fs::read(spool.path()).unwrap(),b"synthetic retained pack entry 0");
+            assert_eq!(downloaded.load(std::sync::atomic::Ordering::Relaxed),received,"reading the local spool is not another download");
             assert!(crate::asset_repository::PayloadCas::new(f.directory_b.path()).unwrap().stat_object(&small[0]).unwrap().is_none());
             assert_eq!(super::super::lww_residency::packed_source(f.directory_b.path(),&small[0]).unwrap().unwrap().packs,saved.packs,"frozen backup custody never switches its saved source identity");
             let root=f.directory_b.path().to_path_buf();let hash=small[0].clone();
@@ -1396,6 +1404,7 @@ pub(super) mod tests {
             }).await.unwrap();
             let refreshed=super::super::lww_residency::packed_source(f.directory_b.path(),&small[0]).unwrap().unwrap();
             assert_eq!(refreshed.protected_snapshot,id);assert_ne!(refreshed.packs[0].header.object_id,old_pack);
+            assert_eq!(received,refreshed.packs.iter().map(|pack|pack.ciphertext_length).sum::<u64>());
         });
     }
     fn validate_generic_body(object:&RemoteObject,repository:&RepositoryHandle)->Result<()> {object.stored(repository).map(|_|())}
