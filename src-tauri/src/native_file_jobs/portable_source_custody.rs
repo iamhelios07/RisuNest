@@ -481,7 +481,7 @@ pub(crate) fn cleanup_orphans(app: &tauri::AppHandle) -> Result<InterruptedSourc
     {
         use tauri_plugin_ios_native::IosNativeExt;
         let retired = app.ios_native().portable_source_orphans()
-            .map_err(|_| error("Source owner reset could not be confirmed"))?;
+            .map_err(|_| NativeJobError::new("cleanup-failed", "Source cleanup could not be confirmed"))?;
         Ok(cleanup_orphan_receipts(retired.into_iter().map(|source| (source.token, source.name)), |token| {
             app.ios_native().acknowledge_portable_source_orphan(token)
                 .map_err(|_| error("Source orphan cleanup acknowledgement is unavailable"))
