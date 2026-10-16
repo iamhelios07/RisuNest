@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
+import { get } from 'svelte/store'
 import type { PlatformShape } from 'src/ts/platform.testSupport'
 import type { createNativeJobHost } from 'src/ts/storage/nativeFileJobs.testSupport'
 
@@ -20,6 +21,9 @@ vi.mock('@tauri-apps/api/core', async (original) => ({
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: async () => 'C:\\synthetic\\library.risudat', save: vi.fn() }))
 vi.mock('@tauri-apps/plugin-fs', () => ({ stat: async () => ({ size: 128 }) }))
 vi.mock('@tauri-apps/plugin-os', () => ({ platform: () => 'windows' }))
+vi.mock('src/ts/storage/deviceBackup/selectionDialog', () => ({
+    selectPortableBackupRestore: async () => ({library:true, deviceSections:['hypa','local-plugins','local-settings']}),
+}))
 vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => h.platform))
 vi.mock('src/ts/alert', () => ({ alertConfirm: h.confirm, alertCheckboxConfirm: h.checkbox, alertActionConfirm: vi.fn(), alertError: h.error, alertNormal: vi.fn(), openRisuAccountLogin: vi.fn() }))
 // The browser file picker hands over the chosen RisuSave.
@@ -56,12 +60,14 @@ vi.mock('src/lib/Setting/ExternalStorage/ConnectionForm.svelte', () => ({ defaul
 vi.mock('src/lib/Others/Onboarding/onboardingWeave', () => ({ observeOnboardingWeave: () => () => {} }))
 import { language } from 'src/lang'
 import type { Database } from 'src/ts/storage/database.svelte'
-import { dismissNativeFileOperationOutcome } from 'src/ts/storage/nativeFileJobManager'
+import { dismissNativeFileOperationOutcome, nativeFileOperationOutcome } from 'src/ts/storage/nativeFileJobManager'
 import { createNativeJobHost as jobHost, restoreRuntime, status } from 'src/ts/storage/nativeFileJobs.testSupport'
 import { capturePersistentRoot, createPersistentDataRuntime } from 'src/ts/storage/persistentDataRuntime'
 import { encodeRisuSaveLegacy } from 'src/ts/storage/risuSave'
 import { createPersistentStoreHarness } from '../../../../tests/support/persistentStoreHarness'
 import Onboarding from './Onboarding.svelte'
+import { onboardingHold } from './onboardingGate'
+import { retryCommittedWorkingSetRefreshWithContinuation } from 'src/ts/storage/committedWorkingSetContinuation'
 
 const library = (username: string, characterId: string) => ({
     username,
@@ -103,6 +109,105 @@ async function chooseImport() {
 }
 
 const asked = () => h.checkbox.mock.calls.length + h.confirm.mock.calls.length > 0
+
+it.each([
+    ['block-risu-save', 'refresh'], ['block-risu-save', 'lost-ack'], ['block-risu-save', 'unchanged'],
+    ['portable', 'refresh'], ['portable', 'lost-ack'], ['portable', 'bodies'],
+] as const)('recovers the original %s onboarding import after %s without activating twice', async (format, failure) => {
+    h.platform = {runtime: 'tauri', os: 'windows'}
+    let database = library('Existing', 'existing')
+    const storage = await createPersistentStoreHarness(database)
+    let refreshFails = false
+    const runtime = createPersistentDataRuntime({
+        store: storage.store,
+        state: {
+            captureRoot: () => capturePersistentRoot(database), capturePresets: () => database.botPresets,
+            captureSelectedCharacter: () => null, captureCharacter: id => database.characters.find(c => c.chaId === id) ?? null,
+            getSelectedCharacterId: () => undefined,
+            replaceDatabase: value => { database = structuredClone(value) },
+            publishCharacter: vi.fn(), publishConversation: vi.fn(),
+        },
+        prepareDatabase: async value => { if (refreshFails) throw Error('Synthetic refresh failure'); return value },
+        prepareRoot: async value => { if (refreshFails) throw Error('Synthetic refresh failure'); return value },
+    })
+    await runtime.initializeActiveWorkingSet(database)
+    h.runtime = runtime
+    let activated = false
+    let resolved = false
+    let selected = false, adopted = false, bodiesRetried = false
+    let result = {revision: storage.revision + 1, sourceBytes: 128, sourceFingerprintKind: format === 'portable' ? 'portable-catalog-sha256' as const : 'whole-file-sha256' as const,
+        sourceSha256: 'c'.repeat(64), characterCount: 1, presetCount: 0, warningCodes: []}
+    h.host = jobHost([], {
+        native_backup_source_format: format,
+        native_file_job_status: () => {
+            const kind = format === 'portable' ? 'restore-portable-backup' : 'restore-block-risu-save'
+            if (format === 'portable' && !selected) return {...status('waitingForInput'), kind, phase:'awaiting-backup-selection',
+                restorePreview:{libraryIncluded:true, repairRequired:false, deviceSections:['hypa','local-plugins','local-settings']}}
+            if (!activated) return {...status('waitingForInput'), kind, phase: 'awaiting-activation'}
+            if (!resolved && (failure === 'lost-ack' || failure === 'unchanged')) throw {code: 'activation-outcome-unresolved', message: 'Synthetic pending receipt'}
+            if (format === 'portable') {
+                const pending = failure === 'bodies' && !bodiesRetried
+                return {...status(!adopted ? 'running' : pending ? 'failed' : 'succeeded', adopted && !pending ? result : undefined), kind,
+                    phase: adopted ? 'complete' : 'activating-database', activationRevision:result.revision, activationAuthority:'1',
+                    deviceSessionId:'synthetic-device', restoreAdoptionConfirmed:adopted,
+                    portableBodyRetry:{pending, available:pending, sourceRequired:false, stagingId:'synthetic-stage', catalogSha256:'c'.repeat(64)},
+                }
+            }
+            return failure === 'unchanged' ? status('cancelled') : status('succeeded', result)
+        },
+        native_portable_select_sections: () => { selected = true },
+        native_device_backup_recovery_complete: () => {},
+        pds_open: () => ({revision:result.revision}),
+        native_portable_confirm_restore_adoption: () => { adopted = true },
+        native_portable_retry_restore_bodies: () => { bodiesRetried = true },
+        native_file_job_finalize: async () => {
+            activated = true
+            if (failure !== 'unchanged') {
+                result = {...result, revision: (await storage.store.replaceFromDatabase(library('Restored', 'restored'))).revision}
+            }
+            refreshFails = failure === 'refresh' || failure === 'bodies'
+        },
+    })
+    await chooseImport()
+    await vi.waitFor(() => expect(get(nativeFileOperationOutcome)?.error?.recoveryRequired).toBe(true))
+    await tick()
+    expect(h.error).not.toHaveBeenCalled()
+    expect(get(onboardingHold)).toBe(true)
+    expect([...target.querySelectorAll('button')].some(b => b.textContent?.trim() === language.risuNest.importDialog.close)).toBe(false)
+    if (failure === 'lost-ack' || failure === 'unchanged') {
+        await runtime.retryCommittedWorkingSetRefresh().catch(() => {})
+        expect(() => runtime.assertPersistentMutationAllowed()).toThrow()
+        expect(get(onboardingHold)).toBe(true)
+    }
+    resolved = true
+    refreshFails = false
+    await retryCommittedWorkingSetRefreshWithContinuation(runtime)
+    await tick()
+    if (failure === 'bodies') {
+        expect(get(onboardingHold)).toBe(true)
+        expect(get(nativeFileOperationOutcome)?.status?.portableBodyRetry?.pending).toBe(true)
+        const retry = [...target.querySelectorAll('button')].find(b => b.textContent?.trim() === language.retry)
+        expect(retry).toBeDefined()
+        retry!.click()
+        await vi.waitFor(() => expect(get(onboardingHold)).toBe(false))
+        await tick()
+    }
+    if (failure === 'unchanged') {
+        expect(get(onboardingHold)).toBe(true)
+        expect(get(nativeFileOperationOutcome)?.state).toBe('cancelled')
+        expect(get(nativeFileOperationOutcome)?.error?.recoveryRequired).toBe(false)
+        expect(database.username).toBe('Existing')
+        expect(h.state.db.didFirstSetup).not.toBe(true)
+    } else {
+        expect(get(onboardingHold)).toBe(false)
+        expect(target.textContent).toContain(language.risuNest.onboarding.done.title)
+        expect(database.username).toBe('Restored')
+        expect(get(nativeFileOperationOutcome)).toBeNull()
+        expect(() => runtime.assertPersistentMutationAllowed()).not.toThrow()
+    }
+    expect(h.host.commands().filter(c => c === 'native_file_job_start')).toHaveLength(1)
+    expect(h.host.commands().filter(c => c === 'native_file_job_finalize')).toHaveLength(1)
+})
 
 it('restores a backup picked during onboarding over a library with characters without asking', async () => {
     h.platform = { runtime: 'tauri', os: 'windows' }

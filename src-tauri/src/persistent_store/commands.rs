@@ -405,6 +405,17 @@ pub(crate) fn with_store<T>(
     with_store_mutex(&state, operation)
 }
 
+pub(crate) fn with_store_if_ready<T>(
+    state: &PersistentStoreState,
+    operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
+) -> StoreResult<Option<T>> {
+    let Some(_guard) = state.try_admit_renderer_operation()? else { return Ok(None); };
+    let store = state.store.lock().map_err(|error| StoreError::Store {
+        message: format!("persistent store mutex poisoned: {error}"),
+    })?;
+    store.as_ref().map(operation).transpose()
+}
+
 fn with_store_mutex<T>(
     state: &PersistentStoreState,
     operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,

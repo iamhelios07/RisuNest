@@ -98,6 +98,14 @@ export const languageEnglish = {
         restored: 'Selected backup areas restored.',
     
         "invalidInlaysConfirm": (count: number) => `Damaged inlay entries (${count}) will not be restored. Continue restoring?`,
+        omittedRestoreData: {
+            data: (count: number) => `Unsupported saved data (${count}) will not be restored.`,
+            remote: (count: number) => `Data stored outside this backup (${count}) will not be restored.`,
+            missing: (count: number) => `Missing saved data (${count}) will not be restored.`,
+            values: (count: number) => `Unsupported saved values (${count}) will not be restored.`,
+            pluginStorage: (count: number) => `Unsupported plugin storage (${count}) will not be restored.`,
+            inlays: (count: number) => `Unsupported inlay entries (${count}) will not be restored.`,
+        },
         "recovery": {
             "dismiss": 'Dismiss attempt',
             "later": 'Keep for later',
@@ -2778,6 +2786,9 @@ export const languageEnglish = {
             stagePreparingAttachments: 'Preparing attachments',
             stageReadingDatabase: 'Reading database',
             stageDecodingDatabase: 'Decoding database',
+            stageRequestingBackupKey: 'Requesting the backup key',
+            stageDecryptingDatabase: 'Decrypting the backup',
+            stageCleaningUp: 'Data restored. Removing temporary files',
             stageFinalizingStaging: 'Saving settings and presets',
             stageAssignPluginValues: 'Assign plugin values',
             stageActivating: 'Applying data',
@@ -2811,6 +2822,7 @@ export const languageEnglish = {
             resultFailed: 'Import failed. Your existing data is unchanged.',
             resultFailedAfterCommit:
                 'The data was imported, but the screen could not be refreshed. Select Refresh screen before making more changes.',
+            resultActivationUnresolved: 'The restore result could not be confirmed. Select Refresh screen to check it before making more changes.',
             errorDetails: 'Error details',
             errorDetailsHide: 'Hide error details',
             copyDetails: 'Copy',

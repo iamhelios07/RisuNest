@@ -746,20 +746,6 @@ fn legacy_restore_rejects_what_the_whole_value_decoder_rejects() {
         ("string characters", characters(text("characters"))),
         ("undefined characters", characters(undefined())),
         (
-            "binary in a character",
-            characters(MessagePackValue::Array(vec![MessagePackValue::Map(vec![
-                entry("chaId", text("binary")),
-                entry("data", MessagePackValue::Binary(vec![1, 2, 3])),
-            ])])),
-        ),
-        (
-            "unknown extension in a character",
-            characters(MessagePackValue::Array(vec![MessagePackValue::Map(vec![
-                entry("chaId", text("extension")),
-                entry("data", MessagePackValue::Ext(42, vec![1])),
-            ])])),
-        ),
-        (
             "invalid timestamp in a character",
             characters(MessagePackValue::Array(vec![MessagePackValue::Map(vec![
                 entry("chaId", text("timestamp")),
@@ -808,13 +794,6 @@ fn legacy_restore_rejects_what_the_whole_value_decoder_rejects() {
             root_bytes(vec![
                 entry("characters", MessagePackValue::Array(vec![character.clone()])),
                 entry("modules", text("modules")),
-            ]),
-        ),
-        (
-            "unknown extension in another root entry",
-            root_bytes(vec![
-                entry("characters", MessagePackValue::Array(vec![character.clone()])),
-                entry("other", MessagePackValue::Ext(42, vec![1])),
             ]),
         ),
         ("array root", messagepack_bytes(&MessagePackValue::Array(vec![character.clone()]))),
@@ -1182,7 +1161,7 @@ fn reference_decode_messagepack<'a, R: Read>(
     if read != 0 {
         return Err(corrupt("trailing data after legacy MessagePack value"));
     }
-    let value = match messagepack_to_json(packed)? {
+    let value = match messagepack_to_json(packed, job)? {
         JsonSlot::Value(value) => value,
         JsonSlot::Undefined => {
             return Err(invalid("legacy MessagePack database cannot be undefined"))

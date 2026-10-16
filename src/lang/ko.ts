@@ -95,6 +95,14 @@ export const languageKorean = {
         restored: '선택한 백업 영역을 복원했습니다.',
     
         "invalidInlaysConfirm": (count: number) => `손상된 인레이 ${count}개는 복원되지 않습니다. 계속 복원하시겠습니까?`,
+        omittedRestoreData: {
+            data: (count: number) => `지원하지 않는 저장 데이터 ${count}개는 복원되지 않습니다.`,
+            remote: (count: number) => `백업 외부에 저장된 데이터 ${count}개는 복원되지 않습니다.`,
+            missing: (count: number) => `백업에 없는 저장 데이터 ${count}개는 복원되지 않습니다.`,
+            values: (count: number) => `지원하지 않는 저장 값 ${count}개는 복원되지 않습니다.`,
+            pluginStorage: (count: number) => `지원하지 않는 플러그인 저장 데이터 ${count}개는 복원되지 않습니다.`,
+            inlays: (count: number) => `지원하지 않는 인레이 ${count}개는 복원되지 않습니다.`,
+        },
         "recovery": {
             "dismiss": '기록 삭제',
             "later": '나중에 확인',
@@ -2592,6 +2600,9 @@ export const languageKorean = {
             stagePreparingAttachments: '첨부 파일 준비 중',
             stageReadingDatabase: '데이터베이스 읽는 중',
             stageDecodingDatabase: '데이터베이스 해석 중',
+            stageRequestingBackupKey: '백업 키 요청 중',
+            stageDecryptingDatabase: '백업 암호 해제 중',
+            stageCleaningUp: '복원 완료, 임시 파일 정리 중',
             stageFinalizingStaging: '설정과 프리셋 저장 중',
             stageAssignPluginValues: '플러그인 값 할당',
             stageActivating: '데이터 적용 중',
@@ -2625,6 +2636,7 @@ export const languageKorean = {
                 '가져오기에 실패했습니다. 기존 데이터는 그대로입니다.',
             resultFailedAfterCommit:
                 '데이터는 가져왔지만 화면을 새로 고치지 못했습니다. 다른 변경을 하기 전에 화면 새로 고침을 선택해주세요.',
+            resultActivationUnresolved: '복원 결과를 확인하지 못했습니다. 다른 변경을 하기 전에 화면 새로 고침을 선택해 결과를 확인해주세요.',
             errorDetails: '오류 상세',
             errorDetailsHide: '오류 상세 숨기기',
             copyDetails: '복사',

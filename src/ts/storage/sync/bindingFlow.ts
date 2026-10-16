@@ -30,6 +30,8 @@ export interface BindingContext {
     state: SyncBindingState
     signal: AbortSignal
     mode?: BindingMode
+    /** Reattach the transport without restarting automatic work after a restore. */
+    holdAutomaticSync?: boolean
 }
 export interface NewDeviceBindingPreparation {
     authorizationId: string

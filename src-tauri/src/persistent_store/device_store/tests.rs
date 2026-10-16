@@ -811,6 +811,7 @@ fn device_settings_accept_only_the_assigned_keys() {
             "official-account.association.v1",
             "official-account.asset-ledger.v1",
             "sync-conflict-backups.index.v1",
+            "native-file-restore-receipts.v1",
         ]
     );
 
@@ -1466,6 +1467,7 @@ mod section_exchange {
             "official-account.association.v1",
             "official-account.asset-ledger.v1",
             "sync-conflict-backups.index.v1",
+            "native-file-restore-receipts.v1",
             "risuNestServerSyncRestoreHold",
             "risu_lastsaved",
             "risuNestDefaultPluginsAttempted",

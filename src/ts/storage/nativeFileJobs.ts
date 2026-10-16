@@ -1,4 +1,5 @@
 import type { ExportExclusions } from './exportExcludedReport'
+import { nativeRestoreDeadline, NativeRestoreControlTimeout, type NativeRestoreClock } from './nativeRestoreDeadline'
 import { exportIOSFile } from './iosFiles'
 import { MAX_CONTENT_METADATA_BYTES } from './contentImportLimits'
 import { invoke } from '@tauri-apps/api/core'
@@ -32,6 +33,7 @@ export type NativeFileJobSource =
     | { type: 'androidSpool'; token: string }
     | { type: 'androidSeekable'; token: string }
     | { type: 'iosScoped'; token: string }
+    | { type: 'savedConflict'; token: string }
 
 export type NativeFileJobState =
     | 'queued'
@@ -235,6 +237,8 @@ export interface NativeSnapshotBodiesStarted {
 
 export type NativeFileJobStage =
     | 'reading-archive'
+    | 'requesting-backup-key'
+    | 'decrypting-database'
     | 'preparing-attachments'
     | 'reading-database'
     | 'decoding-database'
@@ -242,6 +246,7 @@ export type NativeFileJobStage =
     | 'assign-plugin-values'
     | 'awaiting-activation'
     | 'activating'
+    | 'cleaning-up'
     | 'copying-assets'
     | 'copying-source'
     | 'refreshing-app'
@@ -297,6 +302,7 @@ export function resolveNativeFileJobStage(
     format?: NativeFileOperationFormat,
 ): NativeFileJobStage | null {
     if (status.phase === 'copying-missing-bodies') return 'copying-assets'
+    if (status.phase === 'cleaning-up') return 'cleaning-up'
     // The assignment pass happens inside the activation wait, so it is named
     // before the wait's own stage.
     if (status.phase === 'awaiting-activation' && status.pluginValuePreview?.values.length) {
@@ -467,6 +473,7 @@ export interface NativeFileJobStatus {
         | 'awaiting-activation'
         | 'activating-database'
         | 'copying-missing-bodies'
+        | 'cleaning-up'
         | 'writing-export'
         | 'uploading-database'
         | 'awaiting-publication-retry'
@@ -580,11 +587,14 @@ export interface NativeIncompleteRestorePreview {
     unavailableColdKeys: string[]
     characterNames: string[]
     invalidInlays: string[]
+    omissions?: Partial<Record<'data' | 'remote' | 'missing' | 'values' | 'pluginStorage' | 'inlays', number>>
 }
 
 export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
+    confirmationWarnings?: string[]
     /** The restore began as an onboarding import; an unbound device needs no overwrite acknowledgement. */
     firstRun?: boolean
+    holdServerSyncAfterRestore?: boolean
     /** Runs after staging and before taking the destructive replacement fence. */
     beforeActivation?(): void | Promise<void>
     /**
@@ -600,6 +610,8 @@ export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
     afterRefresh?(pluginsAlreadyRestarted?: boolean): void | Promise<void>
     onBlockingChange?(blocking: boolean): void
     afterPortableAdoption?(status: NativeFileJobStatus): Promise<void>
+    /** Updates the original operation after read-only activation recovery. */
+    onRecoveredStatus?(status: NativeFileJobStatus): void
     /** Runs last when the app recovers a committed restore whose refresh failed. */
     afterCommittedRecovery?(jobId: string): Promise<void>
 }
@@ -649,6 +661,7 @@ export type NativeBackupDestination =
 export type NativeLegacyLocalBackupDestination = NativeBackupDestination
 
 export interface NativeFileJobDependencies {
+    restoreClock?: NativeRestoreClock
     isTauri(): boolean
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
     wait(milliseconds: number): Promise<void>
@@ -704,6 +717,13 @@ export class NativeFileJobActivationCommittedError extends NativeFileJobError {
             `Native restore committed revision ${committedRevision}, but the active app state could not be fully refreshed`,
         )
         this.name = 'NativeFileJobActivationCommittedError'
+    }
+}
+
+export class NativeFileJobActivationUnresolvedError extends NativeFileJobError {
+    readonly recoveryRequired = true
+    constructor(readonly cause: unknown) {
+        super('activation-outcome-unresolved', 'Backup activation must be checked before continuing')
     }
 }
 
@@ -1288,6 +1308,19 @@ async function runNativeReplacementRestore(
     } = {},
     dependencies: NativeFileJobDependencies = productionDependencies,
 ): Promise<NativeFileJobResult> {
+    const originalDependencies = dependencies
+    const bounded = <T>(work: Promise<T>, operation: string, lateResult?: (value: T) => void | Promise<void>): Promise<T> =>
+        nativeRestoreDeadline(work, operation, originalDependencies.restoreClock, lateResult)
+    dependencies = {
+        ...originalDependencies,
+        invoke: (command, args) => nativeRestoreDeadline(
+            originalDependencies.invoke(command, args), command, originalDependencies.restoreClock,
+            command === 'native_file_job_start' ? async value => {
+                const id = (value as { jobId?: string })?.jobId
+                if (id) await bounded(originalDependencies.invoke('native_file_job_cancel', { jobId: id }), 'late start cancellation')
+            } : undefined,
+        ),
+    }
     const operation =
         kind === 'restore-official-account-snapshot'
             ? 'Native official account snapshot restore'
@@ -1303,9 +1336,9 @@ async function runNativeReplacementRestore(
         await abortBeforeNativeRestoreStart(source, dependencies)
     }
 
-    const mutationToken = await runtime.capturePersistentMutationToken(
+    const mutationToken = await bounded(runtime.capturePersistentMutationToken(
         mutationReason, { publishOfficial: false },
-    )
+    ), 'mutation flush')
     if (options.signal?.aborted) {
         await abortBeforeNativeRestoreStart(source, dependencies)
     }
@@ -1338,6 +1371,8 @@ async function runNativeReplacementRestore(
     let portableSelectionMade =
         kind !== 'restore-portable-backup'
     let terminal: NativeFileJobStatus | undefined
+    let observedStatus: NativeFileJobStatus | undefined
+    let activationUnresolved = false
     let mutationConflict: NativeFileJobError | undefined
     let upstreamPause: Awaited<ReturnType<typeof import('./upstreamReplacement')['acquireUpstreamImportPause']>> | undefined
     let upstreamBinding: Awaited<ReturnType<typeof import('./sync/bindingRegistry')['prepareBoundLibraryReplacement']>> | undefined
@@ -1376,7 +1411,7 @@ async function runNativeReplacementRestore(
         const opened=await invokeNative(dependencies,'pds_open') as {revision?:unknown}
         if (!Number.isSafeInteger(opened?.revision)||(opened.revision as number)<status.activationRevision!) throw new NativeFileJobError('invalid-activation-receipt','Persistent store opened before portable activation')
         const {refreshDeviceStateAfterRestore}=await import('./deviceStateRestore')
-        await refreshDeviceStateAfterRestore()
+        await bounded(refreshDeviceStateAfterRestore(), 'device settings refresh')
     }
     try {
         while (!terminal) {
@@ -1393,10 +1428,11 @@ async function runNativeReplacementRestore(
                     jobId: started.jobId,
                 },
             )) as NativeFileJobStatus
+            observedStatus = status
             if (['succeeded', 'failed', 'cancelled'].includes(status.state))
                 terminal = status
             try {
-                await options.onNativeStatus?.(status)
+                await bounded(Promise.resolve(options.onNativeStatus?.(status)), 'status follow-up')
                 options.onStatus?.(status)
             } catch (error) {
                 if (status.state === 'succeeded' && status.result)
@@ -1498,38 +1534,53 @@ async function runNativeReplacementRestore(
                     startUiBlocking()
                     {
                         const {prepareBoundLibraryReplacement} = await import('./sync/bindingRegistry')
-                        upstreamBinding = await prepareBoundLibraryReplacement()
+                        upstreamBinding = await prepareBoundLibraryReplacement({control: bounded})
                         const {acquireUpstreamImportPause, confirmUpstreamLibraryReplacement} = await import('./upstreamReplacement')
                         const {language} = await import('../../lang')
-                        const warnings: string[] = []
+                        const warnings: string[] = [...(options.confirmationWarnings ?? [])]
                         if (kind === 'restore-official-account-snapshot') warnings.push(language.risuNest.backup.officialRestoreInlayWarning)
                         const preview = status.incompleteRestorePreview
                         if (preview?.unavailableColdKeys.length) warnings.push(language.errors.coldStorageIncompleteRestoreConfirm(preview.characterNames.join(', '), preview.unavailableColdKeys.length, 0))
                         if (preview?.invalidInlays.length) warnings.push(language.portableBackup.invalidInlaysConfirm(preview.invalidInlays.length))
+                        if (preview?.omissions) {
+                            for (const key of ['data', 'remote', 'missing', 'values', 'pluginStorage', 'inlays'] as const) {
+                                const count = preview.omissions[key] ?? 0
+                                if (count > 0) warnings.push(language.portableBackup.omittedRestoreData[key](count))
+                            }
+                        }
                         if (!(await confirmUpstreamLibraryReplacement(upstreamBinding.bound, warnings, options))) {
                             cancellationRequested = true
                             await invokeNative(dependencies, 'native_file_job_cancel', {jobId:started.jobId})
                             continue
                         }
-                        await upstreamBinding.fence()
+                        const binding = upstreamBinding
+                        try {
+                            await binding.fence()
+                        } catch (error) {
+                            await binding.resume().catch(() => {})
+                            throw error
+                        }
                         upstreamFenced = true
                         const plugins = await import('../plugins/apiV3/v3.svelte')
-                        await plugins.fencePluginExecutionForAuthorityReplacement()
+                        const pluginPreparation = new AbortController()
+                        try { await bounded(plugins.fencePluginExecutionForAuthorityReplacement(pluginPreparation.signal), 'plugin preparation') }
+                        catch (error) { pluginPreparation.abort(); throw error }
                         if (kind==='restore-portable-backup') {
                             const {flushDeviceStateBeforeRestore}=await import('./deviceStateRestore')
-                            await flushDeviceStateBeforeRestore()
+                            await bounded(flushDeviceStateBeforeRestore(), 'device settings flush')
                         }
-                        await options.beforeActivation?.()
-                        upstreamPause = await acquireUpstreamImportPause(runtime, `${mutationReason}-activation`)
+                        await bounded(Promise.resolve(options.beforeActivation?.()), 'preparation follow-up')
+                        upstreamPause = await bounded(acquireUpstreamImportPause(runtime, `${mutationReason}-activation`), 'write pause acquisition',
+                            pause => bounded(pause.abortUnchanged(() => bounded(binding.assertAuthority(), 'binding verification')), 'late write pause release'))
                         replacementFence = upstreamPause.fence
-                        await upstreamBinding.assertAuthority()
+                        await bounded(upstreamBinding.assertAuthority(), 'binding verification')
                     }
                 } catch (error) {
                     mutationConflict =
                         error instanceof NativeFileJobError
                             ? error
                             : new NativeFileJobError(
-                                  isSyncUnavailable(error) ? 'sync-unavailable' : 'revision-conflict',
+                                  error instanceof NativeRestoreControlTimeout ? error.code : isSyncUnavailable(error) ? 'sync-unavailable' : 'revision-conflict',
                                   error instanceof Error
                                       ? error.message
                                       : String(error),
@@ -1552,9 +1603,10 @@ async function runNativeReplacementRestore(
                 if (upstreamPause) {
                     runtime.setActivatedLibraryRecoveryLifecycle(upstreamPause.token, {
                         async beforeRefresh() {
-                            await upstreamBinding!.assertAuthority()
+                            await bounded(upstreamBinding!.assertAuthority(), 'binding verification')
                             if (!terminal || !['succeeded', 'failed', 'cancelled'].includes(terminal.state)) {
                                 terminal = await invokeNative(dependencies, 'native_file_job_status', {jobId: started.jobId}) as NativeFileJobStatus
+                                await bounded(Promise.resolve(options.onNativeStatus?.(terminal)), 'status follow-up')
                             }
                             if (kind === 'restore-portable-backup') {
                                 if (!Number.isSafeInteger(terminal.activationRevision)) throw new NativeFileJobError('invalid-activation-receipt','Portable activation receipt is unavailable')
@@ -1566,14 +1618,14 @@ async function runNativeReplacementRestore(
                                 if (!terminal.result) throw new Error('Native activation result is unavailable')
                                 return terminal.result.revision
                             }
-                            const current = await runtime.store.readRoot()
+                            const current = await bounded(runtime.store.readRoot(), 'activation revision check')
                             if (current.revision !== upstreamPause!.fence.revision) throw new Error('Failed native activation changed the library')
                             return current.revision
                         },
                         async afterRefresh() {
                             const plugins = await import('../plugins/apiV3/v3.svelte')
-                            await plugins.invalidatePluginCachesAfterAuthorityReplacement()
-                            await plugins.restartPluginsAfterAuthorityReplacement()
+                            await bounded(plugins.invalidatePluginCachesAfterAuthorityReplacement(), 'plugin cache refresh')
+                            await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
                             if (kind === 'restore-portable-backup') await confirmPortableAdoption(terminal!)
                         },
                     })
@@ -1605,17 +1657,17 @@ async function runNativeReplacementRestore(
                 }
                 terminal = status
                 try {await preparePortableDeviceReceipt(status)} catch(error) {throw new NativeFileJobActivationCommittedError(status.activationRevision,error)}
-                await replacementFence.refreshCommittedWorkingSet(status.activationRevision)
+                await bounded(replacementFence.refreshCommittedWorkingSet(status.activationRevision), 'working set refresh')
                 const plugins = await import('../plugins/apiV3/v3.svelte')
-                await plugins.invalidatePluginCachesAfterAuthorityReplacement()
-                await plugins.restartPluginsAfterAuthorityReplacement()
+                await bounded(plugins.invalidatePluginCachesAfterAuthorityReplacement(), 'plugin cache refresh')
+                await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
                 await confirmPortableAdoption(status)
                 upstreamPause.complete()
-                await upstreamPause.finish()
+                await bounded(upstreamPause.finish(), 'write pause release')
                 portableAdoptedRevision = status.activationRevision
                 replacementFence = undefined
-                await upstreamBinding!.resume()
-                await options.afterPortableAdoption?.(status)
+                await bounded(upstreamBinding!.resume({holdAutomaticSync: options.holdServerSyncAfterRestore}), 'binding resume')
+                await bounded(Promise.resolve(options.afterPortableAdoption?.(status)), 'portable adoption follow-up')
                 uiBlocking = false
                 options.onBlockingChange?.(false)
                 terminal = undefined
@@ -1657,14 +1709,14 @@ async function runNativeReplacementRestore(
                     options.onStatus?.(
                         syntheticNativeFileJobStatus(terminal, 'reloading-plugins'),
                     )
-                    await options.afterRefresh?.(upstreamPause ? true : undefined)
+                    await bounded(Promise.resolve(options.afterRefresh?.(upstreamPause ? true : undefined)), 'restore follow-up')
                 } catch {
                     committedResult.warningCodes = mergeWarningCodes(
                         committedResult.warningCodes, ['post-refresh-followup-failed'],
                     )
                 }
                 try {
-                    await beforeForget?.()
+                    await bounded(Promise.resolve(beforeForget?.()), 'recovery acknowledgement')
                 } finally {
                     try {
                         await invokeNative(dependencies, 'native_file_job_forget', {
@@ -1688,16 +1740,14 @@ async function runNativeReplacementRestore(
                 options.onStatus?.(
                     syntheticNativeFileJobStatus(terminal, 'refreshing-app'),
                 )
-                const outcome = await replacementFence.refreshCommittedWorkingSet(
-                    terminal.result.revision,
-                )
+                const outcome = await bounded(replacementFence.refreshCommittedWorkingSet(terminal.result.revision), 'working set refresh')
                 if (upstreamPause) {
                     const plugins = await import('../plugins/apiV3/v3.svelte')
-                    await plugins.invalidatePluginCachesAfterAuthorityReplacement()
-                    await plugins.restartPluginsAfterAuthorityReplacement()
+                    await bounded(plugins.invalidatePluginCachesAfterAuthorityReplacement(), 'plugin cache refresh')
+                    await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
                     upstreamPause.complete()
-                    await upstreamPause.finish()
-                    await upstreamBinding!.resume()
+                    await bounded(upstreamPause.finish(), 'write pause release')
+                    await bounded(upstreamBinding!.resume({holdAutomaticSync: options.holdServerSyncAfterRestore}), 'binding resume')
                 }
                 replacementFence.release()
                 replacementFence = undefined
@@ -1707,7 +1757,10 @@ async function runNativeReplacementRestore(
                         runtime,
                         runtime.getStorageAuthorityEpoch(),
                         () => continueAfterRefresh(
-                            options.afterCommittedRecovery && (() => options.afterCommittedRecovery!(started.jobId)),
+                            async () => {
+                                options.onRecoveredStatus?.(terminal!)
+                                await options.afterCommittedRecovery?.(started.jobId)
+                            },
                         ),
                     )
                     throw new Error('Committed native restore requires a read-only working-set refresh')
@@ -1741,16 +1794,42 @@ async function runNativeReplacementRestore(
         } catch {}
         throw error
     } catch (error) {
-        if (portableAdoptedRevision === undefined && upstreamPause && activationSubmitted && (!terminal || terminal.state === 'succeeded' || !['failed', 'cancelled'].includes(terminal.state))) {
-            const minimumRevision = terminal?.activationRevision ?? terminal?.result?.revision ?? upstreamPause.fence.revision
+        activationUnresolved = activationSubmitted && (!terminal || !['succeeded', 'failed', 'cancelled'].includes(terminal.state)
+            || (error instanceof NativeFileJobError && error.code === 'activation-outcome-unresolved'))
+        if (activationUnresolved) terminal = undefined
+        if (portableAdoptedRevision === undefined && upstreamPause && activationSubmitted && (activationUnresolved || terminal?.state === 'succeeded')) {
+            const minimumRevision = observedStatus?.activationRevision ?? terminal?.result?.revision ?? upstreamPause.fence.revision
             runtime.markCommittedWorkingSetRefreshRequired(minimumRevision, error)
             registerCommittedWorkingSetContinuation(minimumRevision, runtime, runtime.getStorageAuthorityEpoch(), async () => {
-                await upstreamBinding!.assertAuthority()
-                await upstreamBinding!.resume()
-                if (kind==='restore-portable-backup' && terminal) await options.afterPortableAdoption?.(terminal)
-                try { await options.afterRefresh?.(upstreamPause ? true : undefined) } catch {}
-                await options.afterCommittedRecovery?.(started.jobId)
-                try { await invokeNative(dependencies, 'native_file_job_forget', {jobId: started.jobId}) } catch {}
+                await bounded(upstreamBinding!.assertAuthority(), 'binding verification')
+                await bounded(upstreamBinding!.resume({holdAutomaticSync: terminal?.state === 'succeeded' && options.holdServerSyncAfterRestore}), 'binding resume')
+                if (kind==='restore-portable-backup' && terminal) await bounded(Promise.resolve(options.afterPortableAdoption?.(terminal)), 'portable recovery follow-up')
+                try { await bounded(Promise.resolve(options.afterRefresh?.(upstreamPause ? true : undefined)), 'restore follow-up') } catch {}
+                if (kind === 'restore-portable-backup') {
+                    const adopted = terminal!
+                    terminal = await pollNativeFileJobUntilTerminal(started.jobId, {
+                        onStatus: status => { if (!isTerminalJob(status)) options.onRecoveredStatus?.(status) },
+                        pollIntervalMs: options.pollIntervalMs,
+                    }, dependencies)
+                    if (terminal.jobId !== started.jobId || terminal.activationRevision !== adopted.activationRevision
+                        || terminal.activationAuthority !== adopted.activationAuthority || terminal.deviceSessionId !== adopted.deviceSessionId
+                        || terminal.restoreAdoptionConfirmed !== true
+                        || (terminal.state === 'succeeded' && terminal.result?.revision !== adopted.activationRevision)) {
+                        throw new NativeFileJobError('invalid-activation-receipt', 'Portable recovery completion differs from activation')
+                    }
+                    if (terminal.portableBodyRetry?.pending) {
+                        options.onRecoveredStatus?.(terminal)
+                        return
+                    }
+                }
+                if (!terminal) throw new Error('Native activation recovery is unavailable')
+                options.onRecoveredStatus?.(terminal)
+                if (terminal.state === 'succeeded') {
+                    await bounded(Promise.resolve(options.afterCommittedRecovery?.(started.jobId)), 'recovery follow-up')
+                }
+                if (!terminal.portableBodyRetry?.pending) {
+                    try { await invokeNative(dependencies, 'native_file_job_forget', {jobId: started.jobId}) } catch {}
+                }
             }, undefined, true)
         }
         if (!terminal && !activationSubmitted) {
@@ -1760,23 +1839,30 @@ async function runNativeReplacementRestore(
                 })
             } catch {}
         }
+        if (activationUnresolved) {
+            const revision = observedStatus?.activationRevision
+            if (revision !== undefined) throw new NativeFileJobActivationCommittedError(revision, error)
+            throw new NativeFileJobActivationUnresolvedError(error)
+        }
         throw error
     } finally {
         if (upstreamPause && portableAdoptedRevision === undefined) {
-            if (!activationSubmitted || terminal?.state === 'cancelled' || terminal?.state === 'failed') {
+            if (!activationUnresolved && (!activationSubmitted || terminal?.state === 'cancelled' || terminal?.state === 'failed')) {
                 try {
-                    await upstreamPause.abortUnchanged(async () => { await upstreamBinding?.assertAuthority() })
+                    const unchanged = await bounded(runtime.store.readRoot(), 'unchanged library check')
+                    if (unchanged.revision !== upstreamPause.fence.revision) throw new Error('Native restore changed the library')
                     const plugins = await import('../plugins/apiV3/v3.svelte')
-                    await plugins.restartPluginsAfterAuthorityReplacement()
-                    await upstreamBinding?.resume()
-                } catch { await upstreamPause.finish() }
-            } else await upstreamPause.finish()
+                    await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
+                    await bounded(upstreamPause.abortUnchanged(async () => { await bounded(Promise.resolve(upstreamBinding?.assertAuthority()), 'binding verification') }), 'unchanged restore recovery')
+                    await bounded(Promise.resolve(upstreamBinding?.resume()), 'binding resume')
+                } catch { await bounded(upstreamPause.finish(), 'write pause release').catch(() => {}) }
+            } else await bounded(upstreamPause.finish(), 'write pause release').catch(() => {})
         } else if (upstreamFenced && !activationSubmitted) {
             try {
-                await upstreamBinding!.assertAuthority()
                 const plugins = await import('../plugins/apiV3/v3.svelte')
-                await plugins.restartPluginsAfterAuthorityReplacement()
-                await upstreamBinding!.resume()
+                await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
+                await bounded(upstreamBinding!.assertAuthority(), 'binding verification')
+                await bounded(upstreamBinding!.resume(), 'binding resume')
             } catch {}
         }
         replacementFence?.release()
@@ -1928,6 +2014,10 @@ export async function runNativeSnapshotRestore(
             onStatus(status) {
                 activation = snapshotRestoreActivation(status) ?? activation
                 restoreOptions.onStatus?.(status)
+            },
+            onRecoveredStatus(status) {
+                activation = snapshotRestoreActivation(status) ?? activation
+                restoreOptions.onRecoveredStatus?.(status)
             },
             afterCommittedRecovery: afterActivationRecovery && (async jobId => {
                 await afterActivationRecovery(activation ?? receipt(

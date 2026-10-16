@@ -1,0 +1,12 @@
+{
+  "name": "native-backup-fixtures",
+  "private": true,
+  "type": "module",
+  "scripts": { "generate": "node generate.mjs" },
+  "dependencies": {
+    "@msgpack/msgpack": "3.0.0-beta2",
+    "msgpackr": "1.9.5",
+    "pako": "2.1.0",
+    "typescript": "5.9.3"
+  }
+}

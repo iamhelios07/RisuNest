@@ -20,12 +20,13 @@ function frame(name, bytes) {
   return result;
 }
 
-export async function measureEntryCount({ count, directory, evaluate, memory, save }) {
+export async function measureEntryCount({ count, directory, evaluate, memory, save, prepareSource = async file => file }) {
   assert.ok([20_000, 50_000, 100_000, 200_001].includes(count), 'Unknown entry-count case');
   const invoke = (command, args = {}) => evaluate(`globalThis.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)},${JSON.stringify(args)})`);
   const readyDeadline = Date.now() + 120_000;
   while (Date.now() < readyDeadline) {
-    const state = await evaluate('globalThis.__deviceBackupSmoke.state()');
+    const state = await evaluate('globalThis.__deviceBackupSmoke?.state() ?? null');
+    if (!state) { await pause(100); continue; }
     assert.ok(!state.failure, state.failure);
     if (state.stage === 'ready') break;
     await pause(100);
@@ -43,6 +44,7 @@ export async function measureEntryCount({ count, directory, evaluate, memory, sa
       await file.writeFile(Buffer.concat(frames));
     }
   } finally { await file.close(); }
+  const nativeSource = await prepareSource(source);
   const result = { schema: 'risunest.synthetic-legacy-entry-count/v1', synthetic: true, count,
     nameLength, bodyLength, totalNameBytes: count * nameLength + 16, phase: 'prepared' };
   const opened = await invoke('pds_open');
@@ -53,7 +55,7 @@ export async function measureEntryCount({ count, directory, evaluate, memory, sa
   result.rendererMaxBytes = before.usedBytes;
   const started = Date.now();
   const job = await invoke('native_file_job_start', { request: {
-    kind: 'restore-legacy-local-backup', source: { type: 'desktopPath', path: source }, expectedRevision: opened.revision,
+    kind: 'restore-legacy-local-backup', source: { type: 'desktopPath', path: nativeSource }, expectedRevision: opened.revision,
   } });
   let finalized = false;
   let status;
@@ -102,8 +104,9 @@ export async function measureEntryCount({ count, directory, evaluate, memory, sa
   const rootBefore = await invoke('pds_read_root');
   const damaged = path.join(directory, 'truncated.bin');
   await writeFile(damaged, Buffer.concat([frame('database.risudat', database), frame('truncated', Buffer.alloc(32)).subarray(0, 20)]));
+  const nativeDamaged = await prepareSource(damaged);
   const failed = await invoke('native_file_job_start', { request: {
-    kind: 'restore-legacy-local-backup', source: { type: 'desktopPath', path: damaged }, expectedRevision: rootBefore.revision,
+    kind: 'restore-legacy-local-backup', source: { type: 'desktopPath', path: nativeDamaged }, expectedRevision: rootBefore.revision,
   } });
   do {
     status = await invoke('native_file_job_status', { jobId: failed.jobId });

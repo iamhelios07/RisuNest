@@ -12,6 +12,7 @@ pub mod screenshot_output;
 
 mod backup_source;
 mod legacy_backup;
+mod restore_receipts;
 pub(crate) mod snapshot_bodies;
 mod snapshot_restore;
 #[cfg(test)]
@@ -129,6 +130,7 @@ pub(crate) enum JobSource {
     AndroidSpool { token: String },
     AndroidSeekable { token: String },
     IosScoped { token: String },
+    SavedConflict { token: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -535,7 +537,7 @@ pub(crate) fn open_job_source(
             let path = resolve_spool_source(job_root, token)?;
             open_regular_file_no_follow(&path)
         }
-        JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody requires its bounded probe or exact job claim")),
+        JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody requires its bounded probe or exact job claim")),
     }
 }
 
@@ -560,7 +562,7 @@ fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, Native
     match source {
         JobSource::DesktopPath { path } => resolve_desktop_source(path),
         JobSource::AndroidSpool { token } => resolve_spool_source(job_root, token),
-        JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody has no path authority")),
+        JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody has no path authority")),
     }
 }
 
@@ -1460,6 +1462,7 @@ impl NativeFileJobState {
                 expected_revision,
             } => {
                 let opened_source = match &source {
+                    JobSource::SavedConflict { .. } => None,
                     JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
                     JobSource::AndroidSpool { token } => {
                         parse_android_spool_token(token)?;
@@ -1521,7 +1524,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
+                    JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
                 };
                 let repository_root =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1600,7 +1603,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => { portable_source_custody::ensure_platform_source(&app, &source)?; None },
+                    JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => { portable_source_custody::ensure_platform_source(&app, &source)?; None },
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1801,7 +1804,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
+                    JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1969,7 +1972,7 @@ impl NativeFileJobState {
                 claim_spool_content_source(&self.root, token, &owned_directory, &display_name)
                     .map(|source| source.opened)
             }
-            JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody is not a content source")),
+            JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody is not a content source")),
         };
         let opened_source = match opened_source {
             Ok(source) => source,
@@ -2041,6 +2044,7 @@ impl NativeFileJobState {
             ));
         };
         let opened_source = match &source {
+            JobSource::SavedConflict { .. } => None,
             JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
             JobSource::AndroidSpool { token } => {
                 parse_android_spool_token(token)?;
@@ -2175,7 +2179,7 @@ impl NativeFileJobState {
                     *opened_source = Some(source.opened);
                     Ok(())
                 }
-                JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } if opened_source.is_none() => {
+                JobSource::SavedConflict { .. } | JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } if opened_source.is_none() => {
                     *opened_source = Some(portable_source_custody::claim(source, &job_id)?);
                     Ok(())
                 }
@@ -3097,6 +3101,13 @@ struct PersistentReplacementSink {
 }
 
 impl restore::ReplacementSink for PersistentReplacementSink {
+    fn prepare_activation_receipt(&self, staging_id: &str, job: &JobControl, result: &JobResultSummary) -> crate::persistent_store::StoreResult<Option<String>> {
+        crate::persistent_store::commands::with_store(self.app.state(), |store| restore_receipts::prepare(store, job, staging_id, result))
+    }
+
+    fn activation_receipt(&self, staging_id: &str, authority: &str) -> crate::persistent_store::StoreResult<Option<i64>> {
+        crate::persistent_store::commands::with_store(self.app.state(), |store| store.lww_file_restore_receipt(staging_id, staging_id, authority))
+    }
     fn begin(
         &self,
     ) -> crate::persistent_store::StoreResult<crate::persistent_store::StagingResult> {
@@ -3253,10 +3264,17 @@ pub(crate) fn native_file_job_start(
 
 #[tauri::command(async)]
 pub(crate) fn native_file_job_status(
+    app: AppHandle,
     state: State<'_, NativeFileJobState>,
     job_id: String,
 ) -> Result<JobStatus, NativeJobError> {
-    state.status_summary(&job_id)
+    let status = state.status_summary(&job_id);
+    if status.as_ref().is_err() || status.as_ref().is_ok_and(|status| matches!(status.kind, JobKind::RestoreBlockRisuSave | JobKind::RestoreLegacyLocalBackup) && status.state == JobState::Failed) {
+        crate::persistent_store::commands::with_store(app.state(), |store| restore_receipts::reconcile_job(store, &state.registry, &job_id))
+            .map_err(|error| NativeJobError::new("activation-outcome-unresolved", error.to_string()))?;
+        return state.status_summary(&job_id);
+    }
+    status
 }
 
 #[tauri::command(async)]
@@ -3300,9 +3318,14 @@ pub(crate) async fn native_file_job_stage_inline_asset(
 
 #[tauri::command(async)]
 pub(crate) fn native_file_job_list(
+    app: AppHandle,
     state: State<'_, NativeFileJobState>,
 ) -> Result<Vec<JobStatus>, NativeJobError> {
-    logged("native_file_job_list", state.list())
+    logged("native_file_job_list", (|| {
+        crate::persistent_store::commands::with_store_if_ready(&app.state(), |store| restore_receipts::reconcile(store, &state.registry))
+            .map_err(|error| NativeJobError::new("activation-outcome-unresolved", error.to_string()))?;
+        state.list()
+    })())
 }
 
 fn should_retry_snapshot_bodies(state: JobState, previous_job_id: Option<&str>) -> bool {
@@ -3479,13 +3502,27 @@ pub(crate) fn native_file_job_official_publication_retry(
 
 #[tauri::command(async)]
 pub(crate) fn native_file_job_forget(
+    app: AppHandle,
     state: State<'_, NativeFileJobState>,
     device: State<'_, crate::device_backup::DeviceBackupState>,
     job_id: String,
 ) -> Result<bool, NativeJobError> {
     logged("native_file_job_forget", (|| {
+        let status = state.status_summary(&job_id).ok();
+        if status.as_ref().is_some_and(|status| matches!(status.kind, JobKind::RestoreBlockRisuSave | JobKind::RestoreLegacyLocalBackup)) {
+            crate::persistent_store::commands::with_store(app.state(), |store| restore_receipts::reconcile_job(store, &state.registry, &job_id))
+                .map_err(|error| NativeJobError::new("activation-outcome-unresolved", error.to_string()))?;
+        } else if status.is_none() {
+            crate::persistent_store::commands::with_store_if_ready(&app.state(), |store| restore_receipts::reconcile_job(store, &state.registry, &job_id))
+                .map_err(|error| NativeJobError::new("activation-outcome-unresolved", error.to_string()))?;
+        }
+        let restore = state.status_summary(&job_id).is_ok_and(|status| matches!(status.kind, JobKind::RestoreBlockRisuSave | JobKind::RestoreLegacyLocalBackup));
         forget_device_session(&state, &device, &job_id)?;
-        state.forget(&job_id)
+        let forgotten = state.forget(&job_id)?;
+        if restore {
+            crate::persistent_store::commands::with_store(app.state(), |store| restore_receipts::forget(store, &job_id)).map_err(error::store_error)?;
+        }
+        Ok(forgotten)
     })())
 }
 
@@ -3626,6 +3663,7 @@ pub(crate) enum JobState {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobPhase {
+    CleaningUp,
     CopyingMissingBodies,
     AwaitingBackupSelection,
     Queued,
@@ -3659,12 +3697,15 @@ pub(crate) struct JobProgress {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobStage {
     ReadingArchive,
+    RequestingBackupKey,
+    DecryptingDatabase,
     PreparingAttachments,
     ReadingDatabase,
     DecodingDatabase,
     FinalizingStaging,
     AwaitingActivation,
     Activating,
+    CleaningUp,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -3953,6 +3994,18 @@ pub(crate) struct IncompleteRestorePreview {
     pub(crate) unavailable_cold_keys: Vec<String>,
     pub(crate) character_names: Vec<String>,
     pub(crate) invalid_inlays: Vec<String>,
+    pub(crate) omissions: RestoreOmissions,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RestoreOmissions {
+    pub(crate) data: u64,
+    pub(crate) remote: u64,
+    pub(crate) missing: u64,
+    pub(crate) values: u64,
+    pub(crate) plugin_storage: u64,
+    pub(crate) inlays: u64,
 }
 
 impl IncompleteRestorePreview {
@@ -3962,6 +4015,16 @@ impl IncompleteRestorePreview {
             warnings.push(format!("unavailable-cold-payloads:{}", self.unavailable_cold_keys.len()));
         }
         if !self.invalid_inlays.is_empty() { warnings.push("invalid-inlay-entry".to_owned()); }
+        for (kind, count) in [
+            ("skipped-backup-data", self.omissions.data),
+            ("remote-backup-data", self.omissions.remote),
+            ("missing-backup-data", self.omissions.missing),
+            ("skipped-backup-values", self.omissions.values),
+            ("skipped-plugin-storage", self.omissions.plugin_storage),
+            ("skipped-backup-inlays", self.omissions.inlays),
+        ] {
+            if count != 0 { warnings.push(format!("{kind}:{count}")); }
+        }
         warnings
     }
 }
@@ -4285,6 +4348,25 @@ pub(crate) struct JobControl {
 }
 
 impl JobControl {
+    pub(crate) fn publish_file_activation(&self, result: &JobResultSummary, authority: String) -> Result<(), String> {
+        let mut status = self.status.lock().map_err(|_| "native job mutex poisoned".to_owned())?;
+        if !matches!(status.kind, JobKind::RestoreBlockRisuSave | JobKind::RestoreLegacyLocalBackup)
+            || status.phase != JobPhase::ActivatingDatabase || status.state.is_terminal() {
+            return Err("invalid file restore activation receipt".into());
+        }
+        status.activation_revision = Some(result.revision);
+        status.activation_authority = Some(authority);
+        status.result = Some(result.clone());
+        status.phase = JobPhase::CleaningUp;
+        if let Some(detail) = status.detail.as_mut() {
+            detail.stage = JobStage::CleaningUp;
+            detail.stage_completed = 0;
+            detail.stage_total = None;
+            detail.stage_unit = StageUnit::Items;
+            detail.current_item = None;
+        }
+        Ok(())
+    }
     pub(crate) fn publish_export_capture(&self, revision: i64) -> Result<(), String> {
         let mut status = self.status.lock().map_err(|_| "native job mutex poisoned".to_owned())?;
         if !matches!(status.kind, JobKind::ExportBlockRisuSave | JobKind::ExportPortableBackup)
@@ -4295,9 +4377,30 @@ impl JobControl {
         status.export_capture_revision = Some(revision);
         Ok(())
     }
-    pub(crate) fn set_incomplete_restore_preview(&self, preview: IncompleteRestorePreview) -> Result<(), String> {
+    pub(crate) fn set_incomplete_restore_preview(&self, mut preview: IncompleteRestorePreview) -> Result<(), String> {
         let mut status = self.status.lock().map_err(|_| "native job mutex poisoned".to_owned())?;
+        if let Some(previous) = &status.incomplete_restore_preview {
+            let inlays = preview.omissions.inlays;
+            preview.omissions = previous.omissions.clone();
+            preview.omissions.inlays = preview.omissions.inlays.saturating_add(inlays);
+        }
         status.incomplete_restore_preview = if preview.warning_codes().is_empty() { None } else { Some(preview) };
+        Ok(())
+    }
+
+    pub(crate) fn record_restore_omission(&self, kind: &str, count: u64) -> Result<(), String> {
+        let mut status = self.status.lock().map_err(|_| "native job mutex poisoned".to_owned())?;
+        let omissions = &mut status.incomplete_restore_preview.get_or_insert_with(Default::default).omissions;
+        let target = match kind {
+            "data" => &mut omissions.data,
+            "remote" => &mut omissions.remote,
+            "missing" => &mut omissions.missing,
+            "values" => &mut omissions.values,
+            "pluginStorage" => &mut omissions.plugin_storage,
+            "inlays" => &mut omissions.inlays,
+            _ => return Err("unknown restore omission category".to_owned()),
+        };
+        *target = target.saturating_add(count);
         Ok(())
     }
     /// Records what the staged save left unowned, and which staging holds it, so
@@ -4645,6 +4748,7 @@ impl JobControl {
             || (status.kind == JobKind::ExportCompatibleLocalBackup && status.state.is_terminal())
             || (status.device_session_id.is_some() && status.state.is_terminal())
             || (status.kind == JobKind::OfficialPublicationUpload && status.state.is_terminal())
+            || (matches!(status.kind, JobKind::RestoreBlockRisuSave | JobKind::RestoreLegacyLocalBackup) && status.state.is_terminal())
     }
 
     fn request_cancel(&self) -> Result<CancelOutcome, String> {
@@ -4658,6 +4762,7 @@ impl JobControl {
         if matches!(
             status.phase,
             JobPhase::ActivatingDatabase
+                | JobPhase::CleaningUp
                 | JobPhase::FinalizingExport
                 | JobPhase::FinalizingPublication
         ) {
@@ -5467,7 +5572,7 @@ impl JobPhase {
             | Self::AwaitingPublicationRetry
             | Self::FinalizingPublication => 3,
             Self::ActivatingDatabase => 4,
-            Self::CopyingMissingBodies => 5,
+            Self::CopyingMissingBodies | Self::CleaningUp => 5,
             Self::Complete => 6,
         }
     }
@@ -5760,8 +5865,8 @@ mod tests {
         let publication_id = publication.id();
         finish_written_publication(&publication);
 
-        let ordinary = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
-        ordinary.start(JobPhase::ReadingSource).unwrap();
+        let ordinary = registry.create(JobKind::ExportBlockRisuSave).unwrap();
+        ordinary.start(JobPhase::WritingExport).unwrap();
         ordinary.finish_success(result(1)).unwrap();
 
         assert_eq!(
@@ -8217,9 +8322,9 @@ mod tests {
         let registry = JobRegistry::with_retention(2, Duration::from_secs(60));
         let mut ids = Vec::new();
         for revision in 1..=3 {
-            let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+            let job = registry.create(JobKind::ExportBlockRisuSave).unwrap();
             ids.push(job.id());
-            job.start(JobPhase::ReadingSource).unwrap();
+            job.start(JobPhase::WritingExport).unwrap();
             job.finish_success(result(revision)).unwrap();
         }
 
@@ -8228,9 +8333,9 @@ mod tests {
         assert!(registry.status(&ids[2]).is_ok());
 
         let expiring = JobRegistry::with_retention(2, Duration::ZERO);
-        let job = expiring.create(JobKind::RestoreBlockRisuSave).unwrap();
+        let job = expiring.create(JobKind::ExportBlockRisuSave).unwrap();
         let id = job.id();
-        job.start(JobPhase::ReadingSource).unwrap();
+        job.start(JobPhase::WritingExport).unwrap();
         job.finish_success(result(1)).unwrap();
         assert!(expiring.status(&id).is_err());
     }
@@ -8502,9 +8607,9 @@ mod tests {
             )
             .unwrap();
 
-        let ordinary = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+        let ordinary = registry.create(JobKind::ExportBlockRisuSave).unwrap();
         let ordinary_id = ordinary.id();
-        ordinary.start(JobPhase::ReadingSource).unwrap();
+        ordinary.start(JobPhase::WritingExport).unwrap();
         ordinary.finish_success(result(1)).unwrap();
 
         let cancelled = registry.create(JobKind::PrepareContentImport).unwrap();
