@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import {
     copyNativeExportToAndroidSaf,
+    reserveAndroidSafDestination,
+    bindAndroidSafDestinationSource,
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
 } from './androidSafBridge'
@@ -9,6 +11,7 @@ import {
 export const ANDROID_DOWNLOAD_PIECE_BYTES = 3 * 1024 * 1024 - 3 * 1024
 
 export interface AndroidSafDownloadDependencies {
+    reserve: typeof reserveAndroidSafDestination
     invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>
     copy(request: AndroidSafDestinationRequest): Promise<AndroidSafDestinationResult>
 }
@@ -16,6 +19,7 @@ export interface AndroidSafDownloadDependencies {
 const productionDependencies: AndroidSafDownloadDependencies = {
     invoke: (command, args) => invoke(command, args),
     copy: (request) => copyNativeExportToAndroidSaf(request),
+    reserve: reserveAndroidSafDestination,
 }
 
 /**
@@ -29,8 +33,16 @@ export async function downloadThroughAndroidSaf(
     data: Uint8Array,
     dependencies: AndroidSafDownloadDependencies = productionDependencies,
 ): Promise<boolean> {
-    const path = await dependencies.invoke<string>('native_download_handoff_create')
+    let reservation
+    try { reservation = await dependencies.reserve(name, 'download') }
+    catch (error) {
+        if ((error as {name?: string})?.name === 'AbortError') return false
+        throw error
+    }
+    let path: string | undefined
     try {
+        path = await dependencies.invoke<string>('native_download_handoff_create')
+        await bindAndroidSafDestinationSource(reservation, path)
         for (let offset = 0; offset < data.length; offset += ANDROID_DOWNLOAD_PIECE_BYTES) {
             const piece = data.subarray(offset, offset + ANDROID_DOWNLOAD_PIECE_BYTES)
             const written = await dependencies.invoke<number>('native_download_handoff_append', {
@@ -44,7 +56,7 @@ export async function downloadThroughAndroidSaf(
         }
         let published: AndroidSafDestinationResult
         try {
-            published = await dependencies.copy({ sourcePath: path, suggestedName: name })
+            published = await dependencies.copy({ sourcePath: path, suggestedName: name, reservation })
         }
         catch (error) {
             if ((error as { name?: unknown } | null)?.name === 'AbortError') return false
@@ -58,7 +70,8 @@ export async function downloadThroughAndroidSaf(
     finally {
         // Runs after the copy settles, so Android has already acknowledged it;
         // a handoff left behind is removed by the startup sweep.
-        await dependencies.invoke('native_download_handoff_cleanup', { path }).catch((error) => {
+        await reservation.release()
+        if (path) await dependencies.invoke('native_download_handoff_cleanup', { path }).catch((error) => {
             console.error('Download handoff cleanup failed', error)
         })
     }

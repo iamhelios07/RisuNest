@@ -635,11 +635,12 @@ internal suspend fun copySafDestinationOnIo(
 private class ManagedHandoffKind(
   val nameRegex: Regex,
   val sourceKind: SafDestinationSourceKind,
+  val publicationPrerequisitesComplete: Boolean = false,
   val fileNamesFor: (String) -> List<String>,
 )
 
 private val MANAGED_HANDOFF_KINDS = listOf(
-  ManagedHandoffKind(MANAGED_RAW_RECOVERY_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+  ManagedHandoffKind(MANAGED_RAW_RECOVERY_NAME, SafDestinationSourceKind.RISU_SAVE, true) { id ->
     listOf("risunest-rescue-$id.risunest-rescue.zip")
   },
   ManagedHandoffKind(MANAGED_PORTABLE_BACKUP_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
@@ -648,16 +649,16 @@ private val MANAGED_HANDOFF_KINDS = listOf(
   ManagedHandoffKind(MANAGED_LEGACY_BACKUP_NAME, SafDestinationSourceKind.LEGACY_BACKUP) { id ->
     listOf("risu-backup-$id.bin")
   },
-  ManagedHandoffKind(MANAGED_CHARACTER_CHARX_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+  ManagedHandoffKind(MANAGED_CHARACTER_CHARX_NAME, SafDestinationSourceKind.RISU_SAVE, true) { id ->
     listOf("risu-charx-$id.charx", "risu-charx-$id.jpeg")
   },
-  ManagedHandoffKind(MANAGED_CHARACTER_CARD_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+  ManagedHandoffKind(MANAGED_CHARACTER_CARD_NAME, SafDestinationSourceKind.RISU_SAVE, true) { id ->
     listOf("risu-character-card-$id.json", "risu-character-card-$id.png")
   },
-  ManagedHandoffKind(MANAGED_RISU_MODULE_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+  ManagedHandoffKind(MANAGED_RISU_MODULE_NAME, SafDestinationSourceKind.RISU_SAVE, true) { id ->
     listOf("risu-module-$id.risum")
   },
-  ManagedHandoffKind(MANAGED_DATASET_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+  ManagedHandoffKind(MANAGED_DATASET_NAME, SafDestinationSourceKind.RISU_SAVE, true) { id ->
     listOf("risu-dataset-$id.json")
   },
   ManagedHandoffKind(MANAGED_DOWNLOAD_NAME, SafDestinationSourceKind.DOWNLOAD) { id ->
@@ -740,6 +741,9 @@ internal fun managedExportSourceKind(source: File): SafDestinationSourceKind = w
   else -> MANAGED_HANDOFF_KINDS.firstOrNull { it.nameRegex.matches(source.name) }?.sourceKind
     ?: SafDestinationSourceKind.RISU_SAVE
 }
+
+internal fun managedExportHasNoPublicationPrerequisites(source: File): Boolean =
+  MANAGED_HANDOFF_KINDS.firstOrNull { it.nameRegex.matches(source.name) }?.publicationPrerequisitesComplete == true
 
 internal fun resolveManagedExportById(appDataRoot: File, exportId: String): File? {
   if (!isCanonicalUuidV4(exportId)) return null
@@ -1017,6 +1021,7 @@ internal fun androidSafDestinationScript(
   message: String? = null,
   warningCodes: List<String>,
   publicationPrerequisitesComplete: Boolean = false,
+  copyStarted: Boolean = true,
 ): String {
   val detail = androidSafDestinationJson(
     requestId,
@@ -1028,6 +1033,7 @@ internal fun androidSafDestinationScript(
     message,
     warningCodes,
     publicationPrerequisitesComplete,
+    copyStarted,
   )
   return "window.tauriAndroidSafDestinationResult=$detail;" +
     "window.dispatchEvent(new CustomEvent('risu-android-saf-destination',{detail:$detail}));"
@@ -1043,6 +1049,7 @@ internal fun androidSafDestinationJson(
   message: String? = null,
   warningCodes: List<String>,
   publicationPrerequisitesComplete: Boolean = false,
+  copyStarted: Boolean = true,
 ): String {
   val warnings = warningCodes.joinToString(",") { jsonString(it) }
   return "{" +
@@ -1054,7 +1061,8 @@ internal fun androidSafDestinationJson(
     "\"code\":${code?.let(::jsonString) ?: "null"}," +
     "\"message\":${message?.let(::jsonString) ?: "null"}," +
     "\"warningCodes\":[$warnings]," +
-    "\"publicationPrerequisitesComplete\":$publicationPrerequisitesComplete" +
+    "\"publicationPrerequisitesComplete\":$publicationPrerequisitesComplete," +
+    "\"copyStarted\":$copyStarted" +
     "}"
 }
 

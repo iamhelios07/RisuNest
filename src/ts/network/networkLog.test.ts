@@ -1,15 +1,29 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PlatformShape } from '../platform.testSupport'
-const native = vi.hoisted(() => ({ invoke: vi.fn(), save: vi.fn(), android: vi.fn(), ios: vi.fn(), platform: { runtime: 'tauri', os: 'windows' } as PlatformShape }))
+const native = vi.hoisted(() => ({ invoke: vi.fn(), save: vi.fn(), android: vi.fn(), reserve: vi.fn(), ios: vi.fn(), platform: { runtime: 'tauri', os: 'windows' } as PlatformShape }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: native.save }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => native.platform))
-vi.mock('../storage/androidSafBridge', () => ({ copyNativeExportToAndroidSaf: native.android }))
+vi.mock('../storage/androidSafBridge', async (importOriginal) => ({
+    ...await importOriginal<typeof import('../storage/androidSafBridge')>(),
+    copyNativeExportToAndroidSaf: native.android,
+    reserveAndroidSafDestination: native.reserve,
+}))
 vi.mock('../storage/iosFiles', () => ({ exportIOSFile: native.ios }))
 import { downloadNetworkLog, parseSsePreview, prettyLogJson } from './networkLog'
 
-beforeEach(() => { vi.clearAllMocks(); native.platform = { runtime: 'tauri', os: 'windows' } })
+beforeEach(() => {
+    vi.clearAllMocks()
+    native.platform = { runtime: 'tauri', os: 'windows' }
+    native.reserve.mockResolvedValue({requestId: 'synthetic-request', bind: async () => {}, release: async () => {}})
+})
 describe('network log viewer', () => {
+    it('does not write a log export when Android destination selection is cancelled', async () => {
+        native.platform = {runtime: 'tauri', os: 'android'}
+        native.reserve.mockRejectedValueOnce(new DOMException('cancelled', 'AbortError'))
+        await expect(downloadNetworkLog('synthetic')).resolves.toBe(false)
+        expect(native.invoke).not.toHaveBeenCalled()
+    })
     it('bounds JSON formatting work and leaves malformed bodies in raw view', () => {
         expect(prettyLogJson('{"value":"[\\\"{}]"}')).not.toBeNull()
         expect(prettyLogJson('['.repeat(30) + '0' + ']'.repeat(30))).toBeNull()
@@ -45,7 +59,7 @@ describe('network log viewer', () => {
             native.invoke.mockResolvedValueOnce({ path: 'synthetic-handoff', bytes: 123 }).mockResolvedValueOnce(undefined)
             native[platform].mockResolvedValueOnce({ bytes: 123 })
             expect(await downloadNetworkLog('synthetic')).toBe(true)
-            expect(native[platform]).toHaveBeenCalledWith({ sourcePath: 'synthetic-handoff', suggestedName: 'network-synthetic.json' })
+            expect(native[platform]).toHaveBeenCalledWith(expect.objectContaining({ sourcePath: 'synthetic-handoff', suggestedName: 'network-synthetic.json' }))
             expect(native.invoke).toHaveBeenLastCalledWith('native_download_handoff_cleanup', { path: 'synthetic-handoff' })
         })
     }

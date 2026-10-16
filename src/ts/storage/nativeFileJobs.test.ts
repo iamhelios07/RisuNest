@@ -1,5 +1,7 @@
+import { androidSafReservationFixture } from '../../../tests/support/androidSafReservation'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { language } from '../../lang'
+import { buildNativeFileJobDialogModel, formatBytes } from '../gui/nativeFileJobDialogModel'
 const restoreAlerts = vi.hoisted(() => ({ confirm: vi.fn(), checkbox: vi.fn() }))
 vi.mock('../alert', () => ({ alertConfirm: restoreAlerts.confirm, alertCheckboxConfirm: restoreAlerts.checkbox }))
 const deviceRestore = vi.hoisted(() => ({ flushDeviceStateBeforeRestore: vi.fn(async () => {}), refreshDeviceStateAfterRestore: vi.fn(async () => {}) }))
@@ -13,6 +15,28 @@ beforeEach(() => {
     library.hasCharacters.mockReset().mockResolvedValue(true)
     restoreAlerts.checkbox.mockReset().mockResolvedValue({confirmed:true,checked:true})
     binding.prepare.mockReset().mockImplementation(async () => ({bound:false,state:{targetAuthority:'1'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{}}))
+})
+
+it('selects the Android destination before flushing or starting an export and releases it on preparation failure', async () => {
+    const picker = androidSafReservationFixture()
+    picker.bridge.reserveExport.mockImplementation(() => {})
+    const failure = new Error('synthetic preparation failure')
+    const flushPendingData = vi.fn(async () => {throw failure})
+    const invoke = vi.fn(async () => {throw new Error('No native job may start')})
+    const exporting = runNativeCompatibleLocalBackupExport(
+        {revision: 3, flushPendingData}, 'risuai', {type: 'androidSaf', suggestedName: 'synthetic.bin'}, {},
+        {isTauri: () => true, invoke, wait: async () => {}, reserveAndroidDestination: picker.reserve,
+            copyToAndroidSaf: async () => {throw new Error('No handoff exists')}},
+    )
+    const rejected = expect(exporting).rejects.toBe(failure)
+    await vi.waitFor(() => expect(picker.bridge.reserveExport).toHaveBeenCalled())
+    expect(flushPendingData).not.toHaveBeenCalled()
+    expect(invoke).not.toHaveBeenCalled()
+    picker.select(picker.bridge.reserveExport.mock.calls[0][0])
+    await rejected
+    expect(flushPendingData).toHaveBeenCalled()
+    expect(invoke).not.toHaveBeenCalled()
+    expect(picker.bridge.releaseExport).toHaveBeenCalled()
 })
 
 it.each(['portable', 'block'] as const)('holds the write pause until the actual %s capture, then permits writes during export', async format => {
@@ -37,6 +61,7 @@ it.each(['portable', 'block'] as const)('holds the write pause until the actual 
             throw new Error(command)
         },
         wait: async () => {if (waits++ === 0) await capture; else await bodies},
+        reserveAndroidDestination: androidSafReservationFixture().reserve,
         copyToAndroidSaf: async () => {throw new Error('Desktop fixture')},
     }
     const operation = format === 'portable'
@@ -77,6 +102,7 @@ describe('local source preservation consent', () => {
                 if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async () => { throw new Error('Desktop test must not use Android') },
             },
         )
@@ -109,6 +135,7 @@ describe('local source preservation consent', () => {
                     if (command === 'native_portable_handoff_cleanup' || command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async () => { throw failure },
             },
         )
@@ -426,6 +453,7 @@ describe('native file jobs', () => {
                         throw new Error(`Unexpected command: ${command}`)
                     },
                     wait: async () => undefined,
+                    reserveAndroidDestination: androidSafReservationFixture().reserve,
                     copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
                 },
             ),
@@ -840,6 +868,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
             },
         )
@@ -912,6 +941,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async (request) => {
                     events.push(
                         `saf:${request.sourcePath}:${request.suggestedName}`,
@@ -983,6 +1013,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async () => ({
                     bytes: 4096,
                     warningCodes: [],
@@ -1049,6 +1080,7 @@ describe('native file jobs', () => {
                         throw new Error(`Unexpected command: ${command}`)
                     },
                     wait: async () => undefined,
+                    reserveAndroidDestination: androidSafReservationFixture().reserve,
                     copyToAndroidSaf: async () => ({
                         bytes: 2048,
                         warningCodes: ['provider-warning'],
@@ -1116,6 +1148,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async () => ({
                     bytes: 2048,
                     warningCodes: ['android-saf-provider-not-atomic'],
@@ -1190,6 +1223,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async () => ({ bytes: 9, warningCodes: [] }),
             },
         )
@@ -1256,6 +1290,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async (request) => {
                     copies.push(request)
                     expect(statuses.at(-1)).toMatchObject({ state: 'running', phase: 'publishing-destination', progress: { completedBytes: 0, totalBytes: 11 } })
@@ -1314,6 +1349,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async () => {
                     throw new Error('A desktop dataset must not use Android SAF')
                 },
@@ -1840,6 +1876,7 @@ describe('native file jobs', () => {
                             throw new Error(`Unexpected command: ${command}`)
                         },
                         wait: async () => undefined,
+                        reserveAndroidDestination: androidSafReservationFixture().reserve,
                         copyToAndroidSaf,
                     },
                 )
@@ -1922,6 +1959,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
             },
         )
@@ -1993,6 +2031,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf,
             },
         )
@@ -2043,6 +2082,7 @@ describe('native file jobs', () => {
                         }
                     },
                     wait: async () => undefined,
+                    reserveAndroidDestination: androidSafReservationFixture().reserve,
                     copyToAndroidSaf: async () => ({
                         bytes: 0,
                         warningCodes: [],
@@ -2257,6 +2297,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
             },
         )
@@ -2281,7 +2322,7 @@ describe('native file jobs', () => {
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
-    it('hands a managed backup export to Android SAF and cleans the native source', async () => {
+    it.each([4096, null])('hands a managed backup export to Android SAF with visible copy progress (provider total %s) and cleans the native source', async (providerTotal) => {
         const events: string[] = []
         const observedStatuses: NativeFileJobStatus[] = []
         const handoffPath =
@@ -2325,6 +2366,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                reserveAndroidDestination: androidSafReservationFixture().reserve,
                 copyToAndroidSaf: async (request) => {
                     events.push(
                         `saf:${request.sourcePath}:${request.suggestedName}`,
@@ -2333,7 +2375,7 @@ describe('native file jobs', () => {
                         requestId: 'android-export',
                         operation: 'destination-copy',
                         copiedBytes: 2048,
-                        totalBytes: 4096,
+                        totalBytes: providerTotal,
                         token: null,
                     })
                     return {
@@ -2351,6 +2393,23 @@ describe('native file jobs', () => {
             phase: 'publishing-destination',
             progress: { completedBytes: 2048, totalBytes: 4096 },
         })
+        const copying = observedStatuses.filter(status => status.phase === 'publishing-destination')
+        expect(copying).toHaveLength(2)
+        for (const [index, status] of copying.entries()) {
+            const model = buildNativeFileJobDialogModel({
+                kind: 'export', presentation: 'dialog', format: 'local-backup', startedAt: 0,
+                observedStages: ['publishing-destination'], status, blocking: false,
+                cancelRequested: false, partialWritesPossible: true,
+            }, null, 1000)
+            expect(model.overallPercent).toBe(index === 0 ? 0 : 50)
+            expect(model.indeterminate).toBe(false)
+            expect(model.overallText).toContain(formatBytes(index === 0 ? 0 : 2048))
+            expect(model.overallText).toContain(formatBytes(4096))
+            expect(model.stages.find(stage => stage.stage === 'publishing-destination')?.detail).toBe(model.overallText)
+            expect(model.terminal).toBeNull()
+            expect(model.cancelEnabled).toBe(true)
+            expect(status.result).toBe(terminal.result)
+        }
         expect(events).toEqual([
             'native_file_job_start:{"request":{"kind":"export-compatible-local-backup","expectedRevision":22,"target":"risuai"}}',
             'native_file_job_status:{"jobId":"lossless-export"}',
@@ -2402,6 +2461,7 @@ describe('native file jobs', () => {
                         throw new Error(`Unexpected command: ${command}`)
                     },
                     wait: async () => undefined,
+                    reserveAndroidDestination: androidSafReservationFixture().reserve,
                     copyToAndroidSaf: async () => ({
                         bytes: 2048,
                         warningCodes: [],
@@ -2458,6 +2518,7 @@ describe('native file jobs', () => {
                         throw new Error(`Unexpected command: ${command}`)
                     },
                     wait: async () => undefined,
+                    reserveAndroidDestination: androidSafReservationFixture().reserve,
                     copyToAndroidSaf: async () => {
                         throw new Error('synthetic destination failure')
                     },
@@ -2530,6 +2591,7 @@ describe('native file jobs', () => {
                         throw new Error(`Unexpected command: ${command}`)
                     },
                     wait: async () => undefined,
+                    reserveAndroidDestination: androidSafReservationFixture().reserve,
                     copyToAndroidSaf: async () => ({
                         bytes: 4096,
                         warningCodes: [],

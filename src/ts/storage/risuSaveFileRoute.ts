@@ -6,6 +6,8 @@ import {
     type AndroidSafDestinationEvent,
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
+    type AndroidSafDestinationReservation,
+    type reserveAndroidSafDestination,
 } from './androidSafBridge'
 import type { PersistentDataRuntime } from './persistentDataRuntime.svelte'
 import { listenRecoveredPublications } from './recoveredPublicationListener'
@@ -48,6 +50,7 @@ type FileRouteRuntime = Pick<
 >
 
 export interface RisuSaveFileRouteDependencies {
+    reserveAndroidDestination: typeof reserveAndroidSafDestination
     platform(): 'native-desktop' | 'native-ios' | 'native-android' | 'web'
     runtime(): FileRouteRuntime
     chooseNativeImport(): Promise<string | null>
@@ -137,6 +140,21 @@ async function exportThroughAndroidSaf(
     options: RisuSaveFileRouteOptions,
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult> {
+    const reservation = await dependencies.reserveAndroidDestination(name, 'risuSave', options.signal)
+    try {
+        return await exportToReservedAndroidSaf(runtime, name, options, dependencies, reservation)
+    } finally {
+        await reservation.release()
+    }
+}
+
+async function exportToReservedAndroidSaf(
+    runtime: FileRouteRuntime,
+    name: string,
+    options: RisuSaveFileRouteOptions,
+    dependencies: RisuSaveFileRouteDependencies,
+    reservation: AndroidSafDestinationReservation,
+): Promise<RisuSaveFileRouteResult> {
     const terminal = await dependencies.withFlushedExport(
         runtime,
         'risu-save-file-export',
@@ -152,6 +170,7 @@ async function exportThroughAndroidSaf(
                 async (file) => {
                     try {
                         const published = await dependencies.copyAndroidExport({
+                            reservation,
                             sourcePath: file.path,
                             suggestedName: name,
                             signal: options.signal,

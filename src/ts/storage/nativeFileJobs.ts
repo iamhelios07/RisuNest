@@ -18,6 +18,9 @@ import { registerCommittedWorkingSetContinuation } from './committedWorkingSetCo
 import {
     copyNativeExportToAndroidSaf,
     discardAndroidSafSource,
+    reserveAndroidSafDestination,
+    type AndroidSafDestinationReservation,
+    type AndroidSafExportKind,
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
 } from './androidSafBridge'
@@ -533,7 +536,7 @@ export type NativeBlockRestoreRuntime = Pick<
 >
 
 export interface NativeFileJobOptions {
-    onStarted?(jobId: string): void | Promise<void>
+    onStarted?(jobId: string, destinationRequestId?: string): void | Promise<void>
     onNativeStatus?(status: NativeFileJobStatus): void | Promise<void>
     signal?: AbortSignal
     pollIntervalMs?: number
@@ -667,6 +670,7 @@ export interface NativeFileJobDependencies {
 }
 
 export interface NativeBackupExportDependencies extends NativeFileJobDependencies {
+    reserveAndroidDestination?: typeof reserveAndroidSafDestination
     copyToIOSFiles?: typeof exportIOSFile
     copyToAndroidSaf(
         request: AndroidSafDestinationRequest,
@@ -686,6 +690,7 @@ const productionBackupExportDependencies: NativeBackupExportDependencies = {
     ...productionDependencies,
     copyToIOSFiles: exportIOSFile,
     copyToAndroidSaf: (request) => copyNativeExportToAndroidSaf(request),
+    reserveAndroidDestination: reserveAndroidSafDestination,
 }
 
 export class NativeFileJobError extends Error {
@@ -2123,6 +2128,8 @@ interface NativeManagedExportSpec {
     safLengthMismatchLabel: string
     handoffCleanupCommand: string
     destination: NativeCharacterCharxExportDestination
+    androidSourceKind?: AndroidSafExportKind
+    reservation?: AndroidSafDestinationReservation
     relaySafCopyProgress?: boolean
     retainHandoffOnPublicationFailure?: boolean
     prepareRequest(): Record<string, unknown> | Promise<Record<string, unknown>>
@@ -2143,13 +2150,33 @@ async function runNativeManagedExport(
         throw new Error(`${spec.operation} requires Tauri`)
     }
     if (options.signal?.aborted) throw abortError()
+    let reservation = spec.reservation
+    if (spec.destination.type === 'androidSaf' && !reservation) {
+        if (!dependencies.reserveAndroidDestination) throw new NativeFileJobError('unsupported', 'Android SAF destination reservation is unavailable')
+        reservation = await dependencies.reserveAndroidDestination(spec.destination.suggestedName, spec.androidSourceKind ?? 'risuSave', options.signal)
+    }
+    try {
+        return await runNativeManagedExportToDestination(spec, options, dependencies, reservation)
+    } finally {
+        await reservation?.release()
+    }
+}
+
+async function runNativeManagedExportToDestination(
+    spec: NativeManagedExportSpec,
+    options: NativeFileJobOptions,
+    dependencies: NativeBackupExportDependencies,
+    reservation?: AndroidSafDestinationReservation,
+): Promise<NativeFileJobResult> {
+    if (options.signal?.aborted) throw abortError()
     const request = await spec.prepareRequest()
     const started = (await invokeNative(dependencies, 'native_file_job_start', {
         request,
     })) as { jobId: string; warningCodes?: string[] }
     let terminal: NativeFileJobStatus
     try {
-        await options.onStarted?.(started.jobId)
+        await reservation?.bind(started.jobId)
+        await options.onStarted?.(started.jobId, reservation?.requestId)
         terminal = await pollNativeFileJobUntilTerminal(
             started.jobId,
             options,
@@ -2212,13 +2239,19 @@ async function runNativeManagedExport(
                     'iOS file publication is unavailable',
                 )
             if (spec.relaySafCopyProgress) options.onStatus?.({
-                ...terminal, state: 'running', phase: 'publishing-destination', detail: undefined,
+                ...terminal, state: 'running', phase: 'publishing-destination',
+                detail: {
+                    stage: 'publishing-destination', stageCompleted: 0,
+                    stageTotal: committedResult.sourceBytes, stageUnit: 'bytes',
+                    counts: terminal.detail?.counts ?? emptyNativeImportCounts(),
+                },
                 progress: { completedBytes: 0, totalBytes: committedResult.sourceBytes, completedItems: 0, totalItems: 1 },
             })
             const published = await publish({
                 sourcePath: managedSource,
                 suggestedName: spec.destination.suggestedName,
                 signal: options.signal,
+                ...(reservation ? { reservation } : {}),
                 ...(spec.relaySafCopyProgress
                     ? {
                           onProgress: (progress) =>
@@ -2226,7 +2259,13 @@ async function runNativeManagedExport(
                                   ...terminal,
                                   state: 'running',
                                   phase: 'publishing-destination',
-                                  detail: undefined,
+                                  detail: {
+                                      stage: 'publishing-destination',
+                                      stageCompleted: progress.copiedBytes,
+                                      stageTotal: progress.totalBytes ?? committedResult.sourceBytes,
+                                      stageUnit: 'bytes',
+                                      counts: terminal.detail?.counts ?? emptyNativeImportCounts(),
+                                  },
                                   progress: {
                                       completedBytes: progress.copiedBytes,
                                       ...(progress.totalBytes === null
@@ -2477,6 +2516,7 @@ function runNativePortableBackupExport(
             safLengthMismatchLabel: operation,
             handoffCleanupCommand,
             destination,
+            androidSourceKind: 'legacyBackup',
             relaySafCopyProgress: true,
             prepareRequest: async () => {
                 await runtime.flushPendingData(flushReason)
@@ -2502,15 +2542,25 @@ function runNativePortableBackupExport(
 }
 
 
-export function runNativeArchiveExport(
+export async function runNativeArchiveExport(
     runtime: NativeBlockRestoreRuntime & {readonly revision: number; flushPendingData(reason: string): Promise<void>},
     destination: NativeBackupDestination,
     selection: NativePortableSelection,
     options: NativeFileJobOptions & { confirmSourcePreservation?(): Promise<boolean> } = {},
     dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
-    return withPausedNativeExport(runtime, 'native-portable-export', options,
-        (revision, observed) => runNativeArchiveExportAtRevision(runtime, revision, destination, selection, {...options, ...observed}, dependencies))
+    if (!dependencies.isTauri()) throw new Error('RisuNest backup requires Tauri')
+    if (options.signal?.aborted) throw abortError()
+    const reservation = destination.type === 'androidSaf'
+        ? await dependencies.reserveAndroidDestination?.(destination.suggestedName, 'risuSave', options.signal)
+        : undefined
+    if (destination.type === 'androidSaf' && !reservation) throw new NativeFileJobError('unsupported', 'Android SAF destination reservation is unavailable')
+    try {
+        return await withPausedNativeExport(runtime, 'native-portable-export', options,
+            (revision, observed) => runNativeArchiveExportAtRevision(runtime, revision, destination, selection, {...options, ...observed}, dependencies, reservation))
+    } finally {
+        await reservation?.release()
+    }
 }
 
 async function runNativeArchiveExportAtRevision(
@@ -2523,6 +2573,7 @@ async function runNativeArchiveExportAtRevision(
     selection: NativePortableSelection,
     options: NativeFileJobOptions & { confirmSourcePreservation?(): Promise<boolean> } = {},
     dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
+    reservation?: AndroidSafDestinationReservation,
 ): Promise<NativeFileJobResult> {
     let intent:
         | import('./deviceBackup/job').PortableExportIntentStore
@@ -2534,6 +2585,7 @@ async function runNativeArchiveExportAtRevision(
         const result = await runNativeManagedExport(
             {
                 operation: 'RisuNest backup',
+                reservation,
                 safLengthMismatchLabel: 'RisuNest backup',
                 handoffCleanupCommand: 'native_portable_handoff_cleanup',
                 destination,
@@ -2562,7 +2614,7 @@ async function runNativeArchiveExportAtRevision(
             },
             {
                 ...options,
-                onStarted: async (jobId) => {
+                onStarted: async (jobId, destinationRequestId) => {
                     startedId = jobId
                     if (hasDevice) {
                         const module = await import('./deviceBackup/job')
@@ -2570,6 +2622,7 @@ async function runNativeArchiveExportAtRevision(
                             jobId,
                             destination,
                             intent,
+                            destinationRequestId,
                         )
                     }
                     await options.onStarted?.(jobId)

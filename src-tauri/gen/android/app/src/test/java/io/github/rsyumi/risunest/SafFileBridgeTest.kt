@@ -636,6 +636,80 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `reserved destination binds one job and preserves the distinct handoff identity after restart`() {
+    val requestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val jobId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    val sourceId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    val file = temporaryDirectory().resolve("destination.json")
+    val store = SafDestinationStateStore(file, testAtomicPublisher)
+    val picking = SafDestinationRecord(requestId, requestId, SafDestinationPhase.PICKING,
+      null, null, null, emptyList(), 1_000, reservedDestination = true, exportBound = false, copyStarted = false)
+    store.save(picking)
+    assertNull(bindReservedSafDestination(picking, requestId, jobId, 1_001))
+    val selected = selectedSafDestinationState(store.load()!!, requestId,
+      "content://synthetic/new-document", false, 1_002)!!
+    val bound = bindReservedSafDestination(selected, requestId, jobId, 1_003)!!
+    store.save(bound)
+    val restarted = SafDestinationStateStore(file, testAtomicPublisher).load()!!
+    assertEquals(jobId, restarted.jobId)
+    assertNull(bindReservedSafDestination(restarted, requestId, sourceId, 1_004))
+    assertNull(beginReservedSafCopy(restarted, sourceId, jobId, sourceId, SafDestinationSourceKind.RISU_SAVE, 1_004))
+    assertNull(beginReservedSafCopy(restarted, requestId, sourceId, sourceId, SafDestinationSourceKind.RISU_SAVE, 1_004))
+    assertNull(beginReservedSafCopy(restarted, requestId, jobId, sourceId, SafDestinationSourceKind.DOWNLOAD, 1_004))
+    val copying = beginReservedSafCopy(restarted, requestId, jobId, sourceId, SafDestinationSourceKind.RISU_SAVE, 1_004)!!
+    store.save(copying)
+    assertEquals(jobId, store.load()!!.jobId)
+    assertEquals(sourceId, store.load()!!.exportId)
+    assertNull(beginReservedSafCopy(copying, requestId, jobId, sourceId, SafDestinationSourceKind.RISU_SAVE, 1_005))
+    assertEquals(SafDestinationRecoveryAction.CLEAN_PARTIAL, decideSafDestinationRecovery(copying, false))
+  }
+
+  @Test
+  fun `reservation cancellation owns only its newly created document including a late picker result`() {
+    val requestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val picking = SafDestinationRecord(requestId, requestId, SafDestinationPhase.CANCELLING,
+      null, null, null, emptyList(), 1_000, reservedDestination = true, exportBound = false, copyStarted = false)
+    assertNull(expiredSafDestinationState(picking, requestId, 1_000 + DESTINATION_PICKER_STALE_MILLIS))
+    assertEquals(SafDestinationRecoveryAction.WAIT_FOR_PICKER,
+      decideSafDestinationRecovery(picking, true, 1_000 + DESTINATION_PICKER_STALE_MILLIS))
+    val selected = selectedSafDestinationState(picking, requestId, "content://synthetic/new", false, 1_001)!!
+    assertEquals(SafDestinationPhase.CANCELLING, selected.phase)
+    val restored = picking.copy(phase = SafDestinationPhase.PICKING)
+    val lateAfterRestart = selectedSafDestinationState(restored, requestId, "content://synthetic/new",
+      restoredSafDestinationCancellation(restored), 1_001)!!
+    assertEquals(SafDestinationPhase.CANCELLING, lateAfterRestart.phase)
+    val deleted = mutableListOf<String>()
+    assertEquals(emptyList<String>(), cleanupReservedSafDestination(selected) { deleted.add(it); true })
+    assertEquals(listOf("content://synthetic/new"), deleted)
+    assertTrue(cleanupReservedSafDestination(selected) { false }.contains("partial-destination-may-remain"))
+    val legacy = selected.copy(reservedDestination = false, exportBound = true, copyStarted = true)
+    assertTrue(cleanupReservedSafDestination(legacy) { error("A preexisting document must survive") }
+      .contains("partial-destination-may-remain"))
+  }
+
+  @Test
+  fun `released v3 destination defaults preserve nonowned documents and unbound cancellations can acknowledge`() {
+    val requestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val storeFile = temporaryDirectory().resolve("destination.json")
+    val store = SafDestinationStateStore(storeFile, testAtomicPublisher)
+    val legacy = SafDestinationRecord(requestId, requestId, SafDestinationPhase.COPYING,
+      "content://synthetic/preexisting", null, null, emptyList(), 1_000)
+    store.save(legacy)
+    storeFile.writeText(storeFile.readText().replace("\"reservedDestination\":false,", "")
+      .replace("\"exportBound\":true,", "").replace("\"copyStarted\":true,", "").replace("\"jobId\":null,", ""))
+    assertEquals(legacy, store.load())
+    assertTrue(cleanupReservedSafDestination(store.load()!!) { error("Released records never own the selected document") }
+      .contains("partial-destination-may-remain"))
+    val unbound = legacy.copy(phase = SafDestinationPhase.CANCELLED, destinationUri = null,
+      reservedDestination = true, exportBound = false, copyStarted = false)
+    store.save(unbound)
+    assertTrue(acknowledgeSafDestinationExport(requestId, store::load,
+      { error("An unstarted export has no publication prerequisite") },
+      { error("An unstarted export has no source to discard") }, store::clear))
+    assertNull(store.load())
+  }
+
+  @Test
   fun `destination state survives store reconstruction with bounded identifiers only`() {
     val root = temporaryDirectory()
     val stateFile = root.resolve("android-saf-destination.json")
@@ -1058,6 +1132,7 @@ class SafFileBridgeTest {
     val source = exports.resolve("risusave-$id.risudat")
     source.writeBytes(byteArrayOf(1))
     exports.resolve("risusave-$id.lease").writeText("{\"exportId\":\"$id\",\"lease\":\"x\"}")
+    assertFalse(managedExportHasNoPublicationPrerequisites(requireNotNull(resolveManagedExportSource(appData, source.path))))
     val outside = appData.resolve("outside/risusave-$id.risudat")
     outside.parentFile!!.mkdirs()
     outside.writeBytes(byteArrayOf(2))
@@ -1141,6 +1216,38 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `managed publication proof survives source cleanup without approving deferred backups`() {
+    val appData = temporaryDirectory()
+    val handoffs = appData.resolve("native-file-jobs/handoffs").apply { mkdirs() }
+    val id = "99999999-9999-4999-8999-999999999999"
+    val store = SafDestinationStateStore(appData.resolve("destination.json"), testAtomicPublisher)
+    val names = listOf("risunest-rescue-$id.risunest-rescue.zip", "risu-charx-$id.charx",
+      "risu-charx-$id.jpeg", "risu-character-card-$id.json", "risu-character-card-$id.png",
+      "risu-module-$id.risum", "risu-dataset-$id.json")
+    for (name in names) {
+      val source = handoffs.resolve(name).apply { writeBytes(byteArrayOf(1)) }
+      val owned = requireNotNull(resolveManagedExportSource(appData, source.path))
+      val record = terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE,
+        managedExportHasNoPublicationPrerequisites(owned))
+      store.save(record)
+      assertTrue(source.delete())
+      val restored = requireNotNull(store.load())
+      assertTrue(androidSafDestinationScriptForRecord(restored, null)
+        .contains("\"publicationPrerequisitesComplete\":true"))
+      assertTrue(acknowledgeStoredDestination(appData, store, id))
+      assertNull(store.load())
+    }
+    for (name in listOf("risunest-backup-$id.risunest", "risusave-$id.risudat", "unknown-$id.bin")) {
+      assertFalse(managedExportHasNoPublicationPrerequisites(handoffs.resolve(name)))
+    }
+    val unstarted = terminalDestinationRecord(id, id, SafDestinationSourceKind.SCREENSHOT, true)
+      .copy(reservedDestination = true, exportBound = false, copyStarted = false)
+    assertTrue(androidSafDestinationScriptForRecord(unstarted, null).contains("\"copyStarted\":false"))
+    assertTrue(androidSafDestinationJson(id, state = "cancelled", warningCodes = emptyList())
+      .contains("\"copyStarted\":true"))
+  }
+
+  @Test
   fun `a download terminal is acknowledged without publication proof and keeps its handoff`() {
     val appData = temporaryDirectory()
     val stateFile = appData.resolve("native-file-jobs/android-saf-destination.json")
@@ -1196,6 +1303,7 @@ class SafFileBridgeTest {
     val id = "99999999-9999-4999-8999-999999999999"
     val source = handoffs.resolve("risunest-backup-$id.risunest")
     source.writeBytes(byteArrayOf(1, 2, 3))
+    assertFalse(managedExportHasNoPublicationPrerequisites(requireNotNull(resolveManagedExportSource(appData, source.path))))
     val outside = appData.resolve("outside/risunest-backup-$id.risunest")
     outside.parentFile!!.mkdirs()
     outside.writeBytes(byteArrayOf(9))

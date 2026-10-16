@@ -152,7 +152,8 @@ fn source_retirement_suppresses_descendants_and_order_uses_creation_stamps() {
     assert_orders(&catalog(&store,&active_generation(&store.connection).unwrap()));
     assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_retired", [], |r| r.get::<_,i64>(0)).unwrap(), 2);
     assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_receive_rows WHERE status='held'", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
-    assert_eq!(read_unit(&store.connection,&incoming[1].key).unwrap(), Some((incoming[1].stamp.clone(),incoming[1].value.clone())));
+    assert_eq!(read_unit(&store.connection,&incoming[1].key).unwrap(), None);
+    assert_eq!(read_unit(&store.connection,&unit_key(&["conversation","a","retired-chat","name"]).unwrap()).unwrap(), None);
 }
 
 #[test]

@@ -35,11 +35,12 @@ vi.mock('../alert', () => ({ alertConfirm: m.confirm, alertNormal: vi.fn() }))
 vi.mock('../plugins/plugins.svelte', () => ({
     loadPluginsAfterAuthoritativeRestore: m.after,
 }))
-vi.mock('./androidSafBridge', () => ({
+vi.mock('./androidSafBridge', async original => ({
+    ...(await original<typeof import('./androidSafBridge')>()),
     discardAndroidSafSource: m.discard,
     pickAndroidPortableBackupSource: vi.fn(),
     materializeAndroidBackupSource: m.materializeAndroid,
-}))
+} satisfies typeof import('./androidSafBridge')))
 vi.mock('./iosFiles', async (original) => ({...(await original<object>()),pickIOSBackupSource:vi.fn(),materializeIOSBackupSource:m.materializeIOS,discardIOSFile:m.discardIOS}))
 vi.mock('./deviceBackup/selectionDialog', () => ({
     selectPortableBackupExport: m.chooseExport,

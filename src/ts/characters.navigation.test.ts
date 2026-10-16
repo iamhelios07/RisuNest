@@ -113,6 +113,7 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     activateCharacter: mocks.activateCharacter,
     acquireDestructiveReplacementFence: mocks.unexpectedNativeRuntimeAccess,
     capturePersistentMutationToken: mocks.unexpectedNativeRuntimeAccess,
+    getPersistentDataRuntime: mocks.unexpectedNativeRuntimeAccess,
     commitCharacterAddition: mocks.commitCharacterAddition,
     deactivateActiveWorkingSet: mocks.deactivateActiveWorkingSet,
     fencePersistentNavigation: mocks.fencePersistentNavigation,
