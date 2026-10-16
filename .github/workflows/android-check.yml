@@ -73,7 +73,10 @@ jobs:
 
       - name: Run Android Kotlin unit tests
         working-directory: src-tauri/gen/android
-        run: ./gradlew :app:testArmDebugUnitTest :app:testLowMemorySafCopy :tauri-plugin-barcode-scanner:testDebugUnitTest --no-daemon
+        run: |
+          ./gradlew :app:testArmDebugUnitTest --no-daemon
+          ./gradlew :app:testLowMemorySafCopy --no-daemon
+          ./gradlew :tauri-plugin-barcode-scanner:testDebugUnitTest --no-daemon
 
       - name: Verify APK alignment
         shell: pwsh
