@@ -220,7 +220,7 @@ SectionEnd
       if (scenario.missingManager) rmSync(join(location, 'risunest-sync-manager.exe'));
       const uninstall = () => spawnSync(join(location, 'uninstall.exe'), ['/S', ...scenario.args, `_?=${location}`], { timeout: 30000, windowsHide: true, env: { ...process.env, RISUNEST_SYNC_UNINSTALL_DATA_DIR: scenario.custom ? dataRoot : '' } });
       const result = uninstall();
-      assert.equal(result.status, scenario.code, `${scenario.name}: exit ${existsSync(join(location, "calls")) ? readFileSync(join(location, "calls"), "utf8") : "no manager calls"}`);
+      assert.equal(result.status, scenario.code, `${scenario.name}: exit ${existsSync(join(location, "calls")) ? readFileSync(join(location, "calls"), "utf8") : "no manager calls"}\ndiagnostic: ${existsSync(join(location, 'diagnostic')) ? readFileSync(join(location, 'diagnostic'), 'utf8') : 'unavailable'}`);
       assert.equal(existsSync(join(location, 'risunest-sync-manager.exe')), scenario.installed, `${scenario.name}: manager remains on failure`);
       assert.equal(existsSync(join(dataRoot, 'synthetic')), scenario.data, `${scenario.name}: data`);
       if (scenario.missingManager) {
