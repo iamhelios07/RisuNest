@@ -29,8 +29,7 @@ pub(super) const MAX_RELEASE_SCAN_PAGES: u32 = 20;
 pub(super) const MAX_RELEASE_SCAN_PAGES: u32 = 2;
 /// Assets of one release, at the service limit rather than the adapter's.
 pub(super) const MAX_ASSET_SCAN_PAGES: u32 = 10;
-/// Request budget after a listing finds an object. Empty pages are walked
-/// until a match or exhaustion, under the caller's cancellation/deadline.
+/// Per-call request budget, including empty pages, with a resumable cursor.
 pub(super) const MAX_LIST_STEPS: u32 = 64;
 /// Each file in a release must stay under 2 GiB.
 pub(super) const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024 - 1;

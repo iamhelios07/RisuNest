@@ -1041,7 +1041,7 @@ pub(super) async fn list_ordered_backup_points_page(
                 let id=super::gc_store::locator_key(&receipt.locator)?;
                 let point=match cache.points.get(&id).filter(|point|point.reference.receipt==receipt) {
                     Some(point)=>point.clone(),
-                    None=>open_listed_point(receipt,&connected.stored.descriptor,&connected.root_key,connected.provider.as_ref(),&connected.handle,cancel).await?,
+                    None=>super::leases::control_request(cancel,open_listed_point(receipt,&connected.stored.descriptor,&connected.root_key,connected.provider.as_ref(),&connected.handle,cancel)).await?,
                 };
                 if !point_ids.insert(point.document.point_id.clone()) {return Err(corrupt("duplicate backup point identity"));}
                 cache.points.insert(id.clone(),point.clone());
@@ -2131,6 +2131,31 @@ mod tests {
             let retried=list_ordered_backup_points_page(&connected,&mut interrupted,None,30,&cancel).await.unwrap();
             assert_eq!(retried.points,first.points);
             assert_eq!(provider.read_attempts(&receipt.locator.object),reads,"retry keeps authenticated point metadata");
+            let slow_page=provider.list_objects(&connected.handle,Collection::BackupPoints,None,100,&cancel).await.unwrap();
+            tokio::time::pause();
+            provider.state.lock().unwrap().listing_delay=Some(std::time::Duration::from_secs(31));
+            for cursor in ["empty-1", "empty-2", "empty-3"] {
+                provider.script_page(Collection::BackupPoints,Ok(crate::external_storage::contract::ObjectPage {
+                    objects:vec![],next_cursor:Some(cursor.into()),
+                }));
+            }
+            provider.script_page(Collection::BackupPoints,Ok(slow_page));
+            let started=tokio::time::Instant::now();
+            let slow=super::super::history::list_points(&connected,None,&cancel).await.unwrap();
+            assert_eq!(slow.points,first.points);
+            assert!(started.elapsed()>std::time::Duration::from_secs(60));
+            provider.state.lock().unwrap().listing_delay=Some(std::time::Duration::from_secs(61));
+            assert_eq!(super::super::history::list_points(&connected,None,&cancel).await.unwrap_err().kind,ErrorKind::Transient);
+            provider.state.lock().unwrap().listing_delay=None;
+            let barrier=provider.arm_read_barrier(&receipt.locator.object).unwrap();
+            let mut stalled=PointHistoryCache::default();
+            let failure=tokio::time::timeout(std::time::Duration::from_secs(61),
+                list_ordered_backup_points_page(&connected,&mut stalled,None,30,&cancel)).await
+                .expect("each point read keeps its own deadline").unwrap_err();
+            assert_eq!(failure.kind,ErrorKind::Transient);
+            provider.clear_read_barrier(&barrier);
+            assert_eq!(list_ordered_backup_points_page(&connected,&mut stalled,None,30,&cancel).await.unwrap().points,first.points);
+            tokio::time::resume();
             let body=provider.state.lock().unwrap().objects[&receipt.locator.object].0.clone();
             provider.seed("duplicate-point",ObjectRole::BackupPoint,body);
             let mut duplicate=receipt.clone();duplicate.locator.object="duplicate-point".into();
