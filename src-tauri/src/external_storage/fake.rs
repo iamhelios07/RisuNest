@@ -98,6 +98,7 @@ pub(super) struct FakeState {
     reconcile_attempts: Vec<String>,
     metadata_attempts: Vec<String>,
     metadata_delay: Option<std::time::Duration>,
+    pub(super) listing_delay: Option<std::time::Duration>,
     pub(super) incomplete_cleanup_delay: Option<std::time::Duration>,
     pub(super) incomplete_cleanup_empty_pages: usize,
     scripted_pages: Vec<(Collection, Result<ObjectPage>)>,
@@ -672,6 +673,9 @@ impl Provider for FakeProvider {
             if limit == 0 || limit > 1000 {
                 return Err(ProviderError::new(ErrorKind::Unsupported));
             }
+            let delay = self.state.lock().unwrap().listing_delay;
+            if let Some(delay) = delay { tokio::time::sleep(delay).await; }
+            cancel.check()?;
             let scripted = {
                 let mut state = self.state.lock().unwrap();
                 state.scripted_pages.iter().position(|(kind, _)| *kind == collection)
