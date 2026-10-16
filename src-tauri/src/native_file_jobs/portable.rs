@@ -2141,6 +2141,66 @@ mod tests {
     }
 
     #[test]
+    fn portable_export_restore_carries_large_message_and_archive_controls() {
+        use crate::persistent_store::{archive::ArchivedObject, lww::{ApplyReceive, Change, Header, Progress, StageReceive}, portable_identity::IdentityRemap};
+        use risunest_external_storage_format::message_pages::{MessageHash, MessageManifest, ManifestPage, MANIFEST_SCHEMA, MIN_PAGE_MESSAGES};
+        use risunest_sync_wire::{descriptor::RecordDescriptor, stamp::Stamp, unit::{UnitKey, UnitValue}};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = library(&directory.path().join("source"));
+        store.archive_character("char-a", store.revision().unwrap(), 10).unwrap();
+        let lease = store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap().0.lease;
+        let units = store.lww_backup_unit_values(&lease).unwrap();
+        store.release_revision(&lease).unwrap();
+        let UnitValue::Object { descriptor, .. } = &units[&UnitKey::new(&["archive", "char-a"]).unwrap()] else { panic!("archive control") };
+        let mut archived: ArchivedObject = serde_json::from_slice(&store.lww_object_body(&descriptor.object_hash).unwrap().unwrap()).unwrap();
+        archived.identity_remap = vec![IdentityRemap::default(); 35_000];
+        let archive = risunest_sync_wire::payload_value::encode(&serde_json::to_value(archived).unwrap()).unwrap();
+        let archive_hash = risunest_sync_wire::hash(&archive);
+        let mut archive_descriptor = descriptor.clone();
+        archive_descriptor.object_hash = archive_hash.clone();
+        let message = (0..10_000).map(|index| serde_json::json!({"role":"user","data":format!("synthetic-{index}")}))
+            .find(|message| MessageHash::from_bytes(&risunest_sync_wire::payload_value::encode(message).unwrap()).boundary().unwrap()).unwrap();
+        let page = risunest_external_storage_format::logical_records::encode_message_page(&vec![message; MIN_PAGE_MESSAGES]).unwrap();
+        let large_page = risunest_external_storage_format::logical_records::encode_message_page(&[serde_json::json!({"role":"user","data":"x".repeat(risunest_sync_wire::MAX_METADATA_BYTES)})]).unwrap();
+        let mut pages = vec![ManifestPage { hash: page.hash.clone(), message_count: MIN_PAGE_MESSAGES as u32, byte_length: page.size.into() }; 9500];
+        pages[0] = ManifestPage { hash: large_page.hash.clone(), message_count: 1, byte_length: large_page.size.into() };
+        let manifest = MessageManifest { schema: MANIFEST_SCHEMA.into(), message_count: (1 + 9499 * MIN_PAGE_MESSAGES as u64).into(),
+            pages }.encode().unwrap();
+        assert!(archive.len() > risunest_sync_wire::MAX_METADATA_BYTES);
+        assert!(manifest.bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES);
+        eprintln!("synthetic portable controls: archive={} manifest={} large_page={} pages=9500 messages={}",
+            archive.len(), manifest.bytes.len(), large_page.bytes.len(), 1 + 9499 * MIN_PAGE_MESSAGES);
+        for (hash, body) in [(&archive_hash, &archive), (&manifest.hash, &manifest.bytes), (&page.hash, &page.bytes), (&large_page.hash, &large_page.bytes)] {
+            store.lww_put_object(hash, body).unwrap();
+        }
+        let mut manifest_descriptor = RecordDescriptor::content(manifest.hash.clone());
+        manifest_descriptor.dependencies = vec![page.hash.clone(), large_page.hash.clone()];
+        manifest_descriptor.dependencies.sort();
+        let originals = std::collections::BTreeMap::from([
+            (UnitKey::new(&["archive", "held-archive"]).unwrap(), UnitValue::object(archive_descriptor).unwrap()),
+            (UnitKey::new(&["messages", "held-messages", "held-chat"]).unwrap(), UnitValue::object(manifest_descriptor).unwrap()),
+        ]);
+        let header = Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "large-portable-controls".into() };
+        store.lww_stage_receive(&StageReceive {
+            header: header.clone(),
+            changes: originals.iter().map(|(key, value)| Change { key: key.clone(), value: value.clone(),
+                stamp: Stamp { physical_ms: 1u64.into(), logical: 0, writer_id: "00000000-0000-4000-8000-000000000001".into() } }).collect(),
+            progress: Progress { kind: "server".into(), cursor: 1u64.into(), writer_id: None }, admitted_time_upper_ms: u64::MAX.into(),
+        }).unwrap();
+        store.lww_apply_receive(&ApplyReceive { header: header.clone(), generating: Vec::new() }).unwrap();
+        store.lww_finish_receive(&header).unwrap();
+        let mut restored = export_and_restore(directory.path(), store);
+        let lease = restored.lww_acquire_backup_capture(restored.revision().unwrap()).unwrap().0.lease;
+        let restored_units = restored.lww_backup_unit_values(&lease).unwrap();
+        for (key, value) in originals { assert_eq!(restored_units.get(&key), Some(&value)); }
+        assert_eq!(restored.lww_object_body(&archive_hash).unwrap().unwrap(), archive);
+        assert_eq!(restored.lww_object_body(&manifest.hash).unwrap().unwrap(), manifest.bytes);
+        restored.release_revision(&lease).unwrap();
+        restored.restore_character("char-a", restored.revision().unwrap()).unwrap();
+        assert!(restored.read_character("char-a", None).unwrap().is_some());
+    }
+
+    #[test]
     fn a_library_with_archived_characters_exports_without_preservation_and_restores_exactly() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");

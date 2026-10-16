@@ -1983,7 +1983,14 @@ pub(in crate::persistent_store) fn archive_metadata(
     let body = super::super::message_pages::object_body(db, &descriptor.object_hash)?
         .ok_or_else(|| error("archive-metadata-missing"))?;
     let archived: super::super::archive::ArchivedObject = serde_json::from_slice(&body)?;
-    if archive_value(db, &archived)? != *value {
+    let (_, _, descriptor, _) = archive_objects(&archived)?;
+    let expected = {
+        let result = UnitValue::object(descriptor);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::descriptor_creation(&result);
+        result
+    }.map_err(error)?;
+    if expected != *value {
         return Err(error("archive-descriptor-mismatch"));
     }
     Ok(archived)

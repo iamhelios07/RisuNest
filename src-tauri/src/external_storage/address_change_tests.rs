@@ -645,7 +645,7 @@ async fn reach_through_another_address(
     let (first_handle, first_capabilities) = first_device.open(&first, OpenMode::Existing).await.unwrap();
     let stored = saved_connection(&first_device, &first, &created).await;
     let changed = super::connection_commands::change_endpoint(first_device.directory.path(), &stored,
-        second.endpoint.clone(), first_device._dependencies.dependencies.clone(), &created.root_key, &cancel).await.unwrap();
+        second.endpoint.clone(), |_| Ok(first_device._dependencies.dependencies.clone()), &created.root_key, &cancel).await.unwrap();
     assert_eq!(serde_json::to_value(&changed).unwrap()["connection"]["id"].as_str(), Some(stored.id.as_str()));
     let reread = super::connection_store::ConnectionStore::open(first_device.directory.path()).unwrap().read(&stored.id).unwrap();
     let mut expected = serde_json::to_value(&stored).unwrap();
@@ -653,7 +653,7 @@ async fn reach_through_another_address(
     expected["verifiedAtMs"] = reread.verified_at_ms.into();
     assert_eq!(serde_json::to_value(&reread).unwrap(), expected);
     let stale = super::connection_commands::change_endpoint(first_device.directory.path(), &stored,
-        second.endpoint.clone(), first_device._dependencies.dependencies.clone(), &created.root_key, &cancel).await.err().unwrap();
+        second.endpoint.clone(), |_| Ok(first_device._dependencies.dependencies.clone()), &created.root_key, &cancel).await.err().unwrap();
     assert_eq!(stale.kind, ErrorKind::PreconditionFailed);
     let (record_key, record_hash) = back_up(&first_device, &first_handle, &first_capabilities, &created).await;
 
@@ -809,7 +809,7 @@ async fn refuse_another_repository_at_one_address(
     assert_ne!(other.descriptor.repository_id, held.descriptor.repository_id);
     let stored = saved_connection(&first_device, &config, &held).await;
     let mismatch = super::connection_commands::change_endpoint(first_device.directory.path(), &stored,
-        config.endpoint.clone(), second_device._dependencies.dependencies.clone(), &held.root_key, &cancel).await.err().unwrap();
+        config.endpoint.clone(), |_| Ok(second_device._dependencies.dependencies.clone()), &held.root_key, &cancel).await.err().unwrap();
     assert_eq!(mismatch.kind, ErrorKind::RepositoryMismatch);
     let reread = super::connection_store::ConnectionStore::open(first_device.directory.path()).unwrap().read(&stored.id).unwrap();
     assert_eq!(serde_json::to_value(reread).unwrap(), serde_json::to_value(stored).unwrap());

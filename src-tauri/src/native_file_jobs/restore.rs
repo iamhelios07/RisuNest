@@ -4849,7 +4849,8 @@ mod tests {
         let mut projection = None;
         for format in fixture["formats"].as_array().unwrap() {
             let bytes = base64::engine::general_purpose::STANDARD.decode(format["bytes"].as_str().unwrap()).unwrap();
-            for mode in ["standalone", "archive", "encrypted"] {
+            for mode in ["standalone", "archive", "encrypted", "{}", "null", "[]", "true", r#""synthetic""#,
+                r#"{"type":"none"}"#, r#"{"type":"synthetic"}"#, r#"{"type":42}"#] {
                 let archived = mode != "standalone";
                 let encrypted = mode == "encrypted";
                 let (directory, mut sink) = self::fixture();
@@ -4866,10 +4867,15 @@ mod tests {
                         let metadata = directory.path().join("metadata");
                         fs::write(&metadata, br#"{"type":"account","time":1}"#).unwrap();
                         write_container_entry(&mut output, "encryption.risudat", &metadata);
+                    } else if mode != "archive" {
+                        let metadata = directory.path().join("metadata");
+                        fs::write(&metadata, mode).unwrap();
+                        write_container_entry(&mut output, "encryption.risudat", &metadata);
                     }
                     write_container_entry(&mut output, "database.risudat", &source);
                     drop(output);
-                    restore_container_payloads_with_key(&archive, directory.path(), &mut sink, &job, RestoreLimits::default(), fixture["key"].as_str()).unwrap();
+                    let key = if encrypted { fixture["key"].as_str() } else { None };
+                    restore_container_payloads_with_key(&archive, directory.path(), &mut sink, &job, RestoreLimits::default(), key).unwrap();
                 } else {
                     restore_risu_save(&source, 1, &job, &sink).unwrap();
                 }
@@ -4882,6 +4888,28 @@ mod tests {
                 if let Some(expected) = &projection { assert_eq!(&restored, expected, "{format}"); }
                 else { projection = Some(restored); }
             }
+        }
+    }
+
+    #[test]
+    fn readable_non_account_metadata_does_not_allow_an_invalid_database() {
+        for metadata in ["{}", "null", r#"{"type":"synthetic"}"#] {
+            let (directory, mut sink) = fixture();
+            let before = sink.store.lock().unwrap().materialize(None).unwrap();
+            let source = directory.path().join("invalid.risudat");
+            fs::write(&source, b"not a database").unwrap();
+            let meta = directory.path().join("metadata");
+            fs::write(&meta, metadata).unwrap();
+            let archive = directory.path().join("invalid.bin");
+            let mut output = File::create(&archive).unwrap();
+            write_container_entry(&mut output, "encryption.risudat", &meta);
+            write_container_entry(&mut output, "database.risudat", &source);
+            drop(output);
+            let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+            let failure = restore_container_payloads_with_key(&archive, directory.path(), &mut sink, &job, RestoreLimits::default(), None).unwrap_err();
+            assert!(!failure.to_string().contains("backup-encryption-unsupported"));
+            assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+            assert_eq!(sink.store.lock().unwrap().materialize(None).unwrap(), before);
         }
     }
 
