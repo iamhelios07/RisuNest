@@ -208,7 +208,7 @@ pub(crate) async fn external_storage_list_history(
     app: AppHandle,
     request: HistoryRequest,
 ) -> Result<Value> {
-    logged("external_storage_list_history", async move {
+    logged("external_storage_list_history", Box::pin(async move {
         let state = decode_cursor(&request)?;
         let connected =
             super::connection_commands::open_connected(&app, &request.connection_id).await?;
@@ -310,7 +310,7 @@ pub(crate) async fn external_storage_list_history(
             output["nextCursor"] = json!(encode_cursor(next)?);
         }
         Ok(output)
-    }.await)
+    }).await)
 }
 #[cfg(test)]
 mod tests {
