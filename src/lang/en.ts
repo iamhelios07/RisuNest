@@ -2443,6 +2443,8 @@ export const languageEnglish = {
             messageSendKeyButton: 'Send button',
             chatEditPopup: 'Edit chat messages in a popup',
             chatEditPopupHelp: 'Pressing the chat edit button lets you edit the message in a popup.',
+            syncStatusUi: 'Show sync UI',
+            syncStatusUiHelp: 'Shows the status icon and overlays that report the sync status. When turned off, it is harder to notice right away when something is waiting for sync or a sync error occurs.',
         },
         textEditor: {
             open: 'Edit in popup',

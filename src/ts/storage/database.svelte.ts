@@ -721,6 +721,7 @@ export function normalizeDatabaseDefaults(data:Database): Database {
     data.streamingThoughtMode ??= 'recent'
     data.streamingDeferDisplayProcessing ??= false
     data.risunestChatEditPopup ??= true
+    data.risunestSyncStatusUi ??= true
     data.echoMessage ??= "Echo Message"
     data.echoDelay ??= 0
     if(!isTauri){
@@ -1318,6 +1319,7 @@ export interface Database{
     streamingThoughtMode?: StreamingThoughtMode
     streamingDeferDisplayProcessing?: boolean
     risunestChatEditPopup?: boolean
+    risunestSyncStatusUi?: boolean
     pluginDevelopMode?: boolean
     echoMessage?:string
     echoDelay?:number

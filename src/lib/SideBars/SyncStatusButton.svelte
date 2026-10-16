@@ -19,7 +19,7 @@
     const attention = 'text-[color:color-mix(in_srgb,var(--risu-theme-danger-400)_80%,var(--risu-theme-textcolor))]'
     const icons = { connected: CloudCheckIcon, working: CloudSyncIcon, idle: CloudOffIcon, paused: CloudIcon, attention: CloudAlertIcon }
     let button = $state<HTMLButtonElement>()
-    const display = $derived($syncStatus && syncStatusDisplay($syncStatus, externalStorageStrings(DBState.db.language), $persistentLocalSaveFailure !== null))
+    const display = $derived((DBState.db.risunestSyncStatusUi ?? true) && $syncStatus && syncStatusDisplay($syncStatus, externalStorageStrings(DBState.db.language), $persistentLocalSaveFailure !== null))
     const open = $derived(!!button && $syncStatusPanel?.anchor === button)
 
     function toggle() {

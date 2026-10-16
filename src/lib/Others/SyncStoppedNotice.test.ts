@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { get } from 'svelte/store'
 import { language } from 'src/lang'
-import { settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
+import { DBState, settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
 import { activeRisuNestSettingsTab } from 'src/ts/setting/risuNestSettingsTabs'
 import { pluginStartupState } from 'src/ts/plugins/pluginStartupGate'
 import { externalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
@@ -22,6 +22,7 @@ afterEach(async () => {
     pluginStartupState.set({ phase: 'released', refused: false, since: 0 })
     settingsOpen.set(false)
     activeRisuNestSettingsTab.set(null)
+    DBState.db.risunestSyncStatusUi = true
 })
 const server = (view: Partial<ServerSyncView>): SyncStatusSource => ({
     target: 'server',
@@ -87,4 +88,13 @@ it('reports an external connection that needs the user', async () => {
     await show({ target: 'external', connection, syncStopped: false, refresh: () => {}, syncNow: async () => {} })
     expect(notice()?.querySelector('p')?.textContent).toBe(strings.statusReauth)
     expect(notice()?.textContent).toContain(strings.reauthenticate)
+})
+
+it('stays hidden while the sync UI is turned off', async () => {
+    DBState.db.risunestSyncStatusUi = false
+    component = mount(SyncStoppedNotice, { target: document.body })
+    await show(stopped('unauthorized'))
+    expect(notice()).toBeNull()
+    DBState.db.risunestSyncStatusUi = true; await tick()
+    expect(notice()).not.toBeNull()
 })

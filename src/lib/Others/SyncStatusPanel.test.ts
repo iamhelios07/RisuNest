@@ -10,6 +10,7 @@ import { get } from 'svelte/store'
 import { language } from 'src/lang'
 import { externalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
 import { syncStatusPanel } from 'src/ts/gui/syncStatusPanel'
+import { DBState } from 'src/ts/stores.svelte'
 import { syncStatus, type SyncStatusSource } from 'src/ts/storage/sync/syncStatus'
 import type { ServerSyncView } from 'src/ts/storage/sync/syncStatusView'
 import type { ExternalConnectionSummary } from 'src/ts/storage/sync/external/types'
@@ -22,6 +23,7 @@ afterEach(async () => {
     component = undefined
     document.body.replaceChildren()
     syncStatus.set(null)
+    DBState.db.risunestSyncStatusUi = true
 })
 async function open(source: SyncStatusSource) {
     const anchor = document.body.appendChild(document.createElement('button'))
@@ -63,6 +65,12 @@ it('lists server rows it knows and reads pending changes when an attempt ends, n
     await vi.waitFor(() => expect(document.querySelector('[data-sync-status-panel]')?.textContent).toContain(language.lwwSync.clockBlocked))
 
     document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); await tick()
+    expect(get(syncStatusPanel)).toBeNull()
+    expect(document.querySelector('[data-sync-status-panel]')).toBeNull()
+
+    syncStatusPanel.set({ anchor: document.body.querySelector('button')!, placement: 'side' }); await tick()
+    expect(document.querySelector('[data-sync-status-panel]')).not.toBeNull()
+    DBState.db.risunestSyncStatusUi = false; await tick()
     expect(get(syncStatusPanel)).toBeNull()
     expect(document.querySelector('[data-sync-status-panel]')).toBeNull()
 })

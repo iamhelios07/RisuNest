@@ -19,7 +19,7 @@
 
     const strings = $derived(externalStorageStrings(DBState.db.language))
     const saveFailed = $derived($persistentLocalSaveFailure !== null)
-    const display = $derived($syncStatus && syncStatusDisplay($syncStatus, strings, saveFailed))
+    const display = $derived((DBState.db.risunestSyncStatusUi ?? true) && $syncStatus && syncStatusDisplay($syncStatus, strings, saveFailed))
     let panel = $state<HTMLElement>()
     let place = $state<{ top?: number; bottom?: number; left: number; right?: number; width?: number; height: number }>({ left: 8, height: 0 })
     let pending = $state<number | undefined>()
@@ -62,7 +62,7 @@
         untrack(close)
     })
     $effect(() => {
-        if (!$syncStatus) untrack(close)
+        if (!display) untrack(close)
     })
     // Read when the panel opens and when a sync attempt ends, as the server card does, not on every progress report.
     const pendingKey = $derived.by(() => {

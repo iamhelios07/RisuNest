@@ -9,7 +9,7 @@
     import { DBState, DynamicGUI, MobileGUI, sideBarClosing, sideBarStore } from "src/ts/stores.svelte";
 
     // The closed sidebar hides the status button, so the tab carries every state but connected.
-    const display = $derived($syncStatus && syncStatusDisplay($syncStatus, externalStorageStrings(DBState.db.language), $persistentLocalSaveFailure !== null))
+    const display = $derived((DBState.db.risunestSyncStatusUi ?? true) && $syncStatus && syncStatusDisplay($syncStatus, externalStorageStrings(DBState.db.language), $persistentLocalSaveFailure !== null))
     const dot = $derived(display && display.tone !== 'connected' ? display : null)
 </script>
 

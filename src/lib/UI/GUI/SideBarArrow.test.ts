@@ -7,7 +7,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import type { writable } from 'svelte/store'
 import { language } from 'src/lang'
-import { MobileGUI, sideBarStore } from 'src/ts/stores.svelte'
+import { DBState, MobileGUI, sideBarStore } from 'src/ts/stores.svelte'
 import { persistentLocalSaveFailure } from 'src/ts/storage/persistentDataRuntime.svelte'
 import { syncStatus, type SyncStatusSource } from 'src/ts/storage/sync/syncStatus'
 import type { ServerSyncView } from 'src/ts/storage/sync/syncStatusView'
@@ -21,6 +21,7 @@ afterEach(async () => {
     document.body.replaceChildren()
     syncStatus.set(null)
     saveFailure.set(null)
+    DBState.db.risunestSyncStatusUi = true
 })
 const server = (view: Partial<ServerSyncView>): SyncStatusSource => ({
     target: 'server',
@@ -54,4 +55,9 @@ it('marks the closed sidebar tab with every sync state except connected', async 
     syncStatus.set(server({})); saveFailure.set(new Error('disk full')); await tick()
     expect(dot()).toBe('attention')
     expect(tab().getAttribute('aria-label')).toBe(`${language.menu}, ${language.risuNest.tabs.sync}: ${language.risuNest.syncStatus.saveFailed}`)
+
+    DBState.db.risunestSyncStatusUi = false; await tick()
+    expect(dot()).toBeUndefined()
+    expect(tab().getAttribute('aria-label')).toBe(language.menu)
+    expect(tab().classList.contains('opacity-50')).toBe(true)
 })

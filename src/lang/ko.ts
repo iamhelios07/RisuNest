@@ -2258,6 +2258,8 @@ export const languageKorean = {
             messageSendKeyButton: '전송 버튼',
             chatEditPopup: '채팅 수정 팝업창 사용',
             chatEditPopupHelp: '채팅 수정 버튼을 누르면 팝업창에서 내용을 수정할 수 있도록 합니다.',
+            syncStatusUi: '동기화 UI 표시',
+            syncStatusUiHelp: '동기화 상태를 알려주는 상태 아이콘과 오버레이를 보여줍니다. 사용하지 않으면 동기화를 위해 대기 중인 상황이나 동기화 오류가 있을 때 바로 알기 어려워집니다.',
         },
         textEditor: {
             open: '팝업창에서 수정',

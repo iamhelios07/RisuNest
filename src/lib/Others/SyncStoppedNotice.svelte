@@ -9,7 +9,7 @@
     import SettingButton from '../Setting/RisuNest/SettingButton.svelte'
 
     // The stop's own label and text, not the local save failure that takes the status button first.
-    const display = $derived($syncStatus && syncStatusDisplay($syncStatus, externalStorageStrings(DBState.db.language), false))
+    const display = $derived((DBState.db.risunestSyncStatusUi ?? true) && $syncStatus && syncStatusDisplay($syncStatus, externalStorageStrings(DBState.db.language), false))
     // 닫기 holds until the cause changes or a sync succeeds; retries between two reports of one stop keep it.
     let dismissed = $state<{ key: string; lastSuccessAt?: number }>()
     const visible = $derived(!!display?.stopKey && (dismissed?.key !== display.stopKey || dismissed.lastSuccessAt !== display.lastSuccessAt))
