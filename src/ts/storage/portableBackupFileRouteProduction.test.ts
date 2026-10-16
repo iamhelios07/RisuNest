@@ -369,9 +369,7 @@ describe('common backup file production route', () => {
         }
         m.chooseRestore.mockResolvedValue({ library: true, deviceSections: [] })
         await m.portable.mock.calls[0][2].choosePortableSections(preview)
-        expect(m.chooseRestore).toHaveBeenCalledExactlyOnceWith(preview, {
-            firstRun: true,
-        })
+        expect(m.chooseRestore).toHaveBeenCalledExactlyOnceWith(preview)
     })
     it('full native restoration delegates sync lifecycle to the shared guard', async () => {
         await restoreBackupFromNativeSource({

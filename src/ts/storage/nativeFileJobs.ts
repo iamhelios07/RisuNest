@@ -253,7 +253,9 @@ export type NativeFileJobStage =
     | 'restarting-app'
     | 'awaiting-reselect'
     | 'preparing-export'
+    | 'downloading-export'
     | 'writing-export'
+    | 'verifying-export'
     | 'publishing-destination'
     | 'finalizing-export'
 

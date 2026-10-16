@@ -3703,6 +3703,31 @@ pub(crate) enum JobStage {
     AwaitingActivation,
     Activating,
     CleaningUp,
+    PreparingExport,
+    DownloadingExport,
+    WritingExport,
+    VerifyingExport,
+    PublishingDestination,
+    FinalizingExport,
+}
+
+fn export_progress_stage(kind: JobKind, phase: JobPhase) -> Option<JobStage> {
+    if !matches!(kind, JobKind::ExportPortableBackup | JobKind::ExportBlockRisuSave
+        | JobKind::ExportCompatibleLocalBackup | JobKind::ExportCharacterCharx
+        | JobKind::ExportCharacterCard | JobKind::ExportRisuModule
+        | JobKind::OfficialPublicationUpload) { return None; }
+    match phase {
+        JobPhase::WritingExport => Some(if kind == JobKind::ExportPortableBackup { JobStage::PreparingExport } else { JobStage::WritingExport }),
+        JobPhase::PublishingDestination | JobPhase::UploadingDatabase => Some(JobStage::PublishingDestination),
+        JobPhase::FinalizingExport | JobPhase::FinalizingPublication => Some(JobStage::FinalizingExport),
+        _ => None,
+    }
+}
+
+fn reset_export_detail(status: &mut JobStatus) {
+    if let Some(stage) = export_progress_stage(status.kind, status.phase) {
+        status.detail = Some(JobDetail::new(stage, StageUnit::Bytes, 0, None, ImportCounts::default()));
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -5048,6 +5073,7 @@ impl JobControl {
         }
         status.state = JobState::Running;
         status.phase = JobPhase::FinalizingPublication;
+        reset_export_detail(&mut status);
         status.publication_attempt = None;
         Ok(())
     }
@@ -5082,7 +5108,20 @@ impl JobControl {
         }
         status.state = JobState::Running;
         status.phase = phase;
+        reset_export_detail(&mut status);
         Ok(())
+    }
+
+    pub(crate) fn set_export_progress(&self, progress: JobProgress, completed: u64, total: Option<u64>) -> Result<(), String> {
+        self.set_progress(progress)?;
+        self.set_export_bytes(completed, total)
+    }
+
+    pub(crate) fn set_export_bytes(&self, completed: u64, total: Option<u64>) -> Result<(), String> {
+        let status = self.status();
+        let stage = export_progress_stage(status.kind, status.phase)
+            .ok_or_else(|| "native job is not exporting".to_owned())?;
+        self.set_detail(JobDetail::new(stage, StageUnit::Bytes, completed, total, ImportCounts::default()))
     }
 
     pub(crate) fn set_progress(&self, progress: JobProgress) -> Result<(), String> {
@@ -5150,6 +5189,7 @@ impl JobControl {
             return Err("native job phase transition is invalid".to_owned());
         }
         status.phase = phase;
+        reset_export_detail(&mut status);
         Ok(())
     }
 
@@ -5165,6 +5205,7 @@ impl JobControl {
             return Err("native export publication cannot commit from its current state".to_owned());
         }
         status.phase = JobPhase::FinalizingExport;
+        reset_export_detail(&mut status);
         Ok(())
     }
 
@@ -8137,8 +8178,17 @@ mod tests {
             .unwrap();
 
         job.start(JobPhase::WritingExport).unwrap();
+        job.set_export_progress(JobProgress { completed_bytes: 100, total_bytes: None, ..Default::default() }, 100, None).unwrap();
+        assert_eq!(job.status().detail.unwrap().stage_completed, 100);
         job.set_phase(JobPhase::PublishingDestination).unwrap();
+        assert_eq!(job.status().detail.unwrap().stage_completed, 0);
+        job.set_export_progress(JobProgress { completed_bytes: 125, total_bytes: Some(200), ..Default::default() }, 25, Some(100)).unwrap();
+        let publishing = job.status().detail.unwrap();
+        assert_eq!((publishing.stage_completed, publishing.stage_total), (25, Some(100)));
         job.commit_export_publication().unwrap();
+        let finalizing = job.status().detail.unwrap();
+        assert_eq!(finalizing.stage, JobStage::FinalizingExport);
+        assert_eq!((finalizing.stage_completed, finalizing.stage_total), (0, None));
 
         assert_eq!(job.status().phase, JobPhase::FinalizingExport);
         assert_eq!(job.request_cancel().unwrap(), CancelOutcome::TooLate);

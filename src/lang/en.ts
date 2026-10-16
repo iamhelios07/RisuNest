@@ -2858,6 +2858,8 @@ export const languageEnglish = {
             titleExportBackup: 'Export RisuNest backup',
             titleExportCompatible: 'Export compatible backup',
             stagePreparingExport: 'Preparing data',
+            stageDownloadingExport: 'Downloading files',
+            stageVerifyingExport: 'Checking backup file',
             stageWritingExport: 'Writing backup file',
             stagePublishingDestination: 'Saving to the chosen location',
             stageFinalizingExport: 'Finishing',

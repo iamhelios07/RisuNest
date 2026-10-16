@@ -91,7 +91,9 @@ const STAGE_ORDER: DialogStageId[] = [
 
 const EXPORT_STAGE_ORDER: DialogStageId[] = [
     'preparing-export',
+    'downloading-export',
     'writing-export',
+    'verifying-export',
     'publishing-destination',
     'finalizing-export',
 ]
@@ -289,7 +291,9 @@ function stageLabel(stage: NativeFileJobDialogStage): string {
         case 'reloading-plugins': return copy.stageReloadingPlugins
         case 'restarting-app': return copy.stageRestartingApp
         case 'preparing-export': return copy.stagePreparingExport
+        case 'downloading-export': return copy.stageDownloadingExport
         case 'writing-export': return copy.stageWritingExport
+        case 'verifying-export': return copy.stageVerifyingExport
         case 'publishing-destination': return copy.stagePublishingDestination
         case 'finalizing-export': return copy.stageFinalizingExport
         case 'complete': return copy.stageComplete
@@ -345,6 +349,7 @@ function activeStageDetail(stage: DialogStageId, status: NativeFileJobStatus | u
     if (status.kind === 'export-dataset' && stage === 'writing-export') {
         return progressText(status.progress.completedItems, status.progress.totalItems, 'items')
     }
+    if ((status.kind.startsWith('export-') && status.kind !== 'export-dataset' && status.kind !== 'export-raw-recovery') || status.kind === 'official-publication-upload') return ''
     return progressText(status.progress.completedBytes, status.progress.totalBytes, 'bytes')
 }
 
@@ -631,14 +636,16 @@ function overallOf(
     const progress = status?.progress
     const total = progress?.totalBytes
     const completed = progress?.completedBytes ?? 0
+    const exporting = (status?.kind.startsWith('export-') && status.kind !== 'export-raw-recovery' && status.kind !== 'export-dataset') || status?.kind === 'official-publication-upload'
     if (terminalState === 'succeeded') {
+        const bytes = exporting ? status?.result?.sourceBytes : total
         return {
             overallPercent: 100,
-            overallText: total && total > 0 ? fillTemplate(copy.overall, formatBytes(total), formatBytes(total)) : '',
+            overallText: bytes && bytes > 0 ? exporting ? formatBytes(bytes) : fillTemplate(copy.overall, formatBytes(bytes), formatBytes(bytes)) : '',
             indeterminate: false,
         }
     }
-    if (status?.kind.startsWith('restore-')) {
+    if (status?.kind.startsWith('restore-') || exporting) {
         const detail = status.detail
         if (detail?.stageTotal && detail.stageTotal > 0) {
             return {
@@ -647,7 +654,7 @@ function overallOf(
                 indeterminate: false,
             }
         }
-        return { overallPercent: null, overallText: '', indeterminate: terminalState === null }
+        return { overallPercent: null, overallText: exporting && detail ? progressText(detail.stageCompleted, detail.stageTotal, detail.stageUnit) : '', indeterminate: terminalState === null }
     }
     if (total && total > 0) {
         return {
