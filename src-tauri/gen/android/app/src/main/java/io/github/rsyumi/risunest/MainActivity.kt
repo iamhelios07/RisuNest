@@ -1459,7 +1459,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       } ?: return@synchronized false
       if (current.isTerminal()) return@synchronized true
       if (current.destinationUri == null) return@synchronized false
-      val warnings = cleanupOwnedSafDestination(current)
+      val warnings = interruptedSafDestinationWarnings(current)
       val terminal = current.copy(phase = SafDestinationPhase.CANCELLED, destinationUri = null,
         code = "cancelled", warningCodes = warnings, publicationPrerequisitesComplete = true,
         updatedAtMillis = System.currentTimeMillis())
@@ -1744,7 +1744,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           claimSafDestinationSelection(pending, uri)
         }
       } catch (error: Exception) {
-        val warnings = cleanupUnclaimedSafDestinationOnIo(uri, pending.reservedDestination)
+        val warnings = unclaimedSafDestinationWarnings(uri)
         val failure = destinationTerminalRecord(
           requestId = pending.requestId,
           exportId = pending.exportId,
@@ -1763,7 +1763,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         return@launch
       }
       if (selectedState == null) {
-        val warnings = cleanupUnclaimedSafDestinationOnIo(uri, pending.reservedDestination)
+        val warnings = unclaimedSafDestinationWarnings(uri)
         val terminal = withContext(Dispatchers.IO) {
           addSafDestinationWarnings(pending.requestId, warnings)
         }
@@ -1783,10 +1783,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         if (selectedState.phase == SafDestinationPhase.CANCELLING) {
           withContext(Dispatchers.IO) { safCommands.releaseExport(pending.requestId) }
         } else {
-          runCatching {
-            contentResolver.takePersistableUriPermission(requireNotNull(uri),
-              Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-          }
           val payload = "{\"requestId\":${jsonString(pending.requestId)}}"
           lifecycleWebView?.evaluateJavascript("window.dispatchEvent(new CustomEvent('risunest-android-saf-reserved',{detail:$payload}));", null)
         }
@@ -1839,8 +1835,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             contentResolver.openOutputStream(destinationUri, "wt")
               ?: throw IOException("Android SAF provider did not open the destination")
           },
-          deletePartial = { android.provider.DocumentsContract.deleteDocument(contentResolver, destinationUri) },
-          createdDocument = selectedState.reservedDestination,
+          deletePartial = { false },
+          // CreateDocument can return an existing document selected for overwrite.
+          createdDocument = false,
           isCancelled = { pending.cancellation.get() || !copyContext.isActive },
           onProgress = { copiedBytes ->
             dispatchSafProgress(
@@ -1882,7 +1879,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         terminalMessage = "Android SAF destination copy failed"
         val warnings = if (destinationUri.scheme == ContentResolver.SCHEME_CONTENT) {
           withContext(Dispatchers.IO) {
-            cleanupOwnedSafDestination(selectedState)
+            interruptedSafDestinationWarnings(selectedState)
           }
         } else {
           emptyList()
@@ -1912,7 +1909,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     val terminalRecord = loadSafDestinationState()?.takeIf(SafDestinationRecord::isTerminal)
     val terminalRequestId = terminalRecord?.requestId
     safScope.launch {
-      val warnings = cleanupUnclaimedSafDestinationOnIo(uri, terminalRecord?.reservedDestination == true)
+      val warnings = unclaimedSafDestinationWarnings(uri)
       val terminal = terminalRequestId?.let { requestId ->
         withContext(Dispatchers.IO) { addSafDestinationWarnings(requestId, warnings) }
       }
@@ -1920,19 +1917,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
-  private suspend fun cleanupUnclaimedSafDestinationOnIo(uri: Uri?, owned: Boolean = false): List<String> =
-    withContext(Dispatchers.IO) {
-      if (uri == null || uri.scheme != ContentResolver.SCHEME_CONTENT) return@withContext emptyList()
-      if (owned && runCatching {
-        android.provider.DocumentsContract.deleteDocument(contentResolver, uri)
-      }.getOrDefault(false)) emptyList() else interruptedSafDestinationWarnings()
-    }
-
-  private fun cleanupOwnedSafDestination(record: SafDestinationRecord): List<String> {
-    return cleanupReservedSafDestination(record) { uri ->
-      android.provider.DocumentsContract.deleteDocument(contentResolver, Uri.parse(uri))
-    }
-  }
+  private fun unclaimedSafDestinationWarnings(uri: Uri?): List<String> =
+    if (uri?.scheme == ContentResolver.SCHEME_CONTENT) interruptedSafDestinationWarnings() else emptyList()
 
   private fun cancelUnclaimedReservedDestination() {
     val requestId = loadSafDestinationState()
@@ -2124,7 +2110,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         safScope.launch {
           try {
             val warnings = withContext(Dispatchers.IO) {
-              cleanupOwnedSafDestination(record)
+              interruptedSafDestinationWarnings(record)
             }
             val wasCancelling = record.phase == SafDestinationPhase.CANCELLING
             val terminal = destinationTerminalRecord(

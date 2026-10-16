@@ -335,15 +335,9 @@ internal fun beginReservedSafCopy(
     ?.copy(copyStarted = true, exportId = exportId)
 }
 
-internal fun cleanupReservedSafDestination(
-  record: SafDestinationRecord,
-  deleteDocument: (String) -> Boolean,
-): List<String> {
-  val uri = record.destinationUri ?: return emptyList()
-  return if (record.reservedDestination && runCatching { deleteDocument(uri) }.getOrDefault(false)) {
-    emptyList()
-  } else interruptedSafDestinationWarnings()
-}
+// A picker reservation proves access, not ownership of the returned document.
+internal fun interruptedSafDestinationWarnings(record: SafDestinationRecord): List<String> =
+  if (record.destinationUri == null) emptyList() else interruptedSafDestinationWarnings()
 
 private data class NullableString(val value: String?)
 private data class NullableLong(val value: Long?)

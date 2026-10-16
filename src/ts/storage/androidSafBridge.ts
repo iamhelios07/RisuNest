@@ -625,7 +625,36 @@ async function recoverUnclaimedAndroidDestination(
     }
 }
 
-/** The receipt owns only the document created by this picker, never a caller-supplied URI. */
+/** Release the reservation without replacing a failed operation's error. */
+export async function withAndroidSafDestination<T>(
+    reservation: AndroidSafDestinationReservation,
+    operation: () => Promise<T>,
+): Promise<T> {
+    let failed = false
+    let originalError: unknown
+    try {
+        return await operation()
+    } catch (error) {
+        failed = true
+        originalError = error
+        throw error
+    } finally {
+        try { await reservation.release() }
+        catch (cleanupError) {
+            if (!failed) throw cleanupError
+            // Cleanup must not replace the producer's error, including cancellation.
+            if (originalError && typeof originalError === 'object' && cleanupError instanceof AndroidSafDestinationError) {
+                try {
+                    const previous = (originalError as {warningCodes?: unknown}).warningCodes
+                    Object.assign(originalError, {warningCodes: [...new Set([
+                        ...(Array.isArray(previous) ? previous : []), ...cleanupError.warningCodes,
+                    ])]})
+                } catch {}
+            }
+        }
+    }
+}
+
 export function reserveAndroidSafDestination(
     suggestedName: string,
     sourceKind: AndroidSafExportKind,
@@ -658,7 +687,7 @@ export function reserveAndroidSafDestination(
                     await bridge.acknowledgeExport?.(requestId)
                     if (terminal.warningCodes.includes('partial-destination-may-remain')) {
                         throw new AndroidSafDestinationError(requestId, 'destination-cleanup-failed', terminal.warningCodes,
-                            'Android SAF destination could not be removed')
+                            'A partial file may remain at the Android SAF destination')
                     }
                 }
             } finally {

@@ -3,6 +3,7 @@ import type { ExportExclusions } from './exportExcludedReport'
 import type { Database } from './database.svelte'
 import {
     AndroidSafDestinationError,
+    withAndroidSafDestination,
     type AndroidSafDestinationEvent,
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
@@ -141,11 +142,8 @@ async function exportThroughAndroidSaf(
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult> {
     const reservation = await dependencies.reserveAndroidDestination(name, 'risuSave', options.signal)
-    try {
-        return await exportToReservedAndroidSaf(runtime, name, options, dependencies, reservation)
-    } finally {
-        await reservation.release()
-    }
+    return withAndroidSafDestination(reservation, () =>
+        exportToReservedAndroidSaf(runtime, name, options, dependencies, reservation))
 }
 
 async function exportToReservedAndroidSaf(

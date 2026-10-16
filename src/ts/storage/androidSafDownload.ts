@@ -3,6 +3,7 @@ import {
     copyNativeExportToAndroidSaf,
     reserveAndroidSafDestination,
     bindAndroidSafDestinationSource,
+    withAndroidSafDestination,
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
 } from './androidSafBridge'
@@ -41,36 +42,34 @@ export async function downloadThroughAndroidSaf(
     }
     let path: string | undefined
     try {
-        path = await dependencies.invoke<string>('native_download_handoff_create')
-        await bindAndroidSafDestinationSource(reservation, path)
-        for (let offset = 0; offset < data.length; offset += ANDROID_DOWNLOAD_PIECE_BYTES) {
-            const piece = data.subarray(offset, offset + ANDROID_DOWNLOAD_PIECE_BYTES)
-            const written = await dependencies.invoke<number>('native_download_handoff_append', {
-                path,
-                offset,
-                chunk: Buffer.from(piece.buffer, piece.byteOffset, piece.byteLength).toString('base64'),
-            })
-            if (written !== offset + piece.length) {
-                throw new Error('Download handoff length differs from the written bytes')
+        return await withAndroidSafDestination(reservation, async () => {
+            path = await dependencies.invoke<string>('native_download_handoff_create')
+            await bindAndroidSafDestinationSource(reservation, path)
+            for (let offset = 0; offset < data.length; offset += ANDROID_DOWNLOAD_PIECE_BYTES) {
+                const piece = data.subarray(offset, offset + ANDROID_DOWNLOAD_PIECE_BYTES)
+                const written = await dependencies.invoke<number>('native_download_handoff_append', {
+                    path,
+                    offset,
+                    chunk: Buffer.from(piece.buffer, piece.byteOffset, piece.byteLength).toString('base64'),
+                })
+                if (written !== offset + piece.length) {
+                    throw new Error('Download handoff length differs from the written bytes')
+                }
             }
-        }
-        let published: AndroidSafDestinationResult
-        try {
-            published = await dependencies.copy({ sourcePath: path, suggestedName: name, reservation })
-        }
-        catch (error) {
-            if ((error as { name?: unknown } | null)?.name === 'AbortError') return false
-            throw error
-        }
-        if (published.bytes !== data.length) {
-            throw new Error('Android copied a different length than the download')
-        }
-        return true
+            const published = await dependencies.copy({ sourcePath: path, suggestedName: name, reservation })
+            if (published.bytes !== data.length) {
+                throw new Error('Android copied a different length than the download')
+            }
+            return true
+        })
+    }
+    catch (error) {
+        if ((error as { name?: unknown } | null)?.name === 'AbortError') return false
+        throw error
     }
     finally {
         // Runs after the copy settles, so Android has already acknowledged it;
         // a handoff left behind is removed by the startup sweep.
-        await reservation.release()
         if (path) await dependencies.invoke('native_download_handoff_cleanup', { path }).catch((error) => {
             console.error('Download handoff cleanup failed', error)
         })

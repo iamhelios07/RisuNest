@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
     copyNativeExportToAndroidSaf,
     reserveAndroidSafDestination,
+    withAndroidSafDestination,
     pickAndroidBackupSource,
     type AndroidSafJavascriptBridge,
 } from './androidSafBridge'
@@ -34,6 +35,31 @@ const terminal = { requestId, exportId, state: 'succeeded' as const, bytes: 3, w
 afterEach(() => { delete window.RisuSafBridge; invokeNative.mockReset() })
 
 describe('asynchronous Android file ownership', () => {
+    it.each(['failed', 'cancelled', 'succeeded'] as const)('keeps the %s operation outcome and cleanup warnings', async (outcome) => {
+        let selected = false
+        const {dependencies, emit} = fixture({copyExport: vi.fn(), copyReservedExport: vi.fn(),
+            reserveExport: vi.fn(), bindExport: async () => true, releaseExport: async () => true,
+            getExportStatus: async () => selected ? JSON.stringify({...terminal,
+                state: 'cancelled', warningCodes: ['partial-destination-may-remain']}) : null,
+        })
+        const picking = reserveAndroidSafDestination('synthetic.bin', 'download', undefined, dependencies)
+        await Promise.resolve()
+        selected = true
+        emit('risunest-android-saf-reserved', {requestId})
+        const reservation = await picking
+        const failure = outcome === 'cancelled' ? new DOMException('cancelled', 'AbortError') : new Error('producer failed')
+        const output = withAndroidSafDestination(reservation, async () => {
+            if (outcome !== 'succeeded') throw failure
+            return true
+        })
+        if (outcome === 'succeeded') {
+            await expect(output).rejects.toMatchObject({code: 'destination-cleanup-failed'})
+        } else {
+            await expect(output).rejects.toBe(failure)
+            expect(failure).toMatchObject({warningCodes: ['partial-destination-may-remain']})
+        }
+    })
+
     it.each(['download', 'legacyBackup'] as const)('recovers orphaned %s receipts before opening another destination', async (sourceKind) => {
         for (const state of ['succeeded', 'failed', 'cancelled'] as const) {
             let saved: string | null = JSON.stringify({...terminal, requestId: exportId, sourceKind, state})

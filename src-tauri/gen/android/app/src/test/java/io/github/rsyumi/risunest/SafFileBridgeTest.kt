@@ -665,7 +665,7 @@ class SafFileBridgeTest {
   }
 
   @Test
-  fun `reservation cancellation owns only its newly created document including a late picker result`() {
+  fun `reservation cancellation preserves unknown ownership including a late picker result`() {
     val requestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     val picking = SafDestinationRecord(requestId, requestId, SafDestinationPhase.CANCELLING,
       null, null, null, emptyList(), 1_000, reservedDestination = true, exportBound = false, copyStarted = false)
@@ -678,12 +678,10 @@ class SafFileBridgeTest {
     val lateAfterRestart = selectedSafDestinationState(restored, requestId, "content://synthetic/new",
       restoredSafDestinationCancellation(restored), 1_001)!!
     assertEquals(SafDestinationPhase.CANCELLING, lateAfterRestart.phase)
-    val deleted = mutableListOf<String>()
-    assertEquals(emptyList<String>(), cleanupReservedSafDestination(selected) { deleted.add(it); true })
-    assertEquals(listOf("content://synthetic/new"), deleted)
-    assertTrue(cleanupReservedSafDestination(selected) { false }.contains("partial-destination-may-remain"))
+    assertTrue(interruptedSafDestinationWarnings(selected).contains("partial-destination-may-remain"))
+    assertTrue(interruptedSafDestinationWarnings(lateAfterRestart).contains("partial-destination-may-remain"))
     val legacy = selected.copy(reservedDestination = false, exportBound = true, copyStarted = true)
-    assertTrue(cleanupReservedSafDestination(legacy) { error("A preexisting document must survive") }
+    assertTrue(interruptedSafDestinationWarnings(legacy)
       .contains("partial-destination-may-remain"))
   }
 
@@ -698,7 +696,7 @@ class SafFileBridgeTest {
     storeFile.writeText(storeFile.readText().replace("\"reservedDestination\":false,", "")
       .replace("\"exportBound\":true,", "").replace("\"copyStarted\":true,", "").replace("\"jobId\":null,", ""))
     assertEquals(legacy, store.load())
-    assertTrue(cleanupReservedSafDestination(store.load()!!) { error("Released records never own the selected document") }
+    assertTrue(interruptedSafDestinationWarnings(store.load()!!)
       .contains("partial-destination-may-remain"))
     val unbound = legacy.copy(phase = SafDestinationPhase.CANCELLED, destinationUri = null,
       reservedDestination = true, exportBound = false, copyStarted = false)
@@ -1090,6 +1088,28 @@ class SafFileBridgeTest {
       listOf("android-saf-provider-not-atomic", "partial-destination-may-remain"),
       failure?.warningCodes,
     )
+  }
+
+  @Test
+  fun `cancellation before destination open preserves existing document bytes`() = runBlocking {
+    val root = temporaryDirectory()
+    val source = root.resolve("synthetic.risudat").apply { writeText("replacement") }
+    val destination = root.resolve("existing.risudat").apply { writeText("original") }
+    for (cancelDuringSourceOpen in listOf(false, true)) {
+      var cancelled = !cancelDuringSourceOpen
+      val failure = try {
+        copySafDestinationOnIo(source,
+          openSource = { source.inputStream().also { cancelled = true } },
+          openDestination = { destination.outputStream() },
+          deletePartial = { destination.delete() },
+          createdDocument = false,
+          isCancelled = { cancelled },
+        )
+        null
+      } catch (error: SafDestinationException) { error }
+      assertEquals("cancelled", failure?.code)
+      assertEquals("original", destination.readText())
+    }
   }
 
   @Test

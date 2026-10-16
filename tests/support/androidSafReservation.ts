@@ -16,7 +16,7 @@ export function androidSafReservationFixture(onReserve: () => void = () => {}) {
         }),
         bindExport: vi.fn(async () => true),
         releaseExport: vi.fn(async () => true),
-        getExportStatus: vi.fn(async () => null),
+        getExportStatus: vi.fn(async (): Promise<string | null> => null),
     } satisfies AndroidSafJavascriptBridge
     const reserve: typeof reserveAndroidSafDestination = (name, kind, signal) =>
         reserveAndroidSafDestination(name, kind, signal, {
