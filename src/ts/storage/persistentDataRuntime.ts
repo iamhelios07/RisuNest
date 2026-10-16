@@ -1497,14 +1497,16 @@ export function createPersistentDataRuntime(
                 if (!(await confirmUpstreamLibraryReplacement(binding.bound, options.upstreamImportWarnings, options))) throw new DOMException('Import cancelled', 'AbortError')
                 const plugins = await import('../plugins/apiV3/v3.svelte')
                 let pause: Awaited<ReturnType<typeof acquireUpstreamImportPause>>
+                let pluginsFenced = false
                 try {
                     await binding.fence()
+                    pluginsFenced = true
                     await plugins.fencePluginExecutionForAuthorityReplacement()
                     pause = await acquireUpstreamImportPause(runtime, reason)
                 } catch (error) {
                     try {
+                        if (pluginsFenced) await plugins.restartPluginsAfterAuthorityReplacement()
                         await binding.assertAuthority()
-                        await plugins.restartPluginsAfterAuthorityReplacement()
                         await binding.resume()
                     } catch {}
                     throw error
@@ -1541,9 +1543,11 @@ export function createPersistentDataRuntime(
                     let abortedUnchanged = false
                     if (!committed) {
                         try {
+                            const unchanged = await dependencies.store.readRoot()
+                            if (unchanged.revision !== pause.fence.revision || coordinator.revision !== pause.fence.revision) throw new PersistentMutationFencedError()
+                            await plugins.restartPluginsAfterAuthorityReplacement()
                             await pause.abortUnchanged(async () => { await binding.assertAuthority() })
                             abortedUnchanged = true
-                            await plugins.restartPluginsAfterAuthorityReplacement()
                             await binding.resume()
                         } catch { await pause.finish() }
                     } else await pause.finish()

@@ -306,6 +306,20 @@ it('ordinary replacement switch failure restores unchanged plugins and active ad
     expect(s.events).toContain('resume')
     expect((await s.deps.native.state()).targetAuthority).toBe('1')
 })
+it.each(['preparation', 'activation'] as const)('keeps unreadable binding recovery after %s failure and restarts only proven unchanged plugins', async failure => {
+    const s = setup()
+    let fenced = false
+    let attempted = false
+    s.deps.plugins.fenceExecution = async () => { fenced = true; if (failure === 'preparation') throw new Error('preparation failed') }
+    const state = s.deps.native.state
+    s.deps.native.state = async () => { if ((failure === 'preparation' && fenced) || attempted) throw new Error('binding unavailable'); return state() }
+    s.deps.native.switchTarget = async () => { attempted = true; throw new Error('activation outcome unknown') }
+    await expect(s.flow.bind(target, s.transport)).rejects.toThrow()
+    if (failure === 'preparation') expect(s.events).toContain('restart')
+    else expect(s.events).not.toContain('restart')
+    expect(s.events).not.toContain('resume')
+    expect(s.events).not.toContain('activate-database')
+})
 it.each(['result', 'cache', 'refresh', 'state'])('postactivation %s failure keeps stale captures fenced and never resumes or publishes', async failure => {
     const s = setup(); newDeviceTransport(s)
     let guarded = false

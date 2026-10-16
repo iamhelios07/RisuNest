@@ -119,6 +119,20 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
 
 beforeEach(()=>{vi.clearAllMocks();library.hasCharacters.mockReset().mockResolvedValue(true);plugins.restartPluginsAfterAuthorityReplacement.mockImplementation(async()=>{});binding.bound=true;binding.fence.mockClear();binding.assertAuthority.mockClear();binding.resume.mockReset();binding.resume.mockImplementation(async()=>{})})
 describe('direct native upstream import publication',()=>{
+    it.each(['preparation','unchanged-write'] as const)('restarts plugins after %s failure even when binding verification is unavailable',async failure=>{
+        const h=await createHarness()
+        if(failure==='preparation') plugins.fencePluginExecutionForAuthorityReplacement.mockRejectedValueOnce(new Error('preparation failed'))
+        else vi.mocked(h.store.replaceFromDatabase).mockRejectedValueOnce(new Error('unchanged write failed'))
+        binding.assertAuthority.mockImplementation(async()=>{throw new Error('binding unavailable')})
+        if(failure==='unchanged-write') binding.assertAuthority.mockResolvedValueOnce(undefined)
+        try {
+            await expect(h.runtime.replacePersistentDatabase(makeDatabase(),'failed-import',{upstreamImport:true})).rejects.toThrow()
+            expect(h.runtime.revision).toBe(1)
+            expect(h.database).toEqual(h.durable)
+            expect(plugins.restartPluginsAfterAuthorityReplacement).toHaveBeenCalledOnce()
+            expect(binding.resume).not.toHaveBeenCalled()
+        } finally { binding.assertAuthority.mockImplementation(async()=>{}) }
+    })
     it('keeps first-run consent through the compatibility replacement runtime',async()=>{
         binding.bound=false
         const h=await createHarness()

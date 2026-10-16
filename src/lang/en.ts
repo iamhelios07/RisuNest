@@ -99,6 +99,7 @@ export const languageEnglish = {
     
         "invalidInlaysConfirm": (count: number) => `Damaged inlay entries (${count}) will not be restored. Continue restoring?`,
         omittedRestoreData: {
+            excludedCharacters: (count: number) => `Group characters and temporary characters (${count}) will not be restored.`,
             data: (count: number) => `Unsupported saved data (${count}) will not be restored.`,
             remote: (count: number) => `Data stored outside this backup (${count}) will not be restored.`,
             missing: (count: number) => `Missing saved data (${count}) will not be restored.`,

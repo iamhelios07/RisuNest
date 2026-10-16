@@ -4003,6 +4003,7 @@ pub(crate) struct RestoreOmissions {
     pub(crate) values: u64,
     pub(crate) plugin_storage: u64,
     pub(crate) inlays: u64,
+    pub(crate) excluded_characters: u64,
 }
 
 impl IncompleteRestorePreview {
@@ -4019,6 +4020,7 @@ impl IncompleteRestorePreview {
             ("skipped-backup-values", self.omissions.values),
             ("skipped-plugin-storage", self.omissions.plugin_storage),
             ("skipped-backup-inlays", self.omissions.inlays),
+            ("excluded-backup-characters", self.omissions.excluded_characters),
         ] {
             if count != 0 { warnings.push(format!("{kind}:{count}")); }
         }
@@ -4395,6 +4397,7 @@ impl JobControl {
             "values" => &mut omissions.values,
             "pluginStorage" => &mut omissions.plugin_storage,
             "inlays" => &mut omissions.inlays,
+            "excludedCharacters" => &mut omissions.excluded_characters,
             _ => return Err("unknown restore omission category".to_owned()),
         };
         *target = target.saturating_add(count);
