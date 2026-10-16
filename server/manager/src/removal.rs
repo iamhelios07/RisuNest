@@ -534,22 +534,16 @@ fn remove_file_within(path: &Path, budget: Duration) -> Result<()> {
 #[cfg(any(windows, test))]
 fn existing_install_inventory(path: &Path) -> Result<Option<Vec<PathBuf>>> {
     safe_path(path)?;
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err("managed-install-marker-invalid".into()),
-        Ok(_) => update::previous_owned_files(path)?
-            .map(Some)
-            .ok_or_else(|| "managed-install-marker-invalid".into()),
-    }
+    Ok(update::previous_owned_files(path).unwrap_or(None))
 }
 
 #[cfg(any(windows, test))]
-pub fn preserve_install_baseline(server: &Path) -> Result<()> {
+pub fn preserve_install_baseline(server: &Path) -> Result<bool> {
     let install = install_directory(server)?;
     safe_path(&install)?;
     let current = marker(&install);
     let Some(mut files) = existing_install_inventory(&current)? else {
-        return Ok(());
+        return Ok(false);
     };
     let baseline = install.join(INSTALL_BASELINE);
     safe_path(&baseline)?;
@@ -563,7 +557,8 @@ pub fn preserve_install_baseline(server: &Path) -> Result<()> {
             .map_err(|_| "managed-install-marker-invalid")?;
     inventory["files"] =
         serde_json::to_value(files).map_err(|_| "managed-install-marker-invalid")?;
-    update::write_json(&baseline, &inventory, "installer-baseline-write-failed")
+    update::write_json(&baseline, &inventory, "installer-baseline-write-failed")?;
+    Ok(true)
 }
 
 #[cfg(any(windows, test))]
@@ -616,12 +611,26 @@ pub fn remove_obsolete_owned_files(server: &Path, previous: &Path) -> Result<boo
 
 #[cfg(windows)]
 pub fn remove_owned_files(root: &Path, server: &Path, force: bool) -> Result<()> {
+    remove_owned_files_with(root, server, force, false)
+}
+
+#[cfg(windows)]
+pub fn remove_owned_files_resumable(root: &Path, server: &Path, force: bool) -> Result<()> {
+    remove_owned_files_with(root, server, force, true)
+}
+
+#[cfg(windows)]
+fn remove_owned_files_with(root: &Path, server: &Path, force: bool, resumable: bool) -> Result<()> {
     let plan = plan_with_force(root, server, false, force)?;
     if !plan.blockers.is_empty() {
         return Err(plan.blockers.join(", "));
     }
     if lifecycle::owner_active(root)? {
         return Err("removal-process-still-running".into());
+    }
+    // These shipped command semantics must survive archive updates that retain uninstall.exe.
+    if !resumable {
+        return remove_released_files(&plan, TRANSIENT_REMOVAL_BUDGET);
     }
     remove_planned_files_with(&plan, TRANSIENT_REMOVAL_BUDGET, || {
         prepare_finalization(
@@ -632,6 +641,18 @@ pub fn remove_owned_files(root: &Path, server: &Path, force: bool) -> Result<()>
             &std::env::current_exe().map_err(|_| "removal-helper-unavailable")?,
         )
     })
+}
+
+#[cfg(windows)]
+fn remove_released_files(plan: &RemovalPlan, budget: Duration) -> Result<()> {
+    let last = final_files(&plan.install);
+    for file in plan.files.iter().filter(|file| !last.contains(file)) {
+        remove_file_within(file, budget)?;
+    }
+    for file in last.iter().filter(|file| plan.files.contains(file)) {
+        remove_file_within(file, budget)?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -654,6 +675,8 @@ fn finalization_directory(server: &Path) -> Result<PathBuf> {
         "receipt.new",
         "complete",
         "complete.new",
+        "data-path",
+        "data-path.new",
     ] {
         safe_path(&directory.join(name))?;
     }
@@ -687,6 +710,13 @@ fn prepare_finalization(
         .map_err(|_| "removal-helper-copy-failed")?;
     fs::rename(&temporary, directory.join("manager.exe"))
         .map_err(|_| "removal-helper-copy-failed")?;
+    use std::os::windows::ffi::OsStrExt;
+    let data_path: Vec<_> = root
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    write_finalization_bytes(&directory, "data-path", &data_path)?;
     write_finalization(
         &directory,
         "receipt",
@@ -701,18 +731,27 @@ fn prepare_finalization(
 
 #[cfg(windows)]
 fn write_finalization(directory: &Path, name: &str, value: &impl Serialize) -> Result<()> {
+    write_finalization_bytes(
+        directory,
+        name,
+        &serde_json::to_vec(value).map_err(|_| "removal-finalization-write-failed")?,
+    )
+}
+
+#[cfg(windows)]
+fn write_finalization_bytes(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let temporary = directory.join(format!("{name}.new"));
     safe_path(&temporary)?;
     let mut file = fs::File::create(&temporary).map_err(|_| "removal-finalization-write-failed")?;
-    file.write_all(&serde_json::to_vec(value).map_err(|_| "removal-finalization-write-failed")?)
+    file.write_all(bytes)
         .and_then(|_| file.sync_all())
         .map_err(|_| "removal-finalization-write-failed")?;
     drop(file);
     let target = directory.join(if name == "receipt" {
         "receipt.json"
     } else {
-        "complete"
+        name
     });
     fs::rename(temporary, target).map_err(|_| "removal-finalization-write-failed".into())
 }
@@ -737,6 +776,22 @@ fn read_finalization(registry: &Path, server: &Path) -> Result<FinalizationRecei
         || receipt.server != server
         || receipt.data.starts_with(&install)
         || install.starts_with(&receipt.data)
+    {
+        return Err("removal-finalization-invalid".into());
+    }
+    use std::os::windows::ffi::OsStrExt;
+    let data_path: Vec<_> = receipt
+        .data
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let path = directory.join("data-path");
+    if fs::metadata(&path)
+        .map_err(|_| "removal-finalization-invalid")?
+        .len()
+        != data_path.len() as u64
+        || fs::read(path).map_err(|_| "removal-finalization-invalid")? != data_path
     {
         return Err("removal-finalization-invalid".into());
     }
@@ -766,13 +821,22 @@ fn read_finalization(registry: &Path, server: &Path) -> Result<FinalizationRecei
 }
 
 #[cfg(windows)]
-pub fn resume_finalization(server: &Path) -> Result<()> {
-    resume_finalization_at(&registry()?, server)
+pub fn resume_finalization(server: &Path, delete_data: bool) -> Result<bool> {
+    resume_finalization_at(&registry()?, server, delete_data, removal_profiles)
 }
 
 #[cfg(windows)]
-fn resume_finalization_at(registry: &Path, server: &Path) -> Result<()> {
+fn resume_finalization_at(
+    registry: &Path,
+    server: &Path,
+    delete_data: bool,
+    profiles: impl FnOnce() -> Result<Vec<PathBuf>>,
+) -> Result<bool> {
     let receipt = read_finalization(registry, server)?;
+    let data_kept = delete_data && !record_path(registry, &receipt.data).exists();
+    if delete_data && !data_kept {
+        delete_registered_data_at(registry, &receipt.data, server, profiles)?;
+    }
     let _lock = if receipt.data.exists() {
         safe_tree(&receipt.data.join("manager-update"))?;
         let started = Instant::now();
@@ -797,8 +861,9 @@ fn resume_finalization_at(registry: &Path, server: &Path) -> Result<()> {
         safe_path(file)?;
     }
     remove_final_files(&files, TRANSIENT_REMOVAL_BUDGET)?;
-    forget_registration_at(registry, &receipt.data, server)?;
-    commit_finalization_at(registry, server)
+    forget_finalization_at(registry, &receipt.data, server)?;
+    commit_finalization_at(registry, server)?;
+    Ok(data_kept)
 }
 
 #[cfg(windows)]
@@ -906,32 +971,70 @@ fn remove_final_files(files: &[PathBuf], budget: Duration) -> Result<()> {
     };
     let disposition = |file: &fs::File, delete: bool| {
         let info = FILE_DISPOSITION_INFO { DeleteFile: delete };
-        unsafe {
+        let result = unsafe {
             SetFileInformationByHandle(
                 file.as_raw_handle() as HANDLE,
                 FileDispositionInfo,
                 (&info as *const FILE_DISPOSITION_INFO).cast(),
                 std::mem::size_of_val(&info) as u32,
             )
+        };
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     };
-    for (index, (file_index, handle)) in handles.iter().enumerate() {
-        if disposition(handle, true) == 0 {
-            let error = std::io::Error::last_os_error();
-            for (_, previous) in &handles[..index] {
-                disposition(previous, false);
+    set_final_dispositions(handles.len(), budget, |index, delete| {
+        disposition(&handles[index].1, delete)
+    })
+    .map_err(|(index, error)| {
+        format!(
+            "removal-file-failed: {} ({error})",
+            files[handles[index].0].display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn set_final_dispositions(
+    count: usize,
+    budget: Duration,
+    mut disposition: impl FnMut(usize, bool) -> std::io::Result<()>,
+) -> std::result::Result<(), (usize, std::io::Error)> {
+    let mut failed = 0;
+    retry_transient(budget, || {
+        for index in 0..count {
+            if let Err(error) = disposition(index, true) {
+                failed = index;
+                for previous in 0..index {
+                    let _ = disposition(previous, false);
+                }
+                return Err(error);
             }
-            return Err(format!(
-                "removal-file-failed: {} ({error})",
-                files[*file_index].display()
-            ));
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .map_err(|error| (failed, error))
+}
+
+fn removal_profiles() -> Result<Vec<PathBuf>> {
+    Ok(platform::webview_data_dir()?
+        .into_iter()
+        .chain(platform::identifier_directories()?)
+        .collect())
 }
 
 pub fn delete_registered_data(root: &Path, server: &Path) -> Result<()> {
-    let registry = registry()?;
+    delete_registered_data_at(&registry()?, root, server, removal_profiles)
+}
+
+fn delete_registered_data_at(
+    registry: &Path,
+    root: &Path,
+    server: &Path,
+    profiles: impl FnOnce() -> Result<Vec<PathBuf>>,
+) -> Result<()> {
     let record = read_record(&record_path(&registry, root))?;
     if record.schema != 1
         || record.data != root
@@ -972,11 +1075,7 @@ pub fn delete_registered_data(root: &Path, server: &Path) -> Result<()> {
     }
     safe_data_tree(root)?;
     if !shared_profile {
-        let profiles: Vec<_> = platform::webview_data_dir()?
-            .into_iter()
-            .chain(platform::identifier_directories()?)
-            .collect();
-        remove_profiles(&profiles)?;
+        remove_profiles(&profiles()?)?;
     }
     platform::cleanup_update_helpers(root)?;
     // The installer guard publishes its release before its executable in manager-update exits.
@@ -1011,30 +1110,27 @@ pub fn forget_registration(root: &Path, server: &Path) -> Result<()> {
 }
 
 fn forget_registration_at(registry: &Path, root: &Path, server: &Path) -> Result<()> {
-    #[cfg(windows)]
-    let finalizing = finalization_directory(server)?
-        .join("receipt.json")
-        .exists();
-    #[cfg(windows)]
-    if finalizing {
-        let receipt = read_finalization(registry, server)?;
-        if receipt.data != root {
-            return Err("removal-registration-conflict".into());
-        }
-        if final_files(&install_directory(server)?)
-            .iter()
-            .any(|file| file.exists())
-        {
-            return Err("removal-finalization-pending".into());
-        }
+    forget_records_at(registry, root, server)
+}
+
+#[cfg(windows)]
+pub fn forget_finalization(root: &Path, server: &Path) -> Result<()> {
+    forget_finalization_at(&registry()?, root, server)
+}
+
+#[cfg(windows)]
+fn forget_finalization_at(registry: &Path, root: &Path, server: &Path) -> Result<()> {
+    let receipt = read_finalization(registry, server)?;
+    if receipt.data != root {
+        return Err("removal-registration-conflict".into());
     }
-    forget_records_at(registry, root, server)?;
-    #[cfg(windows)]
-    if finalizing {
-        // Released uninstallers finish with forget-removal and do not commit separately.
-        commit_finalization_at(registry, server)?;
+    if final_files(&install_directory(server)?)
+        .iter()
+        .any(|file| file.exists())
+    {
+        return Err("removal-finalization-pending".into());
     }
-    Ok(())
+    forget_records_at(registry, root, server)
 }
 
 fn forget_records_at(registry: &Path, root: &Path, server: &Path) -> Result<()> {
@@ -1338,14 +1434,13 @@ mod tests {
                 fs::remove_file(file).unwrap();
             }
             if deleted == 4 {
-                forget_registration_at(&registry, &root, &server).unwrap();
-                assert_eq!(
-                    fs::read(finalization_directory(&server).unwrap().join("complete")).unwrap(),
-                    b"true",
-                    "released uninstallers finish with forget-removal"
-                );
+                forget_finalization_at(&registry, &root, &server).unwrap();
+                assert!(!finalization_directory(&server)
+                    .unwrap()
+                    .join("complete")
+                    .exists());
             }
-            resume_finalization_at(&registry, &server).unwrap();
+            resume_finalization_at(&registry, &server, false, || Ok(Vec::new())).unwrap();
             assert!(files.iter().all(|file| !file.exists()));
             assert!(!record_path(&registry, &root).exists());
             assert_eq!(
@@ -1353,7 +1448,7 @@ mod tests {
                 b"true"
             );
             assert_eq!(root.exists(), !delete_data);
-            resume_finalization_at(&registry, &server).unwrap();
+            resume_finalization_at(&registry, &server, false, || Ok(Vec::new())).unwrap();
         }
     }
 
@@ -1370,7 +1465,7 @@ mod tests {
         fs::write(&helper, b"synthetic helper").unwrap();
         prepare_finalization(&registry, &root, &server, false, &helper).unwrap();
         assert_eq!(
-            forget_registration_at(&registry, &root, &server).unwrap_err(),
+            forget_finalization_at(&registry, &root, &server).unwrap_err(),
             "removal-finalization-pending"
         );
         assert!(record_path(&registry, &root).exists());
@@ -1384,18 +1479,27 @@ mod tests {
             serde_json::to_vec(&extra).unwrap()
         }] {
             fs::write(&receipt, malformed).unwrap();
-            assert!(resume_finalization_at(&registry, &server).is_err());
-            assert!(forget_registration_at(&registry, &root, &server).is_err());
+            assert!(resume_finalization_at(&registry, &server, false, || Ok(Vec::new())).is_err());
+            assert!(forget_finalization_at(&registry, &root, &server).is_err());
             assert!(record_path(&registry, &root).exists());
             assert!(files.iter().all(|file| file.exists()));
         }
         let mut altered: serde_json::Value = serde_json::from_slice(&original).unwrap();
         altered["server"] = serde_json::json!(install.join("other-server"));
         fs::write(&receipt, serde_json::to_vec(&altered).unwrap()).unwrap();
-        assert!(resume_finalization_at(&registry, &server).is_err());
+        assert!(resume_finalization_at(&registry, &server, false, || Ok(Vec::new())).is_err());
         fs::write(&receipt, &original).unwrap();
+        let data_path = finalization_directory(&server).unwrap().join("data-path");
+        let original_path = fs::read(&data_path).unwrap();
+        let mut changed_path = original_path.clone();
+        changed_path[0] ^= 1;
+        fs::write(&data_path, changed_path).unwrap();
+        assert!(resume_finalization_at(&registry, &server, true, || Ok(Vec::new())).is_err());
+        assert!(files.iter().all(|file| file.exists()));
+        assert!(root.exists());
+        fs::write(&data_path, original_path).unwrap();
         fs::remove_file(record_path(&registry, &root)).unwrap();
-        assert!(resume_finalization_at(&registry, &server).is_err());
+        assert!(resume_finalization_at(&registry, &server, false, || Ok(Vec::new())).is_err());
         assert!(files.iter().all(|file| file.exists()));
     }
 
@@ -1584,13 +1688,28 @@ mod tests {
                 .share_mode(0)
                 .open(locked)
                 .unwrap();
-            assert!(preserve_install_baseline(&server).is_err());
+            if locked == &marker_path {
+                assert!(!preserve_install_baseline(&server).unwrap());
+            } else {
+                assert!(preserve_install_baseline(&server).is_err());
+            }
             drop(handle);
             assert_eq!(fs::read(&baseline_path).unwrap(), accumulated);
         }
         fs::write(&marker_path, b"invalid current inventory").unwrap();
-        assert!(preserve_install_baseline(&server).is_err());
+        assert!(!preserve_install_baseline(&server).unwrap());
         assert_eq!(fs::read(&baseline_path).unwrap(), accumulated);
+        for files in [
+            serde_json::json!([null]),
+            serde_json::json!(["server", "server"]),
+            serde_json::json!(["../outside"]),
+        ] {
+            let mut invalid: serde_json::Value = serde_json::from_slice(&current).unwrap();
+            invalid["files"] = files;
+            fs::write(&marker_path, invalid.to_string()).unwrap();
+            assert!(!preserve_install_baseline(&server).unwrap());
+            assert_eq!(fs::read(&baseline_path).unwrap(), accumulated);
+        }
         fs::write(&marker_path, &current).unwrap();
         fs::write(&baseline_path, b"invalid accumulated inventory").unwrap();
         let mut owned = vec![PathBuf::from("server")];
@@ -1832,6 +1951,67 @@ mod tests {
         remove_planned_files(&plan, Duration::from_secs(5)).unwrap();
         scan.join().unwrap();
         assert_eq!(fs::read_dir(&install).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_disposition_retries_roll_back_before_retry_and_stop_at_the_budget() {
+        for code in [5, 32, 87] {
+            let mut marked = [false; 2];
+            let mut fail = true;
+            let result = set_final_dispositions(2, Duration::from_millis(150), |index, delete| {
+                if index == 0 && delete {
+                    assert!(!marked[0]);
+                }
+                if index == 1 && delete && fail {
+                    fail = false;
+                    return Err(std::io::Error::from_raw_os_error(code));
+                }
+                marked[index] = delete;
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), code != 87);
+            assert_eq!(marked, if code == 87 { [false; 2] } else { [true; 2] });
+        }
+        let mut marked = false;
+        let started = Instant::now();
+        let result = set_final_dispositions(2, Duration::from_millis(75), |index, delete| {
+            if index == 1 {
+                return Err(std::io::Error::from_raw_os_error(32));
+            }
+            if delete {
+                assert!(!marked);
+            }
+            marked = delete;
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().1.raw_os_error(), Some(32));
+        assert!(started.elapsed() >= Duration::from_millis(75));
+        assert!(!marked);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resumed_delete_data_uses_registration_and_keeps_data_after_forgetting() {
+        for registered in [false, true] {
+            let (_temp, root, server, registry) = fixture();
+            fs::write(root.join("metadata.sqlite"), b"synthetic").unwrap();
+            let install = server.parent().unwrap();
+            let helper = install.join("source-helper");
+            fs::write(&helper, b"synthetic").unwrap();
+            prepare_finalization(&registry, &root, &server, false, &helper).unwrap();
+            if !registered {
+                for file in final_files(install) {
+                    remove_file(&file).unwrap();
+                }
+                forget_finalization_at(&registry, &root, &server).unwrap();
+            }
+            let kept = resume_finalization_at(&registry, &server, true, || Ok(Vec::new())).unwrap();
+            assert_eq!(kept, !registered);
+            assert_eq!(root.join("metadata.sqlite").exists(), !registered);
+            assert_eq!(root.exists(), !registered);
+            assert!(!record_path(&registry, &root).exists());
+        }
     }
     #[cfg(windows)]
     #[test]
