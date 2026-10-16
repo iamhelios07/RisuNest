@@ -1619,6 +1619,12 @@ async function runNativeReplacementRestore(
                                 terminal = await invokeNative(dependencies, 'native_file_job_status', {jobId: started.jobId}) as NativeFileJobStatus
                                 await bounded(Promise.resolve(options.onNativeStatus?.(terminal)), 'status follow-up')
                             }
+                            if ((terminal.state === 'failed' || terminal.state === 'cancelled') &&
+                                (kind !== 'restore-portable-backup' || !Number.isSafeInteger(terminal.activationRevision))) {
+                                const current = await bounded(runtime.store.readRoot(), 'activation revision check')
+                                if (current.revision !== upstreamPause!.fence.revision) throw new Error('Failed native activation changed the library')
+                                return current.revision
+                            }
                             if (kind === 'restore-portable-backup') {
                                 if (!Number.isSafeInteger(terminal.activationRevision)) throw new NativeFileJobError('invalid-activation-receipt','Portable activation receipt is unavailable')
                                 await preparePortableDeviceReceipt(terminal)
@@ -1637,7 +1643,9 @@ async function runNativeReplacementRestore(
                             const plugins = await import('../plugins/apiV3/v3.svelte')
                             await bounded(plugins.invalidatePluginCachesAfterAuthorityReplacement(), 'plugin cache refresh')
                             await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
-                            if (kind === 'restore-portable-backup') await confirmPortableAdoption(terminal!)
+                            if ((terminal?.state === 'failed' || terminal?.state === 'cancelled') &&
+                                (kind !== 'restore-portable-backup' || !Number.isSafeInteger(terminal.activationRevision))) await bounded(upstreamBinding!.resume(), 'binding resume')
+                            else if (kind === 'restore-portable-backup') await confirmPortableAdoption(terminal!)
                         },
                     })
                 }

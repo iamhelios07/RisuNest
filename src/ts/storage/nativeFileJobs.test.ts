@@ -183,7 +183,7 @@ import { createPluginStartupGate } from '../plugins/pluginStartupGate'
 import { subscribeSyncBindingChanges } from './sync/bindingChanges'
 import { get } from 'svelte/store'
 
-it.each(['portable','block'] as const)('releases an abandoned %s preparation hold when binding verification cannot run',async format=>{
+it.each((['portable','block'] as const).flatMap(format=>(['preparation','failed','cancelled'] as const).map(failure=>({format,failure}))))('releases an ended $format/$failure hold when binding verification cannot run',async ({format,failure})=>{
     const registry=await vi.importActual<typeof import('./sync/bindingRegistry')>('./sync/bindingRegistry')
     const target={kind:'server' as const,connectionId:'synthetic-failed-preparation'}
     const state={target,targetAuthority:'1',selectionEpoch:'1',libraryId:'synthetic',progress:null}
@@ -193,21 +193,33 @@ it.each(['portable','block'] as const)('releases an abandoned %s preparation hol
     const unsupported=async():Promise<never>=>{throw new Error('Unexpected binding switch')}
     const unregister=registry.registerSyncBindingTransport(target,{
         inspectTarget:unsupported,pullAvailableState:unsupported,replaceFromTarget:unsupported,publishInitialSharedState:unsupported,
-        fenceOldJobs:async()=>{},resumeBinding:async()=>{throw new Error('Failed authority check must prevent resume')},receiveAvailableChanges:async()=>{},
+        fenceOldJobs:async()=>{},resumeBinding:async()=>{if(unavailable)throw new Error('Failed authority check must prevent resume')},receiveAvailableChanges:async()=>{},
     })
     const gate=createPluginStartupGate({enabled:()=>true,delay:()=>true,replacementPending:()=>registry.isSyncBindingReplacementPending(),
         context:async()=>{throw new Error('native state unavailable')},start:async()=>{if(await gate.ensure())starts++},
     })
     const stop=subscribeSyncBindingChanges(()=>{if(gate.isWaiting())gate.retry()})
     startupPlugins.restart.mockImplementation(async()=>{expect(await gate.ensure()).toBe(false)})
-    const host=createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'},status('cancelled')])
+    const host=createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'},status(failure==='preparation'?'cancelled':failure)],{
+        native_file_job_finalize:()=>{unavailable=true;return 'requested'},
+    })
     try {
         const restore=format==='portable'?runNativeArchiveRestore:runNativeBlockRisuSaveRestore
-        await expect(restore(restoreRuntime(8),{type:'desktopPath',path:'synthetic.risudat'},{
+        let lifecycle: {beforeRefresh():Promise<number>;afterRefresh():Promise<void>} | undefined
+        const runtime={...restoreRuntime(8),setActivatedLibraryRecoveryLifecycle:(_token:unknown,value:NonNullable<typeof lifecycle>)=>{lifecycle=value}}
+        await expect(restore(runtime,{type:'desktopPath',path:'synthetic.risudat'},{
             choosePortableSections:async()=>({library:true,deviceSections:['hypa','local-plugins','local-settings']}),
-            beforeActivation:async()=>{unavailable=true;throw new Error('preparation failed')},
+            beforeActivation:async()=>{if(failure==='preparation'){unavailable=true;throw new Error('preparation failed')}},
         },host.dependencies)).rejects.toThrow()
-        expect(host.commands()).not.toContain('native_file_job_finalize')
+        expect(host.commands().includes('native_file_job_finalize')).toBe(failure!=='preparation')
+        if(failure!=='preparation') {
+            expect(registry.isSyncBindingReplacementPending()).toBe(true)
+            await expect(lifecycle!.beforeRefresh()).rejects.toThrow('native state unavailable')
+            expect(registry.isSyncBindingReplacementPending()).toBe(true)
+            unavailable=false
+            expect(await lifecycle!.beforeRefresh()).toBe(8)
+            await lifecycle!.afterRefresh()
+        }
         expect(registry.isSyncBindingReplacementPending()).toBe(false)
         gate.loadOnce()
         await vi.waitFor(()=>expect(starts).toBe(1))
