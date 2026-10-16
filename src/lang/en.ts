@@ -1930,6 +1930,11 @@ export const languageEnglish = {
             syncUnfinished: 'Plugins have not loaded because synchronization did not finish.',
             requestRefused: 'Try again after plugins load.',
         },
+        syncStatus: {
+            saving: 'Saving',
+            saved: 'Saved',
+            saveFailed: 'Save failed',
+        },
 
         backgroundDataFailed: 'Some changes to the data could not be completed.',
         scriptTimeout: 'A Lua script took too long and was stopped.',

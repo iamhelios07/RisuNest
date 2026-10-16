@@ -1746,6 +1746,11 @@ export const languageKorean = {
             syncUnfinished: '동기화를 마치지 못해 플러그인을 불러오지 않았습니다.',
             requestRefused: '플러그인을 불러온 뒤 다시 시도해주세요.',
         },
+        syncStatus: {
+            saving: '저장 중',
+            saved: '저장 완료',
+            saveFailed: '저장 실패',
+        },
 
         backgroundDataFailed: '일부 데이터 변경을 완료하지 못했습니다.',
         scriptTimeout: 'Lua 스크립트 실행 시간이 초과되어 중단되었습니다.',

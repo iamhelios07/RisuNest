@@ -49,6 +49,8 @@
     import SyncExitDialog from './lib/Others/SyncExitDialog.svelte';
     import PluginStartupNotice from './lib/Others/PluginStartupNotice.svelte';
     import PersistentLocalSaveFailure from './lib/Others/PersistentLocalSaveFailure.svelte';
+    import SyncStoppedNotice from './lib/Others/SyncStoppedNotice.svelte';
+    import SyncStatusPanel from './lib/Others/SyncStatusPanel.svelte';
     import PersistentWorkingSetRecovery from './lib/Others/PersistentWorkingSetRecovery.svelte';
     import { persistentWorkingSetInputBlocked } from './ts/storage/persistentDataRuntime.svelte';
     import { restoreFocusAfterInputBlock } from './ts/ui/restoreFocusAfterInputBlock';
@@ -498,4 +500,6 @@
 <div class="pointer-events-none fixed right-2 z-[1000] flex max-h-[calc(100dvh-5rem)] flex-col gap-2 overflow-y-auto sm:left-auto sm:w-full sm:max-w-md {$MobileGUI ? 'left-2 top-[72px]' : 'left-14 top-2'} [&>*]:pointer-events-auto" style:top={$settingsOpen && !$MobileGUI ? `${DBState.db.settingsCloseButtonSize + 16}px` : null}>
     <PersistentLocalSaveFailure />
     <PluginStartupNotice />
+    <SyncStoppedNotice />
 </div>
+<SyncStatusPanel />

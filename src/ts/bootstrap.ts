@@ -631,6 +631,14 @@ export async function loadData() {
                 console.error('External sync transports failed to register', error)
             }
         }
+        if (isTauri) {
+            try {
+                const { installProductionSyncStatus } = await import('./storage/sync/syncStatusProduction')
+                installProductionSyncStatus()
+            } catch (error) {
+                console.error('Sync status failed to start', error)
+            }
+        }
         let heldExitRevision: number | undefined
         let heldExitFence: RetainableReplacementFence | undefined
         let selectedExitDrain: SyncExitDrainAdapter | null = null
