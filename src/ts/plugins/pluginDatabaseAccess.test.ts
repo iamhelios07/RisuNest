@@ -778,7 +778,7 @@ describe('plugin database access', () => {
             ['characters'],
         )
         const chunks = []
-        for await (const chunk of stream as any) chunks.push(chunk)
+        for await (const chunk of stream as any) chunks.push(...(chunk.type === 'batch' ? chunk.chunks : [chunk]))
 
         expect(chunks.map((chunk) => chunk.type)).toEqual([
             'arrayStart',
@@ -820,7 +820,11 @@ describe('plugin database access', () => {
         harness.pinnedDatabases.push(makeFullObjectDatabase([character]))
         const stream = await harness.access.getDatabaseSnapshotStream(['characters'], ['characters'])
         const messages = []
-        for await (const chunk of stream as any) if (chunk.type === 'message') messages.push(chunk.value)
+        for await (const frame of stream as any) {
+            for (const chunk of frame.type === 'batch' ? frame.chunks : [frame]) {
+                if (chunk.type === 'message') messages.push(chunk.value)
+            }
+        }
         expect(messages).toEqual(character.chats[0].message)
         expect(harness.messageWindowReads).toHaveLength(8)
         expect(harness.messageWindowReads).toEqual(Array.from({ length: 8 }, (_, index) => ({ startIndex: index * 128, limit: 128 })))
@@ -858,7 +862,7 @@ describe('plugin database access', () => {
         const result = await harness.access.getFullObjectSnapshotStream(target, callContext())
         expect(result?.select).toBe(select)
         const chunks: any[] = []
-        for await (const chunk of result!.value as any) chunks.push(chunk)
+        for await (const chunk of result!.value as any) chunks.push(...(chunk.type === 'batch' ? chunk.chunks : [chunk]))
         expect(chunks.find((chunk) => chunk.type === 'characterStart').value.chaId).toBe(id)
         expect(chunks.filter((chunk) => chunk.type === 'message').map((chunk) => chunk.value.data))
             .toEqual(select === 'conversation' ? ['b'] : ['a', 'b'])

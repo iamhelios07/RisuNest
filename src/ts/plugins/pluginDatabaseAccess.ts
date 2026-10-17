@@ -36,6 +36,8 @@ import { isConversationSummaryStub } from '../storage/conversationResidency'
 import { resolveLifecyclePluginStorageOwner } from './pluginStorageStore'
 import type { PluginStorageMeta } from './pluginOwner'
 import { attachPluginReadProvenance, PluginReadBaselineError, PluginReadBaselines, collectPluginReadProvenance, type PluginReadProvenance } from './pluginReadBaselines'
+import type { PluginSnapshotChunk } from './pluginReadBaselines'
+import { createPluginSnapshotStream, type PluginSnapshotFrame } from './pluginSnapshotStream'
 import { pluginUnitIntents, type PluginUnitMutation, type PluginWholeMessageIntent } from './pluginUnitIntents'
 import {
     readPinnedConversationContext,
@@ -237,7 +239,7 @@ export interface PluginDatabaseAccess {
     getDatabaseSnapshotStream(
         includeOnly: string[] | 'all',
         allowedKeys: readonly string[],
-    ): Promise<ReadableStream<PluginDatabaseSnapshotChunk>>
+    ): Promise<ReadableStream<PluginSnapshotFrame>>
     setDatabaseLite(
         database: Record<string, unknown>,
         allowedKeys: readonly string[],
@@ -250,32 +252,11 @@ export interface PluginDatabaseAccess {
 
 export interface PluginIframeSnapshot {
     __type: 'IFRAME_OBJECT_STREAM'
-    value: ReadableStream<PluginDatabaseSnapshotChunk>
+    value: ReadableStream<PluginSnapshotFrame>
     select: 'character' | 'conversation'
 }
 
-export type PluginDatabaseSnapshotChunk =
-    | { type: 'provenance'; entries: PluginReadProvenance[] }
-    | { type: 'set'; key: string; value: unknown }
-    | { type: 'arrayStart'; key: string }
-    | { type: 'arrayPush'; key: string; value: unknown }
-    | { type: 'recordStart'; key: string }
-    | { type: 'recordSet'; key: string; entryKey: string; value: unknown }
-    | { type: 'characterStart'; key: 'characters'; value: unknown }
-    | { type: 'conversationStart'; key: 'characters'; value: unknown }
-    | { type: 'message'; key: 'characters'; value: unknown }
-
-function accumulatePluginSnapshotChunk(result: Record<string, any>, chunk: PluginDatabaseSnapshotChunk): void {
-    if (chunk.type === 'provenance') return
-    if (chunk.type === 'set') defineOwnEnumerableProperty(result, chunk.key, structuredClone(chunk.value))
-    else if (chunk.type === 'arrayStart') defineOwnEnumerableProperty(result, chunk.key, [])
-    else if (chunk.type === 'arrayPush') result[chunk.key].push(structuredClone(chunk.value))
-    else if (chunk.type === 'recordStart') defineOwnEnumerableProperty(result, chunk.key, {})
-    else if (chunk.type === 'recordSet') defineOwnEnumerableProperty(result[chunk.key], chunk.entryKey, structuredClone(chunk.value))
-    else if (chunk.type === 'characterStart') result.characters.push({ ...structuredClone(chunk.value as object), chats: [] })
-    else if (chunk.type === 'conversationStart') result.characters.at(-1).chats.push({ ...structuredClone(chunk.value as object), message: [] })
-    else if (chunk.type === 'message') result.characters.at(-1).chats.at(-1).message.push(structuredClone(chunk.value))
-}
+export type PluginDatabaseSnapshotChunk = PluginSnapshotChunk
 
 async function* streamPinnedPluginValues(reader: PersistentRevisionLease, owner: string): AsyncGenerator<PluginStorageValue> {
     let afterKey: PluginStorageValueCursor | undefined
@@ -857,54 +838,18 @@ export function createPluginDatabaseAccess(
                 if (!detail) return target.characterIndex === undefined ? undefined : null
                 assertPinnedRevision(reader.revision, detail.revision, 'Character')
                 const chunks = (async function* (): AsyncGenerator<PluginDatabaseSnapshotChunk> {
-                    let baseline: Record<string, any> | undefined = { characters: [] }
                     yield { type: 'arrayStart', key: 'characters' }
                     if ('conversationId' in resolved) {
-                        baseline.characters.push({ ...structuredClone(detail.value as object), chats: [] })
                         yield { type: 'characterStart', key: 'characters', value: detail.value }
-                        for await (const chunk of streamPinnedConversation(reader, resolved.characterId, String(resolved.conversationId))) {
-                            accumulatePluginSnapshotChunk(baseline, chunk)
-                            yield chunk
-                        }
+                        yield* streamPinnedConversation(reader, resolved.characterId, String(resolved.conversationId))
                     } else {
-                        for await (const chunk of streamPinnedCharacter(reader, resolved.characterId, detail.value)) {
-                            accumulatePluginSnapshotChunk(baseline, chunk)
-                            yield chunk
-                        }
+                        yield* streamPinnedCharacter(reader, resolved.characterId, detail.value)
                     }
-                    if ('conversationId' in resolved) readBaselines.track(baseline.characters[0].chats[0], 'conversation', JSON.stringify([resolved.characterId, resolved.conversationId]), reader.revision, readAuthority)
-                    else readBaselines.track(baseline.characters[0], 'character', resolved.characterId, reader.revision, readAuthority)
-                    const entries = collectPluginReadProvenance(baseline)
-                    baseline = undefined
-                    yield { type: 'provenance', entries }
                 })()
-                let closed = false
-                const close = async () => {
-                    if (closed) return
-                    closed = true
-                    context.signal.removeEventListener('abort', abort)
-                    try { await chunks.return(undefined) }
-                    finally { await releasePersistentRevisionLease(reader) }
-                }
-                const abort = () => { void close().catch(() => undefined) }
-                context.signal.addEventListener('abort', abort, { once: true })
-                const value = new ReadableStream<PluginDatabaseSnapshotChunk>({
-                    async pull(controller) {
-                        try {
-                            throwIfFullObjectCallAborted(context.signal)
-                            const next = await chunks.next()
-                            throwIfFullObjectCallAborted(context.signal)
-                            if (next.done) {
-                                await close()
-                                controller.close()
-                            } else controller.enqueue(next.value)
-                        } catch (error) {
-                            await close().catch(() => undefined)
-                            controller.error(error)
-                        }
-                    },
-                    cancel: close,
-                })
+                const baseline = 'conversationId' in resolved
+                    ? readBaselines.beginSnapshot('conversation', JSON.stringify([resolved.characterId, resolved.conversationId]), readAuthority)
+                    : readBaselines.beginSnapshot('character', resolved.characterId, readAuthority)
+                const value = createPluginSnapshotStream(chunks, baseline, () => releasePersistentRevisionLease(reader), { signal: context.signal })
                 transferred = true
                 return {
                     __type: 'IFRAME_OBJECT_STREAM', value,
@@ -1284,36 +1229,7 @@ export function createPluginDatabaseAccess(
                     }
                 }
             })()
-            // Released once tracked, so the stream holds no copy of the library after it ends.
-            let baseline: Record<string, any> | undefined = {}
-            return new ReadableStream<PluginDatabaseSnapshotChunk>({
-                async pull(controller) {
-                    try {
-                        const next = await iterator.next()
-                        if (next.done) {
-                            if (baseline) {
-                                readBaselines.track(baseline, 'database', 'database', reader.revision, readAuthority)
-                                const entries = collectPluginReadProvenance(baseline)
-                                baseline = undefined
-                                controller.enqueue({ type: 'provenance', entries })
-                            }
-                            controller.close()
-                        } else {
-                            accumulatePluginSnapshotChunk(baseline!, next.value)
-                            controller.enqueue(next.value)
-                        }
-                    } catch (error) {
-                        controller.error(error)
-                    }
-                },
-                async cancel() {
-                    try {
-                        await iterator.return(undefined)
-                    } finally {
-                        await release()
-                    }
-                },
-            })
+            return createPluginSnapshotStream(iterator, readBaselines.beginSnapshot('database', 'database', readAuthority), release)
         },
 
         async getDatabaseSnapshot(includeOnly, allowedKeys) {

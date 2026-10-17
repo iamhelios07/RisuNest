@@ -32,6 +32,9 @@ const commands = new Set([
     'asset_cas_read_object',
     'asset_cas_read_object_range',
     'asset_cas_stat_object',
+    'asset_cas_read_open',
+    'asset_cas_read_part',
+    'asset_cas_read_close',
 ])
 const phases = new Set(['storage', 'data', 'compatibility', 'plugins', 'sync'])
 const marks = new Set([
