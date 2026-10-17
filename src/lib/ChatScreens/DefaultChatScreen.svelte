@@ -980,7 +980,7 @@
         if (experimental) await sleep(1500)
         if (!chatScreenState.matchesComposer(snapshot)) return
         try {
-            const translatedMessage = await translate(input, reverse)
+            const translatedMessage = await translate(input, reverse, undefined, 'throw')
             if (!chatScreenState.matchesComposer(snapshot)) return
             inputTranslationFailed = false
             if (translatedMessage) {

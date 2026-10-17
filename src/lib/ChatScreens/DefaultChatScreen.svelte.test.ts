@@ -551,7 +551,7 @@ it('a late translation cannot replace newer text or write into another conversat
     mocks.translate.mockImplementationOnce(() => new Promise(resolve => { finishTranslation = resolve }))
     await tick()
     type('Original for translation')
-    await vi.waitFor(() => expect(mocks.translate).toHaveBeenCalledWith('Original for translation', false))
+    await vi.waitFor(() => expect(mocks.translate).toHaveBeenCalledWith('Original for translation', false, undefined, 'throw'))
     type('New original')
     DBState.db.characters[0].chatPage = 1
     await tick()
