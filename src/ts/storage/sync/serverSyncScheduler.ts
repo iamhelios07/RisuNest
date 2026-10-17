@@ -97,7 +97,8 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             clear()
             scheduleOutage()
         }
-        if ((typeof error === 'object' && error && 'retryable' in error && error.retryable === false) || integrityCodes.includes(code(error))) {
+        // A settled, cancelled publication can report server-unreachable with a nonretryable 409.
+        if ((typeof error === 'object' && error && 'retryable' in error && error.retryable === false && code(error) !== 'server-unreachable') || integrityCodes.includes(code(error))) {
             blocked = true
             blockedCode = code(error)
             clear()

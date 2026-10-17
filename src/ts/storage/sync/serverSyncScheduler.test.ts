@@ -12,9 +12,24 @@ describe('server LWW foreground scheduler', () => {
     it('classifies tunnel outages and timeouts without masking authentication or local failures', () => {
         for (const status of [502, 503, 504, 530]) expect(isServerSyncUnavailable({ code: 'server-response-error', status })).toBe(true)
         for (const code of ['server-timeout', 'incomplete-response', 'sync-retry-budget-exhausted']) expect(isServerSyncUnavailable({ code })).toBe(true)
-        for (const error of [{ code: 'server-response-error', status: 401 }, { code: 'local-storage', status: 503 }, { code: 'server-unreachable', retryable: false }, new TypeError('Load failed')]) {
+        for (const error of [{ code: 'server-response-error', status: 401 }, { code: 'local-storage', status: 503 }, { code: 'server-unreachable', status: 409, retryable: false }, new TypeError('Load failed')]) {
             expect(isServerSyncUnavailable(error)).toBe(false)
         }
+    })
+    it.each(['timer', 'edit', 'foreground'])('retries a settled cancelled publication on %s despite its nonretryable 409', async trigger => {
+        const f = fixture()
+        const failure = { code: 'server-unreachable', status: 409, retryable: false }
+        f.push.mockRejectedValueOnce(failure)
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.failed).toHaveBeenCalledWith(failure)
+        expect(f.scheduler.isBlocked()).toBe(false)
+        if (trigger === 'edit') f.scheduler.localChange(true)
+        else if (trigger === 'foreground') { await f.scheduler.foreground(false); await f.scheduler.foreground(true) }
+        await vi.advanceTimersByTimeAsync(trigger === 'timer' ? 1000 : 0)
+        expect(f.push).toHaveBeenCalledTimes(2)
+        expect(f.recovered).toHaveBeenCalledOnce()
+        expect(f.scheduler.blockedCode()).toBe('')
+        f.scheduler.dispose()
     })
     it.each(['server-unreachable', 'sync-retry-budget-exhausted'])('backs off %s across all automatic triggers and resumes queued work after recovery', async code => {
         const f = fixture()

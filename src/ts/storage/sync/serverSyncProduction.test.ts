@@ -799,6 +799,23 @@ describe('production server LWW composition', () => {
         await vi.advanceTimersByTimeAsync(5000); await settle()
         expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, error: '' })
     })
+    it('automatically recovers when native publication settles as server-unreachable with a nonretryable 409', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const fallback = f.invoke.getMockImplementation()!
+        let cancelled = true
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_lww_push' && cancelled) {
+                cancelled = false
+                throw { code: 'server-unreachable', status: 409, retryable: false }
+            }
+            return fallback(command, args)
+        })
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, error: 'server-unreachable' })
+        await vi.advanceTimersByTimeAsync(1000); await settle()
+        expect(f.invoke.mock.calls.filter(([command]) => command === 'server_sync_lww_push')).toHaveLength(2)
+        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, error: '' })
+    })
     it('keeps automatic sync stopped through visibility changes until the hold is released', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
