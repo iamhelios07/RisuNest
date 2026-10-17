@@ -3,7 +3,7 @@ use super::job_pins::{
     CasJobOwnerKind, CasObjectRole, CasReleaseOutcome, DurableCasJob, DurableCasJobOwnership,
 };
 use super::{PayloadCas, PreparedPayload};
-use super::payload_cas::{CasObjectReader, OwnedPayloadUpload};
+use super::payload_cas::{ObjectPart, OwnedPayloadUpload};
 use crate::asset_repository::owner_manifest_codec::{
     decode_owner_manifest, encode_owner_manifest, OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES,
 };
@@ -30,7 +30,6 @@ pub(crate) struct ContentDirectObject {
 pub(crate) struct DurableCasJobState {
     jobs: Mutex<HashMap<String, DurableCasJob>>,
     uploads: Mutex<CasUploadPool>,
-    reads: Mutex<CasReadPool>,
 }
 
 impl Default for DurableCasJobState {
@@ -38,7 +37,6 @@ impl Default for DurableCasJobState {
         Self {
             jobs: Mutex::new(HashMap::new()),
             uploads: Mutex::new(CasUploadPool::default()),
-            reads: Mutex::new(CasReadPool::default()),
         }
     }
 }
@@ -221,7 +219,6 @@ impl DurableCasJobState {
     }
 
     fn clear_uploads(&self) -> Result<(), String> {
-        self.reads.lock().map_err(|error| format!("CAS read mutex poisoned: {error}"))?.readers.clear();
         self.uploads
             .lock()
             .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?
@@ -279,43 +276,6 @@ const CAS_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CAS_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CONCURRENT_CAS_UPLOADS: usize = 4;
 const MAX_TOTAL_CAS_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
-
-#[derive(Default)]
-struct CasReadPool {
-    readers: HashMap<String, CasObjectReader>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CasReadOpened {
-    byte_size: u64,
-    start: u64,
-    end_exclusive: u64,
-    capacity: usize,
-}
-
-impl CasReadPool {
-    fn open(&mut self, cas: &PayloadCas, read_id: String, hash: &str, start: u64, end: u64) -> io::Result<Option<CasReadOpened>> {
-        if uuid::Uuid::parse_str(&read_id).is_err() || self.readers.contains_key(&read_id) {
-            return Err(io::Error::new(ErrorKind::InvalidInput, "invalid CAS read ID"));
-        }
-        if self.readers.len() >= 16 {
-            return Err(io::Error::new(ErrorKind::WouldBlock, "CAS read capacity is unavailable"));
-        }
-        let Some(reader) = cas.open_reader(hash, start, end)? else { return Ok(None); };
-        let opened = CasReadOpened { byte_size: reader.byte_size, start: reader.start, end_exclusive: reader.end_exclusive, capacity: crate::asset_byte_transport::BINARY_PART_BYTES };
-        self.readers.insert(read_id, reader);
-        Ok(Some(opened))
-    }
-
-    fn read(&mut self, read_id: &str, start: u64, end: u64) -> io::Result<Vec<u8>> {
-        let reader = self.readers.get_mut(read_id)
-            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "CAS read session is missing"))?;
-        let result = reader.read(start, end, crate::asset_byte_transport::BINARY_PART_BYTES);
-        if result.is_err() { self.readers.remove(read_id); }
-        result
-    }
-}
 
 struct CasUpload {
     session_id: String,
@@ -880,72 +840,71 @@ fn with_content_session_at_root<T>(
     operation(job)
 }
 
-#[tauri::command(async)]
-pub(crate) async fn asset_cas_read_open(
-    app: AppHandle, read_id: String, content_hash: String, start: u64, end_exclusive: u64,
-) -> Result<Option<CasReadOpened>, String> {
-    logged("asset_cas_read_open", async move {
-        tauri::async_runtime::spawn_blocking(move || {
-            let _operation = app.state::<PersistentStoreState>().admit_renderer_operation().map_err(|error| error.to_string())?;
-            let cas = PayloadCas::new(repository_root(&app)?).map_err(|error| error.to_string())?;
-            app.state::<DurableCasJobState>().reads.lock()
-                .map_err(|error| format!("CAS read mutex poisoned: {error}"))?
-                .open(&cas, read_id, &content_hash, start, end_exclusive).map_err(|error| error.to_string())
-        }).await.map_err(|error| format!("failed to join CAS read open: {error}"))?
-    }.await)
-}
+/// The largest part one CAS read command returns.
+pub(crate) const CAS_READ_PART_BYTES: u64 = 1024 * 1024;
+const CAS_OBJECT_MISSING: &str = "cas-object-missing";
+const CAS_OBJECT_SIZE_MISMATCH: &str = "cas-object-size-mismatch";
 
+/// Reads one part of an object of `expected_size` bytes. Nothing outlives the
+/// call: the file is opened and closed inside it.
 #[tauri::command(async)]
-pub(crate) async fn asset_cas_read_part(
-    app: AppHandle, read_id: String, start: u64, end_exclusive: u64,
-) -> Result<tauri::ipc::Response, String> {
-    logged("asset_cas_read_part", async move {
-        tauri::async_runtime::spawn_blocking(move || {
-            let _operation = app.state::<PersistentStoreState>().admit_renderer_operation().map_err(|error| error.to_string())?;
-            app.state::<DurableCasJobState>().reads.lock()
-                .map_err(|error| format!("CAS read mutex poisoned: {error}"))?
-                .read(&read_id, start, end_exclusive).map(tauri::ipc::Response::new).map_err(|error| error.to_string())
-        }).await.map_err(|error| format!("failed to join CAS read part: {error}"))?
-    }.await)
-}
-
-#[tauri::command(async)]
-pub(crate) async fn asset_cas_read_close(app: AppHandle, read_id: String) -> Result<(), String> {
-    logged("asset_cas_read_close", async move {
-        // A part read may hold the pool lock; wait for it off the async runtime.
-        tauri::async_runtime::spawn_blocking(move || {
-            let _operation = app.state::<PersistentStoreState>().admit_renderer_operation().map_err(|error| error.to_string())?;
-            app.state::<DurableCasJobState>().reads.lock()
-                .map_err(|error| format!("CAS read mutex poisoned: {error}"))?.readers.remove(&read_id);
-            Ok(())
-        }).await.map_err(|error| format!("failed to join CAS read close: {error}"))?
-    }.await)
-}
-
-#[tauri::command(async)]
-pub(crate) async fn asset_cas_read_object_range(
+pub(crate) async fn asset_cas_read_bytes(
     app: AppHandle,
     content_hash: String,
     start: u64,
     end_exclusive: u64,
-) -> Result<Option<Vec<u8>>, String> {
-    logged("asset_cas_read_object_range", async move {
-        if end_exclusive < start || end_exclusive - start > CAS_UPLOAD_CHUNK_BYTES as u64 {
-            return Err("CAS range read exceeds the IPC chunk limit".to_owned());
-        }
+    expected_size: u64,
+) -> Result<tauri::ipc::Response, String> {
+    let result = async {
+        let dispatched = app
+            .state::<PersistentStoreState>()
+            .renderer_dispatch_epoch()
+            .map_err(|error| error.to_string())?;
+        check_cas_read_range(start, end_exclusive, expected_size)?;
         let root = repository_root(&app)?;
         tauri::async_runtime::spawn_blocking(move || {
-            let _operation = app
-                .state::<PersistentStoreState>()
-                .admit_renderer_operation()
-                .map_err(|error| error.to_string())?;
-            PayloadCas::new(&root)
-                .and_then(|cas| cas.read_object_range(&content_hash, start, end_exclusive))
-                .map_err(|error| error.to_string())
+            read_cas_part(&app.state::<PersistentStoreState>(), dispatched, &root, &content_hash, start, end_exclusive, expected_size)
+                .map(tauri::ipc::Response::new)
         })
         .await
-        .map_err(|error| format!("failed to join CAS range operation: {error}"))?
-    }.await)
+        .map_err(|error| format!("failed to join CAS read: {error}"))?
+    }
+    .await;
+    match result {
+        // Remote-only aliases make misses routine, so a miss is not a failure.
+        Err(code) if code == CAS_OBJECT_MISSING => Err(code),
+        result => logged("asset_cas_read_bytes", result),
+    }
+}
+
+fn check_cas_read_range(start: u64, end_exclusive: u64, expected_size: u64) -> Result<(), String> {
+    if end_exclusive < start || end_exclusive - start > CAS_READ_PART_BYTES || end_exclusive > expected_size {
+        return Err("invalid CAS read range".to_owned());
+    }
+    Ok(())
+}
+
+fn read_cas_part(
+    store: &PersistentStoreState,
+    dispatched: u64,
+    root: &std::path::Path,
+    content_hash: &str,
+    start: u64,
+    end_exclusive: u64,
+    expected_size: u64,
+) -> Result<Vec<u8>, String> {
+    check_cas_read_range(start, end_exclusive, expected_size)?;
+    let _operation = store
+        .admit_renderer_operation_dispatched_at(dispatched)
+        .map_err(|error| error.to_string())?;
+    let part = PayloadCas::new(root)
+        .and_then(|cas| cas.read_object_part(content_hash, start, end_exclusive, expected_size))
+        .map_err(|error| error.to_string())?;
+    match part {
+        ObjectPart::Bytes(bytes) => Ok(bytes),
+        ObjectPart::Missing => Err(CAS_OBJECT_MISSING.to_owned()),
+        ObjectPart::SizeMismatch => Err(CAS_OBJECT_SIZE_MISMATCH.to_owned()),
+    }
 }
 
 #[tauri::command(async)]
@@ -1819,39 +1778,44 @@ mod tests {
     }
 
     #[test]
-    fn cas_read_session_keeps_one_object_across_unlink_and_closes_on_invalid_offsets() {
+    fn cas_part_reads_check_the_range_size_and_admission_and_leave_no_handle_open() {
+        use crate::asset_repository::body_io::{register_object_purpose, reset_body_io, take_body_io, BodyPurpose};
         let directory = TempDir::new().unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
-        let bytes: Vec<u8> = (0..CAS_UPLOAD_CHUNK_BYTES + 7).map(|i| (i % 256) as u8).collect();
+        let part = CAS_READ_PART_BYTES as usize;
+        let bytes: Vec<u8> = (0..part + 7).map(|i| (i % 251) as u8).collect();
+        let size = bytes.len() as u64;
         let prepared = cas.prepare_bytes(&bytes).unwrap();
-        let mut pool = CasReadPool::default();
-        let id = uuid::Uuid::new_v4().to_string();
-        let opened = pool.open(&cas, id.clone(), &prepared.content_hash, 1, u64::MAX).unwrap().unwrap();
-        assert_eq!(opened.start, 1);
-        assert_eq!(opened.end_exclusive, bytes.len() as u64);
-        assert_eq!(opened.byte_size, bytes.len() as u64);
-        std::fs::remove_file(directory.path().join(prepared.physical_key)).unwrap();
-        assert_eq!(pool.read(&id, 1, CAS_UPLOAD_CHUNK_BYTES as u64 + 1).unwrap(), bytes[1..CAS_UPLOAD_CHUNK_BYTES + 1]);
-        assert_eq!(pool.read(&id, CAS_UPLOAD_CHUNK_BYTES as u64 + 1, bytes.len() as u64).unwrap(), bytes[CAS_UPLOAD_CHUNK_BYTES + 1..]);
-        assert!(pool.read(&id, 1, 2).is_err());
-        assert!(pool.readers.is_empty());
-        assert!(pool.open(&cas, id, &prepared.content_hash, 0, 1).unwrap().is_none());
-    }
+        let hash = prepared.content_hash.as_str();
+        let store = PersistentStoreState::default();
+        let read = |start: u64, end: u64, expected: u64| {
+            read_cas_part(&store, store.renderer_dispatch_epoch().unwrap(), directory.path(), hash, start, end, expected)
+        };
+        reset_body_io();
+        register_object_purpose(hash, BodyPurpose::Asset);
 
-    #[test]
-    fn cas_read_admission_and_renderer_reset_bound_owned_handles() {
-        let directory = TempDir::new().unwrap();
-        let cas = PayloadCas::new(directory.path()).unwrap();
-        let empty = cas.prepare_bytes(&[]).unwrap();
-        let state = DurableCasJobState::default();
-        for _ in 0..16 {
-            let opened = state.reads.lock().unwrap().open(&cas, uuid::Uuid::new_v4().to_string(), &empty.content_hash, 1, u64::MAX).unwrap().unwrap();
-            assert_eq!((opened.start, opened.end_exclusive), (0, 0));
-        }
-        assert!(state.reads.lock().unwrap().open(&cas, uuid::Uuid::new_v4().to_string(), &empty.content_hash, 0, 0).is_err());
-        state.clear_uploads().unwrap();
-        assert!(state.reads.lock().unwrap().readers.is_empty());
-        assert!(state.reads.lock().unwrap().open(&cas, uuid::Uuid::new_v4().to_string(), &empty.content_hash, 0, 0).unwrap().is_some());
+        assert_eq!(read(0, part as u64, size).unwrap(), bytes[..part]);
+        assert_eq!(read(part as u64, size, size).unwrap(), bytes[part..]);
+        assert_eq!(read(size, size, size).unwrap(), Vec::<u8>::new());
+        assert_eq!(read(0, 10, size + 1).unwrap_err(), CAS_OBJECT_SIZE_MISMATCH);
+        assert!(read(0, part as u64 + 1, size).is_err());
+        assert!(read(2, 1, size).is_err());
+        assert!(read(0, size, size - 1).is_err());
+        assert_eq!(read(0, 1, 1).unwrap_err(), CAS_OBJECT_SIZE_MISMATCH);
+
+        let dispatched = store.renderer_dispatch_epoch().unwrap();
+        let maintenance = store.acquire_raw_capture().unwrap();
+        assert!(read(0, 1, size).is_err());
+        drop(maintenance);
+        assert!(read_cas_part(&store, dispatched, directory.path(), hash, 0, 1, size).is_err());
+        assert_eq!(read(0, 1, size).unwrap(), bytes[..1]);
+
+        let work = take_body_io();
+        assert!(work.complete());
+        assert_eq!(work.objects[hash].work.outstanding_readers, 0);
+        std::fs::remove_file(directory.path().join(&prepared.physical_key)).unwrap();
+        assert_eq!(read(0, 0, size).unwrap_err(), CAS_OBJECT_MISSING);
+        assert_eq!(read(0, 1, size).unwrap_err(), CAS_OBJECT_MISSING);
     }
 
     #[test]

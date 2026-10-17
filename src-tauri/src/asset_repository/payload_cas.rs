@@ -111,30 +111,13 @@ impl UploadLease {
     }
 }
 
-pub(crate) struct CasObjectReader {
-    #[cfg(not(test))]
-    file: File,
-    #[cfg(test)]
-    file: super::body_io::TrackedBodyFile,
-    pub(crate) byte_size: u64,
-    pub(crate) start: u64,
-    pub(crate) end_exclusive: u64,
-    position: u64,
-}
-
-impl CasObjectReader {
-    pub(crate) fn read(&mut self, start: u64, end_exclusive: u64, capacity: usize) -> io::Result<Vec<u8>> {
-        let length = end_exclusive.checked_sub(start)
-            .filter(|length| *length <= capacity as u64)
-            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "invalid CAS read part"))?;
-        if start != self.position || end_exclusive > self.end_exclusive {
-            return Err(io::Error::new(ErrorKind::InvalidInput, "unexpected CAS read offset"));
-        }
-        let mut bytes = vec![0; length as usize];
-        self.file.read_exact(&mut bytes)?;
-        self.position = end_exclusive;
-        Ok(bytes)
-    }
+/// One part of an object read at the length its reader expects. A missing
+/// object and a different length are answers the reader acts on, not I/O errors.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ObjectPart {
+    Missing,
+    SizeMismatch,
+    Bytes(Vec<u8>),
 }
 
 impl Drop for UploadLease {
@@ -1075,58 +1058,38 @@ impl PayloadCas {
         Ok(Some(body?))
     }
 
-    pub fn read_object_range(
+    /// Reads `[start, end_exclusive)` of an object that must be `expected_size`
+    /// bytes long. The file is opened and closed within the call, and the bytes
+    /// are never truncated or padded.
+    pub(crate) fn read_object_part(
         &self,
         content_hash: &str,
         start: u64,
         end_exclusive: u64,
-    ) -> io::Result<Option<Vec<u8>>> {
-        #[cfg(test)]
-        let _body_scope = super::body_io::object_scope(content_hash);
-        if end_exclusive < start {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "payload range bounds must be in ascending order",
-            ));
-        }
-        let Some(path) = self.existing_object_path(content_hash)? else {
-            return Ok(None);
-        };
-        let file = File::open(path);
-        #[cfg(test)]
-        super::body_io::open_result("managed", &file);
-        let mut file = file?;
-        let size = file.metadata()?.len();
-        let bounded_start = start.min(size);
-        let bounded_end = end_exclusive.min(size);
-        let length = usize::try_from(bounded_end - bounded_start)
-            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "payload range is too large"))?;
-        file.seek(SeekFrom::Start(bounded_start))?;
-        let mut data = vec![0; length];
-        let read = file.read_exact(&mut data);
-        #[cfg(test)]
-        super::body_io::read_exact_result("managed", &read, data.len());
-        read?;
-        Ok(Some(data))
-    }
-
-    pub(crate) fn open_reader(&self, content_hash: &str, start: u64, end_exclusive: u64) -> io::Result<Option<CasObjectReader>> {
-        if end_exclusive < start {
+        expected_size: u64,
+    ) -> io::Result<ObjectPart> {
+        if end_exclusive < start || end_exclusive > expected_size {
             return Err(io::Error::new(ErrorKind::InvalidInput, "invalid CAS read range"));
         }
-        let Some(path) = self.existing_object_path(content_hash)? else { return Ok(None); };
-        let mut file = match self.open_exact_owned_file(&path) {
+        let length = usize::try_from(end_exclusive - start)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "CAS read part is too large"))?;
+        let Some(path) = self.existing_object_path(content_hash)? else { return Ok(ObjectPart::Missing); };
+        let file = match self.open_exact_owned_file(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(ObjectPart::Missing),
             Err(error) => return Err(error),
         };
-        let byte_size = file.metadata()?.len();
-        let start = start.min(byte_size);
-        let end_exclusive = end_exclusive.min(byte_size);
-        file.seek(SeekFrom::Start(start))?;
+        let size = file.metadata()?.len();
         #[cfg(test)]
         let file = super::body_io::TrackedBodyFile::new(file, content_hash);
-        Ok(Some(CasObjectReader { file, byte_size, start, end_exclusive, position: start }))
+        let mut file = file;
+        if size != expected_size {
+            return Ok(ObjectPart::SizeMismatch);
+        }
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; length];
+        file.read_exact(&mut bytes)?;
+        Ok(ObjectPart::Bytes(bytes))
     }
 
     pub fn open_object(&self, content_hash: &str) -> io::Result<Option<File>> {
@@ -1850,7 +1813,7 @@ pub(crate) fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> 
 
 #[cfg(test)]
 mod tests {
-    use super::{create_staging_file, ExactObjectUnlink, PayloadCas};
+    use super::{create_staging_file, ExactObjectUnlink, ObjectPart, PayloadCas};
     use sha2::Digest;
     use std::io::Cursor;
 
@@ -2000,7 +1963,8 @@ mod tests {
                 barrier.wait();
                 let _guard = crate::asset_repository::coordinator::lock_repository_mutation().unwrap();
                 let expected = b"synthetic available media";
-                assert_eq!(cas.read_object_range(&hash, 0, expected.len() as u64).unwrap().unwrap(), expected);
+                let size = expected.len() as u64;
+                assert_eq!(cas.read_object_part(&hash, 0, size, size).unwrap(), ObjectPart::Bytes(expected.to_vec()));
                 done.send(()).unwrap();
             })
         }).collect();
@@ -2615,23 +2579,29 @@ mod body_io_tests {
     }
 
     #[test]
-    fn continuous_read_opens_once_and_reads_only_the_requested_bytes() {
+    fn a_part_read_checks_the_expected_size_reads_only_its_bytes_and_closes_the_file() {
         let bytes: Vec<u8> = (0..53).collect();
-        let (_directory, cas, prepared) = fixture(&bytes);
+        let (directory, cas, prepared) = fixture(&bytes);
+        let hash = &prepared.content_hash;
         reset_body_io();
-        register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
-        let mut reader = cas.open_reader(&prepared.content_hash, 1, 50).unwrap().unwrap();
-        let mut received = Vec::new();
-        for start in (1..50).step_by(7) { received.extend(reader.read(start, (start + 7).min(50), 7).unwrap()); }
-        drop(reader);
+        register_object_purpose(hash, BodyPurpose::Asset);
+        assert_eq!(cas.read_object_part(hash, 1, 50, 53).unwrap(), ObjectPart::Bytes(bytes[1..50].to_vec()));
+        assert_eq!(cas.read_object_part(hash, 53, 53, 53).unwrap(), ObjectPart::Bytes(Vec::new()));
+        assert_eq!(cas.read_object_part(hash, 0, 10, 100).unwrap(), ObjectPart::SizeMismatch);
+        assert_eq!(cas.read_object_part(hash, 0, 10, 52).unwrap(), ObjectPart::SizeMismatch);
         let work = take_body_io();
-        assert_eq!(received, bytes[1..50]);
         assert!(work.complete());
-        let managed = &work.objects[&prepared.content_hash].work;
-        assert_eq!(managed.opens, 1);
+        let managed = &work.objects[hash].work;
+        assert_eq!(managed.opens, 4);
         assert_eq!(managed.read_bytes, 49);
         assert_eq!(managed.outstanding_readers, 0);
         assert!(managed.body_sha.is_empty());
+
+        let empty = cas.prepare_bytes(&[]).unwrap();
+        assert_eq!(cas.read_object_part(&empty.content_hash, 0, 0, 0).unwrap(), ObjectPart::Bytes(Vec::new()));
+        std::fs::remove_file(directory.path().join(&prepared.physical_key)).unwrap();
+        assert_eq!(cas.read_object_part(hash, 0, 0, 53).unwrap(), ObjectPart::Missing);
+        assert_eq!(cas.read_object_part(&"c".repeat(64), 0, 1, 1).unwrap(), ObjectPart::Missing);
     }
 
     fn fixture(bytes: &[u8]) -> (tempfile::TempDir, PayloadCas, PreparedPayload) {
@@ -2983,7 +2953,7 @@ mod body_io_tests {
         reset_body_io();
         register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
         assert_eq!(cas.read_object(&prepared.content_hash).unwrap().unwrap(), body);
-        assert_eq!(cas.read_object_range(&prepared.content_hash, 2, 7).unwrap().unwrap(), &body[2..7]);
+        assert_eq!(cas.read_object_part(&prepared.content_hash, 2, 7, body.len() as u64).unwrap(), ObjectPart::Bytes(body[2..7].to_vec()));
         let work = take_body_io();
         assert_eq!(work.domains["managed"], BodyWork {
             open_attempts: 2, opens: 2, read_operations: 2, read_bytes: body.len() as u64 + 5,
@@ -3002,7 +2972,8 @@ mod body_io_tests {
         reset_body_io();
         register_object_purpose(&"a".repeat(64), BodyPurpose::Asset);
         assert!(cas.open_exact_owned_file(&missing).is_err());
-        assert!(cas.read_object_range(&"a".repeat(64), 3, 2).is_err());
+        assert!(cas.read_object_part(&"a".repeat(64), 3, 2, 10).is_err());
+        assert!(cas.read_object_part(&"a".repeat(64), 0, 11, 10).is_err());
         let work = take_body_io();
         assert_eq!(work.domains["managed"], BodyWork { open_attempts: 1, failed_opens: 1, ..Default::default() });
         assert_eq!(work.presence_queries, 0);
