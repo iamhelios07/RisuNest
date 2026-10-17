@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import { nativeAssetByteSender, NATIVE_BINARY_PART_BYTES, type NativeByteInvoke } from './nativeAssetByteTransport'
+import { nativeAssetByteSender, type NativeByteInvoke } from './nativeAssetByteTransport'
 
 import {
     defaultInlayEncodeOptions,
@@ -16,6 +16,7 @@ import type {
 } from './assetRepository'
 import {
     objectPhysicalKey,
+    PayloadSizeMismatchError,
     type ImmutablePayloadCas,
     type PreparedImmutablePayload,
 } from './payloadCas'
@@ -28,6 +29,8 @@ import {
 type InvokeCommand = NativeByteInvoke
 
 export const NATIVE_CAS_IPC_CHUNK_BYTES = 64 * 1024
+/** The largest part one native CAS read returns; native enforces the same value. */
+export const NATIVE_CAS_READ_PART_BYTES = 1024 * 1024
 
 export type NativeCasJobKind =
     | 'direct-asset-or-inlay-write'
@@ -40,10 +43,6 @@ export type NativeCasJobKind =
 
 export type NativeCasObjectRole = 'direct-object' | 'owner-manifest'
 export type NativeCasReleaseOutcome = 'committed' | 'aborted'
-
-function bytes(value: unknown, context: string): Uint8Array {
-    return Uint8Array.from(byteValues(value, context))
-}
 
 function byteValues(value: unknown, context: string): Uint8Array | number[] {
     if (value instanceof ArrayBuffer) return new Uint8Array(value)
@@ -135,56 +134,136 @@ export async function prepareCasObject(
     }
 }
 
+/** A native CAS read whose response did not arrive within the stall limit. */
+export class NativeCasReadStallError extends Error {
+    constructor() {
+        super('Native CAS read did not complete')
+        this.name = 'NativeCasReadStallError'
+    }
+}
+
+export interface NativeCasReadBudgetOptions {
+    capacityBytes?: number
+    minimumWeightBytes?: number
+    stallMs?: number
+}
+
+export interface NativeCasReadBudget {
+    run(length: number, read: () => Promise<unknown>): Promise<unknown>
+}
+
+/**
+ * Bounds the read responses a document has in flight. An invoke settles only
+ * after the page has received its body, so holding weight until then also
+ * covers bodies still waiting for delivery. Waiters are served in order.
+ */
+export function createNativeCasReadBudget(options: NativeCasReadBudgetOptions = {}): NativeCasReadBudget {
+    const capacity = options.capacityBytes ?? 8 * 1024 * 1024
+    const minimumWeight = options.minimumWeightBytes ?? 256 * 1024
+    const stallMs = options.stallMs ?? 30_000
+    let available = capacity
+    const waiting: { weight: number, admit: () => void }[] = []
+    const admitWaiting = () => {
+        while (waiting.length > 0 && waiting[0].weight <= available) {
+            const next = waiting.shift()!
+            available -= next.weight
+            next.admit()
+        }
+    }
+    return {
+        async run(length, read) {
+            const weight = Math.min(capacity, Math.max(length, minimumWeight))
+            await new Promise<void>((admit) => {
+                waiting.push({ weight, admit })
+                admitWaiting()
+            })
+            let released = false
+            const release = () => {
+                if (released) return
+                released = true
+                available += weight
+                admitWaiting()
+            }
+            const invoked = new Promise<unknown>((resolve) => resolve(read()))
+            invoked.then(release, release)
+            let timer: ReturnType<typeof setTimeout> | undefined
+            // Android leaves an invoke unsettled when its channel fetch fails. The
+            // read fails without a retry, and a late result is discarded.
+            const stalled = new Promise<never>((_, reject) => {
+                timer = setTimeout(() => {
+                    release()
+                    reject(new NativeCasReadStallError())
+                }, stallMs)
+            })
+            try {
+                return await Promise.race([invoked, stalled])
+            } finally {
+                clearTimeout(timer)
+            }
+        },
+    }
+}
+
+const documentReadBudget = createNativeCasReadBudget()
+
+function expectedObjectSize(value: number): number {
+    if (!Number.isSafeInteger(value) || value < 0) {
+        throw new TypeError('Expected object size must be a nonnegative safe integer')
+    }
+    return value
+}
+
+async function readCasPart(
+    invokeCommand: InvokeCommand,
+    budget: NativeCasReadBudget,
+    contentHash: string,
+    start: number,
+    endExclusive: number,
+    expectedSize: number,
+): Promise<Uint8Array | null> {
+    let result: unknown
+    try {
+        result = await budget.run(endExclusive - start, () => invokeCommand('asset_cas_read_bytes', {
+            contentHash, start, endExclusive, expectedSize,
+        }))
+    } catch (error) {
+        if (error === 'cas-object-missing') return null
+        if (error === 'cas-object-size-mismatch') throw new PayloadSizeMismatchError()
+        throw error
+    }
+    const values = byteValues(result, 'Native CAS read')
+    if (values.length !== endExclusive - start) {
+        throw new TypeError('Native CAS read returned an invalid length')
+    }
+    return values instanceof Uint8Array ? values : Uint8Array.from(values)
+}
+
+/** Reads `[start, end)` clamped to an object of `expectedSize` bytes, one part at a time. */
 async function readCasObjectRange(
     invokeCommand: InvokeCommand,
+    budget: NativeCasReadBudget,
     contentHash: string,
     requestedStart: number,
     requestedEnd: number,
+    expectedSize: number,
 ): Promise<Uint8Array | null> {
-    let readId: string | undefined
-    let start = requestedStart
-    let endExclusive = requestedEnd
-    try {
-        if (requestedEnd - requestedStart >= 256 * 1024) {
-            readId = crypto.randomUUID()
-            const opened = await invokeCommand('asset_cas_read_open', {
-                readId, contentHash, start: requestedStart, endExclusive: requestedEnd,
-            }) as { byteSize: unknown; start: unknown; endExclusive: unknown; capacity: unknown } | null
-            if (opened === null) return null
-            // Native clamps the range to EOF, which bounds the allocation below.
-            const size = safeSize(opened.byteSize, 'Native CAS read open')
-            start = Math.min(requestedStart, size)
-            endExclusive = Math.min(requestedEnd, size)
-            if (opened.start !== start || opened.endExclusive !== endExclusive
-                || opened.capacity !== NATIVE_BINARY_PART_BYTES) {
-                throw new TypeError('Native CAS read returned invalid range metadata')
-            }
-        }
-        // A smaller request is bounded by its own length and may end early at EOF.
-        const combined = new Uint8Array(endExclusive - start)
-        let total = 0
-        for (let offset = start; offset < endExclusive;) {
-            const end = Math.min(offset + (readId ? NATIVE_BINARY_PART_BYTES : NATIVE_CAS_IPC_CHUNK_BYTES), endExclusive)
-            const requestedLength = end - offset
-            const result = await invokeCommand(readId ? 'asset_cas_read_part' : 'asset_cas_read_object_range', {
-                ...(readId ? { readId } : { contentHash }),
-                start: offset,
-                endExclusive: end,
-            })
-            if (result === null) return null
-            const chunk = byteValues(result, 'Native CAS range read')
-            if (chunk.length > requestedLength) {
-                throw new TypeError('Native CAS range read exceeded its requested length')
-            }
-            combined.set(chunk, total)
-            total += chunk.length
-            offset += chunk.length
-            if (chunk.length < requestedLength) break
-        }
-        return total === combined.length ? combined : combined.subarray(0, total)
-    } finally {
-        if (readId) await invokeCommand('asset_cas_read_close', { readId }).catch(() => undefined)
+    const start = Math.min(requestedStart, expectedSize)
+    const end = Math.min(requestedEnd, expectedSize)
+    const firstEnd = Math.min(end, start + NATIVE_CAS_READ_PART_BYTES)
+    // An empty range still makes one call, which reports absence.
+    const first = await readCasPart(invokeCommand, budget, contentHash, start, firstEnd, expectedSize)
+    if (first === null || firstEnd === end) return first
+    // The first part has confirmed the object and its size before the result is reserved.
+    const combined = new Uint8Array(end - start)
+    combined.set(first)
+    for (let offset = firstEnd; offset < end;) {
+        const partEnd = Math.min(end, offset + NATIVE_CAS_READ_PART_BYTES)
+        const part = await readCasPart(invokeCommand, budget, contentHash, offset, partEnd, expectedSize)
+        if (part === null) return null
+        combined.set(part, offset - start)
+        offset = partEnd
     }
+    return combined
 }
 
 export async function pinExistingCasObject(
@@ -274,45 +353,34 @@ export function createNativeDurableCasJobSessionFactory(
 
 export function createNativeImmutablePayloadCas(
     invokeCommand: InvokeCommand = invoke,
+    budget: NativeCasReadBudget = documentReadBudget,
 ): ImmutablePayloadCas {
+    const objectSize = async (contentHash: string, expectedSize: number | undefined) => {
+        if (expectedSize !== undefined) return expectedObjectSize(expectedSize)
+        const size = await invokeCommand('asset_cas_stat_object', { contentHash })
+        return size === null ? null : safeSize(size, 'Native CAS stat')
+    }
     return {
         async prepare(data) {
             void data
             throw new Error('Native CAS writes require a durable ownership session')
         },
-        async readObject(contentHash) {
-            const sizeValue = await invokeCommand('asset_cas_stat_object', { contentHash })
-            if (sizeValue === null) return null
-            const size = safeSize(sizeValue, 'Native CAS stat')
-            if (size === 0) {
-                const result = await invokeCommand('asset_cas_read_object_range', {
-                    contentHash,
-                    start: 0,
-                    endExclusive: 0,
-                })
-                return result === null ? null : bytes(result, 'Native CAS range read')
-            }
-            const result = await readCasObjectRange(invokeCommand, contentHash, 0, size)
-            if (result !== null && result.byteLength !== size) {
-                throw new Error('Native CAS object changed while it was being read')
-            }
-            return result
+        async readObject(contentHash, expectedSize) {
+            const size = await objectSize(contentHash, expectedSize)
+            if (size === null) return null
+            return readCasObjectRange(invokeCommand, budget, contentHash, 0, size, size)
         },
-        async readObjectRange(contentHash, range) {
+        async readObjectRange(contentHash, range, expectedSize) {
             validateBlobReadRange(range)
-            if (range.start === range.endExclusive) {
-                const result = await invokeCommand('asset_cas_read_object_range', {
-                    contentHash,
-                    start: range.start,
-                    endExclusive: range.endExclusive,
-                })
-                return result === null ? null : bytes(result, 'Native CAS range read')
-            }
+            const size = await objectSize(contentHash, expectedSize)
+            if (size === null) return null
             return readCasObjectRange(
                 invokeCommand,
+                budget,
                 contentHash,
                 range.start,
                 range.endExclusive,
+                size,
             )
         },
         async statObject(contentHash) {
@@ -332,6 +400,7 @@ export function createNativeAssetObjectUrlResolver(): AssetObjectUrlResolver {
 
 export function createNativeRemoteAssetReader(
     invokeCommand: InvokeCommand = invoke,
+    budget: NativeCasReadBudget = documentReadBudget,
 ): RemoteAssetReader {
     return {
         async statObject(contentHash) {
@@ -349,10 +418,14 @@ export function createNativeRemoteAssetReader(
             const hydrated = await invokeCommand('asset_remote_hydrate_object', { contentHash })
             if (hydrated === null) return null
             const size = safeSize(hydrated, 'Native remote asset hydration')
-            const start = Math.min(range?.start ?? 0, size)
-            const end = Math.min(range?.endExclusive ?? size, size)
-            const result = await readCasObjectRange(invokeCommand, contentHash, start, end)
-            return result?.byteLength === end - start ? result : null
+            return readCasObjectRange(
+                invokeCommand,
+                budget,
+                contentHash,
+                range?.start ?? 0,
+                range?.endExclusive ?? size,
+                size,
+            )
         },
     }
 }
