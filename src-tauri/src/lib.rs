@@ -41,6 +41,7 @@ mod lossless_f0;
 mod macos_lifecycle;
 pub mod native_file_jobs;
 pub(crate) mod native_log;
+mod diagnostics;
 mod network_log;
 mod native_media;
 mod native_tokenizer;
@@ -867,6 +868,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::data_health::pds_data_health_undo,
         network_log::network_log_command,
         native_log::native_log_tail,
+        diagnostics::diagnostic_device_info,
         native_log::native_log_error,
         native_log::native_log_file_path,
         native_log::native_log_set_file_enabled,

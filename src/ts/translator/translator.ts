@@ -1,4 +1,5 @@
 import { get } from "svelte/store"
+import { CbsHistoryAccessError } from '../cbsHistoryAccess'
 import { parseChatML } from "../parser/chatML";
 import { getDatabase, type character, type customscript, type Database } from "../storage/database.svelte"
 import {
@@ -309,6 +310,15 @@ export async function translateHTML(
         }
     }
     let DoingChat = captureContext ? false : get(doingChat)
+    const parser = captureContext?.scriptContext.parserContext
+    if (parser?.prepareHistory) {
+        const historyAccess = await parser.prepareHistory([
+            ...captureContext.scriptContext.presetRegex, ...captureContext.scriptContext.moduleRegexScripts,
+            ...(alwaysExistChar.customscript ?? []),
+        ].filter((script) => script.type === 'edittrans' && /<[^>]*\bcbs\b[^>]*>/.test(script.flag ?? '')).map((script) => script.in).join('\n'), chatID, false)
+        captureContext = { ...captureContext, scriptContext: { ...captureContext.scriptContext,
+            parserContext: { ...parser, historyAccess } } }
+    }
     if(DoingChat){
         if(isExpTranslator(db)){
             if(!(db.translatorType === 'llm' && await getLLMCache(html) !== null)){
@@ -770,6 +780,7 @@ export function applyEdittransRegex(
                       chatID,
                       projectedChatID: captureContext.projectedChatID,
                       historyOffset: parser.historyOffset,
+                      historyAccess: parser.historyAccess,
                       cbsConditions: captureContext.cbsConditions,
                       db: parser.database,
                       chara: captureContext.chara ?? parser.character,
@@ -825,6 +836,7 @@ export function applyEdittransRegex(
                   text = text.replace(reg, outScript)
               }
           } catch (error) {
+              if (error instanceof CbsHistoryAccessError) throw error
               console.error(error)
           }
       }

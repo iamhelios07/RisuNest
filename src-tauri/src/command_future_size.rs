@@ -56,6 +56,7 @@ macro_rules! async_commands {
 }
 
 async_commands![
+    diagnostics::diagnostic_device_info,
     network_log::network_log_command,
     app_paths::app_paths_roots,
     app_cleanup::app_cleanup_request,
