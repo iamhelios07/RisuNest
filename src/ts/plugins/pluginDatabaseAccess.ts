@@ -33,7 +33,7 @@ import {
 } from '../storage/persistentRecordIterator'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
 import { isConversationSummaryStub } from '../storage/conversationResidency'
-import { resolveLifecyclePluginStorageOwner } from './pluginStorageStore'
+import { resolveLifecyclePluginStorageOwner, toPluginStorageJsonValue } from './pluginStorageStore'
 import type { PluginStorageMeta } from './pluginOwner'
 import { attachPluginReadProvenance, PluginReadBaselineError, PluginReadBaselines, collectPluginReadProvenance, type PluginReadProvenance } from './pluginReadBaselines'
 import type { PluginSnapshotChunk } from './pluginReadBaselines'
@@ -457,6 +457,24 @@ export function validatePluginDatabaseUpdate(
             throw new TypeError('pluginCustomStorage must be a plain record')
         }
         validateSafeKeys(database.pluginCustomStorage)
+    }
+}
+
+/** Plugin storage values in a detached submission become what `pluginStorage.setItem` would store. */
+function normalizeSubmittedPluginStorage(
+    submitted: Record<string, unknown>,
+    allowedKeys: readonly string[],
+): void {
+    const storage = submitted.pluginCustomStorage
+    if (isPlainRecord(storage)) {
+        for (const key of Object.keys(storage)) {
+            if (storage[key] !== undefined) defineOwnEnumerableProperty(storage, key, toPluginStorageJsonValue(storage[key]))
+        }
+    }
+    // Keys outside allowedKeys are stored as plugin storage, as databaseUnitChanges routes them.
+    for (const key of Object.keys(submitted)) {
+        if (key === 'pluginCustomStorage' || allowedKeys.includes(key) || submitted[key] === undefined) continue
+        defineOwnEnumerableProperty(submitted, key, toPluginStorageJsonValue(submitted[key]))
     }
 }
 
@@ -1329,6 +1347,7 @@ export function createPluginDatabaseAccess(
             validatePluginDatabaseUpdate(database)
             if (hasCharacterUpdate(database)) throw new Error(SYNCHRONOUS_CHARACTER_SET_ERROR)
             const submitted = snapshotWithProvenance(database)
+            normalizeSubmittedPluginStorage(submitted, allowedKeys)
             const commit = (baseline: unknown) => {
                 dependencies.assertPersistentMutationAllowed(authority)
                 const intents = readBaselines.intent(submitted, 'database', 'database', baseline)
@@ -1348,6 +1367,7 @@ export function createPluginDatabaseAccess(
             allowedKeys = [...allowedKeys]
             const initialNavigationGeneration = dependencies.getNavigationGeneration()
             const detachedSubmission = snapshotWithProvenance(database)
+            normalizeSubmittedPluginStorage(detachedSubmission, allowedKeys)
             const admission = readBaselines.hasRead('database', 'database') ? undefined : captureDatabaseAdmission(detachedSubmission)
             const intents = readBaselines.intent(detachedSubmission, 'database', 'database', admission ? await admission : {})
             readBaselines.assertOpen()
