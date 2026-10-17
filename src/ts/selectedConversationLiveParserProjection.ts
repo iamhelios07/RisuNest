@@ -60,6 +60,7 @@ export interface LiveChatParserConversationStartRequest {
     readonly totalMessages: number
     readonly signal?: AbortSignal
     readonly isCurrent?: () => boolean
+    readonly onStale?: () => void
 }
 
 export type BoundedLiveChatParserProjection = BoundedChatParserHistoryProjection
@@ -149,10 +150,11 @@ export function createSelectedConversationLiveParserProjectionResolver(
                 const version = source?.snapshot().version
                 const historyVersion = source?.snapshot().historyVersion
                 const historyDependencies = input.dependencies ?? new CbsHistoryDependencies()
+                const historyChanged = () => !!source && hasCbsHistoryChanges(source.snapshot(), historyVersion, historyDependencies)
                 const assertCurrent = () => {
                     assertConversationStartCurrent(input)
                     captureExactCurrent(dependencies, target)
-                    if (source?.snapshot().version !== version || (source && hasCbsHistoryChanges(source.snapshot(), historyVersion, historyDependencies))) throw new ChatParserHistoryProjectionStaleError()
+                    if (source?.snapshot().version !== version || historyChanged()) throw new ChatParserHistoryProjectionStaleError()
                 }
                 const historyAccess = authority ? await prepareCbsHistory({
                     dependencies: historyDependencies,
@@ -166,18 +168,29 @@ export function createSelectedConversationLiveParserProjectionResolver(
                 assertCurrent()
                 context.parserContext.historyAccess = historyAccess
                 context.parserContext.prepareHistory = async (text, chatID, complete) => {
-                    assertCurrent()
-                    const plan = planChatParserHistory({ source: text,
-                        indirections: dependencies.parserIndirections?.(current),
-                        unsafeDependencies: complete ? ['regex-reparse'] : [] })
-                    return authority ? prepareCbsHistory({
-                        dependencies: historyDependencies,
-                        characterId: target.characterId, conversationId: target.conversationId,
-                        totalMessages: input.totalMessages, chatID, plan, signal: input.signal, assertCurrent,
-                        reader: { revision: target.storeRevision,
-                            readResidentMessage: (index) => source?.snapshot().rowAt(index)?.message,
-                            readConversationWindow: (query) => dependencies.runtime.store.readConversationWindow(query) },
-                    }) : captureResidentCbsHistory(current.conversation.message, plan, chatID, historyDependencies)
+                    try {
+                        assertCurrent()
+                        const plan = planChatParserHistory({ source: text,
+                            indirections: dependencies.parserIndirections?.(current),
+                            unsafeDependencies: complete ? ['regex-reparse'] : [] })
+                        return authority ? await prepareCbsHistory({
+                            dependencies: historyDependencies,
+                            characterId: target.characterId, conversationId: target.conversationId,
+                            totalMessages: input.totalMessages, chatID, plan, signal: input.signal, assertCurrent,
+                            reader: { revision: target.storeRevision,
+                                readResidentMessage: (index) => source?.snapshot().rowAt(index)?.message,
+                                readConversationWindow: (query) => dependencies.runtime.store.readConversationWindow(query) },
+                        }) : captureResidentCbsHistory(current.conversation.message, plan, chatID, historyDependencies)
+                    } catch (error) {
+                        // A later pass can depend on a row that changed before it was read,
+                        // which greeting refreshes skipped, so the greeting has to prepare again.
+                        // Notify after this parse call stack, which may be inside a derived.
+                        const requested = () => !input.signal?.aborted && input.isCurrent?.() !== false
+                        if (requested() && historyChanged()) queueMicrotask(() => {
+                            if (requested()) input.onStale?.()
+                        })
+                        throw error
+                    }
                 }
                 return { projection: {
                     kind: 'bounded', characterId: target.characterId, conversationId: target.conversationId,

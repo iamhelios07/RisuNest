@@ -139,7 +139,7 @@ function classifyText(
         const parsed = parseCbsExpression(expression)
         const requirement = HISTORY_REQUIREMENTS[parsed.name]
         if (requirement) requirements.add(requirement)
-        if (parsed.name.includes('{{') || parsed.name === 'call' || parsed.name.startsWith('#each')) {
+        if (hasDynamicCbsName(expression) || parsed.name === 'call' || parsed.name.startsWith('#each')) {
             reasons.add('opaque-cbs')
         }
         if (FULL_HISTORY_CBS_NAMES.has(parsed.name) && (!precise || !requirement)) {
@@ -244,6 +244,17 @@ function parseCbsExpression(expression: string): Readonly<{
             : argumentText.slice(0, nextSeparator)
         ).trim(),
     }
+}
+
+function hasDynamicCbsName(expression: string): boolean {
+    const colonIndex = expression.indexOf(':')
+    const rawName = colonIndex === -1 ? expression : expression.slice(0, colonIndex)
+    if (!rawName.includes('{{')) return false
+    // Blocks and `? ` arithmetic dispatch on their leading keyword, so a nested
+    // condition or operand cannot select another macro. Other names drop
+    // whitespace before lookup and stay dynamic.
+    if (rawName.startsWith('#') || rawName.startsWith('? ')) return /^\S*\{\{/.test(rawName)
+    return true
 }
 
 function normalizeCbsName(name: string): string {

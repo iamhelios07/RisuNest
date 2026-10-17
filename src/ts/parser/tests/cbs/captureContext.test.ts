@@ -323,13 +323,15 @@ test('prepared CBS reads match complete history for composed expressions and spa
         '{{#when::1::is::1}}{{previouschatlog::2}}{{/when}}',
         '{{#escape}}{{history}}{{/escape}}', '{{#pure}}{{#if 1}}{{history}}{{/if}}{{/pure}}',
         '{{#func::f}}{{lastmessage}}{{/func}}{{call::f}}', '<user>|<char>',
+        '{{#if {{getvar::flag}}}}{{lastmessage}}{{/if}}', '{{#when {{getvar::flag}}}}{{previouscharchat}}{{/when}}',
+        '{{? {{getvar::hp}}+{{lastmessageindex}}}}', '{{last message{{getvar::empty}}}}',
         '<risu-style>7b7b6c6173746d657373616765696e6465787d7d</risu-style>',
     ]
     for (const chatID of [-1, 0, 16, 79]) {
         for (const [index, expression] of expressions.entries()) {
             const source = `${expression}|${expressions[(index + 3) % expressions.length]}`
             const context = { db, chara: character, chatID, selectedCharID: 0,
-                chatVariables: { macro: 'lastmessage' }, currentTime: 2_000_000 }
+                chatVariables: { macro: 'lastmessage', flag: '1', hp: '3', empty: '' }, currentTime: 2_000_000 }
             const expected = risuChatParser(source, { ...context })
             const historyAccess = await prepareCbsHistory({ characterId: character.chaId,
                 conversationId: 'conversation', totalMessages: messages.length, chatID,
@@ -382,12 +384,13 @@ test('background and bookmark contexts read precise history and refresh on unper
     const source = new PersistentConversationViewportSource({ characterId: character.chaId,
         conversationId: 'chat', revision: 1, totalMessages: 2, rowBudget: 8, reader: { readConversationWindow } })
     const release = vi.fn(async () => {})
+    const acquireRevision = vi.fn(async () => ({ revision: 1, readConversationWindow, release }))
     live.runtime = {
         captureSelectedConversationTarget: () => ({ characterId: character.chaId, conversationId: 'chat', storeRevision: 1, navigationGeneration: 0 }),
         captureSelectedConversationAuthority: () => ({ totalMessages: source.snapshot().totalMessages, storeRevision: 1 }),
         getActiveConversationViewportSource: () => source,
         subscribeActiveConversationViewportSource: (listener) => { listener(source); return () => {} },
-        store: { acquireRevision: async () => ({ revision: 1, readConversationWindow, release }) },
+        store: { acquireRevision },
         acquireCompleteConversation: () => { throw new Error('Unexpected complete promotion') },
     } as unknown as PersistentDataRuntime
     const observed = vi.fn()
@@ -401,6 +404,8 @@ test('background and bookmark contexts read precise history and refresh on unper
         scriptContext: plain!.projection!.context,
     })).toBe('<b>HP</b>\n')
     expect(bodyIndices).toEqual([])
+    // Each regex pass prepares its output, but none of them needs a stored row.
+    expect(acquireRevision).not.toHaveBeenCalled()
     plain?.release()
     await expect(plain!.projection!.context.parserContext.prepareHistory!('{{lastmessage}}', -1, false)).rejects.toThrow('Live display lease is closed')
     const background = await prepare('{{previouscharchat}}|{{lastmessageindex}}')
@@ -436,6 +441,30 @@ test('background and bookmark contexts read precise history and refresh on unper
     expect(observed).not.toHaveBeenCalled()
     expect(bodyIndices.every((index) => index === 0 || index === 1)).toBe(true)
     expect(release).toHaveBeenCalled()
+    // A display regex can expose a row only after an edit that the lease's own reads skipped.
+    character.customscript = [{ type: 'editdisplay', in: 'HP', out: '{{lastmessage}}', flag: 'g', ableFlag: true }] as any
+    const onStale = vi.fn()
+    const render = async (lease: Awaited<ReturnType<typeof prepare>>) => ParseMarkdown(lease!.projection!.parsedSource!, character, 'back', -1, {}, {
+        scriptContext: lease!.projection!.context,
+    })
+    const late = await acquireLiveDisplayParserLease({ source: 'HP', character, signal: new AbortController().signal, parseFirst: true, chatID: -1, onStale })
+    const lateUpdates = vi.fn()
+    const unsubscribeLate = subscribeLiveDisplayParserSelection(lateUpdates, () => late?.projection?.context.parserContext.historyAccess?.dependencies)
+    lateUpdates.mockClear()
+    source.applyOptimisticRange(3, 0, [{ role: 'char', data: 'late tail' }])
+    expect(lateUpdates).not.toHaveBeenCalled()
+    await expect(render(late)).rejects.toThrow('Live display conversation changed during preparation')
+    expect(onStale).toHaveBeenCalledOnce()
+    // The owner hears about it after the parse call stack, which can be a Svelte derived.
+    const repeated = late!.projection!.context.parserContext.prepareHistory!('{{lastmessage}}', -1, false)
+    expect(onStale).toHaveBeenCalledOnce()
+    await expect(repeated).rejects.toThrow('Live display conversation changed during preparation')
+    expect(onStale).toHaveBeenCalledTimes(2)
+    unsubscribeLate()
+    late?.release()
+    await expect(late!.projection!.context.parserContext.prepareHistory!('{{lastmessage}}', -1, false)).rejects.toThrow('Live display lease is closed')
+    expect(onStale).toHaveBeenCalledTimes(2)
+    expect(await render(await prepare('HP'))).toBe('late tail')
     source.dispose()
 })
 

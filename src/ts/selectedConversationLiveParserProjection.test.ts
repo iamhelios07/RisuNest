@@ -372,15 +372,32 @@ describe('selected conversation live parser projection', () => {
             expect(testHarness.releases()).toBe(1)
         },
     )
-    test('keeps a plain greeting windowed without reading metadata-only history', async () => {
-        const testHarness = harness({ metadataOnly: true })
+    test('keeps a plain greeting windowed and prepares it again when a later pass reads a skipped edit', async () => {
+        const testHarness = await cachedHarness({ metadataOnly: true })
+        const controller = new AbortController()
+        const onStale = vi.fn()
         const lease = await testHarness.resolver.acquireConversationStart!({
             greeting: 'Synthetic greeting',
             totalMessages: 8,
+            signal: controller.signal,
+            onStale,
         })
         expect(lease?.projection?.context.parserContext.historyAccess?.length).toBe(8)
         expect(testHarness.acquire).not.toHaveBeenCalled()
         expect(testHarness.forbiddenHistoryReads()).toBe(0)
+        // The greeting read no row, so refreshes skip this edit until a later pass reads it.
+        testHarness.source.applyOptimisticRange(7, 1, [message(7, 'pending tail')])
+        const prepareHistory = lease!.projection!.context.parserContext.prepareHistory!
+        await expect(prepareHistory('{{lastmessage}}', -1, false)).rejects.toThrow('Chat parser history projection became stale')
+        expect(onStale).toHaveBeenCalledOnce()
+        // The greeting hears about it after the parse call stack, which can be a Svelte derived.
+        const repeated = prepareHistory('{{lastmessage}}', -1, false)
+        expect(onStale).toHaveBeenCalledOnce()
+        await expect(repeated).rejects.toThrow('Chat parser history projection became stale')
+        expect(onStale).toHaveBeenCalledTimes(2)
+        controller.abort()
+        await expect(prepareHistory('{{lastmessage}}', -1, false)).rejects.toThrow()
+        expect(onStale).toHaveBeenCalledTimes(2)
     })
 
     test('holds complete authority for a Lua greeting even when there are no message rows', async () => {

@@ -83,6 +83,9 @@
                     totalMessages,
                     signal: controller.signal,
                     isCurrent,
+                    onStale: () => {
+                        if (isCurrent()) void prepareParser()
+                    },
                 })) ?? null
             if (!isCurrent()) {
                 lease?.release()

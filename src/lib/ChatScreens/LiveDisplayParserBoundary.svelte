@@ -92,6 +92,11 @@
                 signal: controller.signal,
                 chatID,
                 parseFirst,
+                // Abort first so the stale render is discarded rather than shown as failed.
+                onStale: () => {
+                    controller.abort()
+                    retry++
+                },
             }),
         )
             .then((acquired) => {
