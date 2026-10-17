@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createServerSyncScheduler } from './serverSyncScheduler'
+import { createServerSyncScheduler, isServerSyncUnavailable } from './serverSyncScheduler'
 import { createPluginStartupGate } from '../../plugins/pluginStartupGate'
 
 afterEach(() => vi.useRealTimers())
@@ -9,13 +9,69 @@ function fixture() {
     return { ...dependencies, scheduler: createServerSyncScheduler(dependencies) }
 }
 describe('server LWW foreground scheduler', () => {
+    it('classifies tunnel outages and timeouts without masking authentication or local failures', () => {
+        for (const status of [502, 503, 504, 530]) expect(isServerSyncUnavailable({ code: 'server-response-error', status })).toBe(true)
+        for (const code of ['server-timeout', 'incomplete-response']) expect(isServerSyncUnavailable({ code })).toBe(true)
+        for (const error of [{ code: 'server-response-error', status: 401 }, { code: 'local-storage', status: 503 }, new TypeError('Load failed')]) {
+            expect(isServerSyncUnavailable(error)).toBe(false)
+        }
+    })
+    it('backs off an outage across all automatic triggers and resumes queued work after recovery', async () => {
+        const f = fixture()
+        const offline = { code: 'server-unreachable', retryable: true }
+        f.push.mockRejectedValue(offline); f.pull.mockRejectedValue(offline); f.connect.mockRejectedValue(offline)
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        for (const [index, delay] of [5000, 10000, 20000, 40000, 80000, 160000, 300000, 300000].entries()) {
+            f.scheduler.localChange(true); f.scheduler.remoteHint(); await f.scheduler.conversationOpened()
+            await f.scheduler.foreground(false, true); await f.scheduler.foreground(true)
+            await f.scheduler.resumeAutomaticSync(); f.scheduler.socket(false)
+            await vi.advanceTimersByTimeAsync(delay - 1)
+            expect([f.push.mock.calls.length, f.pull.mock.calls.length, f.connect.mock.calls.length]).toEqual([index + 1, index + 1, index + 1])
+            await vi.advanceTimersByTimeAsync(1)
+        }
+        f.push.mockResolvedValue(); f.pull.mockResolvedValue(); f.connect.mockResolvedValue()
+        await vi.advanceTimersByTimeAsync(300000)
+        expect(f.scheduler.isWaiting()).toBe(false)
+        expect(f.recovered).toHaveBeenCalledOnce()
+        f.push.mockClear(); f.scheduler.localChange(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.push).toHaveBeenCalledOnce()
+        f.scheduler.dispose()
+    })
+    it('lets an explicit retry probe during a cooldown and preserves explicit receive failures', async () => {
+        const f = fixture()
+        const offline = { code: 'server-unreachable', retryable: true }
+        f.pull.mockRejectedValue(offline)
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        await expect(f.scheduler.receiveAvailableChanges()).rejects.toEqual(offline)
+        f.pull.mockResolvedValue()
+        await f.scheduler.retry(); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.isWaiting()).toBe(false)
+        expect(f.recovered).toHaveBeenCalledOnce()
+        f.scheduler.dispose()
+    })
+    it('keeps an outage delay when a receive started before the failure finishes later', async () => {
+        const f = fixture()
+        let finish!: () => void
+        f.pull.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        f.scheduler.reportFailure({ code: 'server-unreachable', retryable: true })
+        finish(); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.isWaiting()).toBe(true)
+        expect(f.recovered).not.toHaveBeenCalled()
+        f.scheduler.localChange(true); await vi.advanceTimersByTimeAsync(4999)
+        expect(f.pull).toHaveBeenCalledOnce()
+        await vi.advanceTimersByTimeAsync(1)
+        expect(f.scheduler.isWaiting()).toBe(false)
+        expect(f.recovered).toHaveBeenCalledOnce()
+        f.scheduler.dispose()
+    })
     it('correlates notification retries until the socket connects or a fresh session starts', async () => {
         const f = fixture()
         f.connect.mockRejectedValueOnce({ code: 'server-unreachable' })
         await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
         const first = f.connect.mock.calls[0][0]
         expect(first).toMatch(/^[0-9a-f-]{36}$/)
-        await vi.advanceTimersByTimeAsync(1000)
+        await vi.advanceTimersByTimeAsync(5000)
         expect(f.connect.mock.calls.at(-1)![0]).toBe(first)
         // Starting the native worker succeeded, but the socket has not connected yet.
         f.scheduler.socket(false); await vi.advanceTimersByTimeAsync(2000)
@@ -121,7 +177,7 @@ describe('server LWW foreground scheduler', () => {
         f.push.mockRejectedValueOnce({ code: 'server-unreachable', retryable: true })
         await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
         expect(f.push).toHaveBeenCalledTimes(1)
-        await vi.advanceTimersByTimeAsync(999); expect(f.push).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(4999); expect(f.push).toHaveBeenCalledTimes(1)
         await vi.advanceTimersByTimeAsync(1); expect(f.push).toHaveBeenCalledTimes(2)
         f.push.mockRejectedValueOnce({ code: 'equal-stamp-integrity', retryable: false })
         f.scheduler.localChange(true); await vi.advanceTimersByTimeAsync(0)
@@ -321,7 +377,7 @@ describe('server LWW foreground scheduler', () => {
         f.pull.mockRejectedValueOnce({ code: 'server-unreachable', retryable: true })
         await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
         expect(f.failed).toHaveBeenCalledTimes(2); expect(f.recovered).not.toHaveBeenCalled()
-        await vi.advanceTimersByTimeAsync(1000); expect(f.push).toHaveBeenCalledTimes(2); expect(f.recovered).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(1000); expect(f.push).toHaveBeenCalledTimes(1); expect(f.recovered).not.toHaveBeenCalled()
         await vi.advanceTimersByTimeAsync(4000); expect(f.pull).toHaveBeenCalledTimes(2); expect(f.recovered).toHaveBeenCalledOnce()
         f.scheduler.dispose()
     })
