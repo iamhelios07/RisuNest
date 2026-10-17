@@ -1,3 +1,5 @@
+import type { Database, character, Chat } from './storage/database.svelte'
+
 export type ChatParserUnsafeHistoryDependency =
     | 'lua'
     | 'plugin-v2'
@@ -137,7 +139,7 @@ function classifyText(
         const parsed = parseCbsExpression(expression)
         const requirement = HISTORY_REQUIREMENTS[parsed.name]
         if (requirement) requirements.add(requirement)
-        if (parsed.name.includes('{{') || parsed.name === 'call' || parsed.name.startsWith('#')) {
+        if (parsed.name.includes('{{') || parsed.name === 'call' || parsed.name.startsWith('#each')) {
             reasons.add('opaque-cbs')
         }
         if (FULL_HISTORY_CBS_NAMES.has(parsed.name) && (!precise || !requirement)) {
@@ -200,6 +202,7 @@ function classifyText(
 function extractCbsExpressions(text: string): string[] {
     const starts: number[] = []
     const expressions: string[] = []
+    let pureDepth = 0
     for (let index = 0; index < text.length - 1; index += 1) {
         if (text[index] === '{' && text[index + 1] === '{') {
             starts.push(index + 2)
@@ -207,7 +210,15 @@ function extractCbsExpressions(text: string): string[] {
             continue
         }
         if (text[index] !== '}' || text[index + 1] !== '}' || starts.length === 0) continue
-        expressions.push(text.slice(starts.pop(), index))
+        const expression = text.slice(starts.pop(), index)
+        if (!pureDepth || expression.startsWith('call::')) expressions.push(expression)
+        if (starts.length === 0) {
+            if (pureDepth) {
+                if ((expression.startsWith('#') || expression.startsWith(':')) && expression !== ':else') pureDepth++
+                else if (expression.startsWith('/') && !expression.startsWith('//')) pureDepth--
+            } else if (expression === '#pure' || expression === '#pure_display' || expression === '#puredisplay'
+                || expression.startsWith('#escape') || expression.startsWith('#func ')) pureDepth = 1
+        }
         index += 1
     }
     return expressions
@@ -267,4 +278,40 @@ function collectParserInputText(
         collectParserInputText(child, seen, output)
     }
     return output
+}
+
+export function createLiveChatParserIndirections(
+    database: Database,
+    selectedCharacter: character,
+    conversation: Chat,
+    personaPrompt: string,
+): Readonly<Record<string, unknown>> {
+    const character = selectedCharacter
+    let authorNote = conversation.note ?? ''
+    if (!authorNote) {
+        for (const item of database.promptTemplate ?? []) {
+            if (item.type !== 'authornote' || !item.defaultText) continue
+            authorNote = item.defaultText
+            break
+        }
+    }
+    return {
+        personality: character?.personality ?? '',
+        charpersona: character?.personality ?? '',
+        description: character?.desc ?? '',
+        chardesc: character?.desc ?? '',
+        scenario: character?.scenario ?? '',
+        exampledialogue: character?.exampleMessage ?? '',
+        examplemessage: character?.exampleMessage ?? '',
+        persona: personaPrompt,
+        userpersona: personaPrompt,
+        mainprompt: database.mainPrompt ?? '',
+        systemprompt: database.mainPrompt ?? '',
+        jb: database.jailbreak ?? '',
+        jailbreak: database.jailbreak ?? '',
+        globalnote: database.globalNote ?? '',
+        systemnote: database.globalNote ?? '',
+        ujb: database.globalNote ?? '',
+        authornote: authorNote,
+    }
 }

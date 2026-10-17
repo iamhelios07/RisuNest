@@ -310,6 +310,57 @@ afterAll(() => {
 })
 
 describe('a windowed send through the production runtime', () => {
+    it.each(['direct', 'expanded'])('uses a shared complete lease for %s full-history background CBS', async (kind) => {
+        await bootWindowedConversation(storedMessages(), (seed) => {
+            seed.characters[0].customscript = []
+            seed.characters[0].triggerscript = []
+            seed.characters[0].chats[0].scriptstate = { $expanded: '{{history}}' }
+        })
+        const { acquireLiveDisplayParserLease } = await import('../liveDisplayParserLease')
+        const { risuChatParser } = await import('../parser/parser.svelte')
+        const shared = vi.spyOn(current.runtime, 'acquireCompleteConversation')
+        const controller = new AbortController()
+        const lease = await acquireLiveDisplayParserLease({
+            source: kind === 'direct' ? '{{history}}' : '{{getvar::expanded}}',
+            character: DBState.db.characters[0], signal: controller.signal, parseFirst: true,
+        })
+        try {
+            expect(shared).toHaveBeenCalledOnce()
+            if (kind === 'expanded') {
+                expect(lease?.projection?.parsedSource).toBe('{{history}}')
+                const parser = lease!.projection!.context.parserContext
+                const result = risuChatParser(lease!.projection!.parsedSource!, {
+                    ...parser, db: parser.database, chara: parser.character,
+                })
+                expect(result).toContain('m0')
+                expect(parser.historyAccess!.row(999)?.data).toBe('m999')
+                expect(result).toBe(risuChatParser('{{history}}', { db: DBState.db, chara: DBState.db.characters[0] }))
+                parser.historyAccess!.assertComplete()
+            }
+        } finally { lease?.release(); controller.abort(); shared.mockRestore() }
+    })
+    it('orders concurrent parser variable increments before reentrant script callbacks', async () => {
+        const { reopen, backgroundErrors } = await bootWindowedConversation(storedMessages(), (seed) => {
+            seed.characters[0].customscript = []
+            seed.characters[0].triggerscript = []
+            seed.characters[0].chats[0].scriptstate = { $counter: '0' }
+        })
+        const { parseRisuChat } = await import('../plugins/parseRisuChat')
+        const { pluginV2 } = await import('../plugins/plugins.svelte')
+        const increment = '{{setvar::counter::{{calc::{{getvar::counter}}+1}}}}{{getvar::counter}}'
+        expect(await Promise.all([
+            parseRisuChat(increment, { runVar: true }),
+            parseRisuChat(increment, { runVar: true }),
+            parseRisuChat('{{getvar::counter}}'),
+        ])).toEqual(['1', '2', '2'])
+        const hook = async (data: string) => `${data}:${await parseRisuChat(increment, { runVar: true })}`
+        pluginV2.editprocess.add(hook)
+        try {
+            expect(await parseRisuChat(increment, { runVar: true, processRegex: true })).toBe('3:4')
+        } finally { pluginV2.editprocess.delete(hook) }
+        expect((await reopen()).scriptstate.$counter).toBe('4')
+        expect(backgroundErrors).toEqual([])
+    })
     it.each(['variable', 'inject'])('persists a delayed parser %s write to the invocation conversation after navigation', async (effect) => {
         const { store, reopen, backgroundErrors } = await bootWindowedConversation(storedMessages(), (seed) => {
             seed.characters[0].customscript = effect === 'inject'
@@ -359,7 +410,9 @@ describe('a windowed send through the production runtime', () => {
         const { reopen, backgroundErrors } = await bootWindowedConversation(storedMessages(), (seed) => {
             seed.characters[0].customscript = []
             seed.characters[0].triggerscript = []
+            seed.mainPrompt = '{{#when::1::is::1}}system{{/when}}{{#if 1}}prompt{{/if}}{{#pure}}plain{{/pure}}'
         })
+        const complete = vi.spyOn(current.runtime, 'acquireCompleteConversation')
         const { sendChat } = await import('./index.svelte')
         const { requestChatData } = await import('./request/request')
         const { parseRisuChat } = await import('../plugins/parseRisuChat')
@@ -385,6 +438,8 @@ describe('a windowed send through the production runtime', () => {
         expect(stored.message.at(-1)?.data).toBe('api answer')
         expect(stored.scriptstate.$api_write).toBe('saved')
         expect(backgroundErrors).toEqual([])
+        expect(complete).not.toHaveBeenCalled()
+        complete.mockRestore()
     })
 
     it('keeps parser reads and variable commits available inside successive streaming output callbacks', async () => {

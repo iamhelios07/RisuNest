@@ -1328,6 +1328,7 @@
                     },
                 },
             })
+            await sourceLease.close()
             alertNormal(language.screenshotSaved)
             screenshotDialogOpen = false
             screenshotDialogSnapshot = null
@@ -1363,6 +1364,7 @@
                 screenshotDialogOpen = false
             }
         } finally {
+            await sourceLease.close().catch(console.error)
             if (screenshotController === controller) screenshotController = null
             screenshotRunning = false
         }

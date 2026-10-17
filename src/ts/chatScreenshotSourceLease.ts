@@ -347,11 +347,7 @@ export async function openChatScreenshotSourceLease(
                     throw error
                 } finally {
                     if (activeJob === job) activeJob = null
-                    try {
-                        await release()
-                    } catch (error) {
-                        if (!jobFailed) throw error
-                    }
+                    if (jobFailed) await release().catch(() => {})
                 }
             },
             async close() {

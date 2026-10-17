@@ -17,6 +17,9 @@ import type {
     LiveChatParserProjectionResolver,
 } from 'src/ts/selectedConversationLiveParserProjection'
 import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
+import { captureResidentCbsHistory } from 'src/ts/prepareCbsHistory'
+import { planChatParserHistory } from 'src/ts/chatParserHistory'
+import { createChatParserHistoryProjection } from 'src/ts/chatParserHistoryProjection'
 
 const imageMocks = vi.hoisted(() => ({
     mode: 'normal',
@@ -1663,6 +1666,39 @@ describe('Chats imperative mount lifecycle', () => {
         })
     })
 
+    test.each([3, 67])('prepares and displays only the edited row across %s stream chunks', async (chunks) => {
+        const messages = Array.from({ length: 6 }, (_, index) => makeMessage(index))
+        const source = makePersistentViewportSource(messages)
+        const currentCharacter = makeMetadataOnlyCharacter()
+        const resolve = vi.fn(async (input: Parameters<LiveChatParserProjectionResolver['resolve']>[0]) => {
+            const seed = boundedProjection(currentCharacter, input.row.absoluteIndex)
+            if (seed.kind !== 'bounded') throw new Error('Expected bounded seed')
+            seed.context.parserContext.character.chats[0].message = []
+            const projection = await createChatParserHistoryProjection({
+                characterId: currentCharacter.chaId, conversationId: currentCharacter.chats[0].id!,
+                revision: 1, totalMessages: input.totalMessages, currentAbsoluteIndex: input.row.absoluteIndex,
+                maxProjectionMessages: 4, parserSource: '{{#when::1::is::1}}HP{{/when}}',
+                contextSeed: seed.context, dependencies: input.dependencies, signal: input.signal, isCurrent: input.isCurrent,
+                reader: { revision: 1, readResidentMessage: (index) => source.snapshot().rowAt(index)?.message,
+                    readConversationWindow: async () => { throw new Error('All test rows are resident') } },
+            })
+            if (projection.kind !== 'bounded') throw new Error('Unexpected complete promotion')
+            return projection
+        })
+        mounted = mount(ChatsHarness, { target, props: { initialCharacter: currentCharacter,
+            initialViewportSource: source, parserProjectionResolver: { resolve } } })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(6))
+        const baseline = resolve.mock.calls.length
+        const unchanged = probeElements(target).filter((row) => row.dataset.index !== '5')
+        const counts = unchanged.map((row) => row.dataset.refreshCount)
+        for (let chunk = 1; chunk <= chunks; chunk++) {
+            source.applyOptimisticRange(5, 1, [{ ...messages[5], data: `chunk ${chunk}` }])
+            await vi.waitFor(() => expect(probeElements(target).find((row) => row.dataset.index === '5')?.dataset.message).toBe(`chunk ${chunk}`))
+        }
+        expect(resolve.mock.calls.length - baseline).toBe(chunks)
+        expect(unchanged.map((row) => row.dataset.refreshCount)).toEqual(counts)
+    })
+
     test('keeps an unresolved retained row projection usable across a direct jump', async () => {
         const messages = Array.from({ length: 100 }, (_, index) =>
             makeMessage(index),
@@ -3237,7 +3273,10 @@ describe('Chats imperative mount lifecycle', () => {
     test.each(['append', 'tail'])('keeps the greeting mounted and refreshes its history after %s changes', async (change) => {
         const messages = [makeMessage(0)]
         const source = change === 'tail' ? makePersistentViewportSource(messages) : undefined
-        const acquireGreeting = vi.fn(async (_request: { totalMessages: number }) => null)
+        const acquireGreeting = vi.fn(async (request: import('src/ts/selectedConversationLiveParserProjection').LiveChatParserConversationStartRequest) => {
+            captureResidentCbsHistory(messages, planChatParserHistory({ source: '{{lastmessage}}' }), -1, request.dependencies)
+            return null
+        })
         mounted = mount(ChatsHarness, {
             target,
             props: {

@@ -63,6 +63,7 @@ export interface ProcessScriptInvocationContext {
     parser: Parameters<typeof risuChatParserOrg>[1]
     moduleRegexScripts: readonly customscript[]
     inject(index: number, data: string): void
+    prepareHistory?: ProcessScriptCaptureContext['parserContext']['prepareHistory']
 }
 
 export interface ProcessScriptCaptureContext {
@@ -613,11 +614,15 @@ export async function processScriptFull(
 async function processScriptFullImpl(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
     options.signal?.throwIfAborted()
     const captureContext = options.captureContext
-    const preparedHistory = captureContext?.parserContext.prepareHistory
-        ? await captureContext.parserContext.prepareHistory(data, chatID, getRegexExecutionPlan([
-            ...captureContext.presetRegex, ...(char.customscript ?? []), ...captureContext.moduleRegexScripts,
-        ], mode).entries.length > 0)
-        : captureContext?.parserContext.historyAccess
+    let preparedHistory = captureContext?.parserContext.historyAccess ?? options.invocationContext?.parser?.historyAccess
+    const prepareHistory = captureContext?.parserContext.prepareHistory ?? options.invocationContext?.prepareHistory
+    let historyPreparationError: unknown
+    const prepareFor = async (value: string) => {
+        if (!prepareHistory) return
+        try { preparedHistory = await prepareHistory(value, chatID, false) }
+        catch (error) { historyPreparationError = error; throw error }
+        options.signal?.throwIfAborted()
+    }
     options.signal?.throwIfAborted()
     const invocation = options.invocationContext
     if (invocation && mode !== 'editprocess') throw new Error('Owned script invocations require editprocess mode')
@@ -785,7 +790,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             triggerId: captureContext.parserContext.triggerId,
             role: cbsConditions.chatRole,
         })
-        : invocation ? risuChatParserOrg(value, { ...invocation.parser, chatID, cbsConditions, role: undefined, runVar: false, rmVar: false, tokenizeAccurate: false })
+        : invocation ? risuChatParserOrg(value, { ...invocation.parser, historyAccess: preparedHistory, chatID, cbsConditions, role: undefined, runVar: false, rmVar: false, tokenizeAccurate: false })
         : risuChatParserOrg(value, {
             chatID,
             cbsConditions,
@@ -827,6 +832,9 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     }
 
     try {
+    if (prepareHistory) await prepareFor([data,
+        ...scripts.filter((script) => script.type === mode && script.flag?.includes('<cbs>')).map((script) => script.in),
+    ].join('\n'))
     data = parseCbs(data)
     const useResultCache = options.cache !== 'bypass'
     const hash = useResultCache
@@ -858,6 +866,10 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     }
 
     const parse = parseCbs
+    const parseReplacement = (value: string) => {
+        if (prepareHistory) return prepareFor(value).then(() => { data = parse(value) })
+        data = parse(value)
+    }
 
     function executeScript(entry:RegexExecutionPlanEntry){
         const script = entry.script
@@ -971,7 +983,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                     }
                     else{
                         reg.lastIndex = 0
-                        data = parse(data.replace(reg, outScript))
+                        return parseReplacement(data.replace(reg, outScript))
                     }
                 }
                 else{
@@ -1021,16 +1033,18 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                 }
             }
             else{
-                data = parse(data.replace(reg, outScript))
+                return parseReplacement(data.replace(reg, outScript))
             }
     }
 
-    if(plan.requiresHostExecution){
+    if(plan.requiresHostExecution || prepareHistory){
         for (const entry of plan.entries){
             try {
-                executeScript(entry)
+                if (prepareHistory && entry.dynamicPattern) await prepareFor(entry.pattern)
+                const pending = executeScript(entry)
+                if (pending) await pending
             } catch (error) {
-                if (error instanceof CbsHistoryAccessError) throw error
+                if (error instanceof CbsHistoryAccessError || error === historyPreparationError) throw error
                 console.error(error)
             }
         }

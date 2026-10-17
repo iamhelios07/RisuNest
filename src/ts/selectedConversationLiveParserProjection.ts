@@ -12,6 +12,7 @@ import {
     type ChatParserUnsafeHistoryDependency,
 } from './chatParserHistory'
 import { captureResidentCbsHistory, prepareCbsHistory } from './prepareCbsHistory'
+import { CbsHistoryDependencies, hasCbsHistoryChanges } from './cbsHistoryAccess'
 import { forkChatParserContext } from './chatParserContextSeed.svelte'
 import type { ConversationViewportRow } from './conversationViewportSource'
 import type { CurrentChatMessageTarget } from './chatMessageUi'
@@ -41,11 +42,12 @@ export function collectLiveChatParserUnsafeDependencies(input: {
     if (plan.entries.some((entry) => (
         entry.actions.includes('inject') || entry.replacement.startsWith('@@inject')
     ))) dependencies.push('inject')
-    else if (plan.entries.length > 0) dependencies.push('regex-reparse')
+    if (plan.entries.some((entry) => entry.actions.includes('repeat_back') || entry.replacement.startsWith('@@repeat_back'))) dependencies.push('repeat-back')
     return dependencies
 }
 
 export interface LiveChatParserProjectionRequest {
+    readonly dependencies?: CbsHistoryDependencies
     readonly row: ConversationViewportRow
     readonly totalMessages: number
     readonly signal?: AbortSignal
@@ -53,6 +55,7 @@ export interface LiveChatParserProjectionRequest {
 }
 
 export interface LiveChatParserConversationStartRequest {
+    readonly dependencies?: CbsHistoryDependencies
     readonly greeting: string
     readonly totalMessages: number
     readonly signal?: AbortSignal
@@ -145,19 +148,21 @@ export function createSelectedConversationLiveParserProjectionResolver(
                 const source = dependencies.runtime.getActiveConversationViewportSource?.()
                 const version = source?.snapshot().version
                 const historyVersion = source?.snapshot().historyVersion
+                const historyDependencies = input.dependencies ?? new CbsHistoryDependencies()
                 const assertCurrent = () => {
                     assertConversationStartCurrent(input)
                     captureExactCurrent(dependencies, target)
-                    if (source?.snapshot().version !== version || source?.snapshot().historyVersion !== historyVersion) throw new ChatParserHistoryProjectionStaleError()
+                    if (source?.snapshot().version !== version || (source && hasCbsHistoryChanges(source.snapshot(), historyVersion, historyDependencies))) throw new ChatParserHistoryProjectionStaleError()
                 }
                 const historyAccess = authority ? await prepareCbsHistory({
+                    dependencies: historyDependencies,
                     characterId: target.characterId, conversationId: target.conversationId,
                     totalMessages: input.totalMessages, chatID: -1, plan: classification,
                     signal: input.signal, assertCurrent,
                     reader: { revision: target.storeRevision,
                         readResidentMessage: (index) => source?.snapshot().rowAt(index)?.message,
                         readConversationWindow: (query) => dependencies.runtime.store.readConversationWindow(query) },
-                }) : captureResidentCbsHistory(current.conversation.message, classification, -1)
+                }) : captureResidentCbsHistory(current.conversation.message, classification, -1, historyDependencies)
                 assertCurrent()
                 context.parserContext.historyAccess = historyAccess
                 context.parserContext.prepareHistory = async (text, chatID, complete) => {
@@ -166,12 +171,13 @@ export function createSelectedConversationLiveParserProjectionResolver(
                         indirections: dependencies.parserIndirections?.(current),
                         unsafeDependencies: complete ? ['regex-reparse'] : [] })
                     return authority ? prepareCbsHistory({
+                        dependencies: historyDependencies,
                         characterId: target.characterId, conversationId: target.conversationId,
                         totalMessages: input.totalMessages, chatID, plan, signal: input.signal, assertCurrent,
                         reader: { revision: target.storeRevision,
                             readResidentMessage: (index) => source?.snapshot().rowAt(index)?.message,
                             readConversationWindow: (query) => dependencies.runtime.store.readConversationWindow(query) },
-                    }) : captureResidentCbsHistory(current.conversation.message, plan, chatID)
+                    }) : captureResidentCbsHistory(current.conversation.message, plan, chatID, historyDependencies)
                 }
                 return { projection: {
                     kind: 'bounded', characterId: target.characterId, conversationId: target.conversationId,
@@ -209,6 +215,8 @@ export function createSelectedConversationLiveParserProjectionResolver(
             }
         },
         async resolve(input): Promise<LiveChatParserProjection> {
+            input = { ...input, dependencies: input.dependencies ?? new CbsHistoryDependencies() }
+            input.dependencies!.range(input.row.absoluteIndex, input.row.absoluteIndex + 1)
             assertRequestCurrent(input)
             const target = dependencies.runtime.captureSelectedConversationTarget()
             if (!target) throw new ChatParserHistoryProjectionStaleError()
@@ -229,6 +237,7 @@ export function createSelectedConversationLiveParserProjectionResolver(
             let resident = captureResidentParserRows(dependencies, target, input)
             try {
                 const projection = await createChatParserHistoryProjection({
+                    dependencies: input.dependencies,
                     characterId: authority.characterId,
                     conversationId: authority.conversationId,
                     revision: authority.storeRevision,
@@ -242,11 +251,14 @@ export function createSelectedConversationLiveParserProjectionResolver(
                     reader: {
                         revision: authority.storeRevision,
                         readRoleWindow: dependencies.runtime.store.messageMetadataReadMode === 'projected'
+                            && authority.sessionVersion === authority.persistedSessionVersion
                             ? (query) => dependencies.runtime.store.readConversationMessageMetadataWindow!(query) : undefined,
                         readResidentMessage: resident ? (index) => resident?.readMessage(index) : undefined,
-                        readConversationWindow: (query) => (
-                            dependencies.runtime.store.readConversationWindow(query)
-                        ),
+                        readConversationWindow: async (query) => {
+                            const result = await dependencies.runtime.store.readConversationWindow(query)
+                            return result ? { ...result, value: { ...result.value, totalMessages: input.totalMessages,
+                                hasMoreAfter: result.value.endIndex < input.totalMessages } } : null
+                        },
                     },
                     signal: input.signal,
                     isCurrent: () => requestMatchesSelection(dependencies, target, input)
@@ -298,7 +310,7 @@ function captureResidentParserRows(
 } | null {
     const source = dependencies.runtime.getActiveConversationViewportSource?.()
     const authority = dependencies.runtime.captureSelectedConversationAuthority()
-    if (!source || !authority || authority.sessionVersion !== authority.persistedSessionVersion) return null
+    if (!source || !authority) return null
     const snapshot = source.snapshot()
     const currentRow = snapshot.rowAt(input.row.absoluteIndex)
     if (
@@ -317,26 +329,26 @@ function captureResidentParserRows(
             && currentAuthority?.characterId === authority.characterId
             && currentAuthority?.conversationId === authority.conversationId
             && currentAuthority?.sessionToken === authority.sessionToken
-            && currentAuthority?.sessionVersion === authority.sessionVersion
-            && currentAuthority?.persistedSessionVersion === authority.persistedSessionVersion
+            && (currentAuthority?.sessionVersion === authority.sessionVersion || currentSnapshot?.historyVersion !== snapshot.historyVersion)
             && currentAuthority?.storeRevision === authority.storeRevision
-            && currentAuthority?.totalMessages === authority.totalMessages
             && currentSource === source
             && currentSnapshot?.sourceToken === snapshot.sourceToken
             && currentSnapshot?.version === snapshot.version
             && currentSnapshot?.storeRevision === snapshot.storeRevision
-            && currentSnapshot?.totalMessages === snapshot.totalMessages
+            && !hasCbsHistoryChanges(currentSnapshot, snapshot.historyVersion, input.dependencies!)
     }
     const pin = source.acquireRangePin(
         Math.max(0, input.row.absoluteIndex - dependencies.maxProjectionMessages + 1),
         Math.min(input.totalMessages, input.row.absoluteIndex + dependencies.maxProjectionMessages),
         'viewport',
     )
+    const rows = source.captureResidentRows
+        ? new Map(source.captureResidentRows().map((row) => [row.absoluteIndex, row])) : undefined
     return {
         isCurrent,
         readMessage: (index) => {
             if (!isCurrent()) throw new ChatParserHistoryProjectionStaleError()
-            const row = snapshot.rowAt(index)
+            const row = rows ? rows.get(index) : snapshot.rowAt(index)
             if (
                 !row || row.absoluteIndex !== index || row.key !== snapshot.keyAt(index)
                 || row.sourceVersion !== snapshot.version

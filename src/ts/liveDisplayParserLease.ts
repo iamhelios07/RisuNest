@@ -1,5 +1,6 @@
 import {
     classifyChatParserHistory,
+    createLiveChatParserIndirections,
     planChatParserHistory,
     type ChatParserHistoryClassificationInput,
 } from './chatParserHistory'
@@ -10,7 +11,6 @@ import {
     getDatabase,
     type character,
     type Database,
-    type Chat,
 } from './storage/database.svelte'
 import type { simpleCharacterArgument } from './parser/parser.svelte'
 import { getPersistentDataRuntime } from './storage/persistentDataRuntime.svelte'
@@ -23,6 +23,9 @@ import rfdc from 'rfdc'
 import { cloneConversationMetadata, isMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
 import { captureResidentCbsHistory, prepareCbsHistory } from './prepareCbsHistory'
 import type { BoundedLiveChatParserProjection } from './selectedConversationLiveParserProjection'
+import { CbsHistoryDependencies, hasCbsHistoryChanges, type CbsHistoryAccess } from './cbsHistoryAccess'
+import type { ConversationViewportSnapshot } from './conversationViewportSource'
+export { createLiveChatParserIndirections } from './chatParserHistory'
 
 export interface LiveDisplayParserLease {
     projection?: BoundedLiveChatParserProjection
@@ -40,42 +43,6 @@ interface LiveDisplayParserInputs extends ChatParserHistoryClassificationInput {
     variableStamp?: string | null
 }
 
-export function createLiveChatParserIndirections(
-    database: Database,
-    selectedCharacter: character,
-    conversation: Chat,
-    personaPrompt: string,
-): Readonly<Record<string, unknown>> {
-    const character = selectedCharacter
-    let authorNote = conversation.note ?? ''
-    if (!authorNote) {
-        for (const item of database.promptTemplate ?? []) {
-            if (item.type !== 'authornote' || !item.defaultText) continue
-            authorNote = item.defaultText
-            break
-        }
-    }
-    return {
-        personality: character?.personality ?? '',
-        charpersona: character?.personality ?? '',
-        description: character?.desc ?? '',
-        chardesc: character?.desc ?? '',
-        scenario: character?.scenario ?? '',
-        exampledialogue: character?.exampleMessage ?? '',
-        examplemessage: character?.exampleMessage ?? '',
-        persona: personaPrompt,
-        userpersona: personaPrompt,
-        mainprompt: database.mainPrompt ?? '',
-        systemprompt: database.mainPrompt ?? '',
-        jb: database.jailbreak ?? '',
-        jailbreak: database.jailbreak ?? '',
-        globalnote: database.globalNote ?? '',
-        systemnote: database.globalNote ?? '',
-        ujb: database.globalNote ?? '',
-        authornote: authorNote,
-    }
-}
-
 export function createLiveChatParserSource(
     database: Database,
     character: Exclude<DisplayCharacter, string | null>,
@@ -83,9 +50,10 @@ export function createLiveChatParserSource(
 ) {
     return {
         guiHTML: database.theme === 'customHTML' ? database.guiHTML : '',
-        presetRegex: database.presetRegex ?? [],
-        characterRegex: character.customscript ?? [],
-        moduleRegex,
+        // Regex inputs and results are prepared at their actual CBS pass.
+        regexStamp: createChatParserDependencyStamp({ chaId: character.chaId, customscript: [
+            ...(database.presetRegex ?? []), ...(character.customscript ?? []), ...moduleRegex,
+        ] }),
     }
 }
 
@@ -147,7 +115,7 @@ export function captureLiveDisplayParserInputs(
 export function createLiveDisplayParserLeaseAcquirer(dependencies: {
     runtime(): DisplayRuntime
     classify(source: unknown, character: DisplayCharacter): LiveDisplayParserInputs
-    prepare?(inputs: LiveDisplayParserInputs, chatID: number, signal: AbortSignal, firstPass?: string): Promise<BoundedLiveChatParserProjection>
+    prepare?(inputs: LiveDisplayParserInputs, chatID: number, signal: AbortSignal, firstPass?: string): Promise<LiveDisplayParserLease>
 }) {
     return async (request: {
         source: unknown
@@ -158,11 +126,11 @@ export function createLiveDisplayParserLeaseAcquirer(dependencies: {
     }): Promise<LiveDisplayParserLease | null> => {
         request.signal.throwIfAborted()
         const inputs = dependencies.classify(request.source, request.character)
-        if (dependencies.prepare && !inputs.requiresCompleteConversation && !inputs.unsafeDependencies?.length) {
-            return { projection: await dependencies.prepare(inputs, request.chatID ?? -1, request.signal,
-                request.parseFirst && typeof request.source === 'string' ? request.source : undefined), release() {} }
+        const classification = dependencies.prepare ? planChatParserHistory(inputs) : classifyChatParserHistory(inputs)
+        if (dependencies.prepare && !inputs.requiresCompleteConversation && !classification.requiresFullHistory) {
+            return dependencies.prepare(inputs, request.chatID ?? -1, request.signal,
+                request.parseFirst && typeof request.source === 'string' ? request.source : undefined)
         }
-        const classification = classifyChatParserHistory(inputs)
         if (
             !inputs.requiresCompleteConversation &&
             !classification.requiresFullHistory &&
@@ -208,7 +176,7 @@ export const acquireLiveDisplayParserLease = createLiveDisplayParserLeaseAcquire
     prepare: prepareLiveDisplayParserProjection,
 })
 
-async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInputs, chatID: number, signal: AbortSignal, firstPass?: string): Promise<BoundedLiveChatParserProjection> {
+async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInputs, chatID: number, signal: AbortSignal, firstPass?: string): Promise<LiveDisplayParserLease> {
     const clone = rfdc()
     const runtime = getPersistentDataRuntime()
     const target = runtime.captureSelectedConversationTarget()
@@ -237,20 +205,41 @@ async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInput
     }
     let plan = planChatParserHistory(inputs)
     const authority = runtime.captureSelectedConversationAuthority()
-    const source = runtime.getActiveConversationViewportSource()
-    const version = source?.snapshot().version
-    const historyVersion = source?.snapshot().historyVersion
+    let source = runtime.getActiveConversationViewportSource()
+    let version = source?.snapshot().version
+    let historyVersion = source?.snapshot().historyVersion
+    const historyDependencies = new CbsHistoryDependencies()
+    let completeLease: Awaited<ReturnType<typeof runtime.acquireCompleteConversation>> | undefined
+    let released = false
+    const release = () => { released = true; completeLease?.release(); completeLease = undefined; signal.removeEventListener('abort', release) }
+    signal.addEventListener('abort', release, { once: true })
     const assertCurrent = () => {
         signal.throwIfAborted()
+        if (released) throw new Error('Live display lease is closed')
         const current = runtime.captureSelectedConversationTarget()
         if (!current || current.characterId !== target.characterId || current.conversationId !== target.conversationId
             || current.navigationGeneration !== target.navigationGeneration || source?.snapshot().version !== version
-            || runtime.getActiveConversationViewportSource() !== source || source?.snapshot().historyVersion !== historyVersion) {
+            || runtime.getActiveConversationViewportSource() !== source || (source && hasCbsHistoryChanges(source.snapshot(), historyVersion, historyDependencies))) {
             throw new Error('Live display conversation changed during preparation')
         }
     }
     const totalMessages = isMetadataOnlySelectedConversation(originalChat) ? authority!.totalMessages : originalChat.message.length
-    let historyAccess
+    const prepareComplete = async (plan: ReturnType<typeof planChatParserHistory>, index: number) => {
+        assertCurrent()
+        if (!completeLease) {
+            const acquired = await runtime.acquireCompleteConversation('live-display-parser', target)
+            if (released) { acquired.release(); signal.throwIfAborted(); throw new Error('Live display lease is closed') }
+            completeLease = acquired
+            source = runtime.getActiveConversationViewportSource()
+            version = source?.snapshot().version
+            historyVersion = source?.snapshot().historyVersion
+        }
+        assertCurrent()
+        const messages = getCurrentChat().message
+        if (messages.length !== totalMessages) throw new Error('Live display history changed during promotion')
+        return captureResidentCbsHistory(messages, plan, index, historyDependencies)
+    }
+    let historyAccess: CbsHistoryAccess
     let parsedSource: string | undefined
     const parseFirst = async () => {
         if (firstPass === undefined) return
@@ -259,58 +248,67 @@ async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInput
         historyAccess.assertComplete()
         plan = planChatParserHistory({ ...inputs, source: [inputs.source, parsedSource] })
     }
-    if (!isMetadataOnlySelectedConversation(originalChat)) {
-        historyAccess = captureResidentCbsHistory(originalChat.message, plan, chatID)
-        if (firstPass !== undefined) {
-            await parseFirst()
-            assertCurrent()
-            historyAccess = captureResidentCbsHistory(originalChat.message, plan, chatID)
-        }
-    } else {
-        const resident = new Map((source?.captureResidentRows?.() ?? []).map((row) => [row.absoluteIndex, clone(row.message)]))
-        const lease = await runtime.store.acquireRevision(authority!.storeRevision)
-        try {
-            const prepare = () => prepareCbsHistory({ characterId: target.characterId, conversationId: target.conversationId,
-                totalMessages, chatID, plan, signal, assertCurrent, reader: {
-                    revision: lease.revision, readResidentMessage: (index) => resident.get(index),
-                    readRoleWindow: lease.messageMetadataReadMode === 'projected' && authority!.sessionVersion === authority!.persistedSessionVersion
-                        ? (query) => lease.readConversationMessageMetadataWindow!(query) : undefined,
-                    readConversationWindow: async (query) => {
-                        const result = await lease.readConversationWindow(query)
-                        return result ? { ...result, value: { ...result.value, totalMessages } } : null
-                    },
-                } })
-            historyAccess = await prepare()
+    try {
+        if (!isMetadataOnlySelectedConversation(originalChat)) {
+            historyAccess = captureResidentCbsHistory(originalChat.message, plan, chatID, historyDependencies)
             if (firstPass !== undefined) {
                 await parseFirst()
-                historyAccess = await prepare()
+                assertCurrent()
+                historyAccess = captureResidentCbsHistory(originalChat.message, plan, chatID, historyDependencies)
             }
-        } finally { await lease.release() }
-    }
-    assertCurrent()
-    const prepareHistory = async (text: string, index: number, complete: boolean) => {
+        } else {
+            const resident = new Map((source?.captureResidentRows?.() ?? []).map((row) => [row.absoluteIndex, clone(row.message)]))
+            const lease = await runtime.store.acquireRevision(authority!.storeRevision)
+            try {
+                const prepare = () => plan.requiresFullHistory ? prepareComplete(plan, chatID) : prepareCbsHistory({ characterId: target.characterId, conversationId: target.conversationId,
+                    dependencies: historyDependencies,
+                    totalMessages, chatID, plan, signal, assertCurrent, reader: {
+                        revision: lease.revision, readResidentMessage: (index) => resident.get(index),
+                        readRoleWindow: lease.messageMetadataReadMode === 'projected' && authority!.sessionVersion === authority!.persistedSessionVersion
+                            ? (query) => lease.readConversationMessageMetadataWindow!(query) : undefined,
+                        readConversationWindow: async (query) => {
+                            const result = await lease.readConversationWindow(query)
+                            return result ? { ...result, value: { ...result.value, totalMessages } } : null
+                        },
+                    } })
+                historyAccess = await prepare()
+                for (const [index, message] of historyAccess.preparedRows()) resident.set(index, message)
+                if (firstPass !== undefined) {
+                    await parseFirst()
+                    historyAccess = await prepare()
+                }
+            } finally { await lease.release() }
+        }
         assertCurrent()
-        const plan = planChatParserHistory({ source: text, indirections: inputs.indirections,
-            unsafeDependencies: complete ? ['regex-reparse'] : [] })
-        if (!isMetadataOnlySelectedConversation(originalChat)) return captureResidentCbsHistory(originalChat.message, plan, index)
-        const resident = new Map((source?.captureResidentRows?.() ?? []).map((row) => [row.absoluteIndex, clone(row.message)]))
-        const lease = await runtime.store.acquireRevision(authority!.storeRevision)
-        try {
-            return await prepareCbsHistory({ characterId: target.characterId, conversationId: target.conversationId,
-                totalMessages, chatID: index, plan, signal, assertCurrent, reader: {
-                    revision: lease.revision, readResidentMessage: (index) => resident.get(index),
-                    readRoleWindow: lease.messageMetadataReadMode === 'projected' && authority!.sessionVersion === authority!.persistedSessionVersion
-                        ? (query) => lease.readConversationMessageMetadataWindow!(query) : undefined,
-                    readConversationWindow: async (query) => {
-                        const result = await lease.readConversationWindow(query)
-                        return result ? { ...result, value: { ...result.value, totalMessages } } : null
-                    },
-                } })
-        } finally { await lease.release() }
-    }
-    return { kind: 'bounded', characterId: target.characterId, conversationId: target.conversationId,
-        revision: target.storeRevision, totalMessages, chatID, projectedChatID: chatID, historyOffset: 0, messages: [],
-        parsedSource, context: { ...context, parserContext: { ...context.parserContext, historyAccess, prepareHistory } } }
+        const preparedRows = new Map(historyAccess.preparedRows())
+        const prepareHistory = async (text: string, index: number, complete: boolean) => {
+            assertCurrent()
+            const plan = planChatParserHistory({ source: text, indirections: inputs.indirections,
+                unsafeDependencies: complete ? ['regex-reparse'] : [] })
+            if (plan.requiresFullHistory || completeLease) return prepareComplete(plan, index)
+            if (!isMetadataOnlySelectedConversation(originalChat)) return captureResidentCbsHistory(originalChat.message, plan, index, historyDependencies)
+            const resident = new Map((source?.captureResidentRows?.() ?? []).map((row) => [row.absoluteIndex, clone(row.message)]))
+            const lease = await runtime.store.acquireRevision(authority!.storeRevision)
+            try {
+                const access = await prepareCbsHistory({ characterId: target.characterId, conversationId: target.conversationId,
+                    dependencies: historyDependencies,
+                    totalMessages, chatID: index, plan, signal, assertCurrent, reader: {
+                        revision: lease.revision, readResidentMessage: (index) => preparedRows.get(index) ?? resident.get(index),
+                        readRoleWindow: lease.messageMetadataReadMode === 'projected' && authority!.sessionVersion === authority!.persistedSessionVersion
+                            ? (query) => lease.readConversationMessageMetadataWindow!(query) : undefined,
+                        readConversationWindow: async (query) => {
+                            const result = await lease.readConversationWindow(query)
+                            return result ? { ...result, value: { ...result.value, totalMessages } } : null
+                        },
+                    } })
+                for (const [index, message] of access.preparedRows()) preparedRows.set(index, message)
+                return access
+            } finally { await lease.release() }
+        }
+        return { release, projection: { kind: 'bounded', characterId: target.characterId, conversationId: target.conversationId,
+            revision: target.storeRevision, totalMessages, chatID, projectedChatID: chatID, historyOffset: 0, messages: [],
+            parsedSource, context: { ...context, parserContext: { ...context.parserContext, historyAccess, prepareHistory } } } }
+    } catch (error) { release(); throw error }
 }
 
 export function captureLiveDisplayParserSelection(): string {
@@ -322,13 +320,25 @@ export function captureLiveDisplayParserSelection(): string {
 
 export function subscribeLiveDisplayParserSelection(
     listener: (identity: string, historyRevision?: string) => void,
+    dependencies?: () => CbsHistoryDependencies | undefined,
 ): () => void {
     const runtime = getPersistentDataRuntime()
     let unsubscribeSource: (() => void) | undefined
+    let previous: ConversationViewportSnapshot | undefined
+    let identity: string | undefined
     const update = () => {
         const source = runtime.getActiveConversationViewportSource()
         const snapshot = source?.snapshot()
-        listener(captureLiveDisplayParserSelection(), JSON.stringify([snapshot?.sourceToken, snapshot?.version, snapshot?.historyVersion]))
+        const nextIdentity = captureLiveDisplayParserSelection()
+        const reads = dependencies?.()
+        if (reads && previous && snapshot && identity === nextIdentity && previous.sourceToken === snapshot.sourceToken
+            && previous.version === snapshot.version && !hasCbsHistoryChanges(snapshot, previous.historyVersion, reads)) {
+            previous = snapshot
+            return
+        }
+        identity = nextIdentity
+        previous = snapshot
+        listener(nextIdentity, JSON.stringify([snapshot?.sourceToken, snapshot?.version, snapshot?.historyVersion]))
     }
     const bindSource = () => {
         unsubscribeSource?.()

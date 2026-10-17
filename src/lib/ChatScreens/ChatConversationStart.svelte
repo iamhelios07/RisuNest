@@ -7,12 +7,15 @@
     import LoadingIndicator from 'src/lib/UI/GUI/LoadingIndicator.svelte'
     import type { LiveChatParserConversationStartRequest, BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
     import type { SelectedConversationOperations } from 'src/ts/selectedConversationOperations'
+    import type { ConversationViewportSnapshot } from 'src/ts/conversationViewportSource'
+    import { CbsHistoryDependencies, hasCbsHistoryChanges } from 'src/ts/cbsHistoryAccess'
 
     let {
         currentCharacter,
         resolvedImage,
         showAiWarning,
         totalMessages,
+        historySnapshot,
         onReroll,
         unReroll,
         onRemoveCreatorQuote,
@@ -24,6 +27,7 @@
         resolvedImage: string
         showAiWarning: boolean
         totalMessages: number
+        historySnapshot?: ConversationViewportSnapshot
         onReroll: () => void
         unReroll: () => void
         onRemoveCreatorQuote: () => void
@@ -52,6 +56,7 @@
     let preparingController: AbortController | null = null
     let parserRequestGeneration = 0
     let destroyed = false
+    let historyDependencies = new CbsHistoryDependencies()
 
     export function updateConversationStartPresentation(state: {
         resolvedImage: string
@@ -66,12 +71,14 @@
         parserLease = null
         const generation = ++parserRequestGeneration
         const controller = new AbortController()
+        historyDependencies = new CbsHistoryDependencies()
         preparingController = controller
         parserLoadFailed = false
         const isCurrent = () => !destroyed && generation === parserRequestGeneration
         try {
             const lease =
                 (await acquireConversationStartParserLease?.({
+                    dependencies: historyDependencies,
                     greeting,
                     totalMessages,
                     signal: controller.signal,
@@ -82,6 +89,7 @@
                 return
             }
             parserLease = lease
+            if (lease && !lease.projection) historyDependencies.all = true
             parserProjection = lease?.projection
             parserController = controller
             parserReady = true
@@ -95,8 +103,17 @@
 
     export function refreshConversationStartParser(
         nextTotalMessages = totalMessages,
+        nextSnapshot?: ConversationViewportSnapshot,
+        forced = false,
     ): void {
         totalMessages = nextTotalMessages
+        const previous = historySnapshot
+        if (!forced && previous && nextSnapshot && previous.sourceToken === nextSnapshot.sourceToken
+            && previous.version === nextSnapshot.version && !hasCbsHistoryChanges(nextSnapshot, previous.historyVersion, historyDependencies)) {
+            historySnapshot = nextSnapshot
+            return
+        }
+        historySnapshot = nextSnapshot
         void prepareParser()
     }
 

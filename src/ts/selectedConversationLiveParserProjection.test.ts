@@ -242,21 +242,23 @@ describe('selected conversation live parser projection', () => {
         expect(testHarness.pinReleases).toHaveBeenCalledOnce()
     })
 
-    test('does not reuse optimistic viewport rows whose session has pending persistence', async () => {
+    test('reads resident optimistic edits before persistence without hydrating the conversation', async () => {
         const testHarness = await cachedHarness()
         const capture = testHarness.dependencies.runtime.captureSelectedConversationAuthority
         testHarness.dependencies.runtime.captureSelectedConversationAuthority = () => ({
             ...capture()!, sessionVersion: 1,
         })
         testHarness.source.applyOptimisticRange(3, 1, [message(3, 'pending edit')])
+        testHarness.dependencies.parserSource = () => '{{previouschatlog::3}}'
         const result = await testHarness.resolver.resolve({
             row: testHarness.source.snapshot().rowAt(7)!, totalMessages: 8,
         })
         expect(result.kind).toBe('bounded')
         if (result.kind !== 'bounded') throw new Error('Expected bounded projection')
         expect(result.messages[0].data).toBe('message-7')
-        expect(testHarness.reads).toHaveBeenCalledTimes(1)
-        expect(testHarness.pinReleases).not.toHaveBeenCalled()
+        expect(result.context.parserContext.historyAccess?.row(3)?.data).toBe('pending edit')
+        expect(testHarness.reads).not.toHaveBeenCalled()
+        expect(testHarness.pinReleases).toHaveBeenCalledOnce()
     })
 
     test('does not reuse rows from a replaced viewport revision', async () => {

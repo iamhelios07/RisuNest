@@ -771,14 +771,6 @@ export async function ParseMarkdown(
     }
 
     if(char){
-        const context = renderContext.scriptContext
-        if (context?.parserContext.prepareHistory) {
-            const historyAccess = await context.parserContext.prepareHistory(data, chatID, [
-                ...context.presetRegex, ...(char.customscript ?? []), ...context.moduleRegexScripts,
-            ].some((script) => script.type === 'editdisplay'))
-            renderContext = { ...renderContext, scriptContext: { ...context,
-                parserContext: { ...context.parserContext, historyAccess, prepareHistory: undefined } } }
-        }
         data = (await processScriptFull(char, data, 'editdisplay', chatID, cbsConditions, {
             captureContext: renderContext.scriptContext,
             cache: renderContext.scriptContext ? 'bypass' : 'normal',

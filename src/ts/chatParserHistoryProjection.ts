@@ -6,6 +6,7 @@ import {
     type ChatParserUnsafeHistoryDependency,
 } from './chatParserHistory'
 import { prepareCbsHistory } from './prepareCbsHistory'
+import { CbsHistoryDependencies } from './cbsHistoryAccess'
 import type { ProcessScriptCaptureContext } from './process/scripts'
 import type { Message } from './storage/database.svelte'
 import {
@@ -50,6 +51,7 @@ export interface ChatParserCompleteProjectionLease {
 }
 
 export interface ChatParserHistoryProjectionInput {
+    dependencies?: CbsHistoryDependencies
     characterId: string
     conversationId: string
     revision: DataRevision
@@ -135,6 +137,7 @@ export async function createChatParserHistoryProjection(
         return acquireCompleteProjection(input, currentMessage, classification.reasons)
     }
     const historyAccess = await prepareCbsHistory({
+        dependencies: input.dependencies,
         characterId: input.characterId,
         conversationId: input.conversationId,
         totalMessages: input.totalMessages,
@@ -152,14 +155,21 @@ export async function createChatParserHistoryProjection(
     const messages = [currentMessage]
     const context = buildBoundedContext(input.contextSeed, input, messages, historyOffset)
     context.parserContext.historyAccess = historyAccess
-    context.parserContext.prepareHistory = (source, chatID, complete) => prepareCbsHistory({
-        characterId: input.characterId, conversationId: input.conversationId,
-        totalMessages: input.totalMessages, chatID,
-        plan: planChatParserHistory({ source, indirections: input.parserIndirections,
-            unsafeDependencies: complete ? ['regex-reparse'] : [] }),
-        reader: input.reader, signal: input.signal,
-        assertCurrent: () => assertProjectionCurrent(input),
-    })
+    const preparedRows = new Map(historyAccess.preparedRows())
+    preparedRows.set(input.currentAbsoluteIndex, currentMessage)
+    context.parserContext.prepareHistory = async (source, chatID, complete) => {
+        const access = await prepareCbsHistory({
+            dependencies: historyAccess.dependencies,
+            characterId: input.characterId, conversationId: input.conversationId,
+            totalMessages: input.totalMessages, chatID,
+            plan: planChatParserHistory({ source, indirections: input.parserIndirections,
+                unsafeDependencies: complete ? ['regex-reparse'] : [] }),
+            reader: { ...input.reader, readResidentMessage: (index) => preparedRows.get(index) ?? input.reader.readResidentMessage?.(index) }, signal: input.signal,
+            assertCurrent: () => assertProjectionCurrent(input),
+        })
+        for (const [index, message] of access.preparedRows()) preparedRows.set(index, message)
+        return access
+    }
     assertProjectionCurrent(input)
     return {
         kind: 'bounded',

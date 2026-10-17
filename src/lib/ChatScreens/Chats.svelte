@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { CbsHistoryDependencies, hasCbsHistoryChanges } from 'src/ts/cbsHistoryAccess'
     import type { character, Message, StreamingDisplayOptimizationMode } from 'src/ts/storage/database.svelte'
     import { mount, onDestroy, onMount, tick, unmount, untrack } from 'svelte'
     import { get } from 'svelte/store'
@@ -125,7 +126,7 @@
         captureEditorDraft?: () => Omit<ChatEditorDraft, 'caret'> | null
         restoreEditor?: (draft: ChatEditorDraft) => void
         refreshParserProjection?: (projection?: BoundedLiveChatParserProjection) => void
-        refreshConversationStartParser?: (totalMessages?: number) => void
+        refreshConversationStartParser?: (totalMessages?: number, snapshot?: ConversationViewportSnapshot, forced?: boolean) => void
         updateConversationStartPresentation?: (state: { resolvedImage: string }) => void
         updateStreamingDisplay?: (state: {
             isOptimizedStreamingMessage: boolean
@@ -164,11 +165,12 @@
     let latestPairLookup: Promise<number[]> | null = null
     let latestPairController = new AbortController()
     interface RowParserProjectionState {
+        dependencies: CbsHistoryDependencies
         readonly controller: AbortController
         readonly source: ConversationViewportSource
         readonly sourceToken: string
         readonly sourceVersion: number
-        readonly historyVersion?: number
+        historyVersion?: number
         readonly row: ConversationViewportRow
         readonly totalMessages: number
         readonly renderSignature: ChatRenderSignature
@@ -1735,7 +1737,8 @@
             previousInputs[12] = nextInputs[12]
             if (JSON.stringify(previousInputs) === signature) {
                 element.dataset.chatConversationStartSignature = signature
-                untrack(() => mountInstances.get(key)?.refreshConversationStartParser?.(totalMessages))
+                const forced = JSON.parse(previousSignature)[11] !== nextInputs[11]
+                untrack(() => mountInstances.get(key)?.refreshConversationStartParser?.(totalMessages, historySnapshot, forced))
                 return
             }
         }
@@ -1768,6 +1771,7 @@
                         resolvedImage: resolvedCharacterImage ?? '',
                         showAiWarning,
                         totalMessages,
+                        historySnapshot,
                         onReroll: onFirstMessageReroll,
                         unReroll: unFirstMessageReroll,
                         onRemoveCreatorQuote,
@@ -2036,13 +2040,15 @@
             && existing.source === source
             && existing.sourceToken === sourceSnapshot.sourceToken
             && existing.sourceVersion === sourceSnapshot.version
-            && existing.historyVersion === sourceSnapshot.historyVersion
+            && !hasCbsHistoryChanges(sourceSnapshot, existing.historyVersion, existing.dependencies)
             && existing.row.key === row.key
             && existing.row.absoluteIndex === row.absoluteIndex
             && existing.row.sourceVersion === row.sourceVersion
-            && existing.totalMessages === totalMessages
             && areChatRenderSignaturesEqual(existing.renderSignature, renderSignature)
-        ) return existing
+        ) {
+            if (existing.displayStarted && !activeRowPreparations.has(key)) existing.historyVersion = sourceSnapshot.historyVersion
+            return existing
+        }
 
         const preserveMountedRuntime = sourceHandoffRuntimeKeys.has(key) || (
             existing?.source === source && (
@@ -2057,7 +2063,10 @@
         )
         releaseRowParserProjection(key)
         const controller = new AbortController()
+        const dependencies = new CbsHistoryDependencies()
+        dependencies.range(row.absoluteIndex, row.absoluteIndex + 1)
         const state: RowParserProjectionState = {
+            dependencies,
             controller,
             source,
             sourceToken: sourceSnapshot.sourceToken,
@@ -2084,11 +2093,13 @@
         state: RowParserProjectionState,
     ): void {
         void parserProjectionResolver!.resolve({
+            dependencies: state.dependencies,
             row: state.row,
             totalMessages: state.totalMessages,
             signal: state.controller.signal,
             isCurrent: () => isRowParserProjectionCurrent(key, state),
         }).then((projection) => {
+            if (projection.kind === 'complete') state.dependencies.all = true
             if (!isRowParserProjectionCurrent(key, state)) {
                 if (projection.kind === 'complete') projection.release()
                 return
@@ -2121,8 +2132,11 @@
     ): void {
         finishRowPreparation(key, state)
         releaseResolvedRowParserProjection(state)
+        if (!isRowParserProjectionCurrent(key, state)) {
+            if (rowParserProjections.get(key) === state && !state.controller.signal.aborted) queueProjectionReconcile()
+            return
+        }
         if (
-            !isRowParserProjectionCurrent(key, state) ||
             state.retryTimer !== null
         )
             return
@@ -2161,8 +2175,7 @@
             !snapshot
             || snapshot.sourceToken !== state.sourceToken
             || snapshot.version !== state.sourceVersion
-            || snapshot.historyVersion !== state.historyVersion
-            || snapshot.totalMessages !== state.totalMessages
+            || hasCbsHistoryChanges(snapshot, state.historyVersion, state.dependencies)
         ) return false
         const currentRow = snapshot.rowAt(state.row.absoluteIndex)
         return currentRow?.key === state.row.key

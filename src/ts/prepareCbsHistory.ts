@@ -1,12 +1,16 @@
 import rfdc from 'rfdc'
-import { createCbsHistoryAccess, cbsHistorySearchKey, type CbsHistoryAccess } from './cbsHistoryAccess'
+import { createCbsHistoryAccess, cbsHistorySearchKey, CbsHistoryDependencies, type CbsHistoryAccess } from './cbsHistoryAccess'
 import type { CbsHistoryPlan } from './chatParserHistory'
 import type { Message } from './storage/database.svelte'
 import type { PersistentRevisionReader } from './storage/persistentDataStore'
 
 const clone = rfdc()
 
-function requests(plan: CbsHistoryPlan, chatID: number, total: number) {
+function requests(plan: CbsHistoryPlan, chatID: number, total: number, dependencies: CbsHistoryDependencies) {
+    dependencies.all ||= plan.requiresFullHistory
+    dependencies.count ||= plan.requirements.some((requirement) => requirement === 'count' || requirement === 'tail'
+        || (requirement === 'previouschar' && chatID === -1))
+        || plan.absoluteMessageIndices.some((index) => index >= total)
     const indices = new Set(plan.absoluteMessageIndices)
     const searches: { role: Message['role']; before: number; count: number }[] = []
     for (const requirement of plan.requirements) {
@@ -18,25 +22,29 @@ function requests(plan: CbsHistoryPlan, chatID: number, total: number) {
             case 'idle': if (chatID !== -1) searches.push({ role: 'user', before: chatID + 1, count: 2 }); break
         }
     }
-    return { indices: [...indices].filter((index) => index >= 0 && index < total), searches }
+    const validIndices = [...indices].filter((index) => index >= 0 && index < total)
+    for (const index of validIndices) dependencies.range(index, index + 1)
+    return { indices: validIndices, searches }
 }
 
-export function captureResidentCbsHistory(messages: readonly Message[], plan: CbsHistoryPlan, chatID: number): CbsHistoryAccess {
+export function captureResidentCbsHistory(messages: readonly Message[], plan: CbsHistoryPlan, chatID: number, dependencies = new CbsHistoryDependencies()): CbsHistoryAccess {
     const rows = new Map<number, Message>()
-    if (plan.requiresFullHistory) return createCbsHistoryAccess({ length: messages.length, rows, complete: clone(messages) })
-    const needed = requests(plan, chatID, messages.length)
+    const needed = requests(plan, chatID, messages.length, dependencies)
+    if (plan.requiresFullHistory) return createCbsHistoryAccess({ length: messages.length, rows, complete: clone(messages), dependencies })
     const searches = new Map<string, readonly Message[]>()
     for (const index of needed.indices) rows.set(index, clone(messages[index]))
     for (const { role, before, count } of needed.searches) {
         const found: Message[] = []
-        for (let index = before - 1; index >= 0 && found.length < count; index--) {
+        let index = before - 1
+        for (; index >= 0 && found.length < count; index--) {
             if (messages[index].role !== role) continue
             if (!rows.has(index)) rows.set(index, clone(messages[index]))
             found.push(rows.get(index)!)
         }
+        dependencies.range(index + 1, before)
         searches.set(cbsHistorySearchKey(role, before, count), found)
     }
-    return createCbsHistoryAccess({ length: messages.length, rows, searches })
+    return createCbsHistoryAccess({ length: messages.length, rows, searches, dependencies })
 }
 
 export interface CbsHistoryReader {
@@ -58,8 +66,11 @@ export async function prepareCbsHistory(input: {
     signal?: AbortSignal
     assertCurrent?: () => void
     pageSize?: number
+    dependencies?: CbsHistoryDependencies
 }): Promise<CbsHistoryAccess> {
     const { reader, totalMessages, chatID, plan } = input
+    const dependencies = input.dependencies ?? new CbsHistoryDependencies()
+    const neededByIndex = (input.chatIDs ?? [chatID]).map((current) => requests(plan, current, totalMessages, dependencies))
     let lastPage: { start: number; end: number; messages: Message[] } | undefined
     const pageSize = Math.min(128, Math.max(1, input.pageSize ?? 32))
     const rows = new Map<number, Message>()
@@ -113,6 +124,7 @@ export async function prepareCbsHistory(input: {
     }
     async function previous(role: Message['role'], before: number, count: number) {
         const found: Message[] = []
+        let earliest = 0
         for (let end = Math.min(before, totalMessages); end > 0 && found.length < count;) {
             while (end > 0 && found.length < count) {
                 const resident = rows.get(end - 1) ?? reader.readResidentMessage?.(end - 1)
@@ -122,6 +134,7 @@ export async function prepareCbsHistory(input: {
                     const message = clone(resident)
                     rows.set(end, message)
                     found.push(message)
+                    earliest = end
                 }
             }
             if (end === 0 || found.length === count) break
@@ -137,6 +150,7 @@ export async function prepareCbsHistory(input: {
                     if ((resident?.role ?? metadata!.value.messages[index - start].role) !== role) continue
                     await row(index)
                     found.push(rows.get(index)!)
+                    earliest = index
                 }
             } else {
                 const messages = await page(start, end)
@@ -145,10 +159,12 @@ export async function prepareCbsHistory(input: {
                     const message = messages[index - start]
                     rows.set(index, message)
                     found.push(message)
+                    earliest = index
                 }
             }
             end = start
         }
+        dependencies.range(found.length === count ? earliest : 0, Math.min(before, totalMessages))
         searches.set(cbsHistorySearchKey(role, before, count), found)
     }
     check()
@@ -157,15 +173,14 @@ export async function prepareCbsHistory(input: {
         for (let start = 0; start < totalMessages; start += pageSize) {
             complete.push(...await page(start, Math.min(totalMessages, start + pageSize)))
         }
-        return createCbsHistoryAccess({ length: totalMessages, rows, complete })
+        return createCbsHistoryAccess({ length: totalMessages, rows, complete, dependencies })
     }
-    for (const current of input.chatIDs ?? [chatID]) {
-        const needed = requests(plan, current, totalMessages)
+    for (const needed of neededByIndex) {
         for (const index of needed.indices) await row(index)
         for (const { role, before, count } of needed.searches) {
             if (!searches.has(cbsHistorySearchKey(role, before, count))) await previous(role, before, count)
         }
     }
     check()
-    return createCbsHistoryAccess({ length: totalMessages, rows, searches })
+    return createCbsHistoryAccess({ length: totalMessages, rows, searches, dependencies })
 }

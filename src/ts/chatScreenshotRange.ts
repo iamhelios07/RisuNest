@@ -3,11 +3,10 @@ import { CONVERSATION_RANGE_MAX_LIMIT, type DataRevision } from './storage/persi
 import type { simpleCharacterArgument } from './parser/parser.svelte'
 import type { ProcessScriptCaptureContext } from './process/scripts'
 import {
-    planChatParserHistory,
+    planChatParserHistory, createLiveChatParserIndirections,
 } from './chatParserHistory'
 import { prepareCbsHistory } from './prepareCbsHistory'
 import type { CbsHistoryAccess } from './cbsHistoryAccess'
-import { getRegexExecutionPlan } from './process/regexExecutionPlan'
 import rfdc from 'rfdc'
 
 const cloneScreenshotData = rfdc()
@@ -241,11 +240,12 @@ export async function createChatScreenshotJobFromDialogSnapshot(
     const renderContext = cloneScreenshotData(
         snapshot.renderContext,
     ) as ChatScreenshotRenderContext
-    const scripts = [...renderContext.presetRegex, ...renderContext.moduleRegexScripts,
-        ...(renderContext.parserContext.character.customscript ?? [])]
-    let plan = planChatParserHistory({ source: [selectedMessages, renderContext],
-        unsafeDependencies: renderContext.settings.autoTranslate || getRegexExecutionPlan(scripts, 'editdisplay').entries.length > 0
-            ? ['regex-reparse'] : [] })
+    const parser = renderContext.parserContext
+    const indirections = createLiveChatParserIndirections(parser.database, parser.character,
+        parser.character.chats[parser.character.chatPage], parser.personaPrompt)
+    const planFor = (source: unknown) => planChatParserHistory({ source: [source,
+        renderContext.settings.guiHTML, renderContext.assetStyle], indirections })
+    let plan = planFor(selectedMessages)
     let historyAccess: CbsHistoryAccess | undefined
     const prepare = () => prepareCbsHistory({
         characterId: snapshot.characterId, conversationId: snapshot.chatId,
@@ -280,12 +280,11 @@ export async function createChatScreenshotJobFromDialogSnapshot(
             historyAccess.assertComplete()
             preparedDisplayText[chatID] = { source: message.data, text }
         }
-        plan = planChatParserHistory({ source: [selectedMessages, renderContext, preparedDisplayText] })
+        plan = planFor([selectedMessages, preparedDisplayText])
         historyAccess = await prepare()
         if (!plan.requiresFullHistory) {
             // A row returned by the second CBS pass may supply encoded style CBS.
-            plan = planChatParserHistory({ source: [selectedMessages, renderContext,
-                preparedDisplayText, [...historyAccess.preparedMessages()]] })
+            plan = planFor([selectedMessages, preparedDisplayText, [...historyAccess.preparedMessages()]])
             historyAccess = await prepare()
         }
         renderContext.preparedDisplayText = preparedDisplayText
@@ -299,6 +298,26 @@ export async function createChatScreenshotJobFromDialogSnapshot(
     await hydrateScreenshotSpeakerCharacters(reader, parserMessages, renderContext, signal)
     renderContext.parserContext.historyOffset = historyStart
     renderContext.parserContext.historyAccess = historyAccess
+    const preparedRows = new Map(historyAccess.preparedRows())
+    renderContext.parserContext.prepareHistory = async (source, chatID, complete) => {
+        const access = await prepareCbsHistory({
+            characterId: snapshot.characterId, conversationId: snapshot.chatId, totalMessages: snapshot.totalTurns, chatID,
+            plan: complete ? { ...planFor(source), requiresFullHistory: true } : planFor(source), signal,
+            reader: {
+                revision: reader.revision,
+                readResidentMessage: (index) => selectedMessages[index - selectionStartIndex] ?? preparedRows.get(index),
+                readConversationWindow: async (query) => {
+                    const startIndex = query.startIndex!, endIndex = startIndex + query.limit!
+                    return { revision: reader.revision, value: { characterId: snapshot.characterId, conversationId: snapshot.chatId,
+                        startIndex, endIndex, totalMessages: snapshot.totalTurns,
+                        hasMoreBefore: startIndex > 0, hasMoreAfter: endIndex < snapshot.totalTurns,
+                        messages: await readScreenshotRange(reader, startIndex, endIndex, signal) } }
+                },
+            },
+        })
+        for (const [index, message] of access.preparedRows()) preparedRows.set(index, message)
+        return access
+    }
     renderContext.totalTurns = snapshot.totalTurns
     renderContext.selectionStart = validation.start
     renderContext.historyStartIndex = historyStart

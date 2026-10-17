@@ -128,6 +128,7 @@ async function createProductScreenshotJob(input: {
     start: number
     end: number
     renderContext: ChatScreenshotRenderContext
+    bodyIndices?: number[]
 }) {
     const parserContext = input.renderContext.parserContext
     const sourceCharacter = parserContext.character
@@ -153,6 +154,7 @@ async function createProductScreenshotJob(input: {
         revision: 1,
         totalTurns: frozenMessages.length,
         async readRange(startIndex: number, limit: number) {
+            for (let index = startIndex; index < startIndex + limit; index++) input.bodyIndices?.push(index)
             return structuredClone(frozenMessages.slice(startIndex, startIndex + limit))
         },
     }
@@ -178,6 +180,7 @@ beforeEach(() => {
     live.database = makeDatabase(makeCharacter('Live'), 'Live')
     live.modules = [{ id: 'live', name: 'Live', namespace: 'live-module' }]
     pluginV2.editprocess.clear()
+    vi.mocked(runLuaEditTrigger).mockImplementation(async (_char, _mode, content) => content)
 })
 
 test('Plugin parsing keeps upstream defaults, condition precedence and variable effects', async () => {
@@ -190,7 +193,6 @@ test('Plugin parsing keeps upstream defaults, condition precedence and variable 
 })
 
 test('Plugin editprocess prepares the second CBS pass, permits reentrant calls and retains its target', async () => {
-    vi.mocked(runLuaEditTrigger).mockImplementation(async (_char, _mode, content) => content)
     const original = live.database.characters[0]
     original.chats[0].scriptstate.$expanded = '{{lastmessage}}'
     let entered!: () => void
@@ -210,10 +212,11 @@ test('Plugin editprocess prepares the second CBS pass, permits reentrant calls a
     expect(await pending).toBe('Live current')
 })
 
-test.each(['navigate', 'stream', 'unload'])('Plugin parsing retains its captured window and releases its lease after %s', async (action) => {
+test.each(['navigate', 'stream', 'promote', 'unload'])('Plugin parsing retains its captured window and releases its lease after %s', async (action) => {
     const character = live.database.characters[0]
     const messages = character.chats[0].message
     character.chats[0].id = 'original-conversation'
+    const completeChat = character.chats[0]
     character.chats[0] = createMetadataOnlySelectedConversation(character.chats[0])
     let finish!: () => void
     const waiting = new Promise<void>((resolve) => { finish = resolve })
@@ -237,12 +240,55 @@ test.each(['navigate', 'stream', 'unload'])('Plugin parsing retains its captured
     const pending = parseRisuChat('{{previouschatlog::0}}|{{lastmessage}}', undefined, controller.signal)
     if (action === 'navigate') live.database.characters[0] = makeCharacter('Navigated')
     if (action === 'stream') messages[1].data = 'next stream token'
+    let promoted: Promise<string> | undefined
+    if (action === 'promote') {
+        character.chats[0] = completeChat
+        promoted = parseRisuChat('{{lastmessage}}')
+        messages[1].data = 'next stream token'
+    }
     if (action === 'unload') controller.abort()
     finish()
     if (action === 'unload') await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     else expect(await pending).toBe('Live previous|Live current')
+    if (promoted) expect(await promoted).toBe('Live current')
     expect(release).toHaveBeenCalledOnce()
     if (action === 'stream') expect(await parseRisuChat('{{lastmessage}}')).toBe('next stream token')
+})
+
+test('Plugin regex passes read only the history exposed by their actual output', async () => {
+    const character = live.database.characters[0]
+    const messages: Message[] = Array.from({ length: 80 }, (_, index) => ({ role: 'char', data: `row ${index}` }))
+    character.chats[0].id = 'chat'
+    character.chats[0] = createMetadataOnlySelectedConversation(character.chats[0])
+    character.chats[0].scriptstate.$expanded = '{{previouschatlog::70}}'
+    character.customscript = [{ type: 'editprocess', in: 'HP', out: '<b>HP</b>', flag: 'g', ableFlag: true }] as any
+    const indices: number[] = []
+    const release = vi.fn(async () => {})
+    live.runtime = {
+        captureSelectedConversationAuthority: () => ({ totalMessages: messages.length, storeRevision: 1 }),
+        getActiveConversationViewportSource: () => undefined,
+        store: { acquireRevision: async () => ({ revision: 1, release,
+            readConversationWindow: async (query) => {
+                const start = query.startIndex!, end = start + query.limit!
+                for (let index = start; index < end; index++) indices.push(index)
+                return { revision: 1, value: { characterId: character.chaId, conversationId: 'chat',
+                    startIndex: start, endIndex: end, totalMessages: messages.length,
+                    messages: messages.slice(start, end), hasMoreBefore: start > 0, hasMoreAfter: end < messages.length } }
+            },
+        }) },
+    } as unknown as PersistentDataRuntime
+    expect(await parseRisuChat('{{#when::1::is::1}}HP{{/when}}|{{lastmessageindex}}', { processRegex: true })).toBe('<b>HP</b>\n|79')
+    expect(indices).toEqual([])
+    expect(await parseRisuChat('{{getvar::expanded}}', { processRegex: true })).toBe('row 70')
+    expect(indices).toEqual([70])
+    indices.length = 0
+    character.customscript = [{ type: 'editprocess', in: 'H([0-9]+)', out: '{{previouschatlog::$1}}', flag: 'g', ableFlag: true }] as any
+    expect(await parseRisuChat('H2', { processRegex: true })).toBe('row 2')
+    expect(indices).toEqual([2])
+    messages[2].data = 'updated row 2'
+    expect(await parseRisuChat('H2', { processRegex: true })).toBe('updated row 2')
+    expect(indices).toEqual([2, 2])
+    expect(release).toHaveBeenCalledTimes(4)
 })
 
 test('prepared CBS reads match complete history for composed expressions and sparse rows', async () => {
@@ -274,6 +320,8 @@ test('prepared CBS reads match complete history for composed expressions and spa
         '{{history}}', '{{userhistory}}', '{{charhistory}}', '{{messageunixtimearray}}',
         '{{{{getvar::macro}}}}', '{{#if 1}}{{lastmessage}}{{/if}}',
         '{{#pure}}{{lastmessage}}{{/pure}}', '{{#each {{array::a::b}}}}{{previouscharchat}}{{/each}}',
+        '{{#when::1::is::1}}{{previouschatlog::2}}{{/when}}',
+        '{{#escape}}{{history}}{{/escape}}', '{{#pure}}{{#if 1}}{{history}}{{/if}}{{/pure}}',
         '{{#func::f}}{{lastmessage}}{{/func}}{{call::f}}', '<user>|<char>',
         '<risu-style>7b7b6c6173746d657373616765696e6465787d7d</risu-style>',
     ]
@@ -303,6 +351,19 @@ test('prepared CBS reads match complete history for composed expressions and spa
         totalMessages: messages.length, chatID: 16,
         plan: planChatParserHistory({ source: '{{lastmessageindex}}|{{pick::a::b}}' }), reader })
     expect(readIndices).toEqual([])
+    for (const [source, index, affected] of [
+        ['plain', 79, false], ['{{lastmessageindex}}', 79, false],
+        ['{{previouschatlog::2}}', 79, false], ['{{previouschatlog::2}}', 2, true],
+        ['{{lastmessage}}', 78, false], ['{{lastmessage}}', 79, true],
+        ['{{previouscharchat}}', 13, false], ['{{previouscharchat}}', 15, true],
+        ['{{messageidleduration}}', 11, false], ['{{messageidleduration}}', 12, true],
+    ] as const) {
+        const access = await prepareCbsHistory({ characterId: character.chaId, conversationId: 'conversation',
+            totalMessages: messages.length, chatID: 16, plan: planChatParserHistory({ source }), reader })
+        expect(access.dependencies.affectedBy([{ start: index, end: index + 1, countChanged: false }]), source).toBe(affected)
+    }
+    const count = captureResidentCbsHistory(messages, planChatParserHistory({ source: '{{lastmessageindex}}' }), -1)
+    expect(count.dependencies.affectedBy([{ start: 80, end: 81, countChanged: true }])).toBe(true)
 })
 
 test('background and bookmark contexts read precise history and refresh on unpersisted tail edits', async () => {
@@ -334,6 +395,14 @@ test('background and bookmark contexts read precise history and refresh on unper
     const prepare = (text: string, parseFirst = true) => acquireLiveDisplayParserLease({
         source: text, character, signal: new AbortController().signal, parseFirst, chatID: parseFirst ? -1 : 1,
     })
+    character.customscript = [{ type: 'editdisplay', in: 'HP', out: '<b>HP</b>', flag: 'g', ableFlag: true }] as any
+    const plain = await prepare('{{#when::1::is::1}}HP{{/when}}')
+    expect(await ParseMarkdown(plain!.projection!.parsedSource!, character, 'back', -1, {}, {
+        scriptContext: plain!.projection!.context,
+    })).toBe('<b>HP</b>\n')
+    expect(bodyIndices).toEqual([])
+    plain?.release()
+    await expect(plain!.projection!.context.parserContext.prepareHistory!('{{lastmessage}}', -1, false)).rejects.toThrow('Live display lease is closed')
     const background = await prepare('{{previouscharchat}}|{{lastmessageindex}}')
     expect(background?.projection?.parsedSource).toBe('Live current|1')
     const inputs = captureLiveDisplayParserInputs('{{getvar::live}}', character)
@@ -341,16 +410,26 @@ test('background and bookmark contexts read precise history and refresh on unper
     expect(captureLiveDisplayParserInputs('{{getvar::live}}', character)).not.toEqual(inputs)
     expect((await prepare('{{getvar::live}}'))?.projection?.parsedSource).toBe('new variable value')
     const before = observed.mock.lastCall?.[1]
+    const fixed = await prepare('{{previouschatlog::0}}', false)
+    const fixedUpdates = vi.fn()
+    const unsubscribeFixed = subscribeLiveDisplayParserSelection(fixedUpdates, () => fixed?.projection?.context.parserContext.historyAccess?.dependencies)
+    fixedUpdates.mockClear()
     observed.mockClear()
     source.applyOptimisticRange(1, 1, [{ role: 'char', data: 'streamed tail' }])
+    expect(fixedUpdates).not.toHaveBeenCalled()
     expect(observed).toHaveBeenCalledOnce()
     expect(observed.mock.lastCall?.[1]).not.toBe(before)
     expect((await prepare('{{lastmessage}}'))?.projection?.parsedSource).toBe('streamed tail')
     source.applyOptimisticRange(2, 0, [{ role: 'user', data: 'appended' }])
+    expect(fixedUpdates).not.toHaveBeenCalled()
     expect((await prepare('{{lastmessage}}|{{lastmessageindex}}'))?.projection?.parsedSource).toBe('appended|2')
     const bookmark = await prepare('{{previouschatlog::0}}', false)
     const parser = bookmark!.projection!.context.parserContext
     expect(risuChatParser('{{previouschatlog::0}}', { ...parser, db: parser.database, chara: parser.character, chatID: 1 })).toBe('Live previous')
+    source.applyOptimisticRange(0, 1, [{ role: 'user', data: 'edited dependency' }])
+    expect(fixedUpdates).toHaveBeenCalledOnce()
+    unsubscribeFixed()
+    fixed?.release()
     unsubscribe()
     observed.mockClear()
     source.applyOptimisticRange(2, 1, [{ role: 'user', data: 'later' }])
@@ -394,6 +473,31 @@ test.each([false, true])('prepares newly exposed screenshot CBS and subsequent s
             } }
         expect(await ParseMarkdown(source, character, 'back', 1, {}, { scriptContext: liveContext })).toContain('captured tail')
     }
+})
+
+test.each([false, true])('screenshots defer regex-created CBS reads until rendering (translation %s)', async (translate) => {
+    const messages: Message[] = Array.from({ length: 80 }, (_, index) => ({ role: 'char', data: index === 6 ? 'H2' : `row ${index}` }))
+    const character = makeCharacter('Screenshot', messages)
+    character.customscript = [{ type: 'editdisplay', in: 'H([0-9]+)', out: '{{previouschatlog::$1}}', flag: 'g', ableFlag: true }] as any
+    const database = { ...makeDatabase(character, 'Screenshot'), translatorType: 'bergamot', htmlTranslation: true,
+        translator: 'ko', aiModel: 'gpt' } as Database
+    const context = { character: null, characterName: character.name, moduleAssets: [], presetRegex: [], moduleRegexScripts: [],
+        parserContext: { database, character, userName: 'User', personaPrompt: '', modules: [], moduleLorebooks: [],
+            selectedCharID: 0, chatVariables: {}, globalChatVariables: {}, currentTime: 1 },
+        settings: { autoTranslate: translate, dynamicAssets: false, dynamicAssetsEditDisplay: false },
+    } as unknown as ChatScreenshotRenderContext
+    const bodyIndices: number[] = []
+    const job = await createProductScreenshotJob({ characterId: character.chaId, chatId: 'chat', messages,
+        start: 7, end: 7, renderContext: context, bodyIndices })
+    expect(bodyIndices).toEqual([6])
+    const scriptContext = { ...job.renderContext, dynamicAssets: false, dynamicAssetsEditDisplay: false } as any
+    let text = job.messages[0].data
+    if (translate) {
+        bergamotTranslate.mockResolvedValueOnce('H2')
+        text = await translateHTML(text, false, character, 6, false, { scriptContext })
+    }
+    expect(await ParseMarkdown(text, character, 'back', 6, {}, { scriptContext })).toBe('row 2')
+    expect(bodyIndices).toEqual([6, 2])
 })
 
 test.each([false, true])('backward CBS scans use backend-aware bounded reads (projected %s)', async (projected) => {

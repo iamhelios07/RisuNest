@@ -312,10 +312,10 @@ export async function translateHTML(
     let DoingChat = captureContext ? false : get(doingChat)
     const parser = captureContext?.scriptContext.parserContext
     if (parser?.prepareHistory) {
-        const historyAccess = await parser.prepareHistory(html, chatID, [
+        const historyAccess = await parser.prepareHistory([
             ...captureContext.scriptContext.presetRegex, ...captureContext.scriptContext.moduleRegexScripts,
             ...(alwaysExistChar.customscript ?? []),
-        ].some((script) => script.type === 'edittrans'))
+        ].filter((script) => script.type === 'edittrans' && /<[^>]*\bcbs\b[^>]*>/.test(script.flag ?? '')).map((script) => script.in).join('\n'), chatID, false)
         captureContext = { ...captureContext, scriptContext: { ...captureContext.scriptContext,
             parserContext: { ...parser, historyAccess } } }
     }

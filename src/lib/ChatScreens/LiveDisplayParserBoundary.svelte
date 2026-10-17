@@ -38,16 +38,18 @@
     let retry = $state(0)
     let activeController: AbortController | null = null
     let readyOwner: string | null = null
+    let preparing = false
     let selectionRevision = 0
     let selectionIdentity = $state(untrack(captureLiveDisplayParserSelection))
     onMount(() =>
         subscribeLiveDisplayParserSelection((identity, revision) => {
-            historyRevision = revision ?? ''
             selectionRevision++
+            if (preparing && identity === selectionIdentity) return
+            historyRevision = revision ?? ''
             if (identity !== selectionIdentity) activeController?.abort()
             else if (failed) retry++
             selectionIdentity = identity
-        }),
+        }, () => projection?.context.parserContext.historyAccess?.dependencies),
     )
     const signature = $derived(
         JSON.stringify({
@@ -75,6 +77,7 @@
         const requestedOwner = owner
         const requestedRevision = selectionRevision
         const controller = new AbortController()
+        preparing = true
         activeController = controller
         let lease: { release(): void } | null = null
         // Retain the published DOM while a refresh is admitted, but never carry
@@ -97,12 +100,14 @@
                     return
                 }
                 lease = acquired
+                preparing = false
                 projection = acquired?.projection
                 readyOwner = requestedOwner
                 readySignal = controller.signal
             })
             .catch(() => {
                 if (controller.signal.aborted) return
+                preparing = false
                 // Preparation may complete elsewhere before this rejection arrives.
                 if (selectionRevision !== requestedRevision) retry++
                 else failed = true
