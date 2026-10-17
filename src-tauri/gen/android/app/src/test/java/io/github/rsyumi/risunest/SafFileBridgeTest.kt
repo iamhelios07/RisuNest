@@ -77,6 +77,123 @@ class SafFileBridgeTest {
   )
 
   @Test
+  fun `renderer reconciliation protects live exports and retains copied destinations`() {
+    val id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val record = terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false)
+    val session = SafDestinationRendererSession()
+    session.own(id)
+    assertNull(reconciledSafDestination(record, session.owns(id), 3_000))
+    val oldGeneration = session.generation
+    session.retire()
+    session.own(id, oldGeneration)
+    assertFalse(session.owns(id))
+    val recovered = reconciledSafDestination(record, session.owns(id), 3_000)!!
+    assertEquals(SafDestinationPhase.FAILED, recovered.phase)
+    assertEquals("destination-interrupted", recovered.code)
+    assertEquals(record.destinationUri, recovered.destinationUri)
+    assertTrue(recovered.publicationPrerequisitesComplete)
+    assertTrue(recovered.warningCodes.contains("partial-destination-may-remain"))
+    assertEquals(record.copy(publicationPrerequisitesComplete = true),
+      reconciledSafDestination(record.copy(publicationPrerequisitesComplete = true), false, 3_000))
+    for (phase in listOf(SafDestinationPhase.CANCELLED, SafDestinationPhase.FAILED)) {
+      val unstarted = record.copy(phase = phase, copyStarted = false, exportBound = false, warningCodes = emptyList())
+      assertEquals(unstarted, reconciledSafDestination(unstarted, false, 3_000))
+    }
+    assertNull(reconciledSafDestination(record.copy(phase = SafDestinationPhase.COPYING), false, 3_000))
+    assertNull(reconciledSafDestination(record.copy(sourceKind = SafDestinationSourceKind.SCREENSHOT), false, 3_000))
+    val fullWarnings = record.copy(warningCodes = (1..16).map { "warning-$it" })
+    val bounded = reconciledSafDestination(fullWarnings, false, 3_000)!!
+    assertEquals(16, bounded.warningCodes.size)
+    assertTrue(bounded.warningCodes.contains("partial-destination-may-remain"))
+  }
+
+  @Test
+  fun `released 1_0_5 terminal records recover without a copyStarted field`() {
+    val id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val file = temporaryDirectory().resolve("state.json")
+    val store = SafDestinationStateStore(file, testAtomicPublisher)
+    store.save(terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false))
+    file.writeText(file.readText().replace("\"copyStarted\":true,", ""))
+    val record = store.load()!!
+    assertTrue(record.copyStarted)
+    val recovered = reconciledSafDestination(record, false, 3_000)!!
+    store.save(recovered)
+    assertEquals("destination-interrupted", store.load()!!.code)
+    assertTrue(store.load()!!.publicationPrerequisitesComplete)
+  }
+
+  @Test
+  fun `recovered receipts survive startup readiness and cannot acknowledge a newer live export`() {
+    val id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val nextId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    val file = temporaryDirectory().resolve("state.json")
+    val store = SafDestinationStateStore(file, testAtomicPublisher)
+    val session = SafDestinationRendererSession()
+    store.save(terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false))
+    val retiredReady = AndroidFrontendReady()
+    assertTrue(retiredReady.markReady())
+    retiredReady.cancel()
+    val recovered = session.reconcile(store.load()!!, 3_000, store::save, { true }, store::clear, !retiredReady.isReady)!!
+    assertEquals(recovered, store.load())
+    assertEquals(listOf(recovered), session.pending())
+    assertFalse(session.acknowledge(id, store.load()) { false })
+    assertTrue(session.hasRecovered(id))
+    assertEquals(recovered, store.load())
+    session.reconcile(store.load()!!, 3_001, store::save, { true }, store::clear, false)
+    assertNull(store.load())
+    assertEquals(recovered, session.status(null))
+    val next = terminalDestinationRecord(nextId, nextId, SafDestinationSourceKind.RISU_SAVE, false)
+    assertNull(session.status(next.copy(phase = SafDestinationPhase.COPYING)))
+    assertEquals(next, session.status(next))
+    store.save(next)
+    session.own(nextId)
+    assertNull(session.reconcile(next, 3_002, store::save, { true }, store::clear, false))
+    assertTrue(session.acknowledge(id, store.load(), store::clear))
+    assertEquals(next, store.load())
+    assertTrue(session.pending().isEmpty())
+    assertFalse(session.acknowledge(id, store.load(), store::clear))
+  }
+
+  @Test
+  fun `failed reconciliation keeps its journal and retries cleanup before clearing`() {
+    val id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val file = temporaryDirectory().resolve("state.json")
+    val store = SafDestinationStateStore(file, testAtomicPublisher)
+    val session = SafDestinationRendererSession()
+    store.save(terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false))
+    assertNull(session.reconcile(store.load()!!, 3_000, store::save, { false }, store::clear, false))
+    assertTrue(store.load()!!.publicationPrerequisitesComplete)
+    assertTrue(session.pending().isEmpty())
+    assertNull(session.reconcile(store.load()!!, 3_000, store::save, { true }, { false }, false))
+    assertTrue(session.pending().isEmpty())
+    assertTrue(session.reconcile(store.load()!!, 3_000, store::save, { true }, store::clear, false) != null)
+    assertNull(store.load())
+  }
+
+  @Test
+  fun `recovered RisuSave cleanup removes the exact managed source and lease only`() {
+    val root = temporaryDirectory()
+    val id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val source = root.resolve("persistent/exports/risusave-$id.risudat")
+    source.parentFile!!.mkdirs()
+    val lease = source.parentFile!!.resolve("risusave-$id.lease")
+    val unrelated = source.parentFile!!.resolve("unrelated.risudat").apply { writeText("keep") }
+    source.writeText("synthetic")
+    lease.writeText("{\"exportId\":\"wrong\"}")
+    assertFalse(prepareRecoveredRisuSaveAcknowledgement(root, id))
+    assertTrue(source.exists())
+    lease.writeText("{\"exportId\":\"$id\"}")
+    assertTrue(prepareRecoveredRisuSaveAcknowledgement(root, id))
+    assertFalse(source.exists())
+    assertFalse(lease.exists())
+    assertTrue(unrelated.exists())
+    assertTrue(prepareRecoveredRisuSaveAcknowledgement(root, id))
+    lease.writeText("{\"exportId\":\"$id\"}")
+    assertTrue(prepareRecoveredRisuSaveAcknowledgement(root, id))
+    assertFalse(lease.exists())
+  }
+
+  @Test
   fun `interrupted preparation has no ready identity and can retry`() {
     val root = temporaryDirectory()
     var cancelled = true

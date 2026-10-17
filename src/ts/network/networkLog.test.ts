@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PlatformShape } from '../platform.testSupport'
+import { androidSafReservationFixture } from '../../../tests/support/androidSafReservation'
 const native = vi.hoisted(() => ({ invoke: vi.fn(), save: vi.fn(), android: vi.fn(), reserve: vi.fn(), ios: vi.fn(), platform: { runtime: 'tauri', os: 'windows' } as PlatformShape }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: native.save }))
@@ -18,6 +19,23 @@ beforeEach(() => {
     native.reserve.mockResolvedValue({requestId: 'synthetic-request', bind: async () => {}, release: async () => {}})
 })
 describe('network log viewer', () => {
+    it.each(['cancelled', 'failed', 'succeeded'])('preserves the %s outcome when Android reservation cleanup fails', async outcome => {
+        native.platform = {runtime: 'tauri', os: 'android'}
+        const actual = await vi.importActual<typeof import('../storage/androidSafBridge')>('../storage/androidSafBridge')
+        const picker = androidSafReservationFixture(undefined, actual.reserveAndroidSafDestination)
+        picker.failRelease()
+        native.reserve.mockImplementation(picker.reserve)
+        native.invoke.mockResolvedValue({path: 'synthetic-handoff', bytes: 123})
+        const failure = outcome === 'cancelled' ? new DOMException('cancelled', 'AbortError') : Object.assign(new Error('producer'), {code: 'producer-failed'})
+        if (outcome === 'succeeded') native.android.mockResolvedValueOnce({bytes: 123})
+        else native.android.mockRejectedValueOnce(failure)
+        const result = downloadNetworkLog('synthetic')
+        if (outcome === 'cancelled') await expect(result).resolves.toBe(false)
+        else if (outcome === 'failed') await expect(result).rejects.toBe(failure)
+        else await expect(result).rejects.toMatchObject({code: 'destination-cleanup-failed'})
+        if (outcome !== 'succeeded') expect(failure).toMatchObject({warningCodes: ['partial-destination-may-remain']})
+        expect(native.invoke).toHaveBeenLastCalledWith('native_download_handoff_cleanup', {path: 'synthetic-handoff'})
+    })
     it('does not write a log export when Android destination selection is cancelled', async () => {
         native.platform = {runtime: 'tauri', os: 'android'}
         native.reserve.mockRejectedValueOnce(new DOMException('cancelled', 'AbortError'))

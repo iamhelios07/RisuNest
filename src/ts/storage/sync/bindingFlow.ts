@@ -178,6 +178,11 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
         catch (registrationError) { throw new AggregateError([error, registrationError], 'Sync binding recovery registration failed') }
     }
     return {
+        invalidateCurrentResume(state: SyncBindingState): void {
+            if (active && active.context.state.targetAuthority === state.targetAuthority &&
+                active.context.state.selectionEpoch === state.selectionEpoch && active.context.state.libraryId === state.libraryId &&
+                sameTarget(active.context.state.target, state.target)) active.resumed = false
+        },
         async resumeCurrent(expectedTarget: BindingTarget): Promise<void> {
             if (running) throw new Error('A sync binding change is already running')
             running = true

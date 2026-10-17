@@ -48,7 +48,7 @@ mod screenshot_output_test;
 use crate::native_log::logged;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -3520,7 +3520,7 @@ pub(crate) fn native_file_job_forget(
         forget_device_session(&state, &device, &job_id)?;
         let forgotten = state.forget(&job_id)?;
         if restore {
-            crate::persistent_store::commands::with_store(app.state(), |store| restore_receipts::forget(store, &job_id)).map_err(error::store_error)?;
+            crate::persistent_store::commands::with_store(app.state(), |store| restore_receipts::forget(store, &state.registry, &job_id)).map_err(error::store_error)?;
         }
         Ok(forgotten)
     })())
@@ -4121,6 +4121,7 @@ pub(crate) struct JobRegistry {
     #[cfg(test)]
     content_preparation_gate: Mutex<Option<Arc<ContentPreparationGate>>>,
     jobs: Mutex<HashMap<String, Arc<JobControl>>>,
+    hidden_restore_receipts: Mutex<HashSet<String>>,
     max_terminal_jobs: usize,
     max_terminal_age: Duration,
 }
@@ -4157,6 +4158,7 @@ impl JobRegistry {
             #[cfg(test)]
             content_preparation_gate: Mutex::new(None),
             jobs: Mutex::new(HashMap::new()),
+            hidden_restore_receipts: Mutex::default(),
             max_terminal_jobs,
             max_terminal_age,
         }

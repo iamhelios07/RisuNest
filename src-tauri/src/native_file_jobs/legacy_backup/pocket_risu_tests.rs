@@ -408,6 +408,31 @@ fn pairs_early_sidecars_and_infers_missing_metadata() {
     assert_eq!(payloads.asset_aliases[0].name, "original");
     assert_eq!(payloads.asset_aliases[0].ext, "webp");
     assert_eq!(payloads.asset_aliases[1].mime, "audio/mpeg");
+    for metadata_kind in ["inlay_sidecar", "inlay_info"] {
+        for (metadata, expected_ext) in [
+            (br#"{}"#.as_slice(), "bin"),
+            (br#"{"ext":" "}"#.as_slice(), "bin"),
+            (br#"{"ext":42}"#.as_slice(), "bin"),
+            (br#"{"ext":"bin"}"#.as_slice(), "bin"),
+        ] {
+            let payloads = plan([
+                archive_entry(&format!("{metadata_kind}/movie"), metadata),
+                archive_entry("inlay/movie.MP4", b"synthetic video bytes"),
+            ].concat(), &NeverCancelled).unwrap();
+            assert_eq!(payloads.asset_aliases.len(), 1, "Known raw filename must remain readable");
+            let alias = &payloads.asset_aliases[0];
+            assert_eq!(alias.ext, expected_ext);
+            assert_eq!(alias.mime, "video/mp4");
+            assert_eq!(alias.name, "movie");
+            assert_eq!(alias.inlay_type.as_deref(), Some("image"));
+            assert_eq!(alias.size, 21);
+        }
+        let unknown = plan([
+            archive_entry(&format!("{metadata_kind}/movie"), br#"{"ext":"unknown"}"#),
+            archive_entry("inlay/movie.mp4", b"unsupported bytes"),
+        ].concat(), &NeverCancelled).unwrap();
+        assert!(unknown.asset_aliases.is_empty());
+    }
 }
 
 #[test]
@@ -420,7 +445,7 @@ fn rejects_duplicate_metadata_and_truncated_or_oversized_payloads() {
         .concat(),
         [
             archive_entry("inlay_sidecar/a", b"{}"),
-            archive_entry("inlay_info/a", b"{}"),
+            archive_entry("inlay_sidecar/a", b"{}"),
         ]
         .concat(),
         archive_entry("inlay/a.webp", b"a")[..19].to_vec(),
@@ -471,8 +496,8 @@ fn unsupported_inlay_shapes_are_counted_without_losing_readable_payloads() {
     ].concat(), &NeverCancelled).unwrap();
     assert_eq!(payloads.asset_aliases.len(), 1);
     assert_eq!(payloads.asset_aliases[0].key, "good");
-    assert_eq!(payloads.invalid_inlays, ["inlay/a.unknown", "inlay/b.webp", "inlay/broken-json", "inlay/broken-data-type", "inlay/broken-sidecar.webp", "inlay/broken-provenance.webp"]);
-    assert_eq!(payloads.skipped_inlays, 1);
+    assert_eq!(payloads.invalid_inlays, ["inlay/b.webp", "inlay/broken-json", "inlay/broken-data-type", "inlay/broken-sidecar.webp", "inlay/broken-provenance.webp"]);
+    assert_eq!(payloads.skipped_inlays, 2);
 }
 
 #[test]
@@ -482,12 +507,37 @@ fn extensionless_inlays_preserve_base64_signature_and_raw_sidecar_bytes() {
     let payloads = plan([
         archive_entry("inlay/base64", br#"{"ext":"png","name":"Image","type":"image","data":"AAEC//7+"}"#),
         archive_entry("inlay/url", br#"{"data":"data:image/png;base64,AAEC//7+","ext":"png","name":"URL","type":"image"}"#),
-        archive_entry("inlay/signature", br#"{"ext":"json","name":"Signature","type":"signature","data":"\uD83D\uDE00\ud800x\udc00\n"}"#),
+        archive_entry("inlay/signature", br#"{"type":"signature","data":"\uD83D\uDE00\ud800x\udc00\n"}"#),
         archive_entry("inlay/raw", raw),
         archive_entry("inlay_sidecar/raw", br#"{"ext":"json","name":"Raw","type":"signature"}"#),
         archive_entry("inlay/duplicate", br#"{"data":"longer ignored string","ext":"json","name":"Last","type":"signature","data":"last"}"#),
+        archive_entry("inlay/defaults", br#"{"data":"iVBORw0KGgo="}"#),
+        archive_entry("inlay/no-type", br#"{"ext":"png","name":"Named","data":"AAEC"}"#),
+        archive_entry("inlay/no-name", br#"{"ext":"png","type":"image","data":"AAEC"}"#),
+        archive_entry("inlay/precedence", br#"{"ext":"png","type":"image","name":"Own","data":"AAEC"}"#),
+        archive_entry("inlay_info/precedence", br#"{"ext":"gif","type":"image","name":"Legacy"}"#),
+        archive_entry("inlay_sidecar/precedence", br#"{"ext":"  ..W/E\\BP\u0000  ","type":"image","name":"Sidecar"}"#),
+        archive_entry("inlay/legacy-info", br#"{"ext":"png","type":"image","name":"Own","data":"AAEC"}"#),
+        archive_entry("inlay_info/legacy-info", br#"{"ext":"gif","name":"Legacy"}"#),
+        archive_entry("inlay/raw-png", b"\x89PNG\r\n\x1a\n"),
+        archive_entry("inlay/trailing-dot.", br#"{"data":"iVBORw0KGgo="}"#),
+        archive_entry("inlay/raw-jpeg.weird", &[0xff, 0xd8, 0xff, 0]),
+        archive_entry("inlay/raw-webp", b"RIFF1234WEBP"),
+        archive_entry("inlay/raw-gif", b"GIF89a"),
+        archive_entry("inlay/raw-avif", b"\0\0\0\x18ftypmif1\0\0\0\0mif1avif"),
+        archive_entry("inlay/unrecognized", b"unrecognized synthetic data"),
     ].concat(), &NeverCancelled).unwrap();
     assert!(payloads.invalid_inlays.is_empty());
+    assert_eq!(payloads.skipped_inlays, 1);
+    let signature = payloads.asset_aliases.iter().find(|alias| alias.key == "signature").unwrap();
+    assert_eq!(signature.ext, "bin");
+    assert_eq!(signature.name, "signature");
+    for (id, name, ext) in [("defaults", "defaults", "png"), ("no-type", "Named", "png"), ("no-name", "no-name", "png"), ("precedence", "Sidecar", "webp"), ("legacy-info", "Legacy", "gif"), ("raw-png", "raw-png", "png"), ("trailing-dot", "trailing-dot", "png"), ("raw-jpeg", "raw-jpeg", "jpg"), ("raw-webp", "raw-webp", "webp"), ("raw-gif", "raw-gif", "gif"), ("raw-avif", "raw-avif", "avif")] {
+        let alias = payloads.asset_aliases.iter().find(|alias| alias.key == id).unwrap();
+        assert_eq!(alias.name, name, "{id}");
+        assert_eq!(alias.ext, ext, "{id}");
+        assert_eq!(alias.inlay_type.as_deref(), Some("image"), "{id}");
+    }
     for (id, bytes) in [
         ("base64", &[0, 1, 2, 255, 254, 254][..]),
         ("url", &[0, 1, 2, 255, 254, 254][..]),

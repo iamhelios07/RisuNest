@@ -18,6 +18,7 @@ import { registerRuntimeErrorHandlers } from "./runtimeErrors";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure } from "./stores.svelte";
 import { afterPluginsStarted, keepPluginsOffForThisStart, loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
+import { setPluginStartupSyncExcluded } from './plugins/pluginStartupGate';
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertToast, alertTOS, waitAlert } from "./alert";
 import { backgroundErrorMessage } from "./storage/backgroundErrorMessage";
 import { applyHubSelection, characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
@@ -235,6 +236,7 @@ export async function loadData() {
         applyHubSelection(markers)
         const deviceSettings = loadDeviceSettings(markers)
         const pluginsExcludedAtStart = excluded('plugins')
+        setPluginStartupSyncExcluded(excluded('sync'))
         // A restore or a received change later in this run must not start the plugins either.
         if (pluginsExcludedAtStart) keepPluginsOffForThisStart()
         if (isTauri) {
@@ -356,6 +358,7 @@ export async function loadData() {
         const accountStorage = new AccountStorage(isTauri ? {
             ...nativeAccountStorageOptions,
             credentialRouting: {
+                getAccountId: () => nativeOfficialFlow?.getAccountId(),
                 getToken: () => nativeOfficialFlow?.getToken(),
                 reauthenticate: async (loginResult) => {
                     if (!snapshotRequestReauthentication) {

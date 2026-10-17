@@ -35,7 +35,7 @@ use super::{common, Dependencies};
 use crate::external_storage::{
     capabilities::Capabilities,
     contract::*,
-    http::{HttpRequest, HttpResponse},
+    http::{HttpRequest, HttpResponse, HttpTransport},
 };
 use api::{AssetView, Batch, Context, ReleaseView, RepositoryView};
 use reqwest::Method;
@@ -55,6 +55,24 @@ pub(crate) fn create(dependencies: Dependencies) -> Result<Arc<dyn Provider>> {
 
 struct GithubReleases {
     dependencies: Dependencies,
+}
+
+struct CleanupTransport<'a> {
+    inner: &'a dyn HttpTransport,
+    deleting: &'a (dyn Fn(bool) + Send + Sync),
+}
+impl HttpTransport for CleanupTransport<'_> {
+    fn send<'a>(&'a self, request: HttpRequest, cancel: &'a Cancellation) -> ProviderFuture<'a, HttpResponse> {
+        Box::pin(async move {
+            cancel.check()?;
+            (self.deleting)(true);
+            let response = self.inner.send(request, cancel).await;
+            if response.as_ref().map_or_else(|error| error.http_status.is_some(), |_| true) {
+                (self.deleting)(false);
+            }
+            response
+        })
+    }
 }
 
 fn corrupt() -> ProviderError {
@@ -84,13 +102,60 @@ fn capabilities() -> Capabilities {
 }
 
 impl GithubReleases {
+    async fn cleanup_empty_container(
+        &self,
+        repository: &RepositoryHandle,
+        locator: &RemoteLocator,
+        protected_jobs: &[String],
+        deleting: &(dyn Fn(bool) + Send + Sync),
+        cancel: &Cancellation,
+    ) -> Result<bool> {
+        let context = self.context(repository)?;
+        locator.validate_for(repository)?;
+        let (release, _) = api::parse_locator(&locator.object)?;
+        let request = self.request(context, Method::GET, context.release_url(release)?, ProviderOperation::Metadata);
+        let response = self.send(request, cancel).await?;
+        if response.status == 404 { return Ok(true); }
+        let view: ReleaseView = self.decode(response, cancel).await?;
+        let Some(tag) = locator.collection.as_deref() else { return Ok(false); };
+        let prefix = context.tag(api::JOB_BATCH_PREFIX, 0);
+        let prefix = prefix.strip_suffix("-0").ok_or_else(corrupt)?;
+        let Some((batch_tag, sequence)) = tag.rsplit_once('-') else { return Ok(false); };
+        let Some(job_hash) = batch_tag.strip_prefix(prefix) else { return Ok(false); };
+        if view.id != release || view.tag_name != tag || !view.draft
+            || job_hash.len() != 16 || !job_hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || sequence.parse::<u32>().ok().is_none_or(|value| value.to_string() != sequence)
+            || protected_jobs.iter().any(|job| context.tag(&api::batch_key(ObjectRole::Pack, job), 0)
+                .strip_suffix("-0") == Some(batch_tag)) {
+            return Ok(false);
+        }
+        // Any member, including an unfinished upload, keeps the release alive.
+        if !self.assets_page(context, release, 1, cancel).await?.is_empty() { return Ok(false); }
+        let request = self.request(context, Method::DELETE, context.release_url(release)?, ProviderOperation::Delete);
+        let response = self.send_cleanup_delete(request, deleting, cancel).await?;
+        match response.status {
+            204 | 404 => Ok(true),
+            status => Err(api::classify(status, &response.headers, self.now())),
+        }
+    }
+
     fn now(&self) -> u64 {
         self.dependencies.clock.now_ms()
     }
 
+    async fn send_cleanup_delete(&self, request: HttpRequest, deleting: &(dyn Fn(bool) + Send + Sync), cancel: &Cancellation) -> Result<HttpResponse> {
+        let transport = CleanupTransport { inner: self.dependencies.http.as_ref(), deleting };
+        self.send_with_transport(&transport, request, cancel).await
+    }
+
     async fn send(&self, request: HttpRequest, cancel: &Cancellation) -> Result<HttpResponse> {
+        self.send_with_transport(self.dependencies.http.as_ref(), request, cancel).await
+    }
+
+    async fn send_with_transport(&self, transport: &dyn HttpTransport, request: HttpRequest, cancel: &Cancellation) -> Result<HttpResponse> {
         let account = request.account.clone();
-        let response = self.dependencies.send(request, cancel).await?;
+        let response = crate::external_storage::http::send(transport, self.dependencies.mybox_budget.as_ref(),
+            self.dependencies.clock.as_ref(), self.dependencies.requests.as_ref(), request, cancel).await?;
         if matches!(response.status, 403 | 429) {
             let now = self.now();
             let error = api::classify(response.status, &response.headers, now);
@@ -845,9 +910,10 @@ impl Provider for GithubReleases {
             let mut exhausted_releases = false;
             let mut releases: Option<Vec<ReleaseView>> = None;
             let mut requests = 0;
-            while objects.is_empty() || requests < api::MAX_LIST_STEPS {
+            loop {
                 cancel.check()?;
                 if releases.is_none() {
+                    if requests >= api::MAX_LIST_STEPS { break; }
                     requests += 1;
                     releases = Some(self.releases_page(context, release_page, cancel).await?);
                 }
@@ -874,6 +940,7 @@ impl Provider for GithubReleases {
                     asset_index = 0;
                     continue;
                 }
+                if requests >= api::MAX_LIST_STEPS { break; }
                 requests += 1;
                 let assets = self.assets_page(context, id, asset_page, cancel).await?;
                 let exhausted = assets.len() < api::ASSET_PAGE_SIZE;
@@ -961,7 +1028,13 @@ impl Provider for GithubReleases {
                 } else { next_release(index + 1)? };
                 let candidates = assets.iter().filter(|asset| asset.state == "starter"
                     && asset.size == 0 && api::removable_asset(&asset.name)).collect::<Vec<_>>();
-                if candidates.is_empty() { return Ok(IncompleteCleanupPage { removed: 0, next_cursor }); }
+                if candidates.is_empty() {
+                    let next_cursor = if assets.is_empty() && self.cleanup_empty_container(repository,
+                        &context.locator(&release.tag_name, release.id, 1), protected_jobs, deleting, cancel).await? {
+                        Some(format!("{page}:{index}:1:0"))
+                    } else { next_cursor };
+                    return Ok(IncompleteCleanupPage { removed: 0, next_cursor });
+                }
                 let response = self.send(self.request(context, Method::GET, context.release_url(release.id)?, ProviderOperation::Metadata), cancel).await?;
                 if response.status == 404 { return Ok(IncompleteCleanupPage { removed: 0, next_cursor: next_release(index + 1)? }); }
                 let owner: ReleaseView = self.decode(response, cancel).await?;
@@ -978,15 +1051,17 @@ impl Provider for GithubReleases {
                     if current.id != asset.id || current.name != asset.name
                         || current.state != "starter" || current.size != 0 { continue; }
                     let request = self.request(context, Method::DELETE, context.asset_url(asset.id)?, ProviderOperation::Delete);
-                    cancel.check()?;
-                    deleting(true);
-                    let response = self.send(request, cancel).await?;
+                    let response = self.send_cleanup_delete(request, deleting, cancel).await?;
                     match response.status {
-                        204 | 404 => { deleting(false); removed += 1; }
+                        204 | 404 => { removed += 1; }
                         status => return Err(api::classify(status, &response.headers, self.now())),
                     }
                 }
-                // Deletion shifts numbered asset pages. Revisit this page before advancing.
+                if removed > 0 && self.cleanup_empty_container(repository,
+                    &context.locator(&release.tag_name, release.id, 1), protected_jobs, deleting, cancel).await? {
+                    asset_page = 1;
+                }
+                // Deletion shifts numbered release and asset pages. Revisit before advancing.
                 let next_cursor = if removed > 0 { Some(format!("{page}:{index}:{asset_page}:0")) } else { next_cursor };
                 return Ok(IncompleteCleanupPage { removed, next_cursor });
             }
@@ -1002,33 +1077,7 @@ impl Provider for GithubReleases {
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, ()> {
         Box::pin(async move {
-            let context = self.context(repository)?;
-            locator.validate_for(repository)?;
-            let (release, _) = api::parse_locator(&locator.object)?;
-            let request = self.request(context, Method::GET, context.release_url(release)?, ProviderOperation::Metadata);
-            let response = self.send(request, cancel).await?;
-            if response.status == 404 { return Ok(()); }
-            let view: ReleaseView = self.decode(response, cancel).await?;
-            let Some(tag) = locator.collection.as_deref() else { return Ok(()); };
-            let prefix = context.tag(api::JOB_BATCH_PREFIX, 0);
-            let prefix = prefix.strip_suffix("-0").ok_or_else(corrupt)?;
-            let Some((batch_tag, sequence)) = tag.rsplit_once('-') else { return Ok(()); };
-            let Some(job_hash) = batch_tag.strip_prefix(prefix) else { return Ok(()); };
-            if view.id != release || view.tag_name != tag || !view.draft
-                || job_hash.len() != 16 || !job_hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                || sequence.parse::<u32>().ok().is_none_or(|value| value.to_string() != sequence)
-                || protected_jobs.iter().any(|job| context.tag(&api::batch_key(ObjectRole::Pack, job), 0)
-                    .strip_suffix("-0") == Some(batch_tag)) {
-                return Ok(());
-            }
-            // Any member, including an unfinished upload, keeps the release alive.
-            if !self.assets_page(context, release, 1, cancel).await?.is_empty() { return Ok(()); }
-            let request = self.request(context, Method::DELETE, context.release_url(release)?, ProviderOperation::Delete);
-            let response = self.send(request, cancel).await?;
-            match response.status {
-                204 | 404 => Ok(()),
-                status => Err(api::classify(status, &response.headers, self.now())),
-            }
+            self.cleanup_empty_container(repository, locator, protected_jobs, &|_| {}, cancel).await.map(|_| ())
         })
     }
 

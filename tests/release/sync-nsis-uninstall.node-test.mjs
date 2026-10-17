@@ -42,6 +42,44 @@ SectionEnd
 });
 import { readFileSync, mkdirSync, copyFileSync, symlinkSync, unlinkSync } from 'node:fs';
 
+test('released uninstall validation selects exact previous sources and keeps the legacy baseline', { skip: process.platform !== 'win32' }, () => {
+  const directory = mkdtempSync(join(tmpdir(), 'risunest-frozen-selection-'));
+  try {
+    const source = readFileSync('server/manager/install/windows.test.ps1', 'utf8');
+    const start = source.indexOf('                $frozenCases =');
+    const end = source.indexOf('                foreach ($frozenCase in $frozenCases)', start);
+    assert.ok(start >= 0 && end > start, 'frozen source selection must precede fixture execution');
+    const selection = source.slice(start, end);
+    const script = join(directory, 'select.ps1');
+    writeFileSync(script, `
+$ErrorActionPreference = 'Stop'
+$directory = $PSScriptRoot
+$released = 'previous-bundle'
+$next = 'current-bundle'
+$fixture = New-Item -ItemType Directory (Join-Path $directory 'legacy')
+'{"version":"1.0.4"}' | Set-Content (Join-Path $fixture 'risunest-sync-bundle.json')
+$LegacyReleasedBundle = Join-Path $directory 'legacy.zip'
+Compress-Archive -Path (Join-Path $fixture '*') -DestinationPath $LegacyReleasedBundle
+$result = @()
+foreach ($releasedVersion in @('1.0.4', '1.0.5')) {
+  $nextVersion = if ($releasedVersion -eq '1.0.4') { '1.0.5' } else { '1.0.6' }
+  $testRoot = New-Item -ItemType Directory (Join-Path $directory $releasedVersion)
+${selection}
+  $result += ,@($frozenCases | ForEach-Object { @{ version=$_.Version; source=$_.Ref; directory=$_.Directory.ToString() } })
+}
+ConvertTo-Json -Depth 8 -InputObject $result
+`);
+    const result = spawnSync('powershell.exe', ['-NoProfile', '-File', script], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const [legacyPrevious, resumablePrevious] = JSON.parse(result.stdout);
+    assert.deepEqual(legacyPrevious.map(item => [item.version, item.source]), [['1.0.4', 'sync-v1.0.4'], ['1.0.5', null]]);
+    assert.deepEqual(resumablePrevious.map(item => [item.version, item.source]), [['1.0.5', 'sync-v1.0.5'], ['1.0.4', 'sync-v1.0.4'], ['1.0.6', null]]);
+    assert.equal(resumablePrevious[0].directory, 'previous-bundle');
+    assert.equal(resumablePrevious[2].directory, 'current-bundle');
+    assert.equal(existsSync(join(resumablePrevious[1].directory, 'risunest-sync-bundle.json')), true);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 const q = value => value.replaceAll('$', '$$').replaceAll('"', '$\\"');
 function buildManagerStub(directory) {
   const stubSource = join(directory, 'manager.rs');
@@ -61,7 +99,7 @@ fn main() {
  let mut values=env::args().skip(1).collect::<Vec<_>>();
  let data=if values.first().is_some_and(|v| v=="--data-dir") {let data=std::path::PathBuf::from(values[1].clone());values.drain(0..2);data} else {root.join("local/RisuNestSyncData")};
  if values.first().is_some_and(|v| v=="--server") {root=std::path::PathBuf::from(&values[1]).parent().unwrap().to_owned();values.drain(0..2);}
- if values.iter().any(|v| v=="forget-removal") {return;}
+ if values.iter().any(|v| v=="forget-removal-resumable") {return;}
  assert!(data.starts_with(&root));
  let args=values.join(" ").trim().to_owned();
  if args=="installer removal-check normal delete" {println!("delete-data");}
@@ -76,19 +114,24 @@ fn main() {
   println!("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
  }
  if args=="installer preserve-files" {
+  if fs::read(root.join("risunest-sync-bundle.json")).unwrap()==b"invalid" {println!("skipped");return;}
   let baseline=root.join("risunest-sync-bundle.previous.json");
   if !baseline.exists() {fs::copy(root.join("risunest-sync-bundle.json"), baseline).unwrap();}
  }
  if args=="installer delete-data" {
   if root.join("fail").exists() {std::process::exit(9);}
-  if data.exists() {fs::remove_dir_all(data).unwrap();}
+  if data.exists() {fs::remove_dir_all(&data).unwrap();}
  }
- if values.first().is_some_and(|v| v=="installer") && values.get(1).is_some_and(|v| v=="remove-files") && root.join("fail-remove").exists() {
+ if values.first().is_some_and(|v| v=="installer") && values.get(1).is_some_and(|v| v=="remove-files-resumable") && root.join("fail-remove").exists() {
   fs::remove_file(root.join("fail-remove")).unwrap();
   println!("removal-file-failed: synthetic");
   std::process::exit(7);
  }
- if args=="installer commit-removal" || args=="installer resume-removal" {
+ if args=="installer commit-removal" || args.starts_with("installer resume-removal ") {
+  if args=="installer resume-removal delete" {
+   if data.join("risunest-sync-instance.json").exists() {fs::remove_dir_all(&data).unwrap();}
+   else {println!("keep-data");}
+  }
   let retry=root.join(".risunest-sync-removal"); fs::create_dir_all(&retry).unwrap();
   fs::write(retry.join("complete"), "true").unwrap();
  }
@@ -115,8 +158,9 @@ function waitForFixture(condition) {
   }
 }
 function holdDeletion(binary, path) {
-  const ready = `${path}.lock-ready`;
-  const release = `${path}.lock-release`;
+  const signals = mkdtempSync(join(dirname(binary), 'lock-signals-'));
+  const ready = join(signals, 'ready');
+  const release = join(signals, 'release');
   const child = spawn(binary, ['hold-file', path, ready, release], { windowsHide: true, stdio: 'ignore' });
   const exited = new Promise(resolve => child.once('exit', resolve));
   waitForFixture(() => existsSync(ready));
@@ -124,12 +168,12 @@ function holdDeletion(binary, path) {
     writeFileSync(release, 'release');
     waitForFixture(() => !existsSync(ready));
     await exited;
-    rmSync(release);
+    rmSync(signals, { recursive: true });
   };
 }
 function writeManagerHook(directory) {
   const hook = join(directory, 'hook.nsh');
-  writeFileSync(hook, readFileSync(resolve('server/manager/install/windows.nsh'), 'utf8').replaceAll('$LOCALAPPDATA', '$INSTDIR\\local').replace(/!include [^\r\n]+windows-common.nsh"/, `!include "${resolve('src-tauri/windows-common.nsh')}"`));
+  writeFileSync(hook, readFileSync(resolve('server/manager/install/windows.nsh'), 'utf8').replaceAll('$LOCALAPPDATA', '$INSTDIR\\local').replace(/!include [^\r\n]+windows-common.nsh"/, `!include "${resolve('src-tauri/windows-common.nsh')}"`).replace('DetailPrint "$(SyncResumeDataKept)"', 'FileOpen $0 "$INSTDIR\\data-kept" w\nFileWriteUTF16LE $0 "$(SyncResumeDataKept)"\nFileClose $0'));
   return hook;
 }
 
@@ -234,7 +278,7 @@ SectionEnd
       const calls = readFileSync(join(location, 'calls'), 'utf8');
       if (scenario.name === 'update') {
         assert.match(calls, /^prepare-update:/);
-        assert.doesNotMatch(calls, /uninstall|delete-data|forget-removal/);
+        assert.doesNotMatch(calls, /uninstall|delete-data|forget-removal-resumable/);
       } else {
         assert.equal([...calls.matchAll(/^installer prepare ([1-9]\d*):/gm)].length, 1, `${scenario.name}: prepare receives the uninstaller owner PID`);
         assert.match(calls, /^uninstall lock-held(?: --force)?:/m);
@@ -246,12 +290,12 @@ SectionEnd
       }
       if (scenario.data && !scenario.installed && scenario.name !== 'update') {
         assert.match(calls, /^installer finish aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:/m);
-        assert.ok(calls.indexOf('installer finish') > calls.indexOf('installer remove-files'));
+        assert.ok(calls.indexOf('installer finish') > calls.indexOf('installer remove-files-resumable'));
       }
       if (scenario.unregistered) {
         assert.match(calls, /installer removal-check force delete/);
         assert.match(calls, /uninstall lock-held --force/);
-        assert.match(calls, /installer remove-files force/);
+        assert.match(calls, /installer remove-files-resumable force/);
         assert.doesNotMatch(calls, /installer delete-data/);
       }
       if (scenario.name === 'unchecked') {
@@ -265,7 +309,7 @@ SectionEnd
         assert.equal(existsSync(join(location, 'risunest-sync-manager.exe')), false, `${scenario.name}: retry removes the manager`);
         const retried = readFileSync(join(location, 'calls'), 'utf8').slice(calls.length);
         assert.match(retried, /^installer delete-data:/m);
-        assert.match(retried, /^installer remove-files normal:/m);
+        assert.match(retried, /^installer remove-files-resumable normal:/m);
       }
     }
     {
@@ -290,6 +334,7 @@ SectionEnd
       assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
       const retry = join(location, '.risunest-sync-removal');
       mkdirSync(retry);
+      writeFileSync(join(retry, 'data-path'), Buffer.from(join(location, 'local/RisuNestSyncData'), 'utf16le'));
       copyFileSync(binary, join(retry, 'manager.exe'));
       const prepared = !['helper-copy', 'receipt-staged'].includes(boundary);
       if (prepared) writeFileSync(join(retry, 'receipt.json'), '{}');
@@ -321,6 +366,64 @@ SectionEnd
       assert.equal(existsSync(join(location, 'risunest-sync-manager.exe')), false, boundary);
       assert.equal(existsSync(retry), false, `${boundary}: retry artifacts removed`);
       assert.equal(existsSync(join(location, 'local/RisuNestSyncData')), true, `${boundary}: preserved data`);
+    }
+    for (const [boundary, deleted] of ['pending', 'forgotten', 'complete'].flatMap(boundary => [false, true].map(deleted => [boundary, deleted]))) {
+      const location = join(directory, `delete-resume-${boundary}-${deleted}`);
+      const data = join(location, 'custom data 경로');
+      mkdirSync(data, { recursive: true });
+      writeFileSync(join(data, 'synthetic'), 'fixture');
+      if (boundary === 'pending') writeFileSync(join(data, 'risunest-sync-instance.json'), '{}');
+      assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
+      const retry = join(location, '.risunest-sync-removal');
+      mkdirSync(retry);
+      writeFileSync(join(retry, 'data-path'), Buffer.from(data, 'utf16le'));
+      copyFileSync(binary, join(retry, 'manager.exe'));
+      writeFileSync(join(retry, 'receipt.json'), '{}');
+      rmSync(join(location, 'risunest-sync-manager.exe'));
+      if (boundary === 'complete') writeFileSync(join(retry, 'complete'), 'true');
+      if (deleted) rmSync(data, { recursive: true });
+      const result = spawnSync(join(location, 'uninstall.exe'), ['/S', '/DELETEAPPDATA', `_?=${location}`], { timeout: 30000, windowsHide: true });
+      assert.equal(result.status, 0, boundary);
+      assert.equal(existsSync(data), !deleted && boundary !== 'pending', boundary);
+      assert.equal(existsSync(join(location, 'data-kept')), !deleted && boundary !== 'pending');
+      if (!deleted && boundary !== 'pending') {
+        const message = readFileSync(join(location, 'data-kept'), 'utf16le');
+        assert.ok(message === `Server data could not be deleted. Data folder: ${data}` || message === `서버 데이터를 삭제하지 못했습니다. 데이터 폴더: ${data}`, message);
+      }
+    }
+    for (const invalid of ['', 'relative', 'x'.repeat(20000)]) {
+      const location = join(directory, `invalid-path-${invalid.length}`);
+      mkdirSync(location);
+      assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
+      rmSync(join(location, 'risunest-sync-manager.exe'));
+      const retry = join(location, '.risunest-sync-removal');
+      mkdirSync(retry);
+      writeFileSync(join(retry, 'complete'), 'true');
+      writeFileSync(join(retry, 'data-path'), Buffer.from(invalid, 'utf16le'));
+      assert.equal(spawnSync(join(location, 'uninstall.exe'), ['/S', '/DELETEAPPDATA', `_?=${location}`], { timeout: 30000, windowsHide: true }).status, 1);
+      assert.equal(existsSync(join(location, 'data-kept')), false, 'an invalid path never reports the default data directory');
+      assert.equal(existsSync(join(location, 'uninstall.exe')), true);
+    }
+    for (const locked of ['complete', 'data-path']) {
+      const location = join(directory, `locked-completed-${locked}`);
+      const data = join(location, 'custom data');
+      mkdirSync(data, { recursive: true });
+      assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
+      rmSync(join(location, 'risunest-sync-manager.exe'));
+      const retry = join(location, '.risunest-sync-removal');
+      mkdirSync(retry);
+      writeFileSync(join(retry, 'complete'), 'true');
+      writeFileSync(join(retry, 'data-path'), Buffer.from(data, 'utf16le'));
+      const releaseLock = holdDeletion(binary, join(retry, locked));
+      try {
+        assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 1);
+        assert.equal(readFileSync(join(retry, 'complete'), 'utf8'), 'true');
+        assert.equal(readFileSync(join(retry, 'data-path'), 'utf16le'), data);
+      } finally { await releaseLock(); }
+      assert.equal(spawnSync(join(location, 'uninstall.exe'), ['/S', '/FORCE', '/DELETEAPPDATA', `_?=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
+      assert.equal(existsSync(retry), false);
+      assert.equal(existsSync(data), true);
+      assert.ok(readFileSync(join(location, 'data-kept'), 'utf16le').includes(data));
     }
     completed = true;
   } finally {
@@ -400,7 +503,9 @@ test('Sync setup keeps the replaced bundle list until a retry removes obsolete f
     const replacement = join(directory, 'replacement.json');
     writeFileSync(replacement, '{"version":"1.0.5","files":["risunest-sync-manager.exe"]}\n');
     const script = join(directory, 'installer.nsi');
-    writeFileSync(script, setupScript(directory, writeManagerHook(directory), String.raw`
+    const hook = writeManagerHook(directory);
+    writeFileSync(hook, readFileSync(hook, 'utf8').replaceAll('DetailPrint "$(SyncObsoleteSkipped)"', 'FileOpen $0 "$INSTDIR\\obsolete-skipped" w\nFileWriteUTF16LE $0 "$(SyncObsoleteSkipped)"\nFileClose $0'));
+    writeFileSync(script, setupScript(directory, hook, String.raw`
 !insertmacro NSIS_HOOK_PREINSTALL
 SetOutPath "$INSTDIR"
 File /oname=risunest-sync-manager.exe "${q(binary)}"
@@ -426,6 +531,16 @@ File /oname=risunest-sync-bundle.json "${q(replacement)}"
     assert.equal(install(fresh).status, 0);
     assert.equal(existsSync(join(fresh, 'risunest-sync-bundle.previous.json')), false);
     assert.doesNotMatch(readFileSync(join(fresh, 'calls'), 'utf8'), /obsolete-files/);
+    const corrupt = join(directory, 'corrupt');
+    mkdirSync(corrupt);
+    copyFileSync(binary, join(corrupt, 'risunest-sync-manager.exe'));
+    writeFileSync(join(corrupt, 'risunest-sync-bundle.json'), 'invalid');
+    writeFileSync(join(corrupt, 'risunest-sync-bundle.previous.json'), previous);
+    assert.equal(install(corrupt).status, 0);
+    assert.doesNotMatch(readFileSync(join(corrupt, 'calls'), 'utf8'), /obsolete-files/);
+    assert.equal(readFileSync(join(corrupt, 'risunest-sync-bundle.previous.json'), 'utf8'), previous);
+    const detail = readFileSync(join(corrupt, 'obsolete-skipped'), 'utf16le');
+    assert.ok(detail === 'The previous bundle marker could not be read. Obsolete-file cleanup was skipped.' || detail === '이전 설치의 파일 목록을 읽을 수 없어 이전 파일 제거를 건너뛰었습니다.', detail);
   } finally {
     assert.equal(dirname(directory), resolve(tmpdir()));
     rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -526,6 +641,13 @@ SectionEnd
     } finally { await releaseLock(); }
     assert.equal(spawnSync(active, ['/S', `_?=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
     assert.equal(existsSync(installed), false);
+    assert.equal(existsSync(retry), false);
+    assert.equal(spawnSync('reg.exe', ['query', `HKCU\\${key}`], { windowsHide: true }).status, 1);
+    assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
+    mkdirSync(retry); writeFileSync(join(retry, 'complete'), 'true');
+    assert.equal(spawnSync(installed, ['/S', `_?=${location.toUpperCase()}`], { timeout: 30000, windowsHide: true }).status, 0, 'in-place removal leaves its image for the caller');
+    assert.equal(existsSync(installed), true);
+    assert.equal(existsSync(location), true);
     assert.equal(existsSync(retry), false);
     assert.equal(spawnSync('reg.exe', ['query', `HKCU\\${key}`], { windowsHide: true }).status, 1);
     assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 0);

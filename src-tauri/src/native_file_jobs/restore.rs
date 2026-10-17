@@ -3383,6 +3383,7 @@ mod tests {
 
     #[test]
     fn legacy_import_counts_each_excluded_character_once_before_and_after_cold_expansion() {
+        for historical_json in [false, true] {
         let (directory, mut sink) = fixture();
         sink.prepared_characters.insert("cold".to_owned(), json!({"chaId":"cold","type":"group","chats":[]}));
         let database = json!({"characters":[
@@ -3393,15 +3394,21 @@ mod tests {
         ], "botPresets":[], "characterOrder":["§temp","cold","kept"]});
         let payload = super::legacy_stream_tests::messagepack_bytes(&super::legacy_stream_tests::messagepack_from_json(&database));
         let source = directory.path().join("excluded-legacy.risudat");
-        fs::write(&source, legacy_wire(7, &payload)).unwrap();
+        let bytes = if historical_json {
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&serde_json::to_vec(&database).unwrap()).unwrap();
+            encoder.finish().unwrap()
+        } else { legacy_wire(7, &payload) };
+        fs::write(&source, bytes).unwrap();
         let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
-        let result = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap();
+        let result = restore_risu_save(&source, 1, &job, &sink).unwrap();
         assert_eq!(result.character_count, 1);
         assert_eq!(job.status().incomplete_restore_preview.unwrap().omissions.excluded_characters, 3);
         assert!(result.warning_codes.contains(&"excluded-backup-characters:3".to_owned()));
         let restored = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
         assert_eq!(restored["characters"][0]["name"], "Kept");
         assert_eq!(restored["characterOrder"], json!(["kept"]));
+        }
     }
 
     #[test]

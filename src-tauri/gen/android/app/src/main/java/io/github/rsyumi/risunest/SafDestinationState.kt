@@ -287,6 +287,64 @@ internal fun completedSafPublicationPrerequisites(
   )
 }
 
+internal fun reconciledSafDestination(
+  record: SafDestinationRecord,
+  ownedByRenderer: Boolean,
+  nowMillis: Long,
+): SafDestinationRecord? {
+  if (ownedByRenderer || record.sourceKind != SafDestinationSourceKind.RISU_SAVE || !record.isTerminal()) return null
+  if (!record.exportBound || !record.copyStarted || record.publicationPrerequisitesComplete) return record
+  return record.copy(
+    phase = SafDestinationPhase.FAILED,
+    code = "destination-interrupted",
+    warningCodes = (record.warningCodes.filterNot { it in interruptedSafDestinationWarnings() }.take(14) +
+      interruptedSafDestinationWarnings()).distinct(),
+    publicationPrerequisitesComplete = true,
+    updatedAtMillis = nowMillis,
+  )
+}
+
+// Session ownership is deliberately transient; persisted records belong to the previous renderer.
+internal class SafDestinationRendererSession {
+  var generation: Long = 0
+    private set
+  private var ownedRequestId: String? = null
+  private val recovered = linkedMapOf<String, SafDestinationRecord>()
+
+  fun own(requestId: String, expectedGeneration: Long = generation) {
+    if (expectedGeneration == generation) ownedRequestId = requestId
+  }
+  fun retire() { ownedRequestId = null; generation++ }
+  fun owns(requestId: String): Boolean = ownedRequestId == requestId
+  fun pending(): List<SafDestinationRecord> = recovered.values.toList()
+  fun hasRecovered(requestId: String): Boolean = recovered.containsKey(requestId)
+  fun status(current: SafDestinationRecord?): SafDestinationRecord? =
+    if (current == null) recovered.values.firstOrNull() else current.takeIf(SafDestinationRecord::isTerminal)
+
+  fun reconcile(
+    record: SafDestinationRecord,
+    nowMillis: Long,
+    save: (SafDestinationRecord) -> Unit,
+    prepare: (SafDestinationRecord) -> Boolean,
+    clear: (String) -> Boolean,
+    retainJournal: Boolean,
+  ): SafDestinationRecord? {
+    val terminal = reconciledSafDestination(record, owns(record.requestId), nowMillis) ?: return null
+    save(terminal)
+    if (!prepare(terminal)) return null
+    if (!retainJournal && !clear(terminal.requestId)) return null
+    recovered[terminal.requestId] = terminal
+    return terminal
+  }
+
+  fun acknowledge(requestId: String, current: SafDestinationRecord?, clear: (String) -> Boolean): Boolean {
+    if (!recovered.containsKey(requestId)) return false
+    if (current?.requestId == requestId && !clear(requestId)) return false
+    recovered.remove(requestId)
+    return true
+  }
+}
+
 internal fun acknowledgeSafDestinationExport(
   requestId: String,
   load: () -> SafDestinationRecord?,

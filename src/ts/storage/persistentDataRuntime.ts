@@ -1510,7 +1510,7 @@ export function createPersistentDataRuntime(
                         if (pluginsFenced) await plugins.restartPluginsAfterAuthorityReplacement()
                         await binding.assertAuthority()
                         await binding.resume()
-                    } catch {}
+                    } catch {} finally { binding.release() }
                     throw error
                 }
                 let committed = false

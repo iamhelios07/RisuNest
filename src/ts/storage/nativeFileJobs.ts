@@ -19,6 +19,7 @@ import {
     copyNativeExportToAndroidSaf,
     discardAndroidSafSource,
     reserveAndroidSafDestination,
+    withAndroidSafDestination,
     type AndroidSafDestinationReservation,
     type AndroidSafExportKind,
     type AndroidSafDestinationRequest,
@@ -1302,6 +1303,23 @@ async function abortBeforeNativeRestoreStart(
     throw abortError()
 }
 
+function cancellableRestorePreparation<T>(work: Promise<T>, signal?: AbortSignal, lateResult?: (value: T) => Promise<void>): Promise<T> {
+    return new Promise((resolve, reject) => {
+        let cancelled = false
+        const abort = () => { cancelled = true; reject(abortError()) }
+        signal?.addEventListener('abort', abort, { once: true })
+        if (signal?.aborted) abort()
+        work.then(value => {
+            signal?.removeEventListener('abort', abort)
+            if (cancelled) void lateResult?.(value).catch(() => {})
+            else resolve(value)
+        }, error => {
+            signal?.removeEventListener('abort', abort)
+            reject(error)
+        })
+    })
+}
+
 async function runNativeReplacementRestore(
     kind:
         | 'restore-block-risu-save'
@@ -1347,9 +1365,12 @@ async function runNativeReplacementRestore(
         await abortBeforeNativeRestoreStart(source, dependencies)
     }
 
-    const mutationToken = await bounded(runtime.capturePersistentMutationToken(
-        mutationReason, { publishOfficial: false },
-    ), 'mutation flush')
+    const mutationToken = await cancellableRestorePreparation(
+        runtime.capturePersistentMutationToken(mutationReason, { publishOfficial: false }), options.signal,
+    ).catch(async error => {
+        if (options.signal?.aborted) await abortBeforeNativeRestoreStart(source, dependencies)
+        throw error
+    })
     if (options.signal?.aborted) {
         await abortBeforeNativeRestoreStart(source, dependencies)
     }
@@ -1581,14 +1602,14 @@ async function runNativeReplacementRestore(
                             await bounded(flushDeviceStateBeforeRestore(), 'device settings flush')
                         }
                         await bounded(Promise.resolve(options.beforeActivation?.()), 'preparation follow-up')
-                        upstreamPause = await bounded(acquireUpstreamImportPause(runtime, `${mutationReason}-activation`), 'write pause acquisition',
+                        upstreamPause = await cancellableRestorePreparation(acquireUpstreamImportPause(runtime, `${mutationReason}-activation`), options.signal,
                             pause => bounded(pause.abortUnchanged(() => bounded(binding.assertAuthority(), 'binding verification')), 'late write pause release'))
                         replacementFence = upstreamPause.fence
                         await bounded(upstreamBinding.assertAuthority(), 'binding verification')
                     }
                 } catch (error) {
-                    mutationConflict =
-                        error instanceof NativeFileJobError
+                    mutationConflict = options.signal?.aborted && error instanceof Error && error.name === 'AbortError'
+                        ? undefined : error instanceof NativeFileJobError
                             ? error
                             : new NativeFileJobError(
                                   error instanceof NativeRestoreControlTimeout ? error.code : isSyncUnavailable(error) ? 'sync-unavailable' : 'revision-conflict',
@@ -1619,6 +1640,12 @@ async function runNativeReplacementRestore(
                                 terminal = await invokeNative(dependencies, 'native_file_job_status', {jobId: started.jobId}) as NativeFileJobStatus
                                 await bounded(Promise.resolve(options.onNativeStatus?.(terminal)), 'status follow-up')
                             }
+                            if ((terminal.state === 'failed' || terminal.state === 'cancelled') &&
+                                (kind !== 'restore-portable-backup' || !Number.isSafeInteger(terminal.activationRevision))) {
+                                const current = await bounded(runtime.store.readRoot(), 'activation revision check')
+                                if (current.revision !== upstreamPause!.fence.revision) throw new Error('Failed native activation changed the library')
+                                return current.revision
+                            }
                             if (kind === 'restore-portable-backup') {
                                 if (!Number.isSafeInteger(terminal.activationRevision)) throw new NativeFileJobError('invalid-activation-receipt','Portable activation receipt is unavailable')
                                 await preparePortableDeviceReceipt(terminal)
@@ -1637,7 +1664,9 @@ async function runNativeReplacementRestore(
                             const plugins = await import('../plugins/apiV3/v3.svelte')
                             await bounded(plugins.invalidatePluginCachesAfterAuthorityReplacement(), 'plugin cache refresh')
                             await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
-                            if (kind === 'restore-portable-backup') await confirmPortableAdoption(terminal!)
+                            if ((terminal?.state === 'failed' || terminal?.state === 'cancelled') &&
+                                (kind !== 'restore-portable-backup' || !Number.isSafeInteger(terminal.activationRevision))) await bounded(upstreamBinding!.resume(), 'binding resume')
+                            else if (kind === 'restore-portable-backup') await confirmPortableAdoption(terminal!)
                         },
                     })
                 }
@@ -1668,7 +1697,8 @@ async function runNativeReplacementRestore(
                 }
                 terminal = status
                 try {await preparePortableDeviceReceipt(status)} catch(error) {throw new NativeFileJobActivationCommittedError(status.activationRevision,error)}
-                await bounded(replacementFence.refreshCommittedWorkingSet(status.activationRevision), 'working set refresh')
+                options.onStatus?.(syntheticNativeFileJobStatus(status, 'refreshing-app'))
+                await replacementFence.refreshCommittedWorkingSet(status.activationRevision)
                 const plugins = await import('../plugins/apiV3/v3.svelte')
                 await bounded(plugins.invalidatePluginCachesAfterAuthorityReplacement(), 'plugin cache refresh')
                 await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
@@ -1751,7 +1781,7 @@ async function runNativeReplacementRestore(
                 options.onStatus?.(
                     syntheticNativeFileJobStatus(terminal, 'refreshing-app'),
                 )
-                const outcome = await bounded(replacementFence.refreshCommittedWorkingSet(terminal.result.revision), 'working set refresh')
+                const outcome = await replacementFence.refreshCommittedWorkingSet(terminal.result.revision)
                 if (upstreamPause) {
                     const plugins = await import('../plugins/apiV3/v3.svelte')
                     await bounded(plugins.invalidatePluginCachesAfterAuthorityReplacement(), 'plugin cache refresh')
@@ -1876,6 +1906,7 @@ async function runNativeReplacementRestore(
                 await bounded(upstreamBinding!.resume(), 'binding resume')
             } catch {}
         }
+        if (!activationSubmitted) upstreamBinding?.release()
         replacementFence?.release()
         if (uiBlocking) options.onBlockingChange?.(false)
     }
@@ -2194,11 +2225,8 @@ async function runNativeManagedExport(
         if (!dependencies.reserveAndroidDestination) throw new NativeFileJobError('unsupported', 'Android SAF destination reservation is unavailable')
         reservation = await dependencies.reserveAndroidDestination(spec.destination.suggestedName, spec.androidSourceKind ?? 'risuSave', options.signal)
     }
-    try {
-        return await runNativeManagedExportToDestination(spec, options, dependencies, reservation)
-    } finally {
-        await reservation?.release()
-    }
+    return withAndroidSafDestination(reservation, () =>
+        runNativeManagedExportToDestination(spec, options, dependencies, reservation))
 }
 
 async function runNativeManagedExportToDestination(
@@ -2594,12 +2622,9 @@ export async function runNativeArchiveExport(
         ? await dependencies.reserveAndroidDestination?.(destination.suggestedName, 'risuSave', options.signal)
         : undefined
     if (destination.type === 'androidSaf' && !reservation) throw new NativeFileJobError('unsupported', 'Android SAF destination reservation is unavailable')
-    try {
-        return await withPausedNativeExport(runtime, 'native-portable-export', options,
-            (revision, observed) => runNativeArchiveExportAtRevision(runtime, revision, destination, selection, {...options, ...observed}, dependencies, reservation))
-    } finally {
-        await reservation?.release()
-    }
+    return withAndroidSafDestination(reservation, () =>
+        withPausedNativeExport(runtime, 'native-portable-export', options,
+            (revision, observed) => runNativeArchiveExportAtRevision(runtime, revision, destination, selection, {...options, ...observed}, dependencies, reservation)))
 }
 
 async function runNativeArchiveExportAtRevision(
