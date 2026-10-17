@@ -99,8 +99,11 @@ impl UploadLease {
     fn acquire(file: File, path: PathBuf) -> io::Result<Self> {
         let lease = Self { file, path };
         fs2::FileExt::try_lock_exclusive(&lease.file)?;
-        // A different process may have swept the marker between create and lock.
-        reject_link_components(&lease.path)?;
+        // A different process may have swept the marker between create and lock. The caller
+        // has just checked the folders above it, so only the marker itself is checked here.
+        if is_link_like(&fs::symlink_metadata(&lease.path)?) {
+            return invalid_owned_path(&lease.path, "linked path component is forbidden");
+        }
         if exact_file_identity(&lease.file)? != exact_file_identity(&File::open(&lease.path)?)? {
             return exact_object_changed();
         }
@@ -146,18 +149,17 @@ impl OwnedPayloadUpload {
     #[cfg(test)]
     pub(crate) fn path(&self) -> &Path { &self.staging.path }
 
-    fn validate(&self) -> io::Result<()> {
-        reject_link_components(&self.staging.path)?;
+    /// Body bytes go only through the held handle, which a changed path cannot redirect.
+    /// `finish` checks the path again before it publishes the file by that path.
+    fn ensure_unchanged(&self) -> io::Result<()> {
         if exact_file_identity(&self.file)? != self.identity { return exact_object_changed(); }
-        let path_file = File::open(&self.staging.path)?;
-        if exact_file_identity(&path_file)? != self.identity { return exact_object_changed(); }
         Ok(())
     }
 
     pub(crate) fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         #[cfg(test)]
         let _scope = self.observation.enter();
-        self.validate()?;
+        self.ensure_unchanged()?;
         let written = self.file.write_all(bytes);
         #[cfg(test)]
         super::body_io::staging_write_result(&written, bytes.len());
@@ -180,7 +182,7 @@ impl OwnedPayloadUpload {
         let _scope = self.observation.enter();
         if self.repository_root != cas.repository_root { return Err(io::Error::other("CAS upload repository changed")); }
         cas.ensure_repository_root()?;
-        self.validate()?;
+        self.ensure_unchanged()?;
         let Self {
             #[cfg(test)]
             mut observation,
@@ -190,7 +192,8 @@ impl OwnedPayloadUpload {
         #[cfg(test)]
         observation.verified(&content_hash);
         let physical_key = object_physical_key(&content_hash);
-        if let Some(existing) = cas.verify_import_destination(&content_hash, byte_size, &|| false)? {
+        let existing = cas.existing_object_path_in_checked_root(&content_hash)?;
+        if let Some(existing) = cas.verify_destination(existing, &content_hash, byte_size, &|| false)? {
             if !cas.existing_verification_matches(&cas.repository_root.join(&physical_key), &existing)? {
                 return exact_object_changed();
             }
@@ -337,6 +340,8 @@ impl PayloadCas {
         let lease = UploadLease::acquire(lease_file, lease_path)?;
         let path = directory.join(format!("{id}.tmp"));
         let (file, staging) = create_staging_file(&path, &directory)?;
+        // Confirm that the body was created inside the repository before any byte is written.
+        self.ensure_canonical_confinement(&path)?;
         let identity = exact_file_identity(&file)?;
         #[cfg(test)]
         {
@@ -1335,6 +1340,11 @@ impl PayloadCas {
         super::body_io::presence_query();
         validate_content_hash(content_hash)?;
         self.ensure_repository_root()?;
+        self.existing_object_path_in_checked_root(content_hash)
+    }
+
+    /// `existing_object_path` for a valid hash, after the caller has just checked the repository root.
+    fn existing_object_path_in_checked_root(&self, content_hash: &str) -> io::Result<Option<PathBuf>> {
         let assets_directory = self.repository_root.join("assets");
         if !self.existing_owned_directory(&assets_directory)? {
             return Ok(None);
@@ -1488,7 +1498,12 @@ impl PayloadCas {
     }
 
     fn verify_import_destination(&self, hash: &str, size: u64, cancelled: &dyn Fn() -> bool) -> io::Result<Option<VerifiedExistingObject>> {
-        let Some(path) = self.existing_object_path(hash)? else { return Ok(None); };
+        let path = self.existing_object_path(hash)?;
+        self.verify_destination(path, hash, size, cancelled)
+    }
+
+    fn verify_destination(&self, path: Option<PathBuf>, hash: &str, size: u64, cancelled: &dyn Fn() -> bool) -> io::Result<Option<VerifiedExistingObject>> {
+        let Some(path) = path else { return Ok(None); };
         match self.verify_existing_object_checked(&path, hash, size, &object_physical_key(hash), cancelled) {
             Ok(verified) => Ok(Some(verified)),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -1920,6 +1935,14 @@ mod tests {
             }
             #[cfg(windows)]
             if finish { upload.finish(&cas).unwrap(); }
+        }
+        let mut upload = cas.begin_owned_upload().unwrap();
+        upload.append(b"received").unwrap();
+        std::fs::rename(upload.path(), directory.path().join("moved")).unwrap();
+        std::fs::write(upload.path(), b"impostor").unwrap();
+        assert!(upload.finish(&cas).is_err());
+        for bytes in [&b"received"[..], b"impostor"] {
+            assert!(cas.stat_object(&hex::encode(sha2::Sha256::digest(bytes))).unwrap().is_none());
         }
     }
 
