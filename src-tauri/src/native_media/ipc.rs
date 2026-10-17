@@ -617,8 +617,8 @@ fn append_input(app: &AppHandle, upload_id: &str, offset: u64, data: &[u8]) -> R
 pub(crate) fn native_media_inlay_input_chunk_raw(
     app: AppHandle, request: tauri::ipc::Request<'_>,
 ) -> Result<u64, crate::asset_byte_transport::ByteTransferError> {
-    let (id, offset, bytes) = crate::asset_byte_transport::raw_part(&request)?;
-    append_input(&app, &id, offset, bytes).map_err(Into::into)
+    logged("native_media_inlay_input_chunk_raw", crate::asset_byte_transport::raw_part(&request)
+        .and_then(|(id, offset, bytes)| append_input(&app, &id, offset, bytes).map_err(Into::into)))
 }
 
 #[tauri::command]

@@ -143,8 +143,8 @@ export function startStreamingSmoke() {
               try {
                 if (profile === 'asset-bytes-legacy') Object.defineProperty(window, 'RisuNestCommit', { configurable: true, value: undefined })
                 const measurements = await runNativeAssetMeasurements(store)
-                  const concurrency = await verifyConcurrentNativeByteWriters(store)
-                  return { passed: true, cases: [{ id: 'native-asset-bytes', measurements }, { id: 'concurrent-byte-writers', ...concurrency }] }
+                const concurrency = await verifyConcurrentNativeByteWriters(store)
+                return { passed: true, cases: [{ id: 'native-asset-bytes', measurements }, { id: 'concurrent-byte-writers', ...concurrency }] }
               } finally {
                 if (descriptor) Object.defineProperty(window, 'RisuNestCommit', descriptor)
               }

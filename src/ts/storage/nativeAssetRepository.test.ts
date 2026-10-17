@@ -143,10 +143,21 @@ describe('native asset repository adapters', () => {
     it('bounds range allocation by EOF and distinguishes missing objects from empty results', async () => {
         const source = Uint8Array.from({ length: NATIVE_CAS_IPC_CHUNK_BYTES + 256 }, (_, i) => i % 256)
         let present = true
+        const sessions = new Map<unknown, number>()
         const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
-            if (command === 'asset_cas_stat_object') return present ? source.length : null
-            if (command === 'asset_cas_read_object_range') {
-                expect(Number(args?.endExclusive)).toBeLessThanOrEqual(source.length)
+            if (command === 'asset_cas_read_open') {
+                if (!present) return null
+                // Native clamps the requested range to the object's size.
+                const start = Math.min(Number(args?.start), source.length)
+                const end = Math.min(Number(args?.endExclusive), source.length)
+                sessions.set(args?.readId, end)
+                return { byteSize: source.length, start, endExclusive: end, capacity: 256 * 1024 }
+            }
+            if (command === 'asset_cas_read_close') { sessions.delete(args?.readId); return }
+            if (command === 'asset_cas_read_part' || command === 'asset_cas_read_object_range') {
+                expect(Number(args?.endExclusive)).toBeLessThanOrEqual(command === 'asset_cas_read_part'
+                    ? sessions.get(args?.readId)!
+                    : Number(args?.start) + NATIVE_CAS_IPC_CHUNK_BYTES)
                 return present ? source.subarray(Number(args?.start), Number(args?.endExclusive)) : null
             }
             throw new Error(`Unexpected command ${command}`)
@@ -156,8 +167,12 @@ describe('native asset repository adapters', () => {
             .resolves.toEqual(source)
         await expect(cas.readObjectRange('11'.repeat(32), { start: source.length + 1, endExclusive: Number.MAX_SAFE_INTEGER }))
             .resolves.toEqual(new Uint8Array())
+        await expect(cas.readObjectRange('11'.repeat(32), { start: source.length - 3, endExclusive: source.length + 5 }))
+            .resolves.toEqual(source.subarray(source.length - 3))
+        expect(sessions.size).toBe(0)
         present = false
         await expect(cas.readObjectRange('11'.repeat(32), { start: 0, endExclusive: 0 })).resolves.toBeNull()
+        await expect(cas.readObjectRange('11'.repeat(32), { start: 0, endExclusive: Number.MAX_SAFE_INTEGER })).resolves.toBeNull()
     })
 
     it.each(['complete', 'short', 'overlong', 'error', 'missing'] as const)('releases the owned large-read session after %s', async outcome => {

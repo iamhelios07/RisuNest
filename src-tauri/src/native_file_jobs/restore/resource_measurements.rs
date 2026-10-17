@@ -101,20 +101,20 @@ fn native_backup_resource_measurement() {
         let aliases = payloads["aliases"].as_array().unwrap();
         assert_eq!(aliases.len(), attachments.len());
         for attachment in &attachments {
-        let alias = aliases.iter().find(|alias| alias["objectHash"] == attachment["sha256"]).unwrap();
-        if let Some(key) = attachment.get("key") { assert_eq!(&alias["key"], key); }
-        assert_eq!(alias["objectHash"], attachment["sha256"]);
-        assert_eq!(alias["size"], attachment["bytes"]);
-        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
-        let hash = attachment["sha256"].as_str().unwrap();
-        let mut body = cas.open_object_tracked(hash).unwrap().unwrap();
-        let mut digest = Sha256::new();
-        loop {
-            let count = body.read(&mut buffer).unwrap();
-            if count == 0 { break; }
-            digest.update(&buffer[..count]);
-        }
-        assert_eq!(hex::encode(digest.finalize()), hash);
+            let alias = aliases.iter().find(|alias| alias["objectHash"] == attachment["sha256"]).unwrap();
+            if let Some(key) = attachment.get("key") { assert_eq!(&alias["key"], key); }
+            assert_eq!(alias["objectHash"], attachment["sha256"]);
+            assert_eq!(alias["size"], attachment["bytes"]);
+            let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+            let hash = attachment["sha256"].as_str().unwrap();
+            let mut body = cas.open_object_tracked(hash).unwrap().unwrap();
+            let mut digest = Sha256::new();
+            loop {
+                let count = body.read(&mut buffer).unwrap();
+                if count == 0 { break; }
+                digest.update(&buffer[..count]);
+            }
+            assert_eq!(hex::encode(digest.finalize()), hash);
         }
     }
     fs::write(report_path, serde_json::to_vec_pretty(&json!({

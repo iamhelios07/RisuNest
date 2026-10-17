@@ -669,8 +669,8 @@ fn append_upload(app: &AppHandle, upload_id: &str, offset: u64, data: &[u8]) -> 
 pub(crate) fn asset_cas_job_upload_chunk_raw(
     app: AppHandle, request: tauri::ipc::Request<'_>,
 ) -> Result<u64, crate::asset_byte_transport::ByteTransferError> {
-    let (id, offset, bytes) = crate::asset_byte_transport::raw_part(&request)?;
-    append_upload(&app, &id, offset, bytes).map_err(Into::into)
+    logged("asset_cas_job_upload_chunk_raw", crate::asset_byte_transport::raw_part(&request)
+        .and_then(|(id, offset, bytes)| append_upload(&app, &id, offset, bytes).map_err(Into::into)))
 }
 
 #[tauri::command(async)]
@@ -912,10 +912,13 @@ pub(crate) async fn asset_cas_read_part(
 #[tauri::command(async)]
 pub(crate) async fn asset_cas_read_close(app: AppHandle, read_id: String) -> Result<(), String> {
     logged("asset_cas_read_close", async move {
-        let _operation = app.state::<PersistentStoreState>().admit_renderer_operation().map_err(|error| error.to_string())?;
-        app.state::<DurableCasJobState>().reads.lock()
-            .map_err(|error| format!("CAS read mutex poisoned: {error}"))?.readers.remove(&read_id);
-        Ok(())
+        // A part read may hold the pool lock; wait for it off the async runtime.
+        tauri::async_runtime::spawn_blocking(move || {
+            let _operation = app.state::<PersistentStoreState>().admit_renderer_operation().map_err(|error| error.to_string())?;
+            app.state::<DurableCasJobState>().reads.lock()
+                .map_err(|error| format!("CAS read mutex poisoned: {error}"))?.readers.remove(&read_id);
+            Ok(())
+        }).await.map_err(|error| format!("failed to join CAS read close: {error}"))?
     }.await)
 }
 

@@ -138,23 +138,29 @@ export async function prepareCasObject(
 async function readCasObjectRange(
     invokeCommand: InvokeCommand,
     contentHash: string,
-    start: number,
-    endExclusive: number,
+    requestedStart: number,
+    requestedEnd: number,
 ): Promise<Uint8Array | null> {
     let readId: string | undefined
+    let start = requestedStart
+    let endExclusive = requestedEnd
     try {
-        if (endExclusive - start >= 256 * 1024) {
+        if (requestedEnd - requestedStart >= 256 * 1024) {
             readId = crypto.randomUUID()
-            const opened = await invokeCommand('asset_cas_read_open', { readId, contentHash, start, endExclusive }) as {
-                byteSize: unknown; start: unknown; endExclusive: unknown; capacity: unknown
-            } | null
+            const opened = await invokeCommand('asset_cas_read_open', {
+                readId, contentHash, start: requestedStart, endExclusive: requestedEnd,
+            }) as { byteSize: unknown; start: unknown; endExclusive: unknown; capacity: unknown } | null
             if (opened === null) return null
+            // Native clamps the range to EOF, which bounds the allocation below.
             const size = safeSize(opened.byteSize, 'Native CAS read open')
-            if (opened.start !== start || opened.endExclusive !== endExclusive || size < endExclusive
+            start = Math.min(requestedStart, size)
+            endExclusive = Math.min(requestedEnd, size)
+            if (opened.start !== start || opened.endExclusive !== endExclusive
                 || opened.capacity !== NATIVE_BINARY_PART_BYTES) {
                 throw new TypeError('Native CAS read returned invalid range metadata')
             }
         }
+        // A smaller request is bounded by its own length and may end early at EOF.
         const combined = new Uint8Array(endExclusive - start)
         let total = 0
         for (let offset = start; offset < endExclusive;) {
@@ -294,29 +300,20 @@ export function createNativeImmutablePayloadCas(
         },
         async readObjectRange(contentHash, range) {
             validateBlobReadRange(range)
-            const sizeValue = await invokeCommand('asset_cas_stat_object', { contentHash })
-            if (sizeValue === null) return null
-            const size = safeSize(sizeValue, 'Native CAS stat')
-            const start = Math.min(range.start, size)
-            const end = Math.min(range.endExclusive, size)
-            if (start === end) {
+            if (range.start === range.endExclusive) {
                 const result = await invokeCommand('asset_cas_read_object_range', {
                     contentHash,
-                    start,
-                    endExclusive: end,
+                    start: range.start,
+                    endExclusive: range.endExclusive,
                 })
                 return result === null ? null : bytes(result, 'Native CAS range read')
             }
-            const result = await readCasObjectRange(
+            return readCasObjectRange(
                 invokeCommand,
                 contentHash,
-                start,
-                end,
+                range.start,
+                range.endExclusive,
             )
-            if (result !== null && result.byteLength !== end - start) {
-                throw new Error('Native CAS object changed while it was being read')
-            }
-            return result
         },
         async statObject(contentHash) {
             const result = await invokeCommand('asset_cas_stat_object', { contentHash })

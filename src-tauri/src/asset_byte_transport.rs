@@ -13,6 +13,11 @@ impl From<String> for ByteTransferError {
     fn from(message: String) -> Self { Self { code: "transfer-failed", message } }
 }
 
+impl crate::native_log::CommandFailure for ByteTransferError {
+    fn code(&self) -> std::borrow::Cow<'_, str> { self.code.into() }
+    fn detail(&self) -> Option<std::borrow::Cow<'_, str>> { Some(self.message.as_str().into()) }
+}
+
 #[tauri::command(async)]
 pub(crate) fn native_asset_bytes_probe(request: Request<'_>) -> bool {
     matches!(request.body(), InvokeBody::Raw(bytes) if bytes.is_empty())

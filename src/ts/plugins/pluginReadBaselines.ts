@@ -374,6 +374,8 @@ export class PluginSnapshotBaseline {
         } else if (chunk.type === 'arrayPush') {
             const field = this.fields.get(chunk.key)
             if (field && 'targets' in field) {
+                // Characters stream through characterStart; only presets arrive whole.
+                if (field.childKind !== 'preset') throw new Error('Invalid plugin snapshot record chunk')
                 const value = chunk.value as any
                 const target = value?.id
                 this.reads.push({ kind: 'preset', target, path: [chunk.key, field.targets.length],
