@@ -35,6 +35,7 @@ export interface ConversationViewportRow {
 }
 
 export interface ConversationViewportSnapshot {
+    readonly historyVersion?: number
     readonly sourceToken: string
     /** Render-input revision; display-owned variable writes do not advance it. */
     readonly version: number
@@ -65,6 +66,7 @@ export interface ConversationViewportPin {
 
 export interface ConversationViewportSource {
     snapshot(): ConversationViewportSnapshot
+    captureResidentRows?(): readonly ConversationViewportRow[]
     ensureRange(input: ConversationViewportRangeRequest): Promise<void>
     findLatestMessagePair?(signal: AbortSignal): Promise<number[]>
     acquireRangePin(
@@ -174,6 +176,10 @@ implements ConversationViewportSource {
             indexOfKey: (key) => keyIndices.get(key) ?? -1,
             rowAt: (absoluteIndex) => rows.get(absoluteIndex),
         }
+    }
+
+    captureResidentRows(): readonly ConversationViewportRow[] {
+        return [...this.rows.values()]
     }
 
     findLatestMessagePair(signal: AbortSignal): Promise<number[]> {
@@ -423,6 +429,7 @@ implements ConversationViewportSource {
     private readonly pins = new Map<number, PersistentRangePinState>()
     private rows = new Map<number, PersistentCachedRow>()
     private optimisticRows = new Set<number>()
+    private historyVersion = 0
     private currentRevision: DataRevision
     private persistedTotalMessages: number
     private totalMessages: number
@@ -459,12 +466,18 @@ implements ConversationViewportSource {
         return {
             sourceToken: this.sourceToken,
             version: epoch,
+            historyVersion: this.historyVersion,
             storeRevision: this.currentRevision,
             totalMessages,
             keyAt: (absoluteIndex) => this.keyAt(epoch, totalMessages, absoluteIndex),
             indexOfKey: (key) => this.indexOfKey(epoch, totalMessages, key),
             rowAt: (absoluteIndex) => this.rowAt(epoch, absoluteIndex),
         }
+    }
+
+    captureResidentRows(): readonly ConversationViewportRow[] {
+        this.assertUsable()
+        return [...this.rows.values()].map(({ row }) => row)
     }
 
     findLatestMessagePair(signal: AbortSignal): Promise<number[]> {
@@ -620,6 +633,7 @@ implements ConversationViewportSource {
             // count only at the end of the conversation.
             || (messages.length !== deleteCount && startIndex + deleteCount !== this.totalMessages)
         ) throw new RangeError('Optimistic conversation range is unsupported')
+        this.historyVersion++
         this.latestPair = null
         const previousRows = new Map(this.rows)
         const previousOptimisticRows = new Set(this.optimisticRows)
@@ -655,6 +669,7 @@ implements ConversationViewportSource {
             this.rows = previousRows
             this.optimisticRows = previousOptimisticRows
             this.totalMessages = previousTotalMessages
+            this.historyVersion++
             this.notifyListeners()
         }
     }

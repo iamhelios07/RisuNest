@@ -5,7 +5,7 @@
     import CreatorQuote from './CreatorQuote.svelte'
     import { onMount } from 'svelte'
     import LoadingIndicator from 'src/lib/UI/GUI/LoadingIndicator.svelte'
-    import type { LiveChatParserConversationStartRequest } from 'src/ts/selectedConversationLiveParserProjection'
+    import type { LiveChatParserConversationStartRequest, BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
     import type { SelectedConversationOperations } from 'src/ts/selectedConversationOperations'
 
     let {
@@ -29,7 +29,7 @@
         onRemoveCreatorQuote: () => void
         acquireConversationStartParserLease?: (
             request: LiveChatParserConversationStartRequest,
-        ) => Promise<{ release(): void } | null>
+        ) => Promise<{ projection?: BoundedLiveChatParserProjection; release(): void } | null>
         selectedConversationOperations?: SelectedConversationOperations
         onDisplaySettled?: () => void
     } = $props()
@@ -45,6 +45,7 @@
                   currentCharacter.firstMessage),
     )
     let parserReady = $state(false)
+    let parserProjection = $state.raw<BoundedLiveChatParserProjection | undefined>()
     let parserLoadFailed = $state(false)
     let parserLease: { release(): void } | null = null
     let parserController = $state<AbortController | null>(null)
@@ -81,6 +82,7 @@
                 return
             }
             parserLease = lease
+            parserProjection = lease?.projection
             parserController = controller
             parserReady = true
         } catch {
@@ -161,6 +163,7 @@
             {selectedConversationOperations}
             {onDisplaySettled}
             parserAbortSignal={parserController?.signal}
+            {parserProjection}
         />
     {/if}
     {#if showAiWarning && totalMessages === 0}

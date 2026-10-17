@@ -168,6 +168,7 @@
         readonly source: ConversationViewportSource
         readonly sourceToken: string
         readonly sourceVersion: number
+        readonly historyVersion?: number
         readonly row: ConversationViewportRow
         readonly totalMessages: number
         readonly renderSignature: ChatRenderSignature
@@ -1708,6 +1709,7 @@
     ): void {
         const character = currentCharacter as character
         const currentChat = character.chats[character.chatPage]
+        const historySnapshot = activeViewportSource?.snapshot()
         const signature = JSON.stringify([
             character.chaId,
             currentChat.id,
@@ -1721,14 +1723,16 @@
             totalMessages,
             parserCharacterStamp,
             get(ReloadGUIPointer),
+            [historySnapshot?.storeRevision, historySnapshot?.historyVersion ?? 0],
         ])
         const previousSignature = element.dataset.chatConversationStartSignature
         if (previousSignature && previousSignature !== signature && mountInstances.has(key)) {
             const previousInputs = JSON.parse(previousSignature)
             const nextInputs = JSON.parse(signature)
-            // Recheck history admission on reload or a new message count without discarding the greeting.
+            // Recheck history admission on reload or history edits without discarding the greeting.
             previousInputs[9] = nextInputs[9]
             previousInputs[11] = nextInputs[11]
+            previousInputs[12] = nextInputs[12]
             if (JSON.stringify(previousInputs) === signature) {
                 element.dataset.chatConversationStartSignature = signature
                 untrack(() => mountInstances.get(key)?.refreshConversationStartParser?.(totalMessages))
@@ -2032,6 +2036,7 @@
             && existing.source === source
             && existing.sourceToken === sourceSnapshot.sourceToken
             && existing.sourceVersion === sourceSnapshot.version
+            && existing.historyVersion === sourceSnapshot.historyVersion
             && existing.row.key === row.key
             && existing.row.absoluteIndex === row.absoluteIndex
             && existing.row.sourceVersion === row.sourceVersion
@@ -2043,6 +2048,7 @@
             existing?.source === source && (
                 existing.sourceToken !== sourceSnapshot.sourceToken
                 || existing.sourceVersion !== sourceSnapshot.version
+                || existing.historyVersion !== sourceSnapshot.historyVersion
                 || existing.row.key !== row.key
                 || existing.row.absoluteIndex !== row.absoluteIndex
                 || existing.row.sourceVersion !== row.sourceVersion
@@ -2056,6 +2062,7 @@
             source,
             sourceToken: sourceSnapshot.sourceToken,
             sourceVersion: sourceSnapshot.version,
+            historyVersion: sourceSnapshot.historyVersion,
             row,
             totalMessages,
             renderSignature,
@@ -2154,6 +2161,7 @@
             !snapshot
             || snapshot.sourceToken !== state.sourceToken
             || snapshot.version !== state.sourceVersion
+            || snapshot.historyVersion !== state.historyVersion
             || snapshot.totalMessages !== state.totalMessages
         ) return false
         const currentRow = snapshot.rowAt(state.row.absoluteIndex)

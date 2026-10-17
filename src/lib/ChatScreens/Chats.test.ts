@@ -3234,14 +3234,16 @@ describe('Chats imperative mount lifecycle', () => {
         expect(chatMountProbe.unmounts).toHaveLength(unmounts)
     })
 
-    test('keeps the greeting mounted when a new message changes the chat length', async () => {
+    test.each(['append', 'tail'])('keeps the greeting mounted and refreshes its history after %s changes', async (change) => {
         const messages = [makeMessage(0)]
+        const source = change === 'tail' ? makePersistentViewportSource(messages) : undefined
         const acquireGreeting = vi.fn(async (_request: { totalMessages: number }) => null)
         mounted = mount(ChatsHarness, {
             target,
             props: {
                 initialMessages: messages,
                 initialCharacter: makeCharacter(messages),
+                initialViewportSource: source,
                 acquireConversationStartParserLease: acquireGreeting,
             },
         })
@@ -3249,9 +3251,10 @@ describe('Chats imperative mount lifecycle', () => {
         await vi.waitFor(() => expect(conversationStartProbe(target)).not.toBeNull())
         const greeting = conversationStartProbe(target)
         const unmounts = chatMountProbe.unmounts.length
-        ;(mounted as HarnessInstance).setMessages([...messages, makeMessage(1)])
+        if (source) source.applyOptimisticRange(0, 1, [{ ...messages[0], data: 'streamed tail' }])
+        else (mounted as HarnessInstance).setMessages([...messages, makeMessage(1)])
         await vi.waitFor(() => expect(acquireGreeting).toHaveBeenCalledTimes(2))
-        expect(acquireGreeting.mock.calls[1][0].totalMessages).toBe(2)
+        expect(acquireGreeting.mock.calls[1][0].totalMessages).toBe(source ? 1 : 2)
         expect(conversationStartProbe(target)).toBe(greeting)
         expect(chatMountProbe.unmounts).toHaveLength(unmounts)
     })

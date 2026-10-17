@@ -12,6 +12,7 @@
     } from 'src/ts/storage/database.svelte'
     import { language } from 'src/lang'
     import LoadingIndicator from '../UI/GUI/LoadingIndicator.svelte'
+    import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
 
     let {
         source,
@@ -19,14 +20,20 @@
         children,
         refreshRevision = 0,
         preservePendingContent = false,
+        chatID = -1,
+        parseFirst = false,
     }: {
         source: unknown
         character: Parameters<typeof captureLiveDisplayParserInputs>[1]
-        children: Snippet<[AbortSignal]>
+        children: Snippet<[AbortSignal, BoundedLiveChatParserProjection | undefined]>
+        chatID?: number
+        parseFirst?: boolean
         refreshRevision?: number
         preservePendingContent?: boolean
     } = $props()
     let readySignal = $state<AbortSignal | null>(null)
+    let projection = $state.raw<BoundedLiveChatParserProjection | undefined>()
+    let historyRevision = $state('')
     let failed = $state(false)
     let retry = $state(0)
     let activeController: AbortController | null = null
@@ -34,7 +41,8 @@
     let selectionRevision = 0
     let selectionIdentity = $state(untrack(captureLiveDisplayParserSelection))
     onMount(() =>
-        subscribeLiveDisplayParserSelection((identity) => {
+        subscribeLiveDisplayParserSelection((identity, revision) => {
+            historyRevision = revision ?? ''
             selectionRevision++
             if (identity !== selectionIdentity) activeController?.abort()
             else if (failed) retry++
@@ -45,6 +53,8 @@
         JSON.stringify({
             characterId: getCurrentCharacter()?.chaId,
             conversationId: getCurrentChat()?.id,
+            chatID,
+            parseFirst,
             inputs: captureLiveDisplayParserInputs(source, character),
         }),
     )
@@ -61,6 +71,7 @@
         void selectionIdentity
         void retry
         void refreshRevision
+        void historyRevision
         const requestedOwner = owner
         const requestedRevision = selectionRevision
         const controller = new AbortController()
@@ -76,6 +87,8 @@
                 source,
                 character,
                 signal: controller.signal,
+                chatID,
+                parseFirst,
             }),
         )
             .then((acquired) => {
@@ -84,6 +97,7 @@
                     return
                 }
                 lease = acquired
+                projection = acquired?.projection
                 readyOwner = requestedOwner
                 readySignal = controller.signal
             })
@@ -103,7 +117,7 @@
 </script>
 
 {#if readySignal}
-    {@render children(readySignal)}
+    {@render children(readySignal, projection)}
 {/if}
 {#if failed}
     <div

@@ -8,9 +8,11 @@ import {
     type ChatParserHistoryProjectionReader,
 } from './chatParserHistoryProjection'
 import {
-    classifyChatParserHistory,
+    planChatParserHistory,
     type ChatParserUnsafeHistoryDependency,
 } from './chatParserHistory'
+import { captureResidentCbsHistory, prepareCbsHistory } from './prepareCbsHistory'
+import { forkChatParserContext } from './chatParserContextSeed.svelte'
 import type { ConversationViewportRow } from './conversationViewportSource'
 import type { CurrentChatMessageTarget } from './chatMessageUi'
 import type { ProcessScriptCaptureContext } from './process/scripts'
@@ -39,6 +41,7 @@ export function collectLiveChatParserUnsafeDependencies(input: {
     if (plan.entries.some((entry) => (
         entry.actions.includes('inject') || entry.replacement.startsWith('@@inject')
     ))) dependencies.push('inject')
+    else if (plan.entries.length > 0) dependencies.push('regex-reparse')
     return dependencies
 }
 
@@ -79,7 +82,7 @@ export interface LiveChatParserProjectionResolver {
     resolve(input: LiveChatParserProjectionRequest): Promise<LiveChatParserProjection>
     acquireConversationStart?(
         input: LiveChatParserConversationStartRequest,
-    ): Promise<{ release(): void } | null>
+    ): Promise<{ projection?: BoundedLiveChatParserProjection; release(): void } | null>
 }
 
 type LiveParserRuntime = Pick<
@@ -131,16 +134,51 @@ export function createSelectedConversationLiveParserProjectionResolver(
             const target = dependencies.runtime.captureSelectedConversationTarget()
             if (!target) throw new ChatParserHistoryProjectionStaleError()
             const current = captureExactCurrent(dependencies, target)
-            const classification = classifyChatParserHistory({
+            const classification = planChatParserHistory({
                 source: [input.greeting, dependencies.parserSource(current)],
                 indirections: dependencies.parserIndirections?.(current),
                 unsafeDependencies: dependencies.unsafeDependencies(current),
             })
-            if (
-                !classification.requiresFullHistory &&
-                classification.absoluteMessageIndices.length === 0
-            )
-                return null
+            if (!classification.requiresFullHistory) {
+                const context = forkChatParserContext(dependencies.createBoundedContextSeed(current))
+                const authority = dependencies.runtime.captureSelectedConversationAuthority()
+                const source = dependencies.runtime.getActiveConversationViewportSource?.()
+                const version = source?.snapshot().version
+                const historyVersion = source?.snapshot().historyVersion
+                const assertCurrent = () => {
+                    assertConversationStartCurrent(input)
+                    captureExactCurrent(dependencies, target)
+                    if (source?.snapshot().version !== version || source?.snapshot().historyVersion !== historyVersion) throw new ChatParserHistoryProjectionStaleError()
+                }
+                const historyAccess = authority ? await prepareCbsHistory({
+                    characterId: target.characterId, conversationId: target.conversationId,
+                    totalMessages: input.totalMessages, chatID: -1, plan: classification,
+                    signal: input.signal, assertCurrent,
+                    reader: { revision: target.storeRevision,
+                        readResidentMessage: (index) => source?.snapshot().rowAt(index)?.message,
+                        readConversationWindow: (query) => dependencies.runtime.store.readConversationWindow(query) },
+                }) : captureResidentCbsHistory(current.conversation.message, classification, -1)
+                assertCurrent()
+                context.parserContext.historyAccess = historyAccess
+                context.parserContext.prepareHistory = async (text, chatID, complete) => {
+                    assertCurrent()
+                    const plan = planChatParserHistory({ source: text,
+                        indirections: dependencies.parserIndirections?.(current),
+                        unsafeDependencies: complete ? ['regex-reparse'] : [] })
+                    return authority ? prepareCbsHistory({
+                        characterId: target.characterId, conversationId: target.conversationId,
+                        totalMessages: input.totalMessages, chatID, plan, signal: input.signal, assertCurrent,
+                        reader: { revision: target.storeRevision,
+                            readResidentMessage: (index) => source?.snapshot().rowAt(index)?.message,
+                            readConversationWindow: (query) => dependencies.runtime.store.readConversationWindow(query) },
+                    }) : captureResidentCbsHistory(current.conversation.message, plan, chatID)
+                }
+                return { projection: {
+                    kind: 'bounded', characterId: target.characterId, conversationId: target.conversationId,
+                    revision: target.storeRevision, totalMessages: input.totalMessages,
+                    chatID: -1, projectedChatID: -1, historyOffset: 0, messages: [], context,
+                }, release() {} }
+            }
 
             // A greeting is not a persisted message row, including in an empty
             // conversation. Its live scripts still need the same owned history
@@ -203,6 +241,8 @@ export function createSelectedConversationLiveParserProjectionResolver(
                     contextSeed: dependencies.createBoundedContextSeed(current),
                     reader: {
                         revision: authority.storeRevision,
+                        readRoleWindow: dependencies.runtime.store.messageMetadataReadMode === 'projected'
+                            ? (query) => dependencies.runtime.store.readConversationMessageMetadataWindow!(query) : undefined,
                         readResidentMessage: resident ? (index) => resident?.readMessage(index) : undefined,
                         readConversationWindow: (query) => (
                             dependencies.runtime.store.readConversationWindow(query)

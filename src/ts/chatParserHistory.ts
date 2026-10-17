@@ -3,12 +3,15 @@ export type ChatParserUnsafeHistoryDependency =
     | 'plugin-v2'
     | 'display-trigger'
     | 'inject'
+    | 'repeat-back'
+    | 'regex-reparse'
 
 export type ChatParserHistoryReason =
     | ChatParserUnsafeHistoryDependency
     | 'full-history-cbs'
     | 'dynamic-previous-chat-log'
     | 'ambiguous-risu-style'
+    | 'opaque-cbs'
 
 export interface ChatParserHistoryClassification {
     readonly requiresFullHistory: boolean
@@ -20,6 +23,21 @@ export interface ChatParserHistoryClassificationInput {
     readonly source: unknown
     readonly unsafeDependencies?: readonly ChatParserUnsafeHistoryDependency[]
     readonly indirections?: Readonly<Record<string, unknown>>
+}
+
+export type CbsHistoryRequirement = 'count' | 'current' | 'tail' | 'previouschar' | 'previoususer' | 'idle'
+
+export interface CbsHistoryPlan extends ChatParserHistoryClassification {
+    readonly requirements: readonly CbsHistoryRequirement[]
+}
+
+const HISTORY_REQUIREMENTS: Readonly<Record<string, CbsHistoryRequirement>> = {
+    lastmessageid: 'count', lastmessageindex: 'count', pick: 'count', rollp: 'count', rollpick: 'count',
+    messagetime: 'current', messagedate: 'current', role: 'current',
+    lastmessage: 'tail', idleduration: 'tail',
+    previouscharchat: 'previouschar', lastcharmessage: 'previouschar',
+    previoususerchat: 'previoususer', lastusermessage: 'previoususer',
+    messageidleduration: 'idle',
 }
 
 const FULL_HISTORY_CBS_NAMES = new Set([
@@ -44,6 +62,15 @@ const PREVIOUS_CHAT_LOG_CBS_NAME = 'previouschatlog'
 export function classifyChatParserHistory(
     input: ChatParserHistoryClassificationInput,
 ): ChatParserHistoryClassification {
+    const { requirements, ...classification } = buildHistoryPlan(input, false)
+    return classification
+}
+
+export function planChatParserHistory(input: ChatParserHistoryClassificationInput): CbsHistoryPlan {
+    return buildHistoryPlan(input, true)
+}
+
+function buildHistoryPlan(input: ChatParserHistoryClassificationInput, precise: boolean): CbsHistoryPlan {
     const reasons = new Set<ChatParserHistoryReason>(input.unsafeDependencies ?? [])
     const absoluteMessageIndices = new Set<number>()
     const texts = collectParserInputText(input.source)
@@ -54,6 +81,7 @@ export function classifyChatParserHistory(
         ]),
     )
     const followedIndirections = new Set<string>()
+    const requirements = new Set<CbsHistoryRequirement>()
 
     for (const text of texts) {
         classifyText(
@@ -63,6 +91,8 @@ export function classifyChatParserHistory(
             true,
             indirections,
             followedIndirections,
+            requirements,
+            precise,
         )
     }
 
@@ -70,6 +100,7 @@ export function classifyChatParserHistory(
         requiresFullHistory: reasons.size > 0,
         absoluteMessageIndices: [...absoluteMessageIndices].sort((a, b) => a - b),
         reasons: [...reasons],
+        requirements: [...requirements],
     }
 }
 
@@ -98,10 +129,18 @@ function classifyText(
     decodeStyles: boolean,
     indirections: ReadonlyMap<string, unknown>,
     followedIndirections: Set<string>,
+    requirements: Set<CbsHistoryRequirement>,
+    precise: boolean,
 ): void {
+    if (/@@repeat_back|<repeat_back(?:>|:)/.test(text)) reasons.add('repeat-back')
     for (const expression of extractCbsExpressions(text)) {
         const parsed = parseCbsExpression(expression)
-        if (FULL_HISTORY_CBS_NAMES.has(parsed.name)) {
+        const requirement = HISTORY_REQUIREMENTS[parsed.name]
+        if (requirement) requirements.add(requirement)
+        if (parsed.name.includes('{{') || parsed.name === 'call' || parsed.name.startsWith('#')) {
+            reasons.add('opaque-cbs')
+        }
+        if (FULL_HISTORY_CBS_NAMES.has(parsed.name) && (!precise || !requirement)) {
             reasons.add('full-history-cbs')
             continue
         }
@@ -125,6 +164,8 @@ function classifyText(
                 true,
                 indirections,
                 followedIndirections,
+                requirements,
+                precise,
             )
         }
     }
@@ -145,6 +186,8 @@ function classifyText(
                 false,
                 indirections,
                 followedIndirections,
+                requirements,
+                precise,
             )
         }
     }

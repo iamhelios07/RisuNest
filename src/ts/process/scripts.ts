@@ -1,4 +1,6 @@
 import { get } from "svelte/store";
+import { planChatParserHistory } from '../chatParserHistory';
+import { CbsHistoryAccessError, type CbsHistoryAccess } from '../cbsHistoryAccess';
 import { Mutex } from '../mutex';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { type Chat, type character, type customscript, type Database, type loreBook, getDatabase, getCurrentCharacter, getCurrentChat } from "../storage/database.svelte";
@@ -47,10 +49,20 @@ export interface ProcessScriptOptions {
     /** true forces the Worker path, false opts out, undefined offloads whenever a Worker is available. */
     regexWorker?: boolean
     captureContext?: ProcessScriptCaptureContext
+    invocationContext?: ProcessScriptInvocationContext
     projectedChatID?: number
     promptOperationScope?: PromptScriptOperationScope
     /** Collects the chat variables a display row's pipeline reads. */
     variableReads?: DisplayReadRecord
+}
+
+export interface ProcessScriptInvocationContext {
+    database: Database
+    character: character
+    chat: Chat
+    parser: Parameters<typeof risuChatParserOrg>[1]
+    moduleRegexScripts: readonly customscript[]
+    inject(index: number, data: string): void
 }
 
 export interface ProcessScriptCaptureContext {
@@ -73,6 +85,8 @@ export interface ProcessScriptCaptureContext {
         currentTime: number
         triggerId?: string
         historyOffset?: number
+        historyAccess?: CbsHistoryAccess
+        prepareHistory?(source: string, chatID: number, complete: boolean): Promise<CbsHistoryAccess>
     }
 }
 
@@ -307,7 +321,12 @@ function classifyConversationAccess(
     plan: ReturnType<typeof getRegexExecutionPlan>,
     data: string,
 ): ConversationAccess {
-    let access: ConversationAccess = containsCbs(data, HISTORY_SENSITIVE_CBS_NAMES)
+    const readsConversation = (value: string) => {
+        if (containsCbs(value, HISTORY_SENSITIVE_CBS_NAMES)) return true
+        const history = planChatParserHistory({ source: value })
+        return history.requiresFullHistory || history.requirements.length > 0 || history.absoluteMessageIndices.length > 0
+    }
+    let access: ConversationAccess = readsConversation(data)
         ? 'read-only'
         : 'none'
     for (const entry of plan.entries) {
@@ -317,8 +336,8 @@ function classifyConversationAccess(
         if (
             entry.actions.includes('repeat_back') ||
             entry.replacement.startsWith('@@repeat_back') ||
-            (entry.dynamicPattern && containsCbs(entry.pattern, HISTORY_SENSITIVE_CBS_NAMES)) ||
-            containsCbs(entry.replacement, HISTORY_SENSITIVE_CBS_NAMES)
+            (entry.dynamicPattern && readsConversation(entry.pattern)) ||
+            readsConversation(entry.replacement)
         ) {
             access = 'read-only'
         }
@@ -594,8 +613,16 @@ export async function processScriptFull(
 async function processScriptFullImpl(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
     options.signal?.throwIfAborted()
     const captureContext = options.captureContext
+    const preparedHistory = captureContext?.parserContext.prepareHistory
+        ? await captureContext.parserContext.prepareHistory(data, chatID, getRegexExecutionPlan([
+            ...captureContext.presetRegex, ...(char.customscript ?? []), ...captureContext.moduleRegexScripts,
+        ], mode).entries.length > 0)
+        : captureContext?.parserContext.historyAccess
+    options.signal?.throwIfAborted()
+    const invocation = options.invocationContext
+    if (invocation && mode !== 'editprocess') throw new Error('Owned script invocations require editprocess mode')
     const promptOperationScope = captureContext ? undefined : options.promptOperationScope
-    let db = captureContext?.parserContext.database ?? promptOperationScope?.database ?? getDatabase()
+    let db = captureContext?.parserContext.database ?? invocation?.database ?? promptOperationScope?.database ?? getDatabase()
     let emoChanged = false
     if (!captureContext) {
         data = await runLuaEditTrigger(
@@ -629,13 +656,13 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     }
     options.signal?.throwIfAborted()
 
-    let conversationOwner = captureContext
+    let conversationOwner = captureContext || invocation
         ? null
         : promptOperationScope?.getOwner() ?? captureScriptConversationOwner(char)
     const usesPluginCompatibility = !captureContext &&
-        conversationOwner !== null && pluginV2[mode].size > 0
+        (conversationOwner !== null || invocation !== undefined) && pluginV2[mode].size > 0
     const compatibilityPin = usesPluginCompatibility &&
-        !promptOperationScope?.usesPluginCompatibility && conversationOwner.session
+        !promptOperationScope?.usesPluginCompatibility && conversationOwner?.session
         ? conversationOwner.session.acquirePin('compatibility')
         : null
     if(usesPluginCompatibility){
@@ -671,10 +698,10 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             : [
                   ...(captureContext?.presetRegex ?? db.presetRegex ?? []),
                   ...char.customscript,
-                  ...(captureContext?.moduleRegexScripts ?? getModuleRegexScripts()),
+                  ...(captureContext?.moduleRegexScripts ?? invocation?.moduleRegexScripts ?? getModuleRegexScripts()),
               ]
         plan = getRegexExecutionPlan(scripts, mode)
-        conversationAccess = captureContext
+        conversationAccess = captureContext || invocation
             ? 'none'
             : classifyConversationAccess(plan, data)
         const needsConversationOperation = conversationAccess === 'mutating'
@@ -725,7 +752,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             ? { ...character, chats: character.chats.map((chat) => chat.id === windowCopy!.chat.id ? windowCopy!.chat : chat) }
             : character) }
         : db)
-    const operationChat = conversationOperation?.chat ?? conversationOwner?.chat ?? null
+    const operationChat = invocation?.chat ?? conversationOperation?.chat ?? conversationOwner?.chat ?? null
     const parsedReads = new DisplayReadRecord()
     const parseReads = {
         note(key: string) {
@@ -742,6 +769,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             chatID,
             projectedChatID: options.projectedChatID,
             historyOffset: captureContext.parserContext.historyOffset,
+            historyAccess: preparedHistory,
             cbsConditions,
             db: captureContext.parserContext.database,
             chara: captureContext.parserContext.chara ?? captureContext.parserContext.character,
@@ -757,6 +785,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             triggerId: captureContext.parserContext.triggerId,
             role: cbsConditions.chatRole,
         })
+        : invocation ? risuChatParserOrg(value, { ...invocation.parser, chatID, cbsConditions, role: undefined, runVar: false, rmVar: false, tokenizeAccurate: false })
         : risuChatParserOrg(value, {
             chatID,
             cbsConditions,
@@ -779,6 +808,8 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     let conversationOperationCommitted = false
     const finish = <T>(result: T): T => {
         options.signal?.throwIfAborted()
+        invocation?.parser?.historyAccess?.assertComplete()
+        preparedHistory?.assertComplete()
         if (windowCopy) {
             if (!windowCopy.commit()) throw new ConversationSessionInactiveError()
             windowCopy = null
@@ -878,7 +909,9 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                         }
                     }
                     else if((outScript.startsWith('@@inject') || entry.actions.includes('inject')) && chatID !== -1){
-                        if (!captureContext) {
+                        if (invocation) {
+                            invocation.inject(chatID, data)
+                        } else if (!captureContext) {
                             const selchar = operationDatabase.characters.find(
                                 (candidate) => candidate.chaId === conversationOwner?.selectedCharacterId,
                             )
@@ -944,11 +977,11 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                 else{
                     if((outScript.startsWith('@@repeat_back') || entry.actions.includes('repeat_back'))  && chatID !== -1){
                         const v = outScript.split(' ', 2)[1]
-                        const selchar = captureContext
+                        const selchar = invocation?.character ?? (captureContext
                             ? operationDatabase.characters[captureContext.parserContext.selectedCharID]
                             : operationDatabase.characters.find(
                                 (candidate) => candidate.chaId === conversationOwner?.selectedCharacterId,
-                            )
+                            ))
                         if (!selchar) throw new ConversationSessionInactiveError()
                         const chat = resolveHistoryWindowChat(selchar.chats[selchar.chatPage])
                         let lastChat = chat.fmIndex === -1 ? selchar.firstMessage : selchar.alternateGreetings[chat.fmIndex]
@@ -997,6 +1030,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             try {
                 executeScript(entry)
             } catch (error) {
+                if (error instanceof CbsHistoryAccessError) throw error
                 console.error(error)
             }
         }

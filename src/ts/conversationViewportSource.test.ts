@@ -439,9 +439,14 @@ describe('PersistentConversationViewportSource', () => {
             characterId: 'character-a', conversationId: 'conversation-a', revision: 1, totalMessages: 2, rowBudget: 64,
         })
         const lookup = source.findLatestMessagePair(new AbortController().signal)
-        source.applyOptimisticRange(1, 1, [{ role: 'user', data: 'changed' }])
+        const before = source.snapshot().historyVersion
+        const rollback = source.applyOptimisticRange(1, 1, [{ role: 'user', data: 'changed' }])
+        expect(source.snapshot().historyVersion).not.toBe(before)
         pending.resolve({ revision: 1, value: persistentWindow(0, [{ role: 'user', data: 'old-u' }, { role: 'char', data: 'old-c' }], 2) })
         await expect(lookup).rejects.toMatchObject({ name: 'AbortError' })
+        const changed = source.snapshot().historyVersion
+        rollback()
+        expect(source.snapshot().historyVersion).not.toBe(changed)
         source.dispose()
     })
 
