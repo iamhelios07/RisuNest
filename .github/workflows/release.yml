@@ -918,15 +918,21 @@ jobs:
           if (!previous) {
             console.log("No Sync release was published before this one; released-bundle checks are skipped.");
           } else {
-            const name = assetName({ product: "sync", variant: "managed", os: "windows", arch: process.env.ARCH, format: "zip", version: previous.version });
             const directory = join(process.env.RUNNER_TEMP, "released-sync");
             mkdirSync(directory, { recursive: true });
-            const bundle = join(directory, name);
-            writeFileSync(bundle, await github.downloadAsset(previous.release, name, 256 * 1024 * 1024));
-            const signature = (await github.downloadAsset(previous.release, `${name}.sig`, 64 * 1024)).toString("utf8");
-            await verifyFileSignature(bundle, signature, process.env.RISUNEST_UPDATE_PUBLIC_KEY);
-            appendFileSync(process.env.GITHUB_ENV, `RISUNEST_RELEASED_SYNC_BUNDLE=${bundle}\n`);
-            console.log(`Verified ${name} from ${previous.release.tag_name}.`);
+            async function verifiedBundle(release, version) {
+              if (!release || release.draft || release.prerelease) throw new Error(`Published Sync ${version} compatibility release is required.`);
+              const name = assetName({ product: "sync", variant: "managed", os: "windows", arch: process.env.ARCH, format: "zip", version });
+              const bundle = join(directory, name);
+              writeFileSync(bundle, await github.downloadAsset(release, name, 256 * 1024 * 1024));
+              const signature = (await github.downloadAsset(release, `${name}.sig`, 64 * 1024)).toString("utf8");
+              await verifyFileSignature(bundle, signature, process.env.RISUNEST_UPDATE_PUBLIC_KEY);
+              console.log(`Verified ${name} from ${release.tag_name}.`);
+              return bundle;
+            }
+            const bundle = await verifiedBundle(previous.release, previous.version);
+            const legacy = previous.version === "1.0.4" ? bundle : await verifiedBundle(await github.getByTag("sync-v1.0.4"), "1.0.4");
+            appendFileSync(process.env.GITHUB_ENV, `RISUNEST_RELEASED_SYNC_BUNDLE=${bundle}\nRISUNEST_LEGACY_SYNC_BUNDLE=${legacy}\nRISUNEST_RELEASED_SYNC_TAG=${previous.release.tag_name}\n`);
           }
           EOF
       - name: Run synthetic Windows NSIS install failure and rollback checks
@@ -937,9 +943,14 @@ jobs:
         run: |
           $arguments = @()
           if ($env:RISUNEST_RELEASED_SYNC_BUNDLE) {
+            foreach ($tag in (@($env:RISUNEST_RELEASED_SYNC_TAG, 'sync-v1.0.4') | Select-Object -Unique)) {
+              git fetch --no-tags --depth=1 origin "refs/tags/$($tag):refs/tags/$($tag)"
+              if ($LASTEXITCODE -ne 0) { throw "Could not fetch the frozen installer source: $tag" }
+            }
             $built = Join-Path $env:CARGO_TARGET_DIR "$env:TARGET/release"
             $arguments = @(
               '-ReleasedBundle', $env:RISUNEST_RELEASED_SYNC_BUNDLE,
+              '-LegacyReleasedBundle', $env:RISUNEST_LEGACY_SYNC_BUNDLE,
               '-ManagerBinary', (Join-Path $built 'risunest-sync-manager.exe'),
               '-BackgroundBinary', (Join-Path $built 'risunest-sync-manager-background.exe')
             )
