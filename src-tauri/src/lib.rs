@@ -830,6 +830,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         server_sync::commands::server_sync_lww_retry,
         server_sync::commands::server_sync_lww_drain,
         server_sync::commands::server_sync_cancel,
+        server_sync::commands::server_sync_claim_offline_notice,
         server_sync::commands::server_sync_notify_start,
         server_sync::commands::server_sync_notify_stop,
         server_sync::commands::server_sync_asset_policy,

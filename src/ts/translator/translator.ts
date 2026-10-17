@@ -44,7 +44,7 @@ export function getCurrentTranslatorPreset(database: Database = getDatabase()): 
     return getCurrentTranslatorPresetFromState(database)
 }
 
-export async function translate(text:string, reverse:boolean, captureContext?: TranslateHTMLContext) {
+export async function translate(text:string, reverse:boolean, captureContext?: TranslateHTMLContext, errorMode: 'alert' | 'throw' = 'alert') {
     let db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
     if(!captureContext){
         if(!reverse){
@@ -68,10 +68,11 @@ export async function translate(text:string, reverse:boolean, captureContext?: T
         db.aiModel.startsWith('novellist') ? 'ja' : 'en',
         undefined,
         captureContext,
+        errorMode,
     )
 }
 
-export async function runTranslator(text:string, reverse:boolean, from:string,target:string, exarg?:{translatorNote?:string}, captureContext?: TranslateHTMLContext) {
+export async function runTranslator(text:string, reverse:boolean, from:string,target:string, exarg?:{translatorNote?:string}, captureContext?: TranslateHTMLContext, errorMode: 'alert' | 'throw' = 'alert') {
     const arg = {
 
         from: reverse ? from : target,
@@ -109,9 +110,10 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
                 fullResult.push(chunk[0])
                 continue
             }
-            const result = await translateMain(trimed, arg, captureContext);
+            const result = await translateMain(trimed, arg, captureContext, errorMode);
 
             if(result.startsWith('ERR::')){
+                if (errorMode === 'throw') throw new Error(result)
                 alertError(result)
                 return text
             }
@@ -136,11 +138,11 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
 
 }
 
-async function translateMain(text:string, arg:{from:string, to:string, host:string, translatorNote?:string}, captureContext?: TranslateHTMLContext){
+async function translateMain(text:string, arg:{from:string, to:string, host:string, translatorNote?:string}, captureContext?: TranslateHTMLContext, errorMode: 'alert' | 'throw' = 'alert'){
     let db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
     if(db.translatorType === 'llm'){
         const tr = arg.to || 'en'
-        return translateLLM(text, {to: tr, from: arg.from, translatorNote: arg.translatorNote}, captureContext)
+        return translateLLM(text, {to: tr, from: arg.from, translatorNote: arg.translatorNote}, captureContext, errorMode)
     }
     if(db.translatorType === 'deepl'){
         const body = {
@@ -563,7 +565,7 @@ function normalizeLLMCacheKey(key:string):string{
     return key.replace(inlaySlotMarkerRegex, '')
 }
 
-async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}, captureContext?: TranslateHTMLContext):Promise<string>{
+async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}, captureContext?: TranslateHTMLContext, errorMode: 'alert' | 'throw' = 'alert'):Promise<string>{
     if(!arg.regenerate){
         const cacheMatch = await LLMCacheStorage.getItem(normalizeLLMCacheKey(text))
         if(cacheMatch !== null){
@@ -626,10 +628,12 @@ async function translateLLM(text:string, arg:{to:string, from:string, regenerate
     }, 'translate')
 
     if(rq.type === 'fail'){
+        if (errorMode === 'throw') throw new Error(rq.result)
         alertError(rq.result)
         return text
     }
     if(rq.type === 'streaming' || rq.type === 'multiline'){
+        if (errorMode === 'throw') throw new Error('Unexpected response type')
         alertError('Unexpected response type')
         return text
     }
