@@ -962,6 +962,7 @@
         updateInputSizeAll()
     });
 
+    let inputTranslationFailed = false
     async function updateInputTransateMessage(reverse: boolean) {
         if (!DBState.db.useAutoTranslateInput) return
         const snapshot = captureComposerInput()
@@ -978,10 +979,18 @@
         }
         if (experimental) await sleep(1500)
         if (!chatScreenState.matchesComposer(snapshot)) return
-        const translatedMessage = await translate(input, reverse)
-        if (translatedMessage && chatScreenState.matchesComposer(snapshot)) {
-            if (reverse) snapshot.composer.text = translatedMessage
-            else snapshot.composer.translation = translatedMessage
+        try {
+            const translatedMessage = await translate(input, reverse)
+            if (!chatScreenState.matchesComposer(snapshot)) return
+            inputTranslationFailed = false
+            if (translatedMessage) {
+                if (reverse) snapshot.composer.text = translatedMessage
+                else snapshot.composer.translation = translatedMessage
+            }
+        } catch (error) {
+            if (!chatScreenState.matchesComposer(snapshot)) return
+            if (!inputTranslationFailed) alertError(error)
+            inputTranslationFailed = true
         }
     }
 
