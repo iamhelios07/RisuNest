@@ -23,8 +23,9 @@ export function serverSyncErrorCode(error: unknown): string {
 }
 const isCancellation = (error: unknown) => serverSyncErrorCode(error) === 'cancelled' || (typeof error === 'object' && !!error && 'name' in error && error.name === 'AbortError')
 export function isServerSyncUnavailable(error: unknown): boolean {
+    if (typeof error === 'object' && error && 'retryable' in error && error.retryable === false) return false
     const code = serverSyncErrorCode(error)
-    if (['server-unreachable', 'server-timeout', 'request-timeout', 'incomplete-response', 'directory-unreachable', 'directory-response-error', 'directory-incomplete-response'].includes(code)) return true
+    if (['server-unreachable', 'server-timeout', 'request-timeout', 'incomplete-response', 'directory-unreachable', 'directory-response-error', 'directory-incomplete-response', 'sync-retry-budget-exhausted'].includes(code)) return true
     // Tunnel/gateway HTML responses have no Sync error body.
     return code === 'server-response-error' && typeof error === 'object' && error !== null
         && 'status' in error && typeof error.status === 'number' && error.status >= 500 && error.status < 600
@@ -96,7 +97,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             clear()
             scheduleOutage()
         }
-        if ((typeof error === 'object' && error && 'retryable' in error && error.retryable === false && code(error) !== 'server-unreachable') || integrityCodes.includes(code(error))) {
+        if ((typeof error === 'object' && error && 'retryable' in error && error.retryable === false) || integrityCodes.includes(code(error))) {
             blocked = true
             blockedCode = code(error)
             clear()

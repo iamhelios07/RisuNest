@@ -101,6 +101,23 @@ const openConversation = (conversationId: string) => { f.conversation = { charac
 const callOrder = (command: string) => f.invoke.mock.invocationCallOrder[f.invoke.mock.calls.findIndex(([name]) => name === command)]
 
 describe('production server LWW composition', () => {
+    it('does not claim the offline warning for an unknown operation failure before a real outage', async () => {
+        f.database.risunestSyncStatusUi = true
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const base = f.invoke.getMockImplementation()!
+        let failure: unknown = new Error('Invalid local operation state')
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_lww_pull') throw failure
+            if (command === 'server_sync_claim_offline_notice') return true
+            return base(command, args)
+        })
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        expect(f.alert).not.toHaveBeenCalled()
+        expect(f.invoke.mock.calls.some(([name]) => name === 'server_sync_claim_offline_notice')).toBe(false)
+        failure = { code: 'server-unreachable', retryable: true }
+        await vi.advanceTimersByTimeAsync(5000)
+        expect(f.alert).toHaveBeenCalledExactlyOnceWith((await import('src/lang')).language.risuNest.serverSync.offlineNotice)
+    })
     it.each([false, true])('retries an offline startup activation before allowing any transfer after the server returns (manual retry: %s)', async manualRetry => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         const base = f.invoke.getMockImplementation()!
@@ -809,6 +826,26 @@ describe('production server LWW composition', () => {
         visible(true); await settle()
         const syncCommands = f.invoke.mock.calls.map(([command]) => command as string)
         expect(syncCommands).toEqual(expect.arrayContaining(['server_sync_notify_start', 'server_sync_lww_pull', 'server_sync_lww_push']))
+    })
+    it('restores automatic sync when stopping the old jobs for a manual retry fails', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const fallback = f.invoke.getMockImplementation()!
+        let failStop = false
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'pds_lww_binding_state') return bindingContext().state
+            if (command === 'server_sync_notify_stop' && failStop) {
+                failStop = false
+                throw { code: 'server-sync-state-unavailable', retryable: true }
+            }
+            return fallback(command, args)
+        })
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        f.invoke.mockClear(); failStop = true
+        await expect(production.retryServerSync()).rejects.toMatchObject({ code: 'server-sync-state-unavailable' })
+        await settle()
+        expect(f.invoke.mock.calls.map(([command]) => command)).toEqual(expect.arrayContaining([
+            'server_sync_notify_start', 'server_sync_lww_pull', 'server_sync_lww_push',
+        ]))
     })
     it('settles the old registration tolerantly and claims a fresh writer for a new registration without pushing', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()

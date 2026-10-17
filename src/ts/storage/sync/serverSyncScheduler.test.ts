@@ -11,14 +11,14 @@ function fixture() {
 describe('server LWW foreground scheduler', () => {
     it('classifies tunnel outages and timeouts without masking authentication or local failures', () => {
         for (const status of [502, 503, 504, 530]) expect(isServerSyncUnavailable({ code: 'server-response-error', status })).toBe(true)
-        for (const code of ['server-timeout', 'incomplete-response']) expect(isServerSyncUnavailable({ code })).toBe(true)
-        for (const error of [{ code: 'server-response-error', status: 401 }, { code: 'local-storage', status: 503 }, new TypeError('Load failed')]) {
+        for (const code of ['server-timeout', 'incomplete-response', 'sync-retry-budget-exhausted']) expect(isServerSyncUnavailable({ code })).toBe(true)
+        for (const error of [{ code: 'server-response-error', status: 401 }, { code: 'local-storage', status: 503 }, { code: 'server-unreachable', retryable: false }, new TypeError('Load failed')]) {
             expect(isServerSyncUnavailable(error)).toBe(false)
         }
     })
-    it('backs off an outage across all automatic triggers and resumes queued work after recovery', async () => {
+    it.each(['server-unreachable', 'sync-retry-budget-exhausted'])('backs off %s across all automatic triggers and resumes queued work after recovery', async code => {
         const f = fixture()
-        const offline = { code: 'server-unreachable', retryable: true }
+        const offline = { code, retryable: true }
         f.push.mockRejectedValue(offline); f.pull.mockRejectedValue(offline); f.connect.mockRejectedValue(offline)
         await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
         for (const [index, delay] of [5000, 10000, 20000, 40000, 80000, 160000, 300000, 300000].entries()) {

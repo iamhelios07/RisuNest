@@ -72,7 +72,11 @@ let context: BindingContext | undefined
 let activationPending: BindingContext | undefined
 let activating: Promise<void> | undefined
 let error = ''
-let gatewayUnavailable = false
+let serverUnavailable = false
+const recordFailure = (value: unknown) => {
+    error = serverSyncErrorCode(value) || 'server-unreachable'
+    serverUnavailable = isServerSyncUnavailable(value)
+}
 let foreground = false
 let heldForCommittedRestore = false
 let replacing = false
@@ -94,7 +98,7 @@ const changed = () => {
     if (offlineNoticePending || offlineNoticeClaimed || !isTauri || document.visibilityState === 'hidden'
         || binding || (!context && persistedBinding?.target.kind !== 'server')
         || getDatabase().risunestSyncStatusUi === false
-        || (!isServerSyncUnavailable({ code: error }) && !(error === 'server-response-error' && gatewayUnavailable))) return
+        || !error || !serverUnavailable) return
     offlineNoticePending = true
     // Native state survives a WebView reload, including iOS content-process recovery.
     void invoke<boolean>('server_sync_claim_offline_notice').then(claimed => {
@@ -259,8 +263,7 @@ function continueHydration(): void {
         if (representativesOnly) representativesPending = true
         else hydrationPending = true
         if (serverSyncErrorCode(value) !== 'cancelled' && foreground && !scheduler.isBlocked()) {
-            hydrationError = serverSyncErrorCode(value) || 'server-unreachable'; error = hydrationError
-            gatewayUnavailable = isServerSyncUnavailable(value)
+            recordFailure(value); hydrationError = error
             if (isServerSyncUnavailable(value)) scheduler.reportFailure(value)
         }
     }).finally(() => {
@@ -308,7 +311,7 @@ const transientTransportFailure = (value: unknown) => {
 const settingsResolvedFailure = (value: unknown) => ['unauthorized', 'invalid-device-token', 'server-epoch-changed', 'device-credential-unavailable'].includes(serverSyncErrorCode(value))
 async function resumeCurrentServerBinding(state: BindingContext['state']): Promise<void> {
     try { await resumeCurrentSyncBinding(state.target) }
-    catch (value) { error = serverSyncErrorCode(failures(value)[0]) || 'server-unreachable'; await controller.ensureStatus(); throw value }
+    catch (value) { recordFailure(failures(value)[0]); await controller.ensureStatus(); throw value }
 }
 /** Sends queued pages until none remain; without `drain` it stops when the app leaves the foreground. */
 async function pushAvailable(captured: BindingContext, drain = false): Promise<void> {
@@ -366,7 +369,7 @@ const scheduler = createServerSyncScheduler({
     }),
     connect: async operationId => { if (context) { await ensureActivated(context); await invoke('server_sync_notify_start', { request: header(), operationId }) } },
     disconnect: async () => { await invoke('server_sync_notify_stop'); await invoke('server_sync_cancel') },
-    failed(value) { error = serverSyncErrorCode(value) || 'server-unreachable'; gatewayUnavailable = isServerSyncUnavailable(value); changed() },
+    failed(value) { recordFailure(value); changed() },
     recovered() { if (error && error !== hydrationError) { error = ''; changed() }; continueHydration() },
     retrying: continueHydration,
     activity() { settleAttempt(); changed() },
@@ -393,7 +396,7 @@ const transport: SyncBindingTransport = {
     reportStopped(value) {
         if (connectionAttempt?.dismissed) return
         const code = serverSyncErrorCode(failures(value)[0])
-        if (code !== 'cancelled') { error = code || 'server-unreachable'; changed() }
+        if (code !== 'cancelled') { recordFailure(failures(value)[0]); changed() }
     },
     async fenceOldJobs(c) { foreground = false; context = undefined; persistedBinding = undefined; await scheduler.fence(); await hydrating; activationPending = undefined; await invoke('server_sync_lww_fence', { newDevice: c.mode === 'new-device' || c.mode === 'fresh-writer' }); hydrationPending = false; representativesPending = false; hydrationAgain = false },
     async receiveAvailableChanges(c) { c.signal.throwIfAborted(); if (!context || context.state.targetAuthority !== c.state.targetAuthority || context.state.selectionEpoch !== c.state.selectionEpoch) throw new Error('Sync binding changed'); await receiveAvailableServerChanges(); c.signal.throwIfAborted() },
@@ -448,7 +451,7 @@ async function bindServer(options: SyncBindingOptions = {}): Promise<BindingOutc
         const statusKnown = await controller.ensureStatus().then(() => true, () => false)
         const bound = bindingIncomplete || persistedBinding?.target.kind === 'server' || context && !context.signal.aborted
         if (currentAttempt.dismissed && statusKnown && !bound) { error = ''; hydrationError = ''; changed() }
-        else if (code !== 'cancelled') { error = code || 'server-unreachable'; changed() }
+        else if (code !== 'cancelled') { recordFailure(failures(value)[0]); changed() }
         throw value
     }
     finally {
@@ -490,8 +493,9 @@ export async function retryServerSync(): Promise<void> {
     if (!context || context.signal.aborted || context.state.targetAuthority !== current.targetAuthority || context.state.selectionEpoch !== current.selectionEpoch || context.state.libraryId !== current.libraryId || context.state.target.kind !== 'server' || context.state.target.connectionId !== current.target.connectionId) {
         await resumeCurrentServerBinding(current)
     }
-    foreground = false; await scheduler.fence()
+    foreground = false
     try {
+        await scheduler.fence()
         await hydrating
         if (context) await ensureActivated(context)
         await retryNativeClock(); await scheduler.retry()
@@ -540,7 +544,7 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     }))
     disposers.push(() => { clearTimeout(priorityTimer); priorityTimer = undefined })
     disposers.push(await listen<{ connected: boolean }>('risu-server-sync-notification', event => scheduler.socket(event.payload.connected)))
-    const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; error = serverSyncErrorCode(value) || 'server-unreachable'; changed() }) }
+    const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; recordFailure(value); changed() }) }
     document.addEventListener('visibilitychange', visibility)
     disposers.push(() => document.removeEventListener('visibilitychange', visibility))
     disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; foreground = false; hydrationPending = false; representativesPending = false; clearTimeout(representativesTimer); representativesTimer = undefined; hydrationAgain = false; attempt = undefined; clearFinished(); watchSamples() }
