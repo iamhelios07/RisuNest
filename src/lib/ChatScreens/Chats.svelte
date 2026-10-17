@@ -2037,6 +2037,7 @@
         const existing = rowParserProjections.get(key)
         if (
             existing
+            && !existing.controller.signal.aborted
             && existing.source === source
             && existing.sourceToken === sourceSnapshot.sourceToken
             && existing.sourceVersion === sourceSnapshot.version
@@ -2052,7 +2053,8 @@
 
         const preserveMountedRuntime = sourceHandoffRuntimeKeys.has(key) || (
             existing?.source === source && (
-                existing.sourceToken !== sourceSnapshot.sourceToken
+                existing.controller.signal.aborted
+                || existing.sourceToken !== sourceSnapshot.sourceToken
                 || existing.sourceVersion !== sourceSnapshot.version
                 || existing.historyVersion !== sourceSnapshot.historyVersion
                 || existing.row.key !== row.key
@@ -2098,6 +2100,7 @@
             totalMessages: state.totalMessages,
             signal: state.controller.signal,
             isCurrent: () => isRowParserProjectionCurrent(key, state),
+            onStale: () => handleRowParserProjectionStale(key, state),
         }).then((projection) => {
             if (projection.kind === 'complete') state.dependencies.all = true
             if (!isRowParserProjectionCurrent(key, state)) {
@@ -2159,6 +2162,17 @@
             state.preparationPending = true
             startRowMountDrain()
         }, PARSER_PROJECTION_RETRY_DELAY_MS)
+    }
+
+    // A later CBS pass read history that changed before it registered the read.
+    // Abort that render and prepare the row again, as for a covered history change.
+    function handleRowParserProjectionStale(
+        key: string,
+        state: RowParserProjectionState,
+    ): void {
+        if (rowParserProjections.get(key) !== state || state.controller.signal.aborted) return
+        state.controller.abort()
+        queueProjectionReconcile()
     }
 
     function isRowParserProjectionCurrent(

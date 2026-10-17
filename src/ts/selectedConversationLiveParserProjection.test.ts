@@ -400,6 +400,30 @@ describe('selected conversation live parser projection', () => {
         expect(onStale).toHaveBeenCalledTimes(2)
     })
 
+    test('asks a row to prepare again only when its later pass fails on changed history', async () => {
+        const testHarness = await cachedHarness()
+        const controller = new AbortController()
+        const onStale = vi.fn()
+        const result = await testHarness.resolver.resolve({
+            row: testHarness.source.snapshot().rowAt(5)!,
+            totalMessages: 8,
+            signal: controller.signal,
+            onStale,
+        })
+        if (result.kind !== 'bounded') throw new Error('Expected bounded projection')
+        const prepareHistory = result.context.parserContext.prepareHistory!
+        // A failure without a history change would only fail again.
+        testHarness.reads.mockRejectedValueOnce(new Error('Synthetic read failure'))
+        await expect(prepareHistory('{{previouschatlog::0}}', 5, false)).rejects.toThrow('Synthetic read failure')
+        expect(onStale).not.toHaveBeenCalled()
+        testHarness.source.applyOptimisticRange(7, 1, [message(7, 'pending tail')])
+        await expect(prepareHistory('{{lastmessage}}', 5, false)).rejects.toThrow('Chat parser history projection became stale')
+        expect(onStale).toHaveBeenCalledOnce()
+        controller.abort()
+        await expect(prepareHistory('{{lastmessage}}', 5, false)).rejects.toThrow()
+        expect(onStale).toHaveBeenCalledOnce()
+    })
+
     test('holds complete authority for a Lua greeting even when there are no message rows', async () => {
         const testHarness = harness({
             messages: [],

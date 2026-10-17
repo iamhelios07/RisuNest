@@ -16,6 +16,7 @@ import type {
     LiveChatParserProjection,
     LiveChatParserProjectionResolver,
 } from 'src/ts/selectedConversationLiveParserProjection'
+import { createSelectedConversationLiveParserProjectionResolver } from 'src/ts/selectedConversationLiveParserProjection'
 import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
 import { captureResidentCbsHistory } from 'src/ts/prepareCbsHistory'
 import { planChatParserHistory } from 'src/ts/chatParserHistory'
@@ -293,6 +294,43 @@ function boundedProjection(
         messages: projectedCharacter.chats[0].message,
         context,
     }
+}
+
+// The production resolver over resident rows, recording each row's latest projection.
+function residentRowParserResolver(
+    messages: readonly Message[],
+    source: ReturnType<typeof makePersistentViewportSource>,
+    currentCharacter: character,
+) {
+    const selection = { characterId: 'character-id', conversationId: 'chat-room-id', navigationGeneration: 0, storeRevision: 1 }
+    const resolver = createSelectedConversationLiveParserProjectionResolver({
+        runtime: {
+            store: { readConversationWindow: async () => { throw new Error('All test rows are resident') } } as any,
+            captureSelectedConversationTarget: () => ({ ...selection }) as any,
+            captureSelectedConversationAuthority: () => ({ ...selection, totalMessages: messages.length,
+                sessionToken: 'session', sessionVersion: 0, persistedSessionVersion: 0 }) as any,
+            getActiveConversationViewportSource: () => source,
+            acquireCompleteConversation: async () => { throw new Error('Unexpected complete promotion') },
+        },
+        maxProjectionMessages: 4,
+        captureCurrent: () => ({ character: currentCharacter, conversation: currentCharacter.chats[0] }) as any,
+        createBoundedContextSeed: () => {
+            const seed = boundedProjection(currentCharacter, 0)
+            if (seed.kind !== 'bounded') throw new Error('Expected bounded seed')
+            seed.context.parserContext.character.chats[0].message = []
+            return seed.context
+        },
+        createCompleteContext: () => { throw new Error('Unexpected complete promotion') },
+        parserSource: () => '',
+        unsafeDependencies: () => [],
+    })
+    const projections = new Map<number, LiveChatParserProjection>()
+    const resolve = vi.fn(async (input: Parameters<LiveChatParserProjectionResolver['resolve']>[0]) => {
+        const projection = await resolver.resolve(input)
+        projections.set(input.row.absoluteIndex, projection)
+        return projection
+    })
+    return { resolve, projections }
 }
 
 function probeElements(target: HTMLElement): HTMLElement[] {
@@ -1697,6 +1735,77 @@ describe('Chats imperative mount lifecycle', () => {
         }
         expect(resolve.mock.calls.length - baseline).toBe(chunks)
         expect(unchanged.map((row) => row.dataset.refreshCount)).toEqual(counts)
+    })
+
+    test('prepares a row again when a later pass reads history edited after its projection', async () => {
+        const messages = Array.from({ length: 6 }, (_, index) => makeMessage(index))
+        const source = makePersistentViewportSource(messages)
+        const currentCharacter = makeMetadataOnlyCharacter()
+        const { resolve, projections } = residentRowParserResolver(messages, source, currentCharacter)
+        mounted = mount(ChatsHarness, { target, props: { initialCharacter: currentCharacter,
+            initialViewportSource: source, parserProjectionResolver: { resolve } } })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(6))
+        const stale = projections.get(2)
+        if (stale?.kind !== 'bounded') throw new Error('Expected bounded projection')
+        const staleSignal = chatMountProbe.mounts.filter((entry) => entry.index === 2).at(-1)?.parserAbortSignal
+        const mediaRow = probeElements(target).find((row) => row.dataset.index === '2')!
+        const mediaInstance = Number(mediaRow.dataset.chatProbe)
+        const media = document.createElement('audio')
+        mediaRow.append(media)
+        media.dispatchEvent(new Event('play'))
+        const bindings = () => chatMountProbe.viewportBindings.filter((entry) => entry.instanceId === mediaInstance).length
+        const displays = () => chatMountProbe.displayUpdates.filter((entry) => entry.instanceId === mediaInstance)
+        const boundBefore = bindings()
+        // Row 2 read only itself, so editing the tail does not refresh it.
+        source.applyOptimisticRange(5, 1, [{ ...messages[5], data: 'edited tail' }])
+        await vi.waitFor(() => expect(probeElements(target).find((row) => row.dataset.index === '5')?.dataset.message).toBe('edited tail'))
+        expect(projections.get(2)).toBe(stale)
+        await expect(stale.context.parserContext.prepareHistory!('{{lastmessage}}', 2, false))
+            .rejects.toThrow('Chat parser history projection became stale')
+        expect(staleSignal?.aborted).toBe(true)
+        await vi.waitFor(() => expect(projections.get(2)).not.toBe(stale))
+        const fresh = projections.get(2)
+        if (fresh?.kind !== 'bounded') throw new Error('Expected bounded projection')
+        expect((await fresh.context.parserContext.prepareHistory!('{{lastmessage}}', 2, false)).row(5)?.data).toBe('edited tail')
+        // Like a covered history change, a playing row keeps its display until the media pauses.
+        await vi.waitFor(() => expect(bindings()).toBeGreaterThan(boundBefore))
+        expect(displays()).toEqual([])
+        expect(media.isConnected).toBe(true)
+        media.dispatchEvent(new Event('pause'))
+        await vi.waitFor(() => expect(displays().some((entry) => entry.signal?.aborted === false)).toBe(true))
+        expect(probeElements(target).find((row) => row.dataset.index === '2')?.dataset.chatProbe).toBe(String(mediaInstance))
+        expect(chatMountProbe.unmounts).toEqual([])
+    })
+
+    test('prepares a row again when a later pass reads history edited while the row was preparing', async () => {
+        chatMountProbe.holdDisplay = true
+        const messages = Array.from({ length: 6 }, (_, index) => makeMessage(index))
+        const source = makePersistentViewportSource(messages)
+        const currentCharacter = makeMetadataOnlyCharacter()
+        const { resolve, projections } = residentRowParserResolver(messages, source, currentCharacter)
+        mounted = mount(ChatsHarness, { target, props: { initialCharacter: currentCharacter,
+            initialViewportSource: source, parserProjectionResolver: { resolve } } })
+        await vi.waitFor(() => expect(chatMountProbe.pendingDisplays.size).toBe(2))
+        const stale = projections.get(5)
+        if (stale?.kind !== 'bounded') throw new Error('Expected bounded projection')
+        const staleSignal = chatMountProbe.mounts.find((entry) => entry.index === 5)?.parserAbortSignal
+        // Row 5 read only itself and is still preparing, so the reconcile for this edit
+        // passes it by before the later pass reads the edited row.
+        source.applyOptimisticRange(3, 1, [{ ...messages[3], data: 'edited row' }])
+        await tick()
+        await tick()
+        expect(staleSignal?.aborted).toBe(false)
+        await expect(stale.context.parserContext.prepareHistory!('{{previouschatlog::3}}', 5, false))
+            .rejects.toThrow('Chat parser history projection became stale')
+        expect(staleSignal?.aborted).toBe(true)
+        chatMountProbe.holdDisplay = false
+        for (const settle of [...chatMountProbe.pendingDisplays.values()]) settle()
+        await vi.waitFor(() => expect(projections.get(5)).not.toBe(stale))
+        const fresh = projections.get(5)
+        if (fresh?.kind !== 'bounded') throw new Error('Expected bounded projection')
+        expect((await fresh.context.parserContext.prepareHistory!('{{previouschatlog::3}}', 5, false)).row(3)?.data).toBe('edited row')
+        await vi.waitFor(() => expect(chatMountProbe.displayUpdates.some((entry) => entry.index === 5 && entry.signal?.aborted === false)).toBe(true))
+        expect(chatMountProbe.unmounts).toEqual([])
     })
 
     test('keeps an unresolved retained row projection usable across a direct jump', async () => {

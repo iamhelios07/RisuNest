@@ -52,6 +52,7 @@ export interface LiveChatParserProjectionRequest {
     readonly totalMessages: number
     readonly signal?: AbortSignal
     readonly isCurrent?: () => boolean
+    readonly onStale?: () => void
 }
 
 export interface LiveChatParserConversationStartRequest {
@@ -304,6 +305,22 @@ export function createSelectedConversationLiveParserProjectionResolver(
                     projection.messages[projection.projectedChatID],
                     input.row.message,
                 )) throw new ChatParserHistoryProjectionStaleError()
+                const historyChanged = resident?.historyChanged
+                const prepareHistory = projection.context.parserContext.prepareHistory
+                if (historyChanged && prepareHistory) projection.context.parserContext.prepareHistory = async (text, chatID, complete) => {
+                    try {
+                        return await prepareHistory(text, chatID, complete)
+                    } catch (error) {
+                        // A later pass can depend on a row that changed after the resident
+                        // rows were captured, which row refreshes skipped, so the row has to
+                        // prepare again. The owner's own check also fails when its baseline
+                        // predates the edit, so only cancellation stops the notification.
+                        // Being past an await, this already runs outside the parse call
+                        // stack, which may be inside a derived.
+                        if (!input.signal?.aborted && historyChanged()) input.onStale?.()
+                        throw error
+                    }
+                }
                 return projection
             } finally {
                 resident?.release()
@@ -319,6 +336,7 @@ function captureResidentParserRows(
 ): {
     readMessage: NonNullable<ChatParserHistoryProjectionReader['readResidentMessage']>
     isCurrent(): boolean
+    historyChanged(): boolean
     release(): void
 } | null {
     const source = dependencies.runtime.getActiveConversationViewportSource?.()
@@ -359,6 +377,8 @@ function captureResidentParserRows(
         ? new Map(source.captureResidentRows().map((row) => [row.absoluteIndex, row])) : undefined
     return {
         isCurrent,
+        historyChanged: () => dependencies.runtime.getActiveConversationViewportSource?.() === source
+            && hasCbsHistoryChanges(source.snapshot(), snapshot.historyVersion, input.dependencies!),
         readMessage: (index) => {
             if (!isCurrent()) throw new ChatParserHistoryProjectionStaleError()
             const row = rows ? rows.get(index) : snapshot.rowAt(index)
