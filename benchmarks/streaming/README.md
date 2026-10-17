@@ -24,6 +24,8 @@ Set `ANDROID_HOME` or pass `--adb=<adb-executable>`. Pass the exact emulator ser
 | `persistence-spike` | Compares bounded JSON, byte-array, and string IPC returns |
 | `persistence` | Exercises the production Worker encoder and Android commit adapter |
 | `parser-context` | Measures a character switch in the mounted production chat screen with synthetic assets |
+| `asset-bytes` | Measures native asset and inlay transfers and verifies concurrent DB/device/asset writes |
+| `asset-bytes-legacy` | Runs the same asset checks with the optional Android binary bridge disabled |
 
 Examples:
 

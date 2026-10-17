@@ -76,6 +76,7 @@ describe('native asset repository adapters', () => {
         const hash = '22'.repeat(32)
         const acknowledgements: number[] = []
         const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            if (command === 'native_asset_bytes_probe') return false
             if (command === 'asset_cas_job_upload_open') {
                 return { capacity: 64 * 1024 }
             }
@@ -104,6 +105,7 @@ describe('native asset repository adapters', () => {
 
         expect(acknowledgements).toEqual([64 * 1024, 64 * 1024 + 3])
         expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+            'native_asset_bytes_probe',
             'asset_cas_job_upload_open',
             'asset_cas_job_upload_chunk',
             'asset_cas_job_upload_chunk',
@@ -136,6 +138,69 @@ describe('native asset repository adapters', () => {
         expect(rangeCalls).toHaveLength(2)
         expect(rangeCalls.map(([, args]) => Number(args?.endExclusive) - Number(args?.start)))
             .toEqual([NATIVE_CAS_IPC_CHUNK_BYTES, 5])
+    })
+
+    it('bounds range allocation by EOF and distinguishes missing objects from empty results', async () => {
+        const source = Uint8Array.from({ length: NATIVE_CAS_IPC_CHUNK_BYTES + 256 }, (_, i) => i % 256)
+        let present = true
+        const sessions = new Map<unknown, number>()
+        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            if (command === 'asset_cas_read_open') {
+                if (!present) return null
+                // Native clamps the requested range to the object's size.
+                const start = Math.min(Number(args?.start), source.length)
+                const end = Math.min(Number(args?.endExclusive), source.length)
+                sessions.set(args?.readId, end)
+                return { byteSize: source.length, start, endExclusive: end, capacity: 256 * 1024 }
+            }
+            if (command === 'asset_cas_read_close') { sessions.delete(args?.readId); return }
+            if (command === 'asset_cas_read_part' || command === 'asset_cas_read_object_range') {
+                expect(Number(args?.endExclusive)).toBeLessThanOrEqual(command === 'asset_cas_read_part'
+                    ? sessions.get(args?.readId)!
+                    : Number(args?.start) + NATIVE_CAS_IPC_CHUNK_BYTES)
+                return present ? source.subarray(Number(args?.start), Number(args?.endExclusive)) : null
+            }
+            throw new Error(`Unexpected command ${command}`)
+        })
+        const cas = createNativeImmutablePayloadCas(invoke)
+        await expect(cas.readObjectRange('11'.repeat(32), { start: 0, endExclusive: Number.MAX_SAFE_INTEGER }))
+            .resolves.toEqual(source)
+        await expect(cas.readObjectRange('11'.repeat(32), { start: source.length + 1, endExclusive: Number.MAX_SAFE_INTEGER }))
+            .resolves.toEqual(new Uint8Array())
+        await expect(cas.readObjectRange('11'.repeat(32), { start: source.length - 3, endExclusive: source.length + 5 }))
+            .resolves.toEqual(source.subarray(source.length - 3))
+        expect(sessions.size).toBe(0)
+        present = false
+        await expect(cas.readObjectRange('11'.repeat(32), { start: 0, endExclusive: 0 })).resolves.toBeNull()
+        await expect(cas.readObjectRange('11'.repeat(32), { start: 0, endExclusive: Number.MAX_SAFE_INTEGER })).resolves.toBeNull()
+    })
+
+    it.each(['complete', 'short', 'overlong', 'error', 'missing'] as const)('releases the owned large-read session after %s', async outcome => {
+        const source = Uint8Array.from({ length: 256 * 1024 + 37 }, (_, i) => i % 256)
+        let activeId: unknown
+        let closed = false
+        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            if (command === 'asset_cas_stat_object') return source.length
+            if (command === 'asset_cas_read_open') {
+                activeId = args?.readId
+                if (outcome === 'missing') return null
+                return { byteSize: source.length, start: 0, endExclusive: source.length, capacity: 256 * 1024 }
+            }
+            expect(args?.readId).toBe(activeId)
+            if (command === 'asset_cas_read_close') { closed = true; return }
+            if (command === 'asset_cas_read_part') {
+                if (outcome === 'error') throw new Error('native read failed')
+                if (outcome === 'short') return new Uint8Array(1)
+                if (outcome === 'overlong') return new Uint8Array(256 * 1024 + 1)
+                return source.slice(Number(args?.start), Number(args?.endExclusive)).buffer
+            }
+            throw new Error(`Unexpected command ${command}`)
+        })
+        const result = createNativeImmutablePayloadCas(invoke).readObject('11'.repeat(32))
+        if (outcome === 'complete') await expect(result).resolves.toEqual(source)
+        else if (outcome === 'missing') await expect(result).resolves.toBeNull()
+        else await expect(result).rejects.toThrow()
+        expect(closed).toBe(true)
     })
 
     it('forwards configurable inlay options and accepts truthful PNG metadata', async () => {
@@ -186,6 +251,7 @@ describe('native asset repository adapters', () => {
         const output = new Uint8Array(transferSize)
         output[transferSize - 1] = 7
         const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            if (command === 'native_asset_bytes_probe') return false
             if (command === 'native_media_inlay_input_open') return { capacity: 64 * 1024 }
             if (command === 'native_media_inlay_input_chunk') {
                 return Number(args?.offset) + (args?.data as number[]).length
@@ -218,6 +284,7 @@ describe('native asset repository adapters', () => {
         )).resolves.toMatchObject({ data: output })
 
         expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+            'native_asset_bytes_probe',
             'native_media_inlay_input_open',
             'native_media_inlay_input_chunk',
             'native_media_inlay_input_chunk',
