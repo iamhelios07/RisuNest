@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { risuChatParser } from 'src/ts/parser/parser.svelte'
     import { pluginStartupGate } from 'src/ts/plugins/pluginStartupGate'
     import { refuseGenerationWhilePluginsWait } from 'src/ts/plugins/pluginStartupRefusal'
     import { captureChatParserContextSeed, createChatParserContextSeed } from 'src/ts/chatParserContextSeed.svelte'
@@ -1013,6 +1014,7 @@
                 renderContext: createScreenshotRenderContext(source, chat),
             }, {
                 store: runtime.store,
+                parseFirstPass: risuChatParser,
                 flushPendingData: (reason) => runtime.flushPendingData(reason),
                 getNavigationGeneration: () => runtime.getNavigationGeneration(),
                 getActiveConversationSession: () => runtime.getActiveConversationSession(),
@@ -1326,6 +1328,7 @@
                     },
                 },
             })
+            await sourceLease.close()
             alertNormal(language.screenshotSaved)
             screenshotDialogOpen = false
             screenshotDialogSnapshot = null
@@ -1361,6 +1364,7 @@
                 screenshotDialogOpen = false
             }
         } finally {
+            await sourceLease.close().catch(console.error)
             if (screenshotController === controller) screenshotController = null
             screenshotRunning = false
         }
