@@ -35,6 +35,7 @@ import {
 } from './nativeFileJobs'
 import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
 import { listenRecoveredAndroidRisuSavePublications } from './risuSaveFileRoute'
+import { createPortableExportIntentStore } from './deviceBackup/job'
 
 let disposeSpoolListener: (() => void) | undefined
 
@@ -275,7 +276,11 @@ export function registerAndroidRisuSaveRoute(): void {
             getStatus: getAndroidSafExportStatus,
             acknowledge: acknowledgeAndroidSafExport,
             listen: listenAndroidSafDestinationEvents,
-            isActive: isAndroidSafDestinationRequestActive,
+            isActive: (requestId) => {
+                if (isAndroidSafDestinationRequestActive(requestId)) return true
+                const intent = createPortableExportIntentStore().read()
+                return intent?.publication === 'android-saf' && intent.requestId === requestId
+            },
         },
     )
 

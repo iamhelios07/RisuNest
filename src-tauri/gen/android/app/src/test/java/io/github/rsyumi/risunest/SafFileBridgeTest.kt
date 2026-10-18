@@ -82,29 +82,62 @@ class SafFileBridgeTest {
     val record = terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false)
     val session = SafDestinationRendererSession()
     session.own(id)
-    assertNull(reconciledSafDestination(record, session.owns(id), 3_000))
+    assertNull(reconciledSafDestination(record, session.owns(id), 3_000, true))
     val oldGeneration = session.generation
     session.retire()
     session.own(id, oldGeneration)
     assertFalse(session.owns(id))
-    val recovered = reconciledSafDestination(record, session.owns(id), 3_000)!!
+    val recovered = reconciledSafDestination(record, session.owns(id), 3_000, true)!!
     assertEquals(SafDestinationPhase.FAILED, recovered.phase)
     assertEquals("destination-interrupted", recovered.code)
     assertEquals(record.destinationUri, recovered.destinationUri)
     assertTrue(recovered.publicationPrerequisitesComplete)
     assertTrue(recovered.warningCodes.contains("partial-destination-may-remain"))
     assertEquals(record.copy(publicationPrerequisitesComplete = true),
-      reconciledSafDestination(record.copy(publicationPrerequisitesComplete = true), false, 3_000))
+      reconciledSafDestination(record.copy(publicationPrerequisitesComplete = true), false, 3_000, true))
     for (phase in listOf(SafDestinationPhase.CANCELLED, SafDestinationPhase.FAILED)) {
       val unstarted = record.copy(phase = phase, copyStarted = false, exportBound = false, warningCodes = emptyList())
-      assertEquals(unstarted, reconciledSafDestination(unstarted, false, 3_000))
+      assertEquals(unstarted, reconciledSafDestination(unstarted, false, 3_000, true))
     }
-    assertNull(reconciledSafDestination(record.copy(phase = SafDestinationPhase.COPYING), false, 3_000))
-    assertNull(reconciledSafDestination(record.copy(sourceKind = SafDestinationSourceKind.SCREENSHOT), false, 3_000))
+    assertNull(reconciledSafDestination(record.copy(phase = SafDestinationPhase.COPYING), false, 3_000, true))
+    assertNull(reconciledSafDestination(record.copy(sourceKind = SafDestinationSourceKind.SCREENSHOT), false, 3_000, true))
     val fullWarnings = record.copy(warningCodes = (1..16).map { "warning-$it" })
-    val bounded = reconciledSafDestination(fullWarnings, false, 3_000)!!
+    val bounded = reconciledSafDestination(fullWarnings, false, 3_000, true)!!
     assertEquals(16, bounded.warningCodes.size)
     assertTrue(bounded.warningCodes.contains("partial-destination-may-remain"))
+  }
+
+  @Test
+  fun `reconciliation preserves portable outcomes while their handoff resolves`() {
+    val root = temporaryDirectory()
+    val id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    val source = root.resolve("native-file-jobs/handoffs/risunest-backup-$id.risunest")
+    source.parentFile!!.mkdirs()
+    source.writeBytes(byteArrayOf(1, 2, 3))
+    val store = SafDestinationStateStore(root.resolve("state.json"), testAtomicPublisher)
+    for (phase in listOf(SafDestinationPhase.SUCCEEDED, SafDestinationPhase.FAILED, SafDestinationPhase.CANCELLED)) {
+      val record = terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false).copy(
+        phase = phase,
+        code = if (phase == SafDestinationPhase.SUCCEEDED) null else "destination-write-failed",
+        warningCodes = if (phase == SafDestinationPhase.SUCCEEDED) emptyList() else listOf("partial-destination-may-remain"),
+      )
+      store.save(record)
+      val session = SafDestinationRendererSession()
+      val recovered = session.reconcile(record, 3_000, store::save, { true }, store::clear, false,
+        { requiresRisuSavePublicationProof(root, it.exportId, it.sourceKind) })!!
+      assertEquals(record.copy(publicationPrerequisitesComplete = true, updatedAtMillis = 3_000), recovered)
+      assertEquals(recovered, session.status(null))
+      assertTrue(source.exists())
+      assertTrue(session.acknowledge(id, store.load(), store::clear))
+      assertNull(session.status(null))
+    }
+    assertTrue(source.delete())
+    val record = terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false)
+    val unresolved = reconciledSafDestination(record, false, 3_000,
+      requiresRisuSavePublicationProof(root, id, record.sourceKind))!!
+    assertEquals(SafDestinationPhase.FAILED, unresolved.phase)
+    assertEquals("destination-interrupted", unresolved.code)
+    assertTrue(unresolved.warningCodes.contains("partial-destination-may-remain"))
   }
 
   @Test
@@ -116,7 +149,7 @@ class SafFileBridgeTest {
     file.writeText(file.readText().replace("\"copyStarted\":true,", ""))
     val record = store.load()!!
     assertTrue(record.copyStarted)
-    val recovered = reconciledSafDestination(record, false, 3_000)!!
+    val recovered = reconciledSafDestination(record, false, 3_000, true)!!
     store.save(recovered)
     assertEquals("destination-interrupted", store.load()!!.code)
     assertTrue(store.load()!!.publicationPrerequisitesComplete)
@@ -133,13 +166,13 @@ class SafFileBridgeTest {
     val retiredReady = AndroidFrontendReady()
     assertTrue(retiredReady.markReady())
     retiredReady.cancel()
-    val recovered = session.reconcile(store.load()!!, 3_000, store::save, { true }, store::clear, !retiredReady.isReady)!!
+    val recovered = session.reconcile(store.load()!!, 3_000, store::save, { true }, store::clear, !retiredReady.isReady, { true })!!
     assertEquals(recovered, store.load())
     assertEquals(listOf(recovered), session.pending())
     assertFalse(session.acknowledge(id, store.load()) { false })
     assertTrue(session.hasRecovered(id))
     assertEquals(recovered, store.load())
-    session.reconcile(store.load()!!, 3_001, store::save, { true }, store::clear, false)
+    session.reconcile(store.load()!!, 3_001, store::save, { true }, store::clear, false, { true })
     assertNull(store.load())
     assertEquals(recovered, session.status(null))
     val next = terminalDestinationRecord(nextId, nextId, SafDestinationSourceKind.RISU_SAVE, false)
@@ -147,7 +180,7 @@ class SafFileBridgeTest {
     assertEquals(next, session.status(next))
     store.save(next)
     session.own(nextId)
-    assertNull(session.reconcile(next, 3_002, store::save, { true }, store::clear, false))
+    assertNull(session.reconcile(next, 3_002, store::save, { true }, store::clear, false, { true }))
     assertTrue(session.acknowledge(id, store.load(), store::clear))
     assertEquals(next, store.load())
     assertTrue(session.pending().isEmpty())
@@ -161,12 +194,12 @@ class SafFileBridgeTest {
     val store = SafDestinationStateStore(file, testAtomicPublisher)
     val session = SafDestinationRendererSession()
     store.save(terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false))
-    assertNull(session.reconcile(store.load()!!, 3_000, store::save, { false }, store::clear, false))
+    assertNull(session.reconcile(store.load()!!, 3_000, store::save, { false }, store::clear, false, { true }))
     assertTrue(store.load()!!.publicationPrerequisitesComplete)
     assertTrue(session.pending().isEmpty())
-    assertNull(session.reconcile(store.load()!!, 3_000, store::save, { true }, { false }, false))
+    assertNull(session.reconcile(store.load()!!, 3_000, store::save, { true }, { false }, false, { true }))
     assertTrue(session.pending().isEmpty())
-    assertTrue(session.reconcile(store.load()!!, 3_000, store::save, { true }, store::clear, false) != null)
+    assertTrue(session.reconcile(store.load()!!, 3_000, store::save, { true }, store::clear, false, { true }) != null)
     assertNull(store.load())
   }
 
