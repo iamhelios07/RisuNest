@@ -1489,6 +1489,16 @@ interface RisuaiPluginAPI {
      * @param text - Text containing CBS macros
      * @param options - Parser context options
      * @returns Parsed text
+     * @throws {Error} If no character or active chat is selected, or messageIndex is
+     * not an integer in the range -1 through the last existing message index.
+     * @throws {Error} If the captured conversation or history revision is no longer
+     * available (PluginParserTargetChangedError in the host). Navigation does not
+     * retarget a call.
+     * @throws {Error} If the pending call is aborted when the plugin is unloaded,
+     * including while waiting for an earlier call's variable writes (AbortError
+     * in the host).
+     * The iframe bridge forwards host error messages as Error instances; it does
+     * not preserve their original error names or subclasses.
      *
      * @example
      * ```typescript
