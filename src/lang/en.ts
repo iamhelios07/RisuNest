@@ -2334,7 +2334,7 @@ export const languageEnglish = {
             registrationRequired: 'New registration code required',
             blocked: 'Automatic sync stopped',
             failed: 'Sync failed',
-            offlineNotice: 'Cannot connect to the Sync server. Sync will retry automatically while the app is open.',
+            offlineNotice: 'Cannot connect to the sync server. Sync will retry automatically while the app is open.',
             errorHelp:
                 'Sync could not finish. Your edits on this device are unchanged. Try again.',
             "connectRowHelpScan": 'Paste the registration code from the server or scan its QR code. Each device needs its own registration code.',
@@ -2451,7 +2451,7 @@ export const languageEnglish = {
             chatEditPopup: 'Edit chat messages in a popup',
             chatEditPopupHelp: 'Pressing the chat edit button lets you edit the message in a popup.',
             syncStatusUi: 'Show sync UI',
-            syncStatusUiHelp: 'Shows the sync status icon, and a notice when sync stops or plugins are waiting for sync.',
+            syncStatusUiHelp: 'Shows the sync status icon, and a notice when sync stops, the sync server cannot be reached, or plugins are waiting for sync.',
         },
         textEditor: {
             open: 'Edit in popup',
