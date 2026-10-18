@@ -2019,13 +2019,14 @@ export class HypaProcesserEx extends HypaProcesser {
         const groupTextsOf = groups.map(group => group.map(c => c.text));
         const keysOf: string[][] = [];
         for (let i = 0; i < groups.length; i++) {
+            const contextSuffix = provider.getCacheKeySuffix(groupTextsOf[i]);
             keysOf.push(
                 await hypaCacheKeys(
                     groups[i].map(chunk => ({
                         producer: 'hypa-v3-group' as const,
                         content: chunk.text,
                         identity,
-                        contextSuffix: provider.getCacheKeySuffix(groupTextsOf[i]),
+                        contextSuffix,
                     }))
                 )
             );
