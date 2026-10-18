@@ -46,7 +46,7 @@ vi.mock(import('../process/scripts'), () => ({
 import { ParseMarkdown, type simpleCharacterArgument } from './parser.svelte'
 
 it('re-runs a reactive parse when an asset changes although only a display script adds its tag', async () => {
-    const assets = $state([['Portrait', 'portrait.png', 'png']])
+    const assets = $state<[string, string, string][]>([['Portrait', 'portrait.png', 'png']])
     const character: simpleCharacterArgument = {
         type: 'simple',
         chaId: 'fixture-character',
