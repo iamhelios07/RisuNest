@@ -952,6 +952,11 @@ mod decoding_tests {
         let checksum = damaged.len() - 8;
         damaged[checksum] ^= 1;
         assert!(decompress(&damaged).is_err());
+        let connection = Connection::open_in_memory().unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&[compressed.clone(), compressed.clone()].concat()).unwrap();
+        let error = stage_payload_with_limit(&connection, file.reopen().unwrap(), &|| false, MAX_DECODED_ARCHIVE_BYTES).err().unwrap();
+        assert!(error.to_string().contains("archived character has trailing compressed data"));
         assert!(decompress(&[compressed.clone(), compressed].concat()).is_err());
         assert!(decompress(&encoded(&[PAYLOAD, b"{}"].concat())).is_err());
     }
