@@ -699,8 +699,8 @@ FunctionEnd
                 }
             } finally {
                 if (Test-Path $oldManager) {
-                    & $oldManager --data-dir $data --server $server uninstall lock-held | Out-Null
-                    & $oldManager --data-dir $data --server $server installer forget-removal | Out-Null
+                    & $ManagerBinary --data-dir $data --server $server uninstall lock-held | Out-Null
+                    & $ManagerBinary --data-dir $data --server $server installer forget-removal | Out-Null
                 }
                 $env:LOCALAPPDATA = $priorLocal
                 $env:APPDATA = $priorRoaming
