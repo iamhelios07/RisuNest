@@ -28,15 +28,15 @@ RisuNest는 [RisuAI](https://github.com/kwaroran/RisuAI)를 포크한 AI 채팅 
 ## 다운로드
 
 <!-- release-downloads:app:start -->
-[RisuNest v1.0.5](https://github.com/rsyumi/RisuNest/releases/tag/app-v1.0.5)에서 운영체제와 CPU 아키텍처에 맞는 파일을 다운로드하세요.
+[RisuNest v1.0.6](https://github.com/rsyumi/RisuNest/releases/tag/app-v1.0.6)에서 운영체제와 CPU 아키텍처에 맞는 파일을 다운로드하세요.
 
 | 플랫폼 | aarch64 (arm64) | x86_64 (x64) |
 | --- | --- | --- |
-| Windows | [EXE](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-windows-aarch64-setup.exe) | [EXE](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-windows-x86_64-setup.exe) |
-| macOS | [DMG](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-darwin-aarch64.dmg) | [DMG](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-darwin-x86_64.dmg) |
-| Linux | [DEB](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-linux-aarch64.deb) / [AppImage](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-linux-aarch64.AppImage) | [DEB](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-linux-x86_64.deb) / [AppImage](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-linux-x86_64.AppImage) |
-| Android | [APK](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-android-aarch64.apk) | - |
-| iOS | [IPA](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-ios-aarch64-unsigned.ipa) | - |
+| Windows | [EXE](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-windows-aarch64-setup.exe) | [EXE](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-windows-x86_64-setup.exe) |
+| macOS | [DMG](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-darwin-aarch64.dmg) | [DMG](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-darwin-x86_64.dmg) |
+| Linux | [DEB](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-linux-aarch64.deb) / [AppImage](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-linux-aarch64.AppImage) | [DEB](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-linux-x86_64.deb) / [AppImage](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-linux-x86_64.AppImage) |
+| Android | [APK](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-android-aarch64.apk) | - |
+| iOS | [IPA](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-ios-aarch64-unsigned.ipa) | - |
 <!-- release-downloads:app:end -->
 
 - iOS는 서명되지 않은 IPA로 배포하므로 AltStore, Sideloadly 같은 도구로 직접 설치해야 합니다.

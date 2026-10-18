@@ -22,6 +22,16 @@
       },
       "versions": [
         {
+          "version": "1.0.6",
+          "buildVersion": "1.0.6",
+          "date": "2026-10-18T18:52:39Z",
+          "localizedDescription": "- Fixed RisuAI account backup and restore not working.\n- Fixed restore problems with some backup files and improved restore failure notices.\n- Fixed backup and sync issues with external storage such as Google Drive, OneDrive, and GitHub.\n- Added a UI and popups that show sync status and errors.\n- Added a feature that delays loading plugins until sync has fully finished (prevents plugin data corruption).\n- Fixed and improved Sync server synchronization.\n- Added CBS parsing for plugins (parseRisuChat).\n- Improved plugin storage compatibility (fixed storing Date objects).\n- Improved conversation loading performance with long chats or many assets.\n- Fixed bugs in automatic input translation, toggle presets, and lorebooks.\n- Fixed a bug that could navigate the RisuNest app to an external page.\n- Fixed and improved file downloads on all platforms, including plugin file downloads.\n- Improved the Windows installer.\n- Improved error messages and logging.",
+          "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-ios-aarch64-unsigned.ipa",
+          "size": 78806152,
+          "sha256": "892b7d61f6cee1f1459fc83a9ea23ecf781a274c8b48e1798c20f808a8aa849e",
+          "minOSVersion": "16.4"
+        },
+        {
           "version": "1.0.5",
           "buildVersion": "1.0.5",
           "date": "2026-10-15T15:01:49Z",
@@ -42,11 +52,11 @@
           "minOSVersion": "16.4"
         }
       ],
-      "version": "1.0.5",
-      "versionDate": "2026-10-15T15:01:49Z",
-      "versionDescription": "- Fixed failures when restoring RisuAI and PocketRisu backups.\n- Fixed large backups failing to restore on Android.\n- Fixed backups with 200,000 or more assets failing to restore.\n- Improved backup restores and Sync/external storage restores to show progress.\n- Improved restore and sync performance.\n- Fixed toggle changes being saved automatically when using toggle binding.\n- Fixed the scroll position jumping when message heights change.\n- Added support for Voyage Context 4 embeddings.\n- Raised the local plugin storage limit.\n- Fixed file selection not working properly on iOS.\n- Improved AltStore integration on iOS and fixed signatures not being passed to the IPA file.\n- Added multiple profiles on desktop through `--profile=<name>`.\n- Added multiple languages and an architecture check to the Windows installer.\n- Improved automatic updates, installation, and removal on Windows.",
-      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.5/RisuNest-1.0.5-ios-aarch64-unsigned.ipa",
-      "size": 78459536
+      "version": "1.0.6",
+      "versionDate": "2026-10-18T18:52:39Z",
+      "versionDescription": "- Fixed RisuAI account backup and restore not working.\n- Fixed restore problems with some backup files and improved restore failure notices.\n- Fixed backup and sync issues with external storage such as Google Drive, OneDrive, and GitHub.\n- Added a UI and popups that show sync status and errors.\n- Added a feature that delays loading plugins until sync has fully finished (prevents plugin data corruption).\n- Fixed and improved Sync server synchronization.\n- Added CBS parsing for plugins (parseRisuChat).\n- Improved plugin storage compatibility (fixed storing Date objects).\n- Improved conversation loading performance with long chats or many assets.\n- Fixed bugs in automatic input translation, toggle presets, and lorebooks.\n- Fixed a bug that could navigate the RisuNest app to an external page.\n- Fixed and improved file downloads on all platforms, including plugin file downloads.\n- Improved the Windows installer.\n- Improved error messages and logging.",
+      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-ios-aarch64-unsigned.ipa",
+      "size": 78806152
     }
   ],
   "news": []
