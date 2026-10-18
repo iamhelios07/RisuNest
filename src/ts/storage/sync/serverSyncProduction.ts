@@ -399,7 +399,12 @@ const transport: SyncBindingTransport = {
         if (code !== 'cancelled') { recordFailure(failures(value)[0]); changed() }
     },
     async fenceOldJobs(c) { foreground = false; context = undefined; persistedBinding = undefined; await scheduler.fence(); await hydrating; activationPending = undefined; await invoke('server_sync_lww_fence', { newDevice: c.mode === 'new-device' || c.mode === 'fresh-writer' }); hydrationPending = false; representativesPending = false; hydrationAgain = false },
-    async receiveAvailableChanges(c) { c.signal.throwIfAborted(); if (!context || context.state.targetAuthority !== c.state.targetAuthority || context.state.selectionEpoch !== c.state.selectionEpoch) throw new Error('Sync binding changed'); await receiveAvailableServerChanges(); c.signal.throwIfAborted() },
+    async receiveAvailableChanges(c) {
+        c.signal.throwIfAborted()
+        if (!context) throw new Error(error || 'Sync binding is unavailable')
+        if (context.state.targetAuthority !== c.state.targetAuthority || context.state.selectionEpoch !== c.state.selectionEpoch) throw new Error('Sync binding changed')
+        await receiveAvailableServerChanges(); c.signal.throwIfAborted()
+    },
     async publishInitialSharedState(c) {
         context = c
         await invoke('server_sync_lww_activate', { request: header() })
