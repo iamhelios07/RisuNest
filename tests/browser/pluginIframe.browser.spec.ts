@@ -333,93 +333,75 @@ test('web mode leaves Blob downloads to the browser', async ({ page }) => {
 })
 
 
-test('native plugin links and window.open use the host opener without replacing the iframe', async ({ page }) => {
+test('native plugin popups remain sandboxed while normal iframe links remain usable', async ({ page, context }) => {
+    await context.route('https://synthetic.invalid/frame', route => route.fulfill({ contentType: 'text/html', headers: { 'Allow-CSP-From': '*' }, body: '<p>Frame destination</p>' }))
     await page.goto('/')
+    const original = page.url()
     await page.evaluate(() => window.boundary.loadDownload(`
-        for (const target of ['', '_blank']) {
-            const a = document.createElement('a');
-            a.href = 'https://synthetic.invalid/' + (target || 'self');
-            a.target = target; a.textContent = target || 'self';
-            document.body.append(a);
-        }
-        const detached = document.createElement('a');
-        detached.href = 'https://synthetic.invalid/detached'; detached.click();
-        window.open('https://synthetic.invalid/window');
-        document.body.dataset.intact = 'yes';
+        const popup = window.open('https://synthetic.invalid/popup');
+        document.body.dataset.popup = String(popup === null);
+        const a = document.createElement('a');
+        a.href = 'https://synthetic.invalid/frame'; a.textContent = 'Frame link'; document.body.append(a);
     `))
     const frame = page.frameLocator('[data-risu-plugin-frame]')
-    await frame.getByText('self', { exact: true }).click()
-    await frame.getByText('_blank', { exact: true }).click()
-    await frame.getByText('self', { exact: true }).click({ button: 'middle' })
-    await expect.poll(() => page.evaluate(() => window.boundary.downloads.opened)).toEqual([
-        'https://synthetic.invalid/detached', 'https://synthetic.invalid/window',
-        'https://synthetic.invalid/self', 'https://synthetic.invalid/_blank', 'https://synthetic.invalid/self',
-    ])
-    await expect(frame.locator('body')).toHaveAttribute('data-intact', 'yes')
-    expect(page.context().pages()).toHaveLength(1)
+    await expect(frame.locator('body')).toHaveAttribute('data-popup', 'true')
+    await frame.getByText('Frame link', { exact: true }).click()
+    await expect(frame.getByText('Frame destination')).toBeVisible()
+    expect(context.pages()).toHaveLength(1)
+    await expect(page).toHaveURL(original)
 })
 
-test('native main-document bridge saves Blob bytes and keeps link and download handling separate', async ({ page }) => {
+test('main-document downloads cancel default handling before the existing window click listener', async ({ page, context }) => {
+    await context.route('https://synthetic.invalid/main.bin', route => route.fulfill({ body: Buffer.from([5, 0, 255]) }))
+    await page.goto('/')
+    await page.evaluate(() => {
+        window.addEventListener('click', event => {
+            const anchor = event.target as HTMLAnchorElement
+            if (anchor.target === '_blank' && !event.defaultPrevented) document.body.dataset.defaultDownload = 'uncancelled'
+        })
+        window.boundary.installMainBridge()
+        const file = document.createElement('a')
+        file.href = 'https://synthetic.invalid/main.bin'
+        file.download = 'main.bin'; file.target = '_blank'; document.body.append(file); file.click()
+    })
+    await expect.poll(() => page.evaluate(() => window.boundary.downloads.files)).toEqual([{ name: 'main.bin', bytes: [5, 0, 255] }])
+    expect(await page.locator('body').getAttribute('data-default-download')).toBeNull()
+    expect(context.pages()).toHaveLength(1)
+})
+
+test('main links use the opener only when replacing the main document', async ({ page }) => {
     await page.goto('/')
     const original = page.url()
     await page.evaluate(() => {
         window.boundary.installMainBridge()
-        const file = document.createElement('a')
-        file.href = URL.createObjectURL(new Blob([new Uint8Array([5, 0, 255])]))
-        file.download = 'main.bin'; file.target = '_blank'; file.click()
-        URL.revokeObjectURL(file.href)
-        const external = document.createElement('a')
-        external.href = 'https://synthetic.invalid/main'; external.textContent = 'External document'
-        document.body.append(external)
-        const prevented = document.createElement('a')
-        prevented.href = 'https://synthetic.invalid/prevented'
-        prevented.onclick = event => event.preventDefault(); prevented.click()
-        for (const url of ['javascript:void(0)', 'file:///secret', 'data:text/html,other', '']) window.open(url)
+        const a = document.createElement('a')
+        a.href = 'https://synthetic.invalid/main'; a.textContent = 'Main link'; document.body.append(a)
         const internal = document.createElement('a')
         internal.href = '#same-document'; document.body.append(internal); internal.click()
+        const prevented = document.createElement('a')
+        prevented.href = 'https://synthetic.invalid/prevented'; prevented.onclick = event => event.preventDefault()
+        document.body.append(prevented); prevented.click()
     })
-    await expect.poll(() => page.evaluate(() => window.boundary.downloads.files)).toEqual([{ name: 'main.bin', bytes: [5, 0, 255] }])
-    await expect(page).toHaveURL(original + '#same-document')
-    await page.getByText('External document', { exact: true }).click()
+    await page.getByText('Main link', { exact: true }).click()
     await expect.poll(() => page.evaluate(() => window.boundary.downloads.opened)).toEqual(['https://synthetic.invalid/main'])
-    expect(page.context().pages()).toHaveLength(1)
     await expect(page).toHaveURL(original + '#same-document')
 })
 
-test('the host rejects forged or unsupported external-open requests', async ({ page }) => {
+test('main popup windows and named iframe targets keep their native browser behavior', async ({ page, context }) => {
+    await context.route('https://synthetic.invalid/popup', route => route.fulfill({ contentType: 'text/html', body: '<script>opener.postMessage("synthetic-auth", "*")</script>' }))
+    await context.route('https://synthetic.invalid/embedded', route => route.fulfill({ contentType: 'text/html', body: '<p>Embedded page</p>' }))
     await page.goto('/')
     await page.evaluate(() => {
-        window.boundary.loadDownload(`
-            let rejected = false;
-            try { await risuai._openExternal('file:///secret'); } catch { rejected = true; }
-            document.body.dataset.rejected = String(rejected);
-        `)
-        const other = document.createElement('iframe')
-        other.sandbox.add('allow-scripts')
-        other.srcdoc = `<script>parent.postMessage({type:'CALL_ROOT',reqId:'forged-open',method:'_openExternal',args:['https://synthetic.invalid/forged']},'*');parent.postMessage({fixture:'open-forgery-sent'},'*')<\/script>`
-        document.body.append(other)
-    })
-    await expect(page.frameLocator('[data-risu-plugin-frame]').locator('body')).toHaveAttribute('data-rejected', 'true')
-    await expect.poll(() => page.evaluate(() => window.boundary.events)).toContainEqual({ fixture: 'open-forgery-sent' })
-    expect(await page.evaluate(() => window.boundary.downloads.opened)).toEqual([])
-})
-
-
-test('explicit application authentication popups retain their window and message channel', async ({ page, context }) => {
-    await context.route('https://synthetic.invalid/auth?popup=1', route => route.fulfill({
-        contentType: 'text/html', body: '<script>opener.postMessage("synthetic-auth", "*")</script>',
-    }))
-    await page.goto('/')
-    await page.evaluate(() => {
-        window.boundary.installMainBridge(true)
-        window.addEventListener('message', event => {
-            if (event.data === 'synthetic-auth') document.body.dataset.auth = 'received'
-        })
+        window.boundary.installMainBridge()
+        window.addEventListener('message', event => { if (event.data === 'synthetic-auth') document.body.dataset.auth = 'received' })
+        const frame = document.createElement('iframe'); frame.name = 'embedded'; document.body.append(frame)
+        const a = document.createElement('a'); a.href = 'https://synthetic.invalid/embedded'; a.target = 'embedded'; a.textContent = 'Embedded link'; document.body.append(a)
     })
     const popup = page.waitForEvent('popup')
-    const hasWindow = await page.evaluate(() => !!window.open('https://synthetic.invalid/auth?popup=1', '_blank'))
-    expect(hasWindow).toBe(true)
+    expect(await page.evaluate(() => !!window.open('https://synthetic.invalid/popup', '_blank'))).toBe(true)
     await expect(page.locator('body')).toHaveAttribute('data-auth', 'received')
+    await page.getByText('Embedded link', { exact: true }).click()
+    await expect(page.frameLocator('[name="embedded"]').getByText('Embedded page')).toBeVisible()
     expect(await page.evaluate(() => window.boundary.downloads.opened)).toEqual([])
     await (await popup).close()
 })

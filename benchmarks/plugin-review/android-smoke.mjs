@@ -174,17 +174,7 @@ async function main() {
     await client.evaluate("location.href = 'https://example.invalid/blocked-document'; true")
     const downloads = await checkDownloads()
     assert.equal(await client.evaluate('location.href'), originalUrl, 'External navigation replaced the app')
-    const openedUrl = await client.evaluate(`window.__pluginReview.externalLink(${JSON.stringify(token)})`)
-    const browserDeadline = Date.now() + 10000
-    let browserOpened = false
-    while (!browserOpened && Date.now() < browserDeadline) {
-        const activities = (await run(['shell', 'dumpsys', 'activity', 'activities'])).stdout
-        browserOpened = /^\s*(?:topResumedActivity=|mResumedActivity:|ResumedActivity:).*?(?:com\.android\.chrome|com\.android\.browser|ResolverActivity)/m.test(activities)
-        if (!browserOpened) await delay(100)
-    }
-    assert.ok(browserOpened, 'External link did not activate a browser or system chooser')
-    assert.equal(await client.evaluate('location.href'), originalUrl, 'Opening a browser replaced the app')
-    const navigation = { externalDocumentBlocked: true, externalBrowserOpened: browserOpened, openedUrl }
+    const navigation = { externalDocumentBlocked: true }
     const report = { timestamp: new Date().toISOString(), synthetic: true, platform: 'android-emulator', serial, avd,
         androidApi: Number((await run(['shell', 'getprop', 'ro.build.version.sdk'])).stdout.trim()),
         apkSha256: createHash('sha256').update(await readFile(apk)).digest('hex'), environment, ...result, downloads, navigation }

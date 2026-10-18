@@ -52,8 +52,7 @@ export function createWebviewDownloadHandler(dependencies: WebviewDownloadDepend
 export function installWebviewBridge(
     save: (name: string, source: Blob | string) => Promise<unknown>,
     reportError: (error: unknown) => void,
-    openExternal?: (url: string) => void | Promise<unknown>,
-    preservePopup?: (url: URL) => boolean,
+    mainDocument = false,
 ) {
     const objects = new Map<string, Blob>()
     const create = URL.createObjectURL.bind(URL)
@@ -68,40 +67,10 @@ export function installWebviewBridge(
         revoke(url)
     }
 
-    const external = (href: string): URL | undefined => {
-        try {
-            const url = new URL(href, document.baseURI)
-            const base = new URL(document.baseURI)
-            if (url.protocol === base.protocol && url.host === base.host
-                && (url.host || (url.pathname === base.pathname && url.search === base.search))) return
-            if (['http:', 'https:', 'mailto:', 'tel:'].includes(url.protocol)) return url
-        } catch { /* Invalid links are not handed to the operating system. */ }
-    }
-    const open = (url: URL) => {
-        try { void Promise.resolve(openExternal!(url.href)).catch(reportError) }
-        catch (error) { reportError(error) }
-    }
-    if (openExternal) {
-        const originalOpen = window.open.bind(window)
-        window.open = (url, target, features) => {
-            if (url) {
-                const destination = external(String(url))
-                if (destination && preservePopup?.(destination)) return originalOpen(url, target, features)
-                if (destination) open(destination)
-            }
-            return null
-        }
-    }
     const handle = (event: MouseEvent) => {
-        if (event.defaultPrevented || (event.button !== 0 && !(event.type === 'auxclick' && event.button === 1))) return
+        if (event.defaultPrevented || event.button !== 0) return
         const anchor = event.composedPath().find(node => node instanceof HTMLAnchorElement) as HTMLAnchorElement | undefined
-        if (!anchor?.hasAttribute('href')) return
-        if (!anchor.hasAttribute('download')) {
-            if (!openExternal) return
-            const target = external(anchor.href)
-            if (target) { event.preventDefault(); open(target) }
-            return
-        }
+        if (!anchor?.hasAttribute('download') || !anchor.hasAttribute('href')) return
         const href = anchor.href
         const blob = objects.get(href)
         if (!blob && !/^(?:data:|https?:)/i.test(href)) return
@@ -109,8 +78,8 @@ export function installWebviewBridge(
         // Capture the Blob before the plugin can immediately revoke its URL.
         void save(anchor.download, blob ?? href).catch(reportError)
     }
-    window.addEventListener('click', handle)
-    if (openExternal) window.addEventListener('auxclick', handle)
+    const clickTarget = mainDocument ? document : window
+    clickTarget.addEventListener('click', handle as EventListener)
 
     const click = HTMLAnchorElement.prototype.click
     HTMLAnchorElement.prototype.click = function () {
@@ -122,8 +91,7 @@ export function installWebviewBridge(
     const dispatch = HTMLAnchorElement.prototype.dispatchEvent
     HTMLAnchorElement.prototype.dispatchEvent = function (event) {
         if (event.type === 'click' && event instanceof MouseEvent && !event.cancelable
-            && ((this.hasAttribute('download') && /^(?:blob:|data:|https?:)/i.test(this.href))
-                || (openExternal && external(this.href)))) {
+            && this.hasAttribute('download') && /^(?:blob:|data:|https?:)/i.test(this.href)) {
             // FileSaver dispatches non-cancelable clicks. Suppress the engine's duplicate download.
             event = new MouseEvent('click', {
                 bubbles: event.bubbles, cancelable: true, composed: event.composed,
@@ -139,4 +107,20 @@ export function installWebviewBridge(
         this.addEventListener('click', handle)
         try { return dispatch.call(this, event) } finally { this.removeEventListener('click', handle) }
     }
+}
+
+export function installMainFrameLinkBridge(openExternal: (url: string) => Promise<unknown>, reportError: (error: unknown) => void) {
+    document.addEventListener('click', event => {
+        if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.shiftKey || event.metaKey || event.altKey) return
+        const anchor = event.composedPath().find(node => node instanceof HTMLAnchorElement) as HTMLAnchorElement | undefined
+        if (!anchor?.hasAttribute('href') || anchor.hasAttribute('download')) return
+        if (!['', '_self', '_top', '_parent'].includes(anchor.target)) return
+        let url: URL
+        try { url = new URL(anchor.href) } catch { return }
+        if (!['http:', 'https:', 'mailto:', 'tel:'].includes(url.protocol)) return
+        const current = new URL(location.href)
+        if (url.protocol === current.protocol && url.host === current.host) return
+        event.preventDefault()
+        void openExternal(url.href).catch(reportError)
+    })
 }

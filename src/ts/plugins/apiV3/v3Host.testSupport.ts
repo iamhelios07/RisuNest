@@ -124,7 +124,6 @@ export function globalApiModule(overrides: Overrides<typeof import('src/ts/globa
         forageStorage: {} as typeof import('src/ts/globalApi.svelte').forageStorage,
         getFetchLogs: vi.fn(),
         downloadFile: vi.fn(async () => true),
-        openURL: vi.fn(),
     } satisfies Partial<typeof import('src/ts/globalApi.svelte')>
     return { ...module, ...overrides }
 }

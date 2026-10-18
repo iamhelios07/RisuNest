@@ -5,7 +5,7 @@ import { nativeDataPath } from '../../src/ts/storage/nativePaths'
 import { exists, mkdir, readFile, remove } from '@tauri-apps/plugin-fs'
 import { SandboxHost } from '../../src/ts/plugins/apiV3/factory'
 import { createPluginDownloadHandler } from '../../src/ts/plugins/apiV3/pluginDownload'
-import { downloadFile, openURL } from '../../src/ts/globalApi.svelte'
+import { downloadFile } from '../../src/ts/globalApi.svelte'
 import { createPluginStorageStore } from '../../src/ts/plugins/pluginStorageStore'
 import { SqlitePersistentDataStore } from '../../src/ts/storage/sqlitePersistentDataStore'
 import type { Database } from '../../src/ts/storage/database.svelte'
@@ -121,20 +121,6 @@ let downloadHost: SandboxHost | undefined
 let downloadResult: { done: boolean; saved?: boolean; error?: string } = { done: false }
 Object.assign(window, { __pluginReview: {
     marker: 'synthetic-plugin-review-v1',
-    async externalLink(token: string) {
-        check(token === verifiedToken && verifiedToken.length > 0, 'Synthetic ownership not verified')
-        const target = 'https://example.invalid/risunest-webview-check'
-        return new Promise<string>(resolve => {
-            downloadHost?.terminate()
-            downloadHost = new SandboxHost({ _getPropertiesForInitialization: () => ({ list: [] }), _getAliases: () => ({}) },
-                createPluginDownloadHandler({
-                    fetch: async () => { throw new Error('Unexpected fixture network request') },
-                    save: async () => { throw new Error('Unexpected fixture file save') },
-                    reportError: error => { throw error },
-                }), url => { check(url === target, 'External URL differs'); openURL(url); resolve(url) })
-            downloadHost.run(document.body, `const a = document.createElement('a'); a.href = ${JSON.stringify(target)}; a.click();`, 'synthetic-native-link')
-        })
-    },
     get downloadResult() { return downloadResult },
     download(token: string, name: string, size: number) {
         check(token === verifiedToken && verifiedToken.length > 0, 'Synthetic ownership not verified')
@@ -146,7 +132,7 @@ Object.assign(window, { __pluginReview: {
                 fetch: async () => { throw new Error('Unexpected fixture network request') },
                 save: async (filename, bytes) => {
                     check(filename === name && bytes.length === size, 'Download metadata differs')
-                    const saved = await downloadFile(filename, bytes)
+                    const saved = await downloadFile(filename, bytes, { saveDialog: true })
                     downloadResult = { done: true, saved }
                     return saved
                 },

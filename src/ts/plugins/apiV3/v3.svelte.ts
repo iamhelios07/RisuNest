@@ -16,7 +16,7 @@ import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburge
 import { v4 } from "uuid";
 import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
 import { language } from "src/lang";
-import { checkCharOrder, downloadFile, openURL, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
+import { checkCharOrder, downloadFile, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
@@ -1855,9 +1855,9 @@ export async function executePluginV3(plugin:RisuPlugin, isCurrent: () => boolea
     const api = makeRisuaiAPIV3(iframe, plugin, claimSession);
     const host = new SandboxHost(api, isTauri ? createPluginDownloadHandler({
         fetch: api.nativeFetch,
-        save: downloadFile,
+        save: (name, bytes) => downloadFile(name, bytes, { saveDialog: true }),
         reportError: error => alertError(String(error)),
-    }) : undefined, isTauri ? openURL : undefined);
+    }) : undefined);
     host.onActivityChanged?.(notifyPluginActivity);
     v3PluginInstances.push({
         name: plugin.name,

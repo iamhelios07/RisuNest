@@ -5,7 +5,7 @@ import { loadV3Plugins, getV3PluginInstance } from '../../src/ts/plugins/apiV3/v
 import { thoughtDriver } from './thoughtDriver'
 import { SandboxHost } from '../../src/ts/plugins/apiV3/factory'
 import { createPluginDownloadHandler } from '../../src/ts/plugins/apiV3/pluginDownload'
-import { installWebviewBridge } from '../../src/ts/webviewDownload'
+import { installWebviewBridge, installMainFrameLinkBridge } from '../../src/ts/webviewDownload'
 
 mount(Settings, { target: document.querySelector('#settings')! })
 const events: unknown[] = []
@@ -42,17 +42,18 @@ const driver = {
                 return true
             },
             reportError: error => { downloads.errors.push(String(error)) },
-        }) : undefined, native ? url => { downloads.opened.push(url) } : undefined)
+        }) : undefined)
         downloadHost.run(frame, script, 'synthetic-download')
     },
-    installMainBridge(preservePopup = false) {
+    installMainBridge() {
         const save = createPluginDownloadHandler({
             fetch: (url, options) => fetch(url, options),
             save: async (name, bytes) => { downloads.files.push({ name, bytes: [...bytes] }); return true },
             reportError: error => { downloads.errors.push(String(error)) },
         })
         installWebviewBridge((name, source) => save(name, source, new AbortController().signal),
-            error => { downloads.errors.push(String(error)) }, url => { downloads.opened.push(url) }, url => preservePopup && url.searchParams.has('popup'))
+            error => { downloads.errors.push(String(error)) }, true)
+        installMainFrameLinkBridge(async url => { downloads.opened.push(url) }, error => { downloads.errors.push(String(error)) })
     },
     unloadDownload() { downloadHost?.terminate() },
     get downloadIdle() { return downloadHost?.isIdle() },
