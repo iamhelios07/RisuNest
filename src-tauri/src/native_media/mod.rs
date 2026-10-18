@@ -14,6 +14,7 @@ use serde::{
     Deserialize, Deserializer, Serialize,
 };
 use std::{
+    borrow::Cow,
     fs::{self, File},
     io::{Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -60,8 +61,9 @@ pub(crate) struct InlayImageMetadata {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct EncodedInlayImage {
-    data: Vec<u8>,
+pub(crate) struct EncodedInlayImage<'a> {
+    /// Borrows the input when the source is kept as it was.
+    data: Cow<'a, [u8]>,
     metadata: InlayImageMetadata,
 }
 
@@ -301,15 +303,15 @@ fn inlay_media_type(format: Option<ImageFormat>, name: &str) -> (String, String)
 
 /// Stores the input untouched. Every image this encoder cannot improve ends up
 /// here, so an attachment never fails because of its format.
-fn preserved_inlay_image(
+fn preserved_inlay_image<'a>(
     id: &str,
-    data: &[u8],
+    data: &'a [u8],
     name: &str,
     size: Option<(u32, u32)>,
-) -> EncodedInlayImage {
+) -> EncodedInlayImage<'a> {
     let (mime, ext) = inlay_media_type(image::guess_format(data).ok(), name);
     EncodedInlayImage {
-        data: data.to_vec(),
+        data: Cow::Borrowed(data),
         metadata: InlayImageMetadata {
             key: id.to_owned(),
             kind: "inlay".to_owned(),
@@ -545,7 +547,7 @@ fn encode_animated_inlay_image(
     name: &str,
     options: &InlayEncodeOptions,
     source: InlayAnimation,
-) -> Result<EncodedInlayImage, String> {
+) -> Result<EncodedInlayImage<'static>, String> {
     let DecodedInlayAnimation {
         frames,
         width,
@@ -577,16 +579,16 @@ fn encode_animated_inlay_image(
             height: Some(height),
             preservation_reason: None,
         },
-        data: encoded,
+        data: Cow::Owned(encoded),
     })
 }
 
-fn encode_inlay_image(
+fn encode_inlay_image<'a>(
     id: &str,
-    data: &[u8],
+    data: &'a [u8],
     name: &str,
     options: Option<InlayEncodeOptions>,
-) -> Result<EncodedInlayImage, String> {
+) -> Result<EncodedInlayImage<'a>, String> {
     if id.is_empty() || id.starts_with("assets/") {
         return Err("invalid Inlay image id".to_owned());
     }
@@ -696,7 +698,7 @@ fn encode_inlay_image(
         preservation_reason: None,
     };
     Ok(EncodedInlayImage {
-        data: encoded,
+        data: Cow::Owned(encoded),
         metadata,
     })
 }
