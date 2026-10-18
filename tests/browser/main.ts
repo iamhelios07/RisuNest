@@ -6,6 +6,8 @@ import { thoughtDriver } from './thoughtDriver'
 import { SandboxHost } from '../../src/ts/plugins/apiV3/factory'
 import { SafeLocalPluginStorage } from '../../src/ts/plugins/pluginSafeClass'
 import { PluginDeviceKeyspace, type PluginDeviceBackend, type PluginDeviceValue } from '../../src/ts/plugins/pluginDeviceKeyspace'
+import { createPluginDownloadHandler } from '../../src/ts/plugins/apiV3/pluginDownload'
+import { installWebviewBridge, installMainFrameLinkBridge } from '../../src/ts/webviewDownload'
 
 mount(Settings, { target: document.querySelector('#settings')! })
 const events: unknown[] = []
@@ -21,6 +23,13 @@ let localHost: SandboxHost | undefined
 let localKeyspace: PluginDeviceKeyspace | undefined
 let localResult: unknown = null
 const localRows = new Map<string, PluginDeviceValue>()
+let downloadHost: SandboxHost | undefined
+const downloads = {
+    files: [] as { name: string; bytes: number[] }[],
+    errors: [] as string[],
+    opened: [] as string[],
+    mode: 'save' as 'save' | 'cancel' | 'fail',
+}
 const driver = {
     state: fixtureState, events, bridgeMessages,
     captureBridgeMessages(enabled: boolean) { captureBridgeMessages = enabled; bridgeMessages.length = 0 },
@@ -61,6 +70,38 @@ const driver = {
         document.body.append(frame)
         localHost.run(frame, script, 'browser-local-storage')
     },
+    downloads,
+    loadDownload(script: string, native = true) {
+        downloadHost?.terminate()
+        const frame = document.createElement('iframe')
+        document.body.append(frame)
+        downloadHost = new SandboxHost({
+            _getPropertiesForInitialization: () => ({ list: [] }),
+            _getAliases: () => ({}),
+        }, native ? createPluginDownloadHandler({
+            fetch: (url, options) => fetch(url, options),
+            save: async (name, bytes) => {
+                if (downloads.mode === 'cancel') return false
+                if (downloads.mode === 'fail') throw new Error('Synthetic storage failure')
+                downloads.files.push({ name, bytes: [...bytes] })
+                return true
+            },
+            reportError: error => { downloads.errors.push(String(error)) },
+        }) : undefined)
+        downloadHost.run(frame, script, 'synthetic-download')
+    },
+    installMainBridge() {
+        const save = createPluginDownloadHandler({
+            fetch: (url, options) => fetch(url, options),
+            save: async (name, bytes) => { downloads.files.push({ name, bytes: [...bytes] }); return true },
+            reportError: error => { downloads.errors.push(String(error)) },
+        })
+        installWebviewBridge((name, source) => save(name, source, new AbortController().signal),
+            error => { downloads.errors.push(String(error)) }, true)
+        installMainFrameLinkBridge(async url => { downloads.opened.push(url) }, error => { downloads.errors.push(String(error)) })
+    },
+    unloadDownload() { downloadHost?.terminate() },
+    get downloadIdle() { return downloadHost?.isIdle() },
     async load(script: string) {
         fixtureState.database.plugins = [{ name: 'boundary', script, arguments: {}, realArg: {}, version: '3.0', customLink: [], argMeta: {}, enabled: true }]
         await loadV3Plugins(fixtureState.database.plugins)
