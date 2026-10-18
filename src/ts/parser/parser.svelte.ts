@@ -32,6 +32,8 @@ import {
     resolveEmotionAsset,
     type AssetLookupIndex,
 } from './assetLookup';
+import { ByteBudgetLru } from '../util/byteBudgetLru';
+import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
 
 export { getAssetDistance as getDistance } from './assetLookup';
 
@@ -1052,6 +1054,19 @@ function decodeStyleRule<T extends CssAtRuleAST | CssDeclarationAST>(rule:T):T{
     return rule
 }
 
+// Scoping depends only on the CSS after CBS, and parsing grows faster than the CSS.
+// A style that every row or streaming update repeats is parsed once.
+function createScopedStyleCache() {
+    return new ByteBudgetLru<string, string>(
+        getRuntimePerformanceBudgets().scopedStyleCacheBytes,
+        (text, scoped) => (text.length + scoped.length) * 2 + 32,
+    )
+}
+let scopedStyleCache = createScopedStyleCache()
+subscribeRuntimePerformanceProfile(() => {
+    scopedStyleCache = createScopedStyleCache()
+})
+
 /**
  * Decodes one <risu-style> body into scoped CSS. Returns the CSS on its own so
  * the caller can put it into a real <style> element instead of a markup string.
@@ -1083,6 +1098,10 @@ function decodeStyleContent(
             currentTime: parser.currentTime,
             triggerId: parser.triggerId,
         } : undefined)
+        const cached = scopedStyleCache.get(text)
+        if (cached !== undefined) {
+            return { css: cached }
+        }
         const ast = css.parse(text)
         const rules = ast?.stylesheet?.rules
         if(rules){
@@ -1091,12 +1110,12 @@ function decodeStyleContent(
             }
             ast.stylesheet.rules = rules
         }
-        return {
-            css: css.stringify(ast, {
-                indent: '',
-                compress: true,
-            })
-        }
+        const scoped = css.stringify(ast, {
+            indent: '',
+            compress: true,
+        })
+        scopedStyleCache.set(text, scoped)
+        return { css: scoped }
     } catch (error) {
         if (error instanceof CbsHistoryAccessError) throw error
         if(renderContext.returnCSSError ?? DBState.db.returnCSSError){
