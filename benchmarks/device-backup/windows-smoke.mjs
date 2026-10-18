@@ -142,6 +142,7 @@ async function absent(candidate) {
 async function sourceHashes() {
   const files = [
     "benchmarks/device-backup/main.ts",
+    "benchmarks/device-backup/android-publication-probe.ts",
     "benchmarks/device-backup/vite.config.ts",
     "benchmarks/device-backup/windows-smoke.mjs",
     "src/ts/storage/nativeFileJobs.ts",
