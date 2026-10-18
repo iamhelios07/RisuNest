@@ -501,13 +501,15 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
             && selectedAssetLookupCache.characterAssets === characterAssets
             && selectedAssetLookupCache.emotionAssets === emotionAssets
     }
-    const assetLookup = canUseSelectedCache
-        ? selectedAssetLookupCache.index
-        : createAssetLookupIndex({
-            characterAssets,
-            emotionAssets,
-            moduleAssets: renderContext.moduleAssets ?? getModuleAssets(),
-        })
+    let assetLookup: AssetLookupIndex | undefined = canUseSelectedCache ? selectedAssetLookupCache.index : undefined
+    const getAssetLookup = () => assetLookup ??= createAssetLookupIndex({
+        characterAssets,
+        emotionAssets,
+        moduleAssets: renderContext.moduleAssets ?? getModuleAssets(),
+    })
+    // Most text has no asset tags, so build the index on the first tag. A reactive
+    // caller still reads every asset here, so an asset edit re-runs it as before.
+    if ($effect.tracking()) getAssetLookup()
 
     let needsSourceAccess = false
     let cx: number|null = null
@@ -528,7 +530,7 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
         }
 
         if(type === 'emotion'){
-            const srcPath = resolveEmotionAsset(assetLookup, name)?.srcPaths[0]
+            const srcPath = resolveEmotionAsset(getAssetLookup(), name)?.srcPaths[0]
             const image = srcPath ? await resolveImage(srcPath) : null
             const path = image?.url ?? (srcPath ? await getFileSrcCached(srcPath) : null)
             if(!path){
@@ -551,7 +553,7 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
 
         const exactOnly = (renderContext.legacyMediaFindings ?? DBState.db.legacyMediaFindings) === true
         const match = resolveAdditionalAsset(
-            assetLookup,
+            getAssetLookup(),
             name,
             exactOnly ? -1 : (renderContext.assetMaxDifference ?? DBState.db.assetMaxDifference),
             getAssetDistance,
