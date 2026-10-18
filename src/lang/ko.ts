@@ -2149,7 +2149,7 @@ export const languageKorean = {
             registrationRequired: '새 등록 코드 필요',
             blocked: '자동 동기화 중지됨',
             failed: '동기화 실패',
-            offlineNotice: 'Sync 서버에 접속할 수 없습니다. 앱이 열려 있는 동안 자동으로 다시 시도합니다.',
+            offlineNotice: '동기화 서버에 접속할 수 없습니다. 앱이 열려 있는 동안 자동으로 다시 시도합니다.',
             errorHelp:
                 '동기화를 마치지 못했습니다. 이 기기에서 고친 내용은 그대로 있습니다. 다시 시도하세요.',
             "connectRowHelpScan": '서버에서 만든 등록 코드를 붙여넣거나 QR 코드를 스캔하세요. 기기마다 별도의 등록 코드가 필요합니다.',
@@ -2266,7 +2266,7 @@ export const languageKorean = {
             chatEditPopup: '채팅 수정 팝업창 사용',
             chatEditPopupHelp: '채팅 수정 버튼을 누르면 팝업창에서 내용을 수정할 수 있도록 합니다.',
             syncStatusUi: '동기화 UI 표시',
-            syncStatusUiHelp: '동기화 상태 아이콘을 표시하며, 동기화가 멈추거나 플러그인이 동기화를 기다리는 경우 알림을 표시합니다.',
+            syncStatusUiHelp: '동기화 상태 아이콘을 표시하며, 동기화가 멈추거나 동기화 서버에 접속할 수 없거나 플러그인이 동기화를 기다리는 경우 알림을 표시합니다.',
         },
         textEditor: {
             open: '팝업창에서 수정',
