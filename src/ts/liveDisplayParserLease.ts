@@ -4,7 +4,7 @@ import {
     planChatParserHistory,
     type ChatParserHistoryClassificationInput,
 } from './chatParserHistory'
-import { collectLiveChatParserUnsafeDependencies } from './selectedConversationLiveParserProjection'
+import { captureRevisionAdvance, collectLiveChatParserUnsafeDependencies } from './selectedConversationLiveParserProjection'
 import {
     getCurrentCharacter,
     getCurrentChat,
@@ -211,21 +211,13 @@ async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInput
     let source = runtime.getActiveConversationViewportSource()
     let version = source?.snapshot().version
     let historyVersion = source?.snapshot().historyVersion
-    const capturedSource = source
-    const sourceToken = source?.snapshot().sourceToken
+    const revisionAdvanced = captureRevisionAdvance(runtime, target)
     const historyDependencies = new CbsHistoryDependencies()
     let completeLease: Awaited<ReturnType<typeof runtime.acquireCompleteConversation>> | undefined
     let released = false
     const release = () => { released = true; completeLease?.release(); completeLease = undefined; signal.removeEventListener('abort', release) }
     signal.addEventListener('abort', release, { once: true })
     const historyChanged = () => !!source && hasCbsHistoryChanges(source.snapshot(), historyVersion, historyDependencies)
-    const revisionAdvanced = () => {
-        const current = runtime.captureSelectedConversationTarget()
-        return !!capturedSource && runtime.getActiveConversationViewportSource() === capturedSource
-            && capturedSource.snapshot().sourceToken === sourceToken
-            && current?.characterId === target.characterId && current.conversationId === target.conversationId
-            && current.navigationGeneration === target.navigationGeneration && current.storeRevision > target.storeRevision
-    }
     const assertCurrent = () => {
         signal.throwIfAborted()
         if (released) throw new Error('Live display lease is closed')

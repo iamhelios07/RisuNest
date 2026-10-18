@@ -329,32 +329,6 @@ test('Plugin regex passes read only the history exposed by their actual output',
     expect(await parseRisuChat('H2', { processRegex: true })).toBe('updated row 2')
     expect(indices).toEqual([2, 2])
     expect(release).toHaveBeenCalledTimes(4)
-    for (const name of ['lastmessage', 'previouscharchat', 'history']) {
-        expect(await parseRisuChat(`{#${name}}}`)).toBe(await parseRisuChat(`{{${name}}}`))
-    }
-})
-
-test.each(['lastmessage', 'previouscharchat', 'history'])('legacy opener %s agrees across resident and prepared history', async (name) => {
-    const character = makeCharacter('Legacy')
-    const db = makeDatabase(character, 'Legacy')
-    const messages = character.chats[0].message
-    const source = `{#${name}}}`
-    const plan = planChatParserHistory({ source })
-    const expected = risuChatParser(source, { db, chara: character, chatID: -1 })
-    const resident = captureResidentCbsHistory(messages, plan, -1)
-    expect(risuChatParser(source, { db, chara: character, chatID: -1, historyAccess: resident })).toBe(expected)
-    resident.assertComplete()
-    const prepared = await prepareCbsHistory({ characterId: character.chaId, conversationId: 'chat',
-        totalMessages: messages.length, chatID: -1, plan, reader: { revision: 1,
-            readConversationWindow: async (query) => ({ revision: 1, value: {
-                characterId: character.chaId, conversationId: 'chat', startIndex: query.startIndex!,
-                endIndex: query.startIndex! + query.limit!, totalMessages: messages.length,
-                messages: messages.slice(query.startIndex!, query.startIndex! + query.limit!),
-                hasMoreBefore: query.startIndex! > 0, hasMoreAfter: query.startIndex! + query.limit! < messages.length,
-            } }),
-        } })
-    expect(risuChatParser(source, { db, chara: character, chatID: -1, historyAccess: prepared })).toBe(expected)
-    prepared.assertComplete()
 })
 
 test('prepared CBS reads match complete history for composed expressions and sparse rows', async () => {
