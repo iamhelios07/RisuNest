@@ -48,7 +48,7 @@ const runtimePerformanceBudgets: Record<RuntimePerformanceProfile, RuntimePerfor
         scriptResultCacheBytes: 2 * 1024 * 1024,
         scriptResultCacheEntries: 250,
         scriptingEngineCacheEntries: 4,
-        scopedStyleCacheBytes: 256 * 1024,
+        scopedStyleCacheBytes: 512 * 1024,
     },
 }
 
