@@ -211,19 +211,28 @@ async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInput
     let source = runtime.getActiveConversationViewportSource()
     let version = source?.snapshot().version
     let historyVersion = source?.snapshot().historyVersion
+    const capturedSource = source
+    const sourceToken = source?.snapshot().sourceToken
     const historyDependencies = new CbsHistoryDependencies()
     let completeLease: Awaited<ReturnType<typeof runtime.acquireCompleteConversation>> | undefined
     let released = false
     const release = () => { released = true; completeLease?.release(); completeLease = undefined; signal.removeEventListener('abort', release) }
     signal.addEventListener('abort', release, { once: true })
     const historyChanged = () => !!source && hasCbsHistoryChanges(source.snapshot(), historyVersion, historyDependencies)
+    const revisionAdvanced = () => {
+        const current = runtime.captureSelectedConversationTarget()
+        return !!capturedSource && runtime.getActiveConversationViewportSource() === capturedSource
+            && capturedSource.snapshot().sourceToken === sourceToken
+            && current?.characterId === target.characterId && current.conversationId === target.conversationId
+            && current.navigationGeneration === target.navigationGeneration && current.storeRevision > target.storeRevision
+    }
     const assertCurrent = () => {
         signal.throwIfAborted()
         if (released) throw new Error('Live display lease is closed')
         const current = runtime.captureSelectedConversationTarget()
         if (!current || current.characterId !== target.characterId || current.conversationId !== target.conversationId
             || current.navigationGeneration !== target.navigationGeneration || source?.snapshot().version !== version
-            || runtime.getActiveConversationViewportSource() !== source || historyChanged()) {
+            || runtime.getActiveConversationViewportSource() !== source || historyChanged() || (!completeLease && revisionAdvanced())) {
             throw new Error('Live display conversation changed during preparation')
         }
     }
@@ -313,7 +322,7 @@ async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInput
                 // A later pass can depend on a row that changed before it was read,
                 // which selection updates skipped, so the owner has to prepare again.
                 // Notify after this parse call stack, which may be inside a derived.
-                if (!released && !signal.aborted && historyChanged()) queueMicrotask(() => {
+                if (!released && !signal.aborted && (historyChanged() || revisionAdvanced())) queueMicrotask(() => {
                     if (!released && !signal.aborted) onStale?.()
                 })
                 throw error

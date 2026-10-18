@@ -289,6 +289,32 @@ test('Plugin regex passes read only the history exposed by their actual output',
     expect(await parseRisuChat('H2', { processRegex: true })).toBe('updated row 2')
     expect(indices).toEqual([2, 2])
     expect(release).toHaveBeenCalledTimes(4)
+    for (const name of ['lastmessage', 'previouscharchat', 'history']) {
+        expect(await parseRisuChat(`{#${name}}}`)).toBe(await parseRisuChat(`{{${name}}}`))
+    }
+})
+
+test.each(['lastmessage', 'previouscharchat', 'history'])('legacy opener %s agrees across resident and prepared history', async (name) => {
+    const character = makeCharacter('Legacy')
+    const db = makeDatabase(character, 'Legacy')
+    const messages = character.chats[0].message
+    const source = `{#${name}}}`
+    const plan = planChatParserHistory({ source })
+    const expected = risuChatParser(source, { db, chara: character, chatID: -1 })
+    const resident = captureResidentCbsHistory(messages, plan, -1)
+    expect(risuChatParser(source, { db, chara: character, chatID: -1, historyAccess: resident })).toBe(expected)
+    resident.assertComplete()
+    const prepared = await prepareCbsHistory({ characterId: character.chaId, conversationId: 'chat',
+        totalMessages: messages.length, chatID: -1, plan, reader: { revision: 1,
+            readConversationWindow: async (query) => ({ revision: 1, value: {
+                characterId: character.chaId, conversationId: 'chat', startIndex: query.startIndex!,
+                endIndex: query.startIndex! + query.limit!, totalMessages: messages.length,
+                messages: messages.slice(query.startIndex!, query.startIndex! + query.limit!),
+                hasMoreBefore: query.startIndex! > 0, hasMoreAfter: query.startIndex! + query.limit! < messages.length,
+            } }),
+        } })
+    expect(risuChatParser(source, { db, chara: character, chatID: -1, historyAccess: prepared })).toBe(expected)
+    prepared.assertComplete()
 })
 
 test('prepared CBS reads match complete history for composed expressions and sparse rows', async () => {
@@ -317,6 +343,7 @@ test('prepared CBS reads match complete history for composed expressions and spa
         '{{previouschatlog::2}}|{{previous_chat_log::70}}', '{{lastmessage}}',
         '{{previouscharchat}}', '{{previoususerchat}}', '{{messageidleduration}}',
         '{{messagetime}}|{{messagedate}}|{{role}}', '{{idleduration}}',
+        '{#lastmessage}}', '{#previouscharchat}}', '{#history}}',
         '{{history}}', '{{userhistory}}', '{{charhistory}}', '{{messageunixtimearray}}',
         '{{{{getvar::macro}}}}', '{{#if 1}}{{lastmessage}}{{/if}}',
         '{{#pure}}{{lastmessage}}{{/pure}}', '{{#each {{array::a::b}}}}{{previouscharchat}}{{/each}}',
@@ -377,17 +404,21 @@ test('background and bookmark contexts read precise history and refresh on unper
     const readConversationWindow: CbsHistoryReader['readConversationWindow'] = async (query) => {
         const start = query.startIndex!, end = start + query.limit!
         for (let index = start; index < end; index++) bodyIndices.push(index)
-        return { revision: 1, value: { characterId: character.chaId, conversationId: 'chat',
+        return { revision, value: { characterId: character.chaId, conversationId: 'chat',
             startIndex: start, endIndex: end, totalMessages: 2, messages: messages.slice(start, end),
             hasMoreBefore: start > 0, hasMoreAfter: end < 2 } }
     }
     const source = new PersistentConversationViewportSource({ characterId: character.chaId,
         conversationId: 'chat', revision: 1, totalMessages: 2, rowBudget: 8, reader: { readConversationWindow } })
+    let revision = 1
     const release = vi.fn(async () => {})
-    const acquireRevision = vi.fn(async () => ({ revision: 1, readConversationWindow, release }))
+    const acquireRevision = vi.fn(async (expected) => {
+        if (expected !== revision) throw new Error('RevisionConflict')
+        return { revision, readConversationWindow, release }
+    })
     live.runtime = {
-        captureSelectedConversationTarget: () => ({ characterId: character.chaId, conversationId: 'chat', storeRevision: 1, navigationGeneration: 0 }),
-        captureSelectedConversationAuthority: () => ({ totalMessages: source.snapshot().totalMessages, storeRevision: 1 }),
+        captureSelectedConversationTarget: () => ({ characterId: character.chaId, conversationId: 'chat', storeRevision: revision, navigationGeneration: 0 }),
+        captureSelectedConversationAuthority: () => ({ totalMessages: source.snapshot().totalMessages, storeRevision: revision }),
         getActiveConversationViewportSource: () => source,
         subscribeActiveConversationViewportSource: (listener) => { listener(source); return () => {} },
         store: { acquireRevision },
@@ -398,6 +429,25 @@ test('background and bookmark contexts read precise history and refresh on unper
     const prepare = (text: string, parseFirst = true) => acquireLiveDisplayParserLease({
         source: text, character, signal: new AbortController().signal, parseFirst, chatID: parseFirst ? -1 : 1,
     })
+    const revisionStale = vi.fn()
+    const retained = await acquireLiveDisplayParserLease({ source: 'plain', character,
+        signal: new AbortController().signal, parseFirst: true, chatID: -1, onStale: revisionStale })
+    const silent = vi.fn()
+    const stopSilent = source.subscribe(silent)
+    silent.mockClear()
+    revision = 2
+    source.advanceUnchangedRevision(revision)
+    expect(silent).not.toHaveBeenCalled()
+    expect(revisionStale).not.toHaveBeenCalled()
+    await expect(retained!.projection!.context.parserContext.prepareHistory!('{{previouschatlog::0}}', -1, false)).rejects.toThrow()
+    expect(revisionStale).toHaveBeenCalledOnce()
+    retained?.release()
+    const fresh = await prepare('{{previouschatlog::0}}')
+    expect(fresh?.projection?.parsedSource).toBe('Live previous')
+    fresh?.release()
+    stopSilent()
+    bodyIndices.length = 0
+    acquireRevision.mockClear()
     character.customscript = [{ type: 'editdisplay', in: 'HP', out: '<b>HP</b>', flag: 'g', ableFlag: true }] as any
     const plain = await prepare('{{#when::1::is::1}}HP{{/when}}')
     expect(await ParseMarkdown(plain!.projection!.parsedSource!, character, 'back', -1, {}, {
@@ -408,6 +458,11 @@ test('background and bookmark contexts read precise history and refresh on unper
     expect(acquireRevision).not.toHaveBeenCalled()
     plain?.release()
     await expect(plain!.projection!.context.parserContext.prepareHistory!('{{lastmessage}}', -1, false)).rejects.toThrow('Live display lease is closed')
+    for (const name of ['lastmessage', 'previouscharchat']) {
+        const legacy = await prepare(`{#${name}}}`)
+        expect(legacy?.projection?.parsedSource).toBe('Live current')
+        legacy?.release()
+    }
     const background = await prepare('{{previouscharchat}}|{{lastmessageindex}}')
     expect(background?.projection?.parsedSource).toBe('Live current|1')
     const inputs = captureLiveDisplayParserInputs('{{getvar::live}}', character)

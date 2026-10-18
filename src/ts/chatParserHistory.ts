@@ -204,8 +204,13 @@ function extractCbsExpressions(text: string): string[] {
     const expressions: string[] = []
     let pureDepth = 0
     for (let index = 0; index < text.length - 1; index += 1) {
-        if (text[index] === '{' && text[index + 1] === '{') {
+        if (text[index] === '{' && (text[index + 1] === '{' || text[index + 1] === '#')) {
             starts.push(index + 2)
+            index += 1
+            continue
+        }
+        if (text[index] === '#' && text[index + 1] === '}' && starts.length > 0) {
+            starts.pop()
             index += 1
             continue
         }
