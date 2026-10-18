@@ -14,6 +14,7 @@ export interface RuntimePerformanceBudgets {
     scriptResultCacheBytes: number
     scriptResultCacheEntries: number
     scriptingEngineCacheEntries: number
+    translationCacheBytes: number
 }
 
 const runtimePerformanceBudgets: Record<RuntimePerformanceProfile, RuntimePerformanceBudgets> = {
@@ -31,6 +32,7 @@ const runtimePerformanceBudgets: Record<RuntimePerformanceProfile, RuntimePerfor
         scriptResultCacheBytes: 8 * 1024 * 1024,
         scriptResultCacheEntries: 1000,
         scriptingEngineCacheEntries: 16,
+        translationCacheBytes: 16 * 1024 * 1024,
     },
     'low-spec': {
         inlayAnimationDecodeBytes: 64 * 1024 * 1024,
@@ -46,6 +48,7 @@ const runtimePerformanceBudgets: Record<RuntimePerformanceProfile, RuntimePerfor
         scriptResultCacheBytes: 2 * 1024 * 1024,
         scriptResultCacheEntries: 250,
         scriptingEngineCacheEntries: 4,
+        translationCacheBytes: 4 * 1024 * 1024,
     },
 }
 
