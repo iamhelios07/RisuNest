@@ -723,20 +723,31 @@ function parseThoughtsAndTools(
     let result = '',
         i = 0
     while (i < data.length) {
-        if (data.slice(i, i + 10) === '<Thoughts>') {
-            let j = i + 10,
-                depth = 1
-            while (j < data.length && depth > 0) {
-                if (data.slice(j, j + 10) === '<Thoughts>') depth++
-                if (data.slice(j, j + 11) === '</Thoughts>') depth--
-                j++
+        // Jump between tags instead of copying one character at a time.
+        const start = data.indexOf('<Thoughts>', i)
+        if (start === -1) {
+            result += data.substring(i)
+            break
+        }
+        result += data.substring(i, start)
+        i = start
+        let j = i + 10,
+            depth = 1
+        while (depth > 0) {
+            j = data.indexOf('<', j)
+            if (j === -1) {
+                j = data.length
+                break
             }
-            if (depth === 0 || thoughtMode === 'collapsed') {
-                const contentEnd = depth === 0 ? j - 1 : data.length
-                result += `<details data-risu-thought${thoughtMode === 'collapsed' ? ' data-risu-streaming-thought' : ''}><summary>${language.cot}</summary>${data.substring(i + 10, contentEnd)}</details>`
-                i = depth === 0 ? j + 10 : data.length
-                continue
-            }
+            if (data.startsWith('<Thoughts>', j)) depth++
+            else if (data.startsWith('</Thoughts>', j)) depth--
+            j++
+        }
+        if (depth === 0 || thoughtMode === 'collapsed') {
+            const contentEnd = depth === 0 ? j - 1 : data.length
+            result += `<details data-risu-thought${thoughtMode === 'collapsed' ? ' data-risu-streaming-thought' : ''}><summary>${language.cot}</summary>${data.substring(i + 10, contentEnd)}</details>`
+            i = depth === 0 ? j + 10 : data.length
+            continue
         }
         result += data[i++]
     }
