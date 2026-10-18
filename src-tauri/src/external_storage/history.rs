@@ -124,7 +124,7 @@ async fn open_snapshot(
     connected: &ConnectedRepository,
     receipt: ObjectReceipt,
     cancel: &Cancellation,
-) -> Result<(RemoteObject, control::SnapshotView)> {
+) -> Result<Option<(RemoteObject, control::SnapshotView)>> {
     receipt.locator.validate_for(&connected.handle)?;
     if !receipt.complete || receipt.byte_length == 0 || receipt.byte_length > MAX_CIPHERTEXT {
         return Err(corrupt());
@@ -143,12 +143,28 @@ async fn open_snapshot(
         return Err(corrupt());
     }
     let bytes = std::fs::read(&path).map_err(runtime::local_error)?;
-    if bytes.len() as u64 != receipt.byte_length {
+    decode_snapshot(&bytes, receipt, &connected.handle, &connected.stored.descriptor.repository_id, &connected.root_key)
+}
+
+pub(super) fn decode_snapshot(
+    bytes: &[u8],
+    receipt: ObjectReceipt,
+    repository: &RepositoryHandle,
+    repository_id: &str,
+    root_key: &[u8; 32],
+) -> Result<Option<(RemoteObject, control::SnapshotView)>> {
+    receipt.locator.validate_for(repository)?;
+    if !receipt.complete || bytes.len() as u64 != receipt.byte_length || receipt.byte_length > MAX_CIPHERTEXT {
         return Err(corrupt());
     }
+    let (advertised, _) = wire::read_public_header(&mut Cursor::new(bytes)).map_err(|_| corrupt())?;
+    if !advertised.object_id.starts_with("snapshot-") {
+        super::lww_checkpoint::open(bytes, &receipt, repository, root_key)?;
+        return Ok(None);
+    }
     let key = derive_key(
-        &connected.root_key,
-        &connected.stored.descriptor.repository_id,
+        root_key,
+        repository_id,
         "metadata",
     )
     .map_err(|_| corrupt())?;
@@ -160,20 +176,20 @@ async fn open_snapshot(
         wire::MAX_METADATA_BYTES as u64,
     )
     .map_err(|_| corrupt())?;
-    if header.repository_id != connected.stored.descriptor.repository_id {
+    if header.repository_id != repository_id {
         return Err(corrupt());
     }
     let role = packaging::native_role(header.role).map_err(|_| corrupt())?;
     let document = control::SnapshotView::read(
         &plaintext,
         header.role,
-        &connected.stored.descriptor.repository_id,
+        repository_id,
     )
     .map_err(|_| corrupt())?;
     if header.object_id != format!("snapshot-{}", document.snapshot_id) {
         return Err(corrupt());
     }
-    Ok((
+    Ok(Some((
         RemoteObject {
             repository_id: header.repository_id,
             object_id: header.object_id,
@@ -184,7 +200,7 @@ async fn open_snapshot(
             plaintext_sha256: hex::encode(hash(&plaintext)),
         },
         document,
-    ))
+    )))
 }
 /// `includedSections` is what a restore may choose from, and `sameDevice` says
 /// whether the values are this device's own. Both come from the authenticated
@@ -296,7 +312,9 @@ pub(crate) async fn external_storage_list_history(
                 if covered.contains(&locator_key(&receipt.locator)?) {
                     continue;
                 }
-                let (reference, document) = open_snapshot(&app, &connected, receipt, &cancel).await?;
+                let Some((reference, document)) = open_snapshot(&app, &connected, receipt, &cancel).await? else {
+                    continue;
+                };
                 cache.remember_discovery(&request.connection_id, &document.snapshot_id, &reference)?;
                 super::usage::remember_snapshot(&runtime::root(&app)?, &request.connection_id, &reference, &document);
                 remember_item(

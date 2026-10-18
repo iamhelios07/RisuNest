@@ -453,27 +453,21 @@ impl ExternalLwwEngine {
         receipt.locator.validate_for(&self.repository)?;
         let bytes=read_bytes(self.provider.as_ref(),&self.repository,&receipt.locator,cancel).await?;
         let (advertised,_)=wire::read_public_header(&mut Cursor::new(&bytes)).map_err(error)?;
-        let ordinary=advertised.object_id.starts_with("snapshot-");
-        let lww_repository_id=segment::format_repository_id(&self.repository.repository_id);
-        let repository_id=if ordinary {self.descriptor.repository_id.as_str()}else{lww_repository_id.as_ref()};
+        if !advertised.object_id.starts_with("snapshot-") {
+            let (reference,document)=lww_checkpoint::open(&bytes,receipt,&self.repository,&self.root_key)?;
+            if document.library_id!=self.library {return Err(segment::corrupt());}
+            return Ok(Some((reference,document)));
+        }
+        let repository_id=self.descriptor.repository_id.as_str();
         if advertised.repository_id!=repository_id
-            || (ordinary && !matches!(advertised.role,wire::ObjectRole::SyncState|wire::ObjectRole::BackupBundle))
-            || (!ordinary && advertised.role!=wire::ObjectRole::SyncState) {return Err(segment::corrupt())}
+            || !matches!(advertised.role,wire::ObjectRole::SyncState|wire::ObjectRole::BackupBundle) {return Err(segment::corrupt())}
         let key=derive_key(&self.root_key,repository_id,"metadata").map_err(error)?;
         let mut plaintext=Vec::new();
         let header=wire::open_envelope(&mut Cursor::new(&bytes),&mut plaintext,&key,wire::MAX_METADATA_BYTES as u64).map_err(error)?;
         if header!=advertised || receipt.byte_length!=bytes.len() as u64 || !receipt.complete {return Err(segment::corrupt());}
-        if ordinary {
-            let backup=super::control::SnapshotView::read(&plaintext,header.role,repository_id)?;
-            if header.object_id!=format!("snapshot-{}",backup.snapshot_id) {return Err(segment::corrupt());}
-            return Ok(None);
-        }
-        let document=Checkpoint::decode(&plaintext)?;
-        for body in document.standalone_bodies.values() {body.locator.as_ref().ok_or_else(segment::corrupt)?.validate_for(&self.repository)?;}
-        if header.repository_id!=repository_id || header.role!=wire::ObjectRole::SyncState
-            || header.object_id!=document.snapshot_id || document.repository_id!=repository_id || document.library_id!=self.library
-            || receipt.byte_length!=bytes.len() as u64 || !receipt.complete { return Err(segment::corrupt()); }
-        Ok(Some((RemoteObject { repository_id:header.repository_id,object_id:header.object_id,role:ObjectRole::Snapshot,receipt:receipt.clone(),ciphertext_sha256:segment::digest(&bytes),plaintext_length:plaintext.len() as u64,plaintext_sha256:segment::digest(&plaintext) },document)))
+        let backup=super::control::SnapshotView::read(&plaintext,header.role,repository_id)?;
+        if header.object_id!=format!("snapshot-{}",backup.snapshot_id) {return Err(segment::corrupt());}
+        Ok(None)
     }
     /// The published state from the retained checkpoints and the segments
     /// above their coverage. Covered segments are never read: their versions
