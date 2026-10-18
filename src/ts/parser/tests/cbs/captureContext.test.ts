@@ -466,6 +466,68 @@ test.each(['retained', 'first pass'])('fully loaded live displays survive a comm
     }
 })
 
+test.each([false, true])('initial live display preparation retries a revision-only advance unless aborted (%s)', async (abort) => {
+    const character = live.database.characters[0]
+    const messages = character.chats[0].message
+    character.chats[0].id = 'chat'
+    character.chats[0] = createMetadataOnlySelectedConversation(character.chats[0])
+    let revision = 1
+    let started!: () => void
+    const reading = new Promise<void>((resolve) => { started = resolve })
+    let finish!: () => void
+    const pendingRead = new Promise<void>((resolve) => { finish = resolve })
+    const readConversationWindow: CbsHistoryReader['readConversationWindow'] = async (query) => {
+        const readRevision = revision
+        if (readRevision === 1) {
+            started()
+            await pendingRead
+        }
+        if (readRevision !== revision) throw new RevisionConflictError(readRevision, revision)
+        const start = query.startIndex!, end = start + query.limit!
+        return { revision, value: { characterId: character.chaId, conversationId: 'chat',
+            startIndex: start, endIndex: end, totalMessages: messages.length, messages: messages.slice(start, end),
+            hasMoreBefore: start > 0, hasMoreAfter: end < messages.length } }
+    }
+    const source = new PersistentConversationViewportSource({ characterId: character.chaId,
+        conversationId: 'chat', revision, totalMessages: messages.length, rowBudget: 8, reader: { readConversationWindow } })
+    live.runtime = {
+        captureSelectedConversationTarget: () => ({ characterId: character.chaId, conversationId: 'chat', storeRevision: revision, navigationGeneration: 0 }),
+        captureSelectedConversationAuthority: () => ({ totalMessages: source.snapshot().totalMessages, storeRevision: revision }),
+        getActiveConversationViewportSource: () => source,
+        store: { acquireRevision: async (expected: number) => {
+            if (expected !== revision) throw new RevisionConflictError(expected, revision)
+            return { revision, readConversationWindow, release: async () => {} }
+        } },
+        acquireCompleteConversation: () => { throw new Error('Unexpected complete promotion') },
+    } as unknown as PersistentDataRuntime
+    const controller = new AbortController()
+    const onStale = vi.fn()
+    try {
+        const pending = acquireLiveDisplayParserLease({ source: '{{previouschatlog::0}}', character,
+            signal: controller.signal, parseFirst: true, chatID: -1, onStale })
+        const rejected = expect(pending).rejects.toThrow(RevisionConflictError)
+        await reading
+        revision = 2
+        source.advanceUnchangedRevision(revision)
+        if (abort) controller.abort()
+        finish()
+        await rejected
+        expect(onStale).toHaveBeenCalledTimes(abort ? 0 : 1)
+
+        const fresh = await acquireLiveDisplayParserLease({ source: '{{previouschatlog::0}}', character,
+            signal: new AbortController().signal, parseFirst: true, chatID: -1, onStale })
+        try {
+            expect(fresh?.projection?.parsedSource).toBe('Live previous')
+            expect(fresh?.projection?.revision).toBe(2)
+            expect(onStale).toHaveBeenCalledTimes(abort ? 0 : 1)
+        } finally { fresh?.release() }
+    } finally {
+        controller.abort()
+        finish()
+        source.dispose()
+    }
+})
+
 test('background and bookmark contexts read precise history and refresh on unpersisted tail edits', async () => {
     const character = live.database.characters[0]
     const messages = character.chats[0].message

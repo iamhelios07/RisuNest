@@ -331,7 +331,13 @@ async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInput
         return { release, projection: { kind: 'bounded', characterId: target.characterId, conversationId: target.conversationId,
             revision: target.storeRevision, totalMessages, chatID, projectedChatID: chatID, historyOffset: 0, messages: [],
             parsedSource, context: { ...context, parserContext: { ...context.parserContext, historyAccess, prepareHistory } } } }
-    } catch (error) { release(); throw error }
+    } catch (error) {
+        if (!signal.aborted && (historyChanged() || revisionAdvanced())) queueMicrotask(() => {
+            if (!signal.aborted) onStale?.()
+        })
+        release()
+        throw error
+    }
 }
 
 export function captureLiveDisplayParserSelection(): string {
