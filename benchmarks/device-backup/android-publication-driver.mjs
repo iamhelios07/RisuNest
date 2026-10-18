@@ -3,6 +3,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {mkdir, readFile, writeFile} from 'node:fs/promises';
 import path from 'node:path';
+import {createHash} from 'node:crypto';
 import {androidTarget, runnerOptions} from '../support/androidTarget.mjs';
 import {REALM_BLOCKED_URL_PATTERNS} from '../../scripts/realmBlocklist.mjs';
 
@@ -49,9 +50,10 @@ async function connect() {
   const socket = new WebSocket(url);
   await new Promise((resolve,reject) => { socket.onopen = resolve; socket.onerror = reject; });
   let sequence = 0, paused = false, callFrameId;
-  const pending = new Map();
+  const pending = new Map(), scripts = new Map();
   socket.onmessage = ({data}) => {
     const message = JSON.parse(data);
+    if (message.method === 'Debugger.scriptParsed') scripts.set(message.params.scriptId,message.params.url);
     if (message.method === 'Debugger.paused') { paused = true; callFrameId = message.params.callFrames[0]?.callFrameId; }
     const entry = pending.get(message.id);
     if (!entry) return;
@@ -73,7 +75,25 @@ async function connect() {
   await call('Network.setBlockedURLs',{urls:[...REALM_BLOCKED_URL_PATTERNS,'*update.rsyumi.workers.dev/translator/prompt-presets.json*']});
   assert.equal(await evaluate("window.__TAURI_INTERNALS__.invoke('plugin:app|identifier')"),packageName);
   assert.equal(await evaluate('document.title'),title);
-  return {pid,evaluate,call,paused:()=>paused,pausedState:async()=> {
+  return {pid,evaluate,call,async armBoundary(mode) {
+    await call('Debugger.enable');
+    const matches=[];
+    for (const [scriptId,url] of scripts) {
+      if (!url.startsWith('http://tauri.localhost/assets/index-')) continue;
+      const {scriptSource}=await call('Debugger.getScriptSource',{scriptId});
+      if (!scriptSource.includes('risunest-synthetic-android-publication')) continue;
+      const lines=scriptSource.split('\n');
+      const needle=`if (pauseAt === "${mode}"`;
+      for (let lineNumber=0;lineNumber<lines.length;lineNumber++) {
+        if (lines[lineNumber].includes(needle)) matches.push({scriptId,url,lineNumber,sha256:createHash('sha256').update(scriptSource).digest('hex')});
+      }
+    }
+    assert.equal(matches.length,1,'Unique compiled synthetic boundary required');
+    const boundary=matches[0];
+    const condition=mode==='copy'?'detail.copiedBytes > 0':'terminal.state === "succeeded"';
+    const result=await call('Debugger.setBreakpoint',{location:{scriptId:boundary.scriptId,lineNumber:boundary.lineNumber},condition});
+    return {url:boundary.url,lineNumber:boundary.lineNumber,sha256:boundary.sha256,resolved:result.actualLocation};
+  },paused:()=>paused,pausedState:async()=> {
     const result=await call('Debugger.evaluateOnCallFrame',{callFrameId,expression:`${api}.state()`,returnByValue:true});
     assert.ok(!result.exceptionDetails);return result.result.value;
   },close:()=>socket.close()};
@@ -119,7 +139,7 @@ try {
     }
   } else {
     assert.equal((await client.evaluate(`${api}.receipt()`)).intent,null,'No earlier publication may be pending');
-    await client.call('Debugger.enable');
+    report.boundary=await client.armBoundary(mode);
     await client.evaluate(`void ${api}.start(${Number(options.mib??32)},${JSON.stringify(mode)}); true`);
     const deadline=Date.now()+180000;
     let lastPicker=0, pickerSaved=false;
