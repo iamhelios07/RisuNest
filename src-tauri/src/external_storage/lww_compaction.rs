@@ -230,7 +230,7 @@ impl ExternalLwwEngine {
             (cache.revision,cache.classified.clone())
         };
         let mut classified=BTreeMap::new();let mut output=Vec::new();
-        for receipt in self.snapshot_receipts(cancel).await? {
+        for receipt in self.checkpoint_receipts(cancel).await? {
             receipt.locator.validate_for(&self.repository)?;
             let key=receipt_key(&receipt);
             // An incomplete receipt is never answered from the cache, so it is refused.
@@ -433,15 +433,15 @@ impl ExternalLwwEngine {
     /// Every published checkpoint, each read once.
     pub(crate) async fn checkpoints(&self,cancel:&Cancellation) -> Result<Vec<(RemoteObject,Checkpoint)>> {
         let mut output=Vec::new();
-        for receipt in self.snapshot_receipts(cancel).await? {
+        for receipt in self.checkpoint_receipts(cancel).await? {
             if let Some(found)=self.classified_checkpoint(&receipt,cancel).await? {output.push(found);}
         }
         Ok(output)
     }
-    pub(crate) async fn snapshot_receipts(&self,cancel:&Cancellation) -> Result<Vec<ObjectReceipt>> {
+    pub(crate) async fn checkpoint_receipts(&self,cancel:&Cancellation) -> Result<Vec<ObjectReceipt>> {
         let mut output=Vec::new(); let mut cursor=None; let mut visited=BTreeSet::new();
         loop {
-            let page=self.provider.list_objects(&self.repository,Collection::Snapshots,cursor.as_deref(),super::lww_engine::LISTING_PAGE,cancel).await?;
+            let page=self.provider.list_objects(&self.repository,Collection::Checkpoints,cursor.as_deref(),super::lww_engine::LISTING_PAGE,cancel).await?;
             output.extend(page.objects);
             match page.next_cursor { Some(next) => { if !visited.insert(next.clone()) { return Err(segment::corrupt()); } cursor=Some(next); }, None=>break }
         }

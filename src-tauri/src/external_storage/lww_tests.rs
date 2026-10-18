@@ -832,37 +832,35 @@ fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() 
         let mut sealed=Vec::new();risunest_external_storage_format::snapshot::seal_envelope(&mut std::io::Cursor::new(backup_plain),&mut sealed,&key,&header).unwrap();
         f.provider.seed(&backup_object,ObjectRole::BackupBundle,sealed);
         assert_eq!(f.sender.snapshot_listing(&Cancellation::default()).await.unwrap().len(),1);
-        let mut history = Vec::new();
-        for receipt in f.sender.snapshot_receipts(&Cancellation::default()).await.unwrap() {
-            let bytes = f.provider.contents(&receipt.locator.object).unwrap();
-            if let Some((_, document)) = super::history::decode_snapshot(
-                &bytes, receipt, &f.sender.repository, &f.sender.descriptor.repository_id, &[7; 32],
-            ).unwrap() {
-                history.push(document.snapshot_id);
-            }
-        }
-        assert_eq!(history, vec![backup_id], "history offers the backup, not the sync checkpoint");
+        // Restoring the backup finds it without opening the checkpoint beside it.
+        let connected = super::cleanup::tests::fixture_connection(&f);
+        let found = super::control::find_snapshot(&connected, backup_id, &Cancellation::default()).await.unwrap();
+        assert_eq!(found.object_id, backup_object);
         let checkpoint_bytes = f.provider.contents(&snapshots[0].locator.object).unwrap();
-        let decode_history = |bytes: &[u8], receipt: ObjectReceipt| super::history::decode_snapshot(
-            bytes, receipt, &f.sender.repository, &f.sender.descriptor.repository_id, &[7; 32],
-        );
-        assert!(decode_history(&checkpoint_bytes, snapshots[0].clone()).unwrap().is_none());
+        let open = |bytes: &[u8], receipt: ObjectReceipt, root_key: &[u8; 32]|
+            super::lww_checkpoint::open(bytes, &receipt, &f.sender.repository, root_key).map(|_| ());
+        open(&checkpoint_bytes, snapshots[0].clone(), &[7; 32]).unwrap();
         let mut damaged = checkpoint_bytes.clone();
         *damaged.last_mut().unwrap() ^= 1;
-        assert_eq!(decode_history(&damaged, snapshots[0].clone()).unwrap_err().kind, ErrorKind::Corrupt);
+        assert_eq!(open(&damaged, snapshots[0].clone(), &[7; 32]).unwrap_err().kind, ErrorKind::Corrupt);
         let mut incomplete = snapshots[0].clone(); incomplete.complete = false;
-        assert_eq!(decode_history(&checkpoint_bytes, incomplete).unwrap_err().kind, ErrorKind::Corrupt);
+        assert_eq!(open(&checkpoint_bytes, incomplete, &[7; 32]).unwrap_err().kind, ErrorKind::Corrupt);
         let mut short = snapshots[0].clone(); short.byte_length -= 1;
-        assert_eq!(decode_history(&checkpoint_bytes, short).unwrap_err().kind, ErrorKind::Corrupt);
-        assert_eq!(super::history::decode_snapshot(&checkpoint_bytes, snapshots[0].clone(),
-            &f.sender.repository, &f.sender.descriptor.repository_id, &[8; 32]).unwrap_err().kind, ErrorKind::Corrupt);
+        assert_eq!(open(&checkpoint_bytes, short, &[7; 32]).unwrap_err().kind, ErrorKind::Corrupt);
+        assert_eq!(open(&checkpoint_bytes, snapshots[0].clone(), &[8; 32]).unwrap_err().kind, ErrorKind::Corrupt);
         let checkpoint_key = risunest_external_storage_format::crypto::derive_key(&[7; 32], &snapshot.repository_id, "metadata").unwrap();
         let mut different_id = snapshot.clone();
         different_id.snapshot_id = "00000000-0000-4000-8000-000000000095".into();
+        // A document that is whole for another repository is caught only by its
+        // binding to the envelope it arrived in.
         let mut different_repository = snapshot.clone();
         different_repository.repository_id = "other-repository".into();
-        // Re-encode an invalid binding directly so the reader, not the writer, rejects it.
-        let different_repository = risunest_sync_wire::canonical::encode(&different_repository).unwrap();
+        for object in [&mut different_repository.library.record_catalog, &mut different_repository.library.asset_catalog]
+            .into_iter().chain(different_repository.asset_catalogs.iter_mut()) {
+            object.header.repository_id = "other-repository".into();
+            object.ciphertext_length = risunest_external_storage_format::snapshot::envelope_length(&object.header).unwrap();
+        }
+        let different_repository = different_repository.encode().unwrap();
         for (plain, role) in [
             (b"{\"schema\":\"risunest.lww-snapshot/v1\"}".to_vec(), risunest_external_storage_format::snapshot::ObjectRole::SyncState),
             (different_id.encode().unwrap(), risunest_external_storage_format::snapshot::ObjectRole::SyncState),
@@ -875,7 +873,7 @@ fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() 
             let mut sealed = Vec::new();
             risunest_external_storage_format::snapshot::seal_envelope(&mut std::io::Cursor::new(plain), &mut sealed, &checkpoint_key, &header).unwrap();
             let mut receipt = snapshots[0].clone(); receipt.byte_length = sealed.len() as u64;
-            assert_eq!(decode_history(&sealed, receipt).unwrap_err().kind, ErrorKind::Corrupt);
+            assert_eq!(open(&sealed, receipt, &[7; 32]).unwrap_err().kind, ErrorKind::Corrupt);
         }
         let mut identical=snapshot.clone(); identical.snapshot_id="00000000-0000-4000-8000-000000000098".into();
         assert_eq!(super::lww_checkpoint::retained(&[snapshot.clone(),identical.clone()]).unwrap(),std::collections::BTreeSet::from([identical.snapshot_id.clone()]));
@@ -3069,10 +3067,10 @@ fn one_listing_call_answers_hundreds_of_segments() {
         assert_eq!(f.sender.listing(&Cancellation::default()).await.unwrap().len(), 250);
         assert_eq!(f.provider.listing_count() - before, 1);
         for index in 0..150 {
-            f.provider.seed(&format!("synthetic-checkpoint-{index:03}"), ObjectRole::SyncState, vec![1]);
+            f.provider.seed(&format!("synthetic-checkpoint-{index:03}"), ObjectRole::Snapshot, vec![1]);
         }
         let before = f.provider.listing_count();
-        assert_eq!(f.sender.snapshot_receipts(&Cancellation::default()).await.unwrap().len(), 150);
+        assert_eq!(f.sender.checkpoint_receipts(&Cancellation::default()).await.unwrap().len(), 150);
         assert_eq!(f.provider.listing_count() - before, 1);
     })
 }
