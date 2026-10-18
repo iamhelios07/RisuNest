@@ -301,6 +301,7 @@ function residentRowParserResolver(
     messages: readonly Message[],
     source: ReturnType<typeof makePersistentViewportSource>,
     currentCharacter: character,
+    onPrepare: () => void = () => {},
 ) {
     const selection = { characterId: 'character-id', conversationId: 'chat-room-id', navigationGeneration: 0, storeRevision: 1 }
     const resolver = createSelectedConversationLiveParserProjectionResolver({
@@ -318,6 +319,7 @@ function residentRowParserResolver(
             const seed = boundedProjection(currentCharacter, 0)
             if (seed.kind !== 'bounded') throw new Error('Expected bounded seed')
             seed.context.parserContext.character.chats[0].message = []
+            onPrepare()
             return seed.context
         },
         createCompleteContext: () => { throw new Error('Unexpected complete promotion') },
@@ -1735,6 +1737,30 @@ describe('Chats imperative mount lifecycle', () => {
         }
         expect(resolve.mock.calls.length - baseline).toBe(chunks)
         expect(unchanged.map((row) => row.dataset.refreshCount)).toEqual(counts)
+    })
+
+    test('renews an in-flight row resolve after a silent revision advance without waiting for failure retry', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+        const messages = [makeMessage(0)]
+        const source = makePersistentViewportSource(messages)
+        const currentCharacter = makeMetadataOnlyCharacter()
+        let advanced = false
+        const { resolve } = residentRowParserResolver(messages, source, currentCharacter, () => {
+            if (advanced) return
+            advanced = true
+            // The current row has been captured, but its asynchronous projection has not settled.
+            queueMicrotask(() => source.advanceUnchangedRevision(2))
+        })
+        mounted = mount(ChatsHarness, { target, props: { initialCharacter: currentCharacter,
+            initialViewportSource: source, parserProjectionResolver: { resolve } } })
+        // Drain preparation without advancing the 250 ms failure retry delay.
+        await settleParserProjection()
+        expect(resolve).toHaveBeenCalledTimes(2)
+        expect(probeElements(target).map((row) => row.dataset.message)).toEqual(['message-0'])
+        expect(target.querySelector('[data-chat-load-error]')).toBeNull()
+        expect(target.querySelector('[data-chat-initial-loading]')).toBeNull()
+        expect(chatMountProbe.mounts.filter((entry) => entry.index === 0)).toHaveLength(1)
+        expect(chatMountProbe.unmounts).toEqual([])
     })
 
     test.each(['history edit', 'revision advance'])('prepares a row again when a later pass follows a %s after its projection', async (change) => {
