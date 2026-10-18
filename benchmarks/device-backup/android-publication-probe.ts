@@ -103,7 +103,7 @@ export function androidPublicationProbe(dependencies: {
       state.phase = "exporting"; pauseAt = stopAt; save();
       try {
         const result = await runNativeArchiveExport(await dependencies.runtime(),
-          {type: "androidSaf", suggestedName: "synthetic-publication.risunest"},
+          {type: "androidSaf", suggestedName: `synthetic-publication-${Date.now()}.risunest`},
           {library: true, deviceSections: deviceSections ? ["local-plugins"] : []}, {
             onStatus(status) {
               if (status.result) state.sourceBytes = status.result.sourceBytes;
