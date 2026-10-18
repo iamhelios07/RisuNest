@@ -5,6 +5,7 @@ import { registerAndroidRisuSaveRoute } from "../../src/ts/storage/androidRisuSa
 import { resumePortableExportsAfterBootstrap } from "../../src/ts/storage/deviceBackup/jobRecovery";
 import { createPortableExportIntentStore } from "../../src/ts/storage/deviceBackup/job";
 import { runNativeArchiveExport } from "../../src/ts/storage/nativeFileJobs";
+import { nativePortableDeviceSections } from "../../src/ts/storage/deviceBackup/selection";
 import { getAndroidSafExportStatus, type AndroidSafDestinationEvent } from "../../src/ts/storage/androidSafBridge";
 import { writeNativePluginDeviceValues } from "../../src/ts/plugins/pluginDeviceTransfer";
 import { sendAndroidCommit } from "../../src/ts/storage/androidCommitTransport";
@@ -81,7 +82,7 @@ export function androidPublicationProbe(dependencies: {
     state: () => ({...state}),
     async receipt() { return {status: await getAndroidSafExportStatus(), intent: createPortableExportIntentStore().read()}; },
     closeDialog(choice = "1") { alertStore.set({type: "none", msg: choice}); },
-    async start(mebibytes = 32, stopAt?: "copy" | "terminal", deviceSections = true) {
+    async start(mebibytes = 32, stopAt?: "copy" | "terminal") {
       await bootstrap;
       if (!Number.isInteger(mebibytes) || mebibytes < 1 || mebibytes > 128) throw new Error("Invalid synthetic size");
       if (createPortableExportIntentStore().read()) throw new Error("Previous synthetic publication remains pending");
@@ -104,7 +105,7 @@ export function androidPublicationProbe(dependencies: {
       try {
         const result = await runNativeArchiveExport(await dependencies.runtime(),
           {type: "androidSaf", suggestedName: `synthetic-publication-${Date.now()}.risunest`},
-          {library: true, deviceSections: deviceSections ? ["local-plugins"] : []}, {
+          {library: true, deviceSections: [...nativePortableDeviceSections]}, {
             onStatus(status) {
               if (status.result) state.sourceBytes = status.result.sourceBytes;
               state.requestId = createPortableExportIntentStore().read()?.requestId;
