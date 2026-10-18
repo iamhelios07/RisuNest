@@ -101,6 +101,7 @@ fn capture_library_inner(
                 probe,
             )?;
         }
+        catalog.begin_inventory()?;
         let source_dependencies=store.capture_portable_units(&lease,&catalog.db,probe)?;
         let mut payloads=catalog.db.prepare("SELECT hash,body FROM backup_payload_spool ORDER BY hash")?;
         let mut rows=payloads.query([])?;
@@ -117,7 +118,6 @@ fn capture_library_inner(
             crate::device_backup::write_native_section(&catalog,section,probe)
                 .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
         }
-        catalog.begin_inventory()?;
         let cas = PayloadCas::new(store.repository_root())?;
         for (hash,size) in &source_dependencies.payloads {
             if source_dependencies.spooled_payloads.contains(hash) {continue;}
