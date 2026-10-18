@@ -232,7 +232,7 @@ async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInput
         const current = runtime.captureSelectedConversationTarget()
         if (!current || current.characterId !== target.characterId || current.conversationId !== target.conversationId
             || current.navigationGeneration !== target.navigationGeneration || source?.snapshot().version !== version
-            || runtime.getActiveConversationViewportSource() !== source || historyChanged() || (!completeLease && revisionAdvanced())) {
+            || runtime.getActiveConversationViewportSource() !== source || historyChanged()) {
             throw new Error('Live display conversation changed during preparation')
         }
     }

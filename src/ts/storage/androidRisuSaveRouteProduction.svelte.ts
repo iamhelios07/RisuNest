@@ -278,8 +278,12 @@ export function registerAndroidRisuSaveRoute(): void {
             listen: listenAndroidSafDestinationEvents,
             isActive: (requestId) => {
                 if (isAndroidSafDestinationRequestActive(requestId)) return true
-                const intent = createPortableExportIntentStore().read()
-                return intent?.publication === 'android-saf' && intent.requestId === requestId
+                try {
+                    const intent = createPortableExportIntentStore().read()
+                    return intent?.publication === 'android-saf' && intent.requestId === requestId
+                } catch {
+                    return false
+                }
             },
         },
     )

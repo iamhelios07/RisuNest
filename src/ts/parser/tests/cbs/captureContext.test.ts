@@ -435,6 +435,37 @@ test('prepared CBS reads match complete history for composed expressions and spa
     expect(count.dependencies.affectedBy([{ start: 80, end: 81, countChanged: true }])).toBe(true)
 })
 
+test.each(['retained', 'first pass'])('fully loaded live displays survive a commit during %s preparation', async (timing) => {
+    const character = live.database.characters[0]
+    character.chats[0].id = 'chat'
+    let revision = 1
+    const source = new PersistentConversationViewportSource({ characterId: character.chaId,
+        conversationId: 'chat', revision, totalMessages: 2, rowBudget: 8,
+        reader: { readConversationWindow: async () => { throw new Error('Unexpected persisted history read') } } })
+    live.runtime = {
+        captureSelectedConversationTarget: () => ({ characterId: character.chaId, conversationId: 'chat', storeRevision: revision, navigationGeneration: 0 }),
+        captureSelectedConversationAuthority: () => null,
+        getActiveConversationViewportSource: () => source,
+        acquireCompleteConversation: () => { throw new Error('Unexpected complete promotion') },
+    } as unknown as PersistentDataRuntime
+    const onStale = vi.fn()
+    const pending = acquireLiveDisplayParserLease({ source: '{{previouschatlog::0}}', character,
+        signal: new AbortController().signal, parseFirst: true, chatID: -1, onStale })
+    const retained = timing === 'retained' ? await pending : undefined
+    revision = 2
+    source.advanceUnchangedRevision(revision)
+    const lease = retained ?? await pending
+    try {
+        expect(lease?.projection?.parsedSource).toBe('Live previous')
+        const access = await lease!.projection!.context.parserContext.prepareHistory!('{{lastmessage}}', -1, false)
+        expect(access.row(1)?.data).toBe('Live current')
+        expect(onStale).not.toHaveBeenCalled()
+    } finally {
+        lease?.release()
+        source.dispose()
+    }
+})
+
 test('background and bookmark contexts read precise history and refresh on unpersisted tail edits', async () => {
     const character = live.database.characters[0]
     const messages = character.chats[0].message

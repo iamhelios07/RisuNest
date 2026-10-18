@@ -128,7 +128,18 @@ describe('Android opened spool production route', () => {
                 requestId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', state: 'succeeded', code: undefined, bytes: 1234, warningCodes: []}}))
             await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(2))
             expect(alertError).toHaveBeenCalledExactlyOnceWith(language.screenshotPartialDestinationMayRemain)
+            for (const [index, corrupt] of ['{broken', '{"version":999}'].entries()) {
+                rememberPortableExport('synthetic-job', {type: 'androidSaf', suggestedName: 'synthetic.risunest'}, store, owned.requestId)
+                for (const key of values.keys()) values.set(key, corrupt)
+                window.dispatchEvent(new CustomEvent('risu-android-saf-destination', {detail: {...terminal,
+                    requestId: index === 0 ? 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee' : 'ffffffff-ffff-4fff-8fff-ffffffffffff'}}))
+                await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(3 + index))
+                expect(alertError).toHaveBeenCalledTimes(2 + index)
+                expect(alertError).toHaveBeenLastCalledWith(language.screenshotPartialDestinationMayRemain)
+                values.clear()
+            }
         } finally {
+            values.clear()
             createPortableExportIntentStore().clear('synthetic-job')
             vi.unstubAllGlobals()
         }

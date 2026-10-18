@@ -28,29 +28,30 @@ fn directory(root: &Path, create: bool) -> Result<PathBuf, String> {
     }
 }
 
-fn handoff(root: &Path, name: &str) -> Result<PathBuf, String> {
+fn handoff(root: &Path, name: &str) -> Result<PathBuf, NativeJobError> {
     if !handoff_name(Path::new(name), "risunest-backup-", ".risunest")
         || Path::new(name).file_name().and_then(|name| name.to_str()) != Some(name) {
-        return Err("Portable export receipt has an invalid handoff name".into());
+        return Err(NativeJobError::new("invalid-receipt", "Portable export receipt has an invalid handoff name"));
     }
     let parent = root.join("handoffs");
-    let metadata = fs::symlink_metadata(&parent).map_err(|error| error.to_string())?;
+    let metadata = fs::symlink_metadata(&parent).map_err(|error| NativeJobError::new("export-receipt-unavailable", error.to_string()))?;
     if !metadata.is_dir() || crate::trust_boundary::is_link_like(&metadata) {
-        return Err("Portable export handoff directory is unavailable".into());
+        return Err(NativeJobError::new("export-receipt-unavailable", "Portable export handoff directory is unavailable"));
     }
     let path = parent.join(name);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() && !crate::trust_boundary::is_link_like(&metadata) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        _ => return Err("Portable export handoff is not an owned regular file".into()),
+        Err(error) => return Err(NativeJobError::new("export-receipt-unavailable", error.to_string())),
+        _ => return Err(NativeJobError::new("invalid-receipt", "Portable export handoff is not an owned regular file")),
     }
     Ok(path)
 }
 
 impl Receipt {
-    fn result(&self, root: &Path) -> Result<JobResultSummary, String> {
+    fn result(&self, root: &Path) -> Result<JobResultSummary, NativeJobError> {
         if self.version != 1 || Uuid::parse_str(&self.job_id).is_err() {
-            return Err("Portable export receipt identity is invalid".into());
+            return Err(NativeJobError::new("invalid-receipt", "Portable export receipt identity is invalid"));
         }
         let result = JobResultSummary {
             revision: self.revision, source_bytes: self.source_bytes,
@@ -59,7 +60,7 @@ impl Receipt {
             warning_codes: self.warning_codes.clone(), handoff_path: Some(handoff(root, &self.handoff_name)?.to_string_lossy().into_owned()),
             export_exclusions: None, publication: None,
         };
-        validate_result(&result)?;
+        validate_result(&result).map_err(|error| NativeJobError::new("invalid-receipt", error))?;
         Ok(result)
     }
 }
@@ -72,7 +73,7 @@ pub(super) fn persist(root: &Path, id: &str, result: &JobResultSummary) -> Resul
     validate_result(result)?;
     let source = Path::new(result.handoff_path.as_deref().ok_or("Portable export handoff is missing")?);
     let name = source.file_name().and_then(|name| name.to_str()).ok_or("Portable export handoff name is invalid")?;
-    let owned = handoff(root, name)?;
+    let owned = handoff(root, name).map_err(|error| error.message)?;
     if source.parent().ok_or("Portable export handoff parent is missing")?.canonicalize().map_err(|error|error.to_string())?
         != root.join("handoffs").canonicalize().map_err(|error|error.to_string())?
         || fs::metadata(&owned).map_err(|error|error.to_string())?.len() != result.source_bytes {
@@ -96,16 +97,16 @@ pub(super) fn persist(root: &Path, id: &str, result: &JobResultSummary) -> Resul
     Ok(())
 }
 
-fn read(root: &Path, path: &Path) -> Result<Receipt, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error|error.to_string())?;
+fn read(root: &Path, path: &Path) -> Result<Receipt, NativeJobError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| NativeJobError::new("export-receipt-unavailable", error.to_string()))?;
     if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) || metadata.len() > MAX_RECEIPT_BYTES {
-        return Err("Portable export receipt is not a bounded regular file".into());
+        return Err(NativeJobError::new("invalid-receipt", "Portable export receipt is not a bounded regular file"));
     }
     let mut bytes = Vec::new();
-    File::open(path).map_err(|error|error.to_string())?.take(MAX_RECEIPT_BYTES + 1).read_to_end(&mut bytes).map_err(|error|error.to_string())?;
-    if bytes.len() as u64 > MAX_RECEIPT_BYTES { return Err("Portable export receipt is too large".into()); }
-    let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error|error.to_string())?;
-    if path.file_stem().and_then(|name|name.to_str()) != Some(receipt.job_id.as_str()) { return Err("Portable export receipt filename differs from its job".into()); }
+    File::open(path).map_err(|error| NativeJobError::new("export-receipt-unavailable", error.to_string()))?.take(MAX_RECEIPT_BYTES + 1).read_to_end(&mut bytes).map_err(|error| NativeJobError::new("export-receipt-unavailable", error.to_string()))?;
+    if bytes.len() as u64 > MAX_RECEIPT_BYTES { return Err(NativeJobError::new("invalid-receipt", "Portable export receipt is too large")); }
+    let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| NativeJobError::new("invalid-receipt", error.to_string()))?;
+    if path.file_stem().and_then(|name|name.to_str()) != Some(receipt.job_id.as_str()) { return Err(NativeJobError::new("invalid-receipt", "Portable export receipt filename differs from its job")); }
     receipt.result(root)?;
     Ok(receipt)
 }
@@ -128,10 +129,23 @@ pub(super) fn retained_handoffs(root: &Path) -> HashSet<PathBuf> {
 pub(super) fn restore(root: &Path, registry: &JobRegistry) -> Result<(), String> {
     let mut errors = Vec::new();
     for path in paths(root)? {
+        let receipt = match read(root, &path) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if error.code == "invalid-receipt" {
+                    if let Err(quarantine_error) = fs::rename(&path, path.with_extension("invalid")) {
+                        errors.push(quarantine_error.to_string());
+                    } else if let Some(parent) = path.parent() {
+                        let _ = crate::trust_boundary::sync_directory(parent);
+                    }
+                }
+                errors.push(error.message);
+                continue;
+            }
+        };
         let restored = (|| {
-            let receipt = read(root, &path)?;
             if registry.lookup(&receipt.job_id)?.is_some() { return Ok(()); }
-            let result = receipt.result(root)?;
+            let result = receipt.result(root).map_err(|error| error.message)?;
             let job = registry.create_internal(JobKind::ExportPortableBackup, Some(result.revision), vec![], false)?;
             let temporary_id = job.id();
             job.status.lock().map_err(|error|error.to_string())?.job_id = receipt.job_id.clone();
@@ -212,6 +226,64 @@ mod tests {
         assert!(!state.forget(&Uuid::new_v4().to_string()).unwrap());
         assert!(state.forget(&job.id()).unwrap());
         assert!(NativeFileJobState::initialize(directory.path().to_path_buf()).list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_export_result_is_not_reported_as_a_receipt_write_failure() {
+        let (directory, state, job, mut result) = fixture();
+        result.source_sha256 = "invalid".into();
+        finish_worker_outcome(&job, JobKind::ExportPortableBackup, Ok(result), vec![], Some(directory.path()));
+        let status = state.status(&job.id()).unwrap();
+        assert_eq!(status.state, JobState::Failed);
+        assert_eq!(status.error.unwrap().code, "store-error");
+        assert!(status.result.is_none());
+        assert!(!directory.path().join(DIRECTORY).exists());
+    }
+
+    #[test]
+    fn invalid_receipts_are_quarantined_without_repeating_startup_warnings() {
+        for corruption in ["json", "identity", "handoff", "digest", "oversize"] {
+            let (directory, state, job, result) = fixture();
+            finish_worker_outcome(&job, JobKind::ExportPortableBackup, Ok(result), vec![], Some(directory.path()));
+            let valid = directory.path().join(DIRECTORY).join(format!("{}.json", job.id()));
+            if corruption == "json" {
+                let handoffs = directory.path().join("handoffs");
+                let held = directory.path().join("held-handoffs");
+                fs::rename(&handoffs, &held).unwrap();
+                fs::write(&handoffs, b"temporarily unavailable").unwrap();
+                assert!(restore(directory.path(), &JobRegistry::default()).is_err());
+                assert!(valid.exists());
+                assert!(!valid.with_extension("invalid").exists());
+                fs::remove_file(&handoffs).unwrap();
+                fs::rename(held, handoffs).unwrap();
+            }
+            let invalid_id = Uuid::new_v4().to_string();
+            let invalid = valid.with_file_name(format!("{invalid_id}.json"));
+            let mut value: Value = serde_json::from_slice(&fs::read(&valid).unwrap()).unwrap();
+            value["jobId"] = Value::String(invalid_id.clone());
+            match corruption {
+                "identity" => value["version"] = Value::from(2),
+                "handoff" => value["handoffName"] = Value::String("../outside.risunest".into()),
+                "digest" => value["sourceSha256"] = Value::String("invalid".into()),
+                _ => {}
+            }
+            let bytes = match corruption {
+                "json" => b"{broken".to_vec(),
+                "oversize" => vec![b' '; MAX_RECEIPT_BYTES as usize + 1],
+                _ => serde_json::to_vec(&value).unwrap(),
+            };
+            fs::write(&invalid, &bytes).unwrap();
+            drop(state);
+            let restarted = NativeFileJobState::initialize(directory.path().to_path_buf());
+            assert_eq!(restarted.list().unwrap().len(), 1, "{corruption}");
+            assert_eq!(restarted.status(&job.id()).unwrap().state, JobState::Succeeded);
+            assert!(!invalid.exists(), "{corruption}");
+            assert_eq!(fs::read(invalid.with_extension("invalid")).unwrap(), bytes);
+            drop(restarted);
+            let next = NativeFileJobState::initialize(directory.path().to_path_buf());
+            assert!(next.startup_warnings.is_empty(), "{corruption}");
+            assert_eq!(next.list().unwrap().len(), 1);
+        }
     }
 
     #[test]

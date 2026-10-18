@@ -3049,7 +3049,7 @@ fn finish_worker_outcome(
         if kind == JobKind::ExportPortableBackup {
             if let Err(error) = completed {
                 if job.is_cancel_requested() { let _ = job.finish_cancelled(); }
-                else { let _ = job.finish_failure("export-receipt-write-failed", &error); }
+                else { let _ = job.finish_native_failure(&error); }
             }
         }
     };
@@ -5342,13 +5342,13 @@ impl JobControl {
     }
 
     pub(crate) fn finish_success(&self, result: JobResultSummary) -> Result<(), String> {
-        self.finish_success_with_receipt(result, None)
+        self.finish_success_with_receipt(result, None).map_err(|error| error.message)
     }
 
-    fn finish_success_with_receipt(&self, mut result: JobResultSummary, receipt_root: Option<&Path>) -> Result<(), String> {
-        validate_result(&result)?;
+    fn finish_success_with_receipt(&self, mut result: JobResultSummary, receipt_root: Option<&Path>) -> Result<(), NativeJobError> {
+        validate_result(&result).map_err(|error| NativeJobError::new("store-error", error))?;
         if result.publication.is_some() {
-            return Err("non-publication job returned publication metadata".to_owned());
+            return Err(NativeJobError::new("store-error", "non-publication job returned publication metadata"));
         }
         let context_warnings = self.status().warning_codes;
         for warning in context_warnings {
@@ -5357,17 +5357,18 @@ impl JobControl {
             }
         }
         result.warning_codes.truncate(MAX_WARNING_CODES);
-        validate_result(&result)?;
+        validate_result(&result).map_err(|error| NativeJobError::new("store-error", error))?;
         let mut status = self
             .status
             .lock()
-            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+            .map_err(|error| NativeJobError::new("store-error", format!("native job status mutex poisoned: {error}")))?;
         if status.state != JobState::Running || self.is_cancel_requested() {
-            return Err("native job cannot succeed from its current state".to_owned());
+            return Err(NativeJobError::new("store-error", "native job cannot succeed from its current state"));
         }
         if status.kind == JobKind::ExportPortableBackup && result.handoff_path.is_some() {
             if let Some(root) = receipt_root {
-                portable_export_receipts::persist(root, &status.job_id, &result)?;
+                portable_export_receipts::persist(root, &status.job_id, &result)
+                    .map_err(|error| NativeJobError::new("export-receipt-write-failed", error))?;
             }
         }
         status.state = JobState::Succeeded;
@@ -5377,7 +5378,7 @@ impl JobControl {
         status.prepared_content = None;
         status.publication_attempt = None;
         drop(status);
-        self.mark_terminal()?;
+        self.mark_terminal().map_err(|error| NativeJobError::new("store-error", error))?;
         Ok(())
     }
 

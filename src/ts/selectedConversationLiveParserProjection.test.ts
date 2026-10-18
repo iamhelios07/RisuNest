@@ -337,6 +337,26 @@ describe('selected conversation live parser projection', () => {
         h.source.dispose()
     })
 
+    test('notifies a revision advance during initial greeting preparation before rejecting it', async () => {
+        const h = await cachedHarness({}, 7, 1)
+        h.reads.mockImplementationOnce(async (query) => {
+            const result = await h.readWindow(query)
+            h.target.storeRevision = 5
+            h.source.advanceUnchangedRevision(5)
+            return result
+        })
+        const controller = new AbortController()
+        const onStale = vi.fn(() => controller.abort())
+        await expect(h.resolver.acquireConversationStart!({ greeting: '{{previouschatlog::0}}', totalMessages: 8,
+            signal: controller.signal, onStale })).rejects.toThrow()
+        expect(onStale).toHaveBeenCalledOnce()
+        expect(controller.signal.aborted).toBe(true)
+        const lease = await h.resolver.acquireConversationStart!({ greeting: '{{previouschatlog::0}}', totalMessages: 8 })
+        expect(lease!.projection!.context.parserContext.historyAccess!.row(0)?.data).toBe('message-0')
+        lease?.release()
+        h.source.dispose()
+    })
+
     test.each([false, true])('prepares greeting gaps with an optimistic total (later pass %s)', async (later) => {
         const h = await cachedHarness({}, 7, 1)
         h.source.applyOptimisticRange(8, 0, [message(8, 'pending tail')])

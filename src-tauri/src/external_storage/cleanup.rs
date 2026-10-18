@@ -308,7 +308,7 @@ pub(crate) async fn run_lww(
 fn finish_delete<T>(owner: &LeaseOwner, result: Result<T>) -> Result<T> {
     if result.as_ref().map_or_else(|error| {
         error.http_status != Some(202)
-            && !matches!(error.kind, ErrorKind::Transient | ErrorKind::Cancelled | ErrorKind::Unsupported)
+            && !matches!(error.kind, ErrorKind::Transient | ErrorKind::Cancelled)
     }, |_| true) {
         owner.set_delete_in_flight(false);
     }
@@ -1870,7 +1870,7 @@ pub(super) mod tests {
             };
             assert_eq!(h.run().await.unwrap().deleted_objects, 0);
             h.clock.advance(leases::UNREACHABLE_GRACE_MS);
-            for kind in [ErrorKind::Unauthorized, ErrorKind::RateLimited] {
+            for kind in [ErrorKind::Unauthorized, ErrorKind::RateLimited, ErrorKind::Unsupported] {
                 *h.view.inventory_delete_error.lock().unwrap() = Some(kind);
                 assert_eq!(h.run().await.unwrap_err().kind, kind);
                 assert!(h.provider.objects_with_role(ObjectRole::Lease).is_empty());
@@ -1879,7 +1879,7 @@ pub(super) mod tests {
             assert_eq!(h.run().await.unwrap_err().kind, ErrorKind::Transient);
             assert!(h.payload_deletes().is_empty());
             assert_eq!(h.run().await.unwrap().stop_reason, StopReason::Lease);
-            assert_eq!(h.view.retired_inventory.lock().unwrap().len(), 3);
+            assert_eq!(h.view.retired_inventory.lock().unwrap().len(), 4);
         });
     }
 
@@ -2194,7 +2194,7 @@ pub(super) mod tests {
     #[test]
     fn container_delete_refusals_release_the_marker_but_response_loss_keeps_it() {
         runtime().block_on(async {
-            for kind in [ErrorKind::Unauthorized, ErrorKind::RateLimited, ErrorKind::Transient] {
+            for kind in [ErrorKind::Unauthorized, ErrorKind::RateLimited, ErrorKind::Unsupported, ErrorKind::Transient] {
                 let h = Harness::new();
                 h.age().await;
                 h.provider.state.lock().unwrap().container_delete_error = Some(kind);
