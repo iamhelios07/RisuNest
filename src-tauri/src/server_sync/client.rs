@@ -881,7 +881,9 @@ impl ServerClient {
         if response.content_length().is_some_and(|v| v > limit as u64) {
             return Err(SyncError::new("response-too-large", 502));
         }
-        let mut bytes = Vec::new();
+        // The declared length, already within the limit, sizes the buffer so a
+        // large reply is not read into one grown by doubling.
+        let mut bytes = Vec::with_capacity(response.content_length().unwrap_or(0) as usize);
         let wire = super::progress::WireReader::new(response.take(limit as u64 + 1), self.lane.clone(), false, None);
         let observer = if (200..300).contains(&status) && (path == "objects/transfer" || (path.starts_with("objects/") && path.ends_with("/part"))) {
             self.body_download_observer.as_deref()
@@ -1140,6 +1142,28 @@ mod progress_tests {
         let mut retried = Vec::new();
         body.reader().read_to_end(&mut retried).unwrap();
         assert_eq!((sent, retried), (vec![7; 4096], vec![7; 4096]));
+    }
+
+    #[test]
+    fn a_reply_is_read_into_a_buffer_of_its_declared_length() {
+        use super::*;
+        use std::{io::Write, net::TcpListener};
+        const LENGTH: usize = 600_000;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") { let mut byte = [0]; socket.read_exact(&mut byte).unwrap(); header.push(byte[0]); }
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {LENGTH}\r\nConnection: close\r\n\r\n").unwrap();
+            socket.write_all(&vec![5; LENGTH]).unwrap();
+        });
+        let client = ServerClient::new(super::tests::config(&endpoint)).unwrap();
+        let reply = client.request_once(Method::GET, "objects/synthetic/part", &[], None, &[], LENGTH, uuid::Uuid::new_v4(), &std::sync::atomic::AtomicU64::new(0)).unwrap();
+        server.join().unwrap();
+        assert_eq!(reply.body, vec![5; LENGTH]);
+        assert!(reply.body.capacity() < LENGTH + LENGTH / 8);
     }
 
     #[test]
