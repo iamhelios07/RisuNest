@@ -150,6 +150,19 @@ pub(crate) trait RepositoryView: Sync {
     fn inventory<'a>(&'a self, _cancel: &'a Cancellation) -> ProviderFuture<'a, InventorySurvey> {
         Box::pin(async { Ok(InventorySurvey::default()) })
     }
+    /// The current state of one surveyed page, or `None` once it is gone.
+    fn inventory_page<'a>(
+        &'a self,
+        page: &'a RemoteObject,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, Option<InventoryPageState>> {
+        Box::pin(async move {
+            let key = locator_key(&page.receipt.locator)?;
+            Ok(self.inventory(cancel).await?.pages.into_iter().find(|current| {
+                locator_key(&current.reference.receipt.locator).ok().as_deref() == Some(key.as_str())
+            }))
+        })
+    }
     fn delete_inventory_page<'a>(
         &'a self,
         _expected: &'a risunest_external_storage_format::snapshot::StoredObject,
@@ -504,10 +517,7 @@ async fn run_owned(
                 outcome.stop_reason = reason;
                 break;
             }
-            let confirmation = view.inventory(cancel).await?;
-            let Some(current) = confirmation.pages.into_iter().find(|page| {
-                locator_key(&page.reference.receipt.locator).ok().as_deref() == Some(key.as_str())
-            }) else {
+            let Some(current) = view.inventory_page(&expected.reference, cancel).await? else {
                 GcStore::open(context.root)?
                     .forget_inventory_page_observation(context.connection_id, &key)?;
                 continue;
@@ -764,64 +774,83 @@ impl ConnectedRepositoryView<'_> {
                 if !page_ids.insert(listed.document.page_id.clone()) {
                     return Err(ProviderError::new(ErrorKind::Corrupt));
                 }
-                let mut present = 0usize;
-                for entry in &listed.document.objects {
-                    let role = if entry.role == risunest_external_storage_format::snapshot::ObjectRole::SyncState
-                        && uuid::Uuid::parse_str(&entry.object_id).is_ok_and(|id| id.to_string()==entry.object_id)
-                    {
-                        ObjectRole::Snapshot
-                    } else {
-                        packaging::native_role(entry.role)?
-                    };
-                    let intent = ObjectIntent {
-                        repository_id: self.connected.handle.repository_id.clone(),
-                        job_id: listed.document.operation_id.clone(),
-                        object_id: entry.object_id.clone(),
-                        role,
-                        byte_length: entry.ciphertext_length,
-                        sha256: hex::encode(entry.ciphertext_sha256),
-                    };
-                    let Some(receipt) = leases::control_request_with_timeout(
-                        cancel,
-                        self.connected.provider.lookup_metadata(
-                            &self.connected.handle,
-                            &intent,
-                            None,
-                            cancel,
-                        ),
-                        INVENTORY_METADATA_TIMEOUT,
-                    )
-                    .await?
-                    else {
-                        continue;
-                    };
-                    super::journal::validate_receipt(
-                        &intent,
-                        &self.connected.handle,
-                        &receipt,
-                    )?;
-                    present += 1;
-                    survey.objects.push(RemoteObject {
-                        repository_id: listed.document.repository_id.clone(),
-                        object_id: entry.object_id.clone(),
-                        role,
-                        receipt,
-                        ciphertext_sha256: intent.sha256,
-                        plaintext_length: entry.plaintext_length,
-                        plaintext_sha256: hex::encode(entry.plaintext_sha256),
-                    });
-                }
-                survey.pages.push(InventoryPageState {
-                    reference: listed.reference,
-                    operation_id: listed.document.operation_id,
-                    all_objects_absent: present == 0,
-                });
+                let state = self.page_state(listed, &mut survey.objects, cancel).await?;
+                survey.pages.push(state);
             }
             match page.next_cursor {
                 Some(next) => cursor = Some(next),
                 None => return Ok(survey),
             }
         }
+    }
+    /// Reads one page again by the receipt a survey listed it under.
+    async fn inventory_page_in_scope(
+        &self, page: &RemoteObject, cancel: &Cancellation, extra_repository_id: Option<&str>,
+    ) -> Result<Option<InventoryPageState>> {
+        let listed = match leases::control_request(cancel, control::open_listed_inventory_page_in_scope(
+            page.receipt.clone(), &self.connected.stored.descriptor, &self.connected.root_key,
+            self.connected.provider.as_ref(), &self.connected.handle, cancel, extra_repository_id,
+        )).await {
+            Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
+            other => other?,
+        };
+        Ok(Some(self.page_state(listed, &mut Vec::new(), cancel).await?))
+    }
+    async fn page_state(
+        &self, listed: control::ListedInventoryPage, objects: &mut Vec<RemoteObject>, cancel: &Cancellation,
+    ) -> Result<InventoryPageState> {
+        let mut present = 0usize;
+        for entry in &listed.document.objects {
+            let role = if entry.role == risunest_external_storage_format::snapshot::ObjectRole::SyncState
+                && uuid::Uuid::parse_str(&entry.object_id).is_ok_and(|id| id.to_string()==entry.object_id)
+            {
+                ObjectRole::Snapshot
+            } else {
+                packaging::native_role(entry.role)?
+            };
+            let intent = ObjectIntent {
+                repository_id: self.connected.handle.repository_id.clone(),
+                job_id: listed.document.operation_id.clone(),
+                object_id: entry.object_id.clone(),
+                role,
+                byte_length: entry.ciphertext_length,
+                sha256: hex::encode(entry.ciphertext_sha256),
+            };
+            let Some(receipt) = leases::control_request_with_timeout(
+                cancel,
+                self.connected.provider.lookup_metadata(
+                    &self.connected.handle,
+                    &intent,
+                    None,
+                    cancel,
+                ),
+                INVENTORY_METADATA_TIMEOUT,
+            )
+            .await?
+            else {
+                continue;
+            };
+            super::journal::validate_receipt(
+                &intent,
+                &self.connected.handle,
+                &receipt,
+            )?;
+            present += 1;
+            objects.push(RemoteObject {
+                repository_id: listed.document.repository_id.clone(),
+                object_id: entry.object_id.clone(),
+                role,
+                receipt,
+                ciphertext_sha256: intent.sha256,
+                plaintext_length: entry.plaintext_length,
+                plaintext_sha256: hex::encode(entry.plaintext_sha256),
+            });
+        }
+        Ok(InventoryPageState {
+            reference: listed.reference,
+            operation_id: listed.document.operation_id,
+            all_objects_absent: present == 0,
+        })
     }
 }
 impl RepositoryView for ConnectedRepositoryView<'_> {
@@ -868,6 +897,13 @@ impl RepositoryView for ConnectedRepositoryView<'_> {
     }
     fn inventory<'a>(&'a self, cancel: &'a Cancellation) -> ProviderFuture<'a, InventorySurvey> {
         Box::pin(self.read_inventory(cancel))
+    }
+    fn inventory_page<'a>(
+        &'a self,
+        page: &'a RemoteObject,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, Option<InventoryPageState>> {
+        Box::pin(self.inventory_page_in_scope(page, cancel, None))
     }
     fn delete_inventory_page<'a>(
         &'a self,
@@ -1041,6 +1077,9 @@ impl RepositoryView for LwwRepositoryView<'_> {
         let mut known=self.base.known_objects()?;known.extend(self.known.lock().map_err(|_|ProviderError::new(ErrorKind::Transient))?.clone());Ok(known)
     }
     fn inventory<'a>(&'a self,cancel:&'a Cancellation)->ProviderFuture<'a,InventorySurvey> {Box::pin(self.base.read_inventory_in_scope(cancel,Some(&self.lww_repository_id)))}
+    fn inventory_page<'a>(&'a self,page:&'a RemoteObject,cancel:&'a Cancellation)->ProviderFuture<'a,Option<InventoryPageState>> {
+        Box::pin(self.base.inventory_page_in_scope(page,cancel,Some(&self.lww_repository_id)))
+    }
     fn delete_inventory_page<'a>(&'a self,expected:&'a risunest_external_storage_format::snapshot::StoredObject,cancel:&'a Cancellation)->ProviderFuture<'a,control::RemoteInventoryPageDeleteOutcome> {
         if expected.header.repository_id==self.lww_repository_id {
             Box::pin(control::delete_authenticated_inventory_page_for_repository(self.base.connected,expected,&self.lww_repository_id,cancel))
@@ -1628,6 +1667,7 @@ pub(super) mod tests {
         retired_inventory: Mutex<Vec<String>>,
         protected: Mutex<Vec<String>>,
         inventory_delete_error: Mutex<Option<ErrorKind>>,
+        surveys: AtomicUsize,
     }
     impl RepositoryView for View {
         fn roots<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, ObservedRoots> {
@@ -1653,7 +1693,15 @@ pub(super) mod tests {
         fn job_roots(&self) -> Result<JobRoots> { Ok(self.jobs.lock().unwrap().clone()) }
         fn known_objects(&self) -> Result<Vec<RemoteObject>> { Ok(self.known.clone()) }
         fn inventory<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, InventorySurvey> {
-            Box::pin(async move { Ok(self.inventory.lock().unwrap().clone()) })
+            Box::pin(async move {
+                self.surveys.fetch_add(1, Ordering::SeqCst);
+                Ok(self.inventory.lock().unwrap().clone())
+            })
+        }
+        fn inventory_page<'a>(&'a self, page: &'a RemoteObject, _: &'a Cancellation) -> ProviderFuture<'a, Option<InventoryPageState>> {
+            Box::pin(async move {
+                Ok(self.inventory.lock().unwrap().pages.iter().find(|current| current.reference.object_id == page.object_id).cloned())
+            })
         }
         fn delete_inventory_page<'a>(
             &'a self,
@@ -1746,6 +1794,7 @@ pub(super) mod tests {
                     retired_inventory: Mutex::new(Vec::new()),
                     protected: Mutex::new(Vec::new()),
                     inventory_delete_error: Mutex::new(None),
+                    surveys: AtomicUsize::new(0),
                 },
             }
         }
@@ -1844,21 +1893,26 @@ pub(super) mod tests {
     fn c_empty_inventory_pages_wait_seven_days_and_are_rechecked_before_retirement() {
         runtime().block_on(async {
             let h = Harness::new();
-            let page = object("inventory-page-old", ObjectRole::InventoryPage);
+            let pages = ["inventory-page-old", "inventory-page-older", "inventory-page-oldest"];
             *h.view.inventory.lock().unwrap() = InventorySurvey {
-                pages: vec![InventoryPageState {
-                    reference: page,
+                pages: pages.iter().map(|id| InventoryPageState {
+                    reference: object(id, ObjectRole::InventoryPage),
                     operation_id: "finished-operation".into(),
                     all_objects_absent: true,
-                }],
+                }).collect(),
                 objects: Vec::new(),
             };
             assert_eq!(h.run().await.unwrap().deleted_objects, 0);
             h.clock.advance(leases::UNREACHABLE_GRACE_MS);
+            h.view.surveys.store(0, Ordering::SeqCst);
             let result = h.run().await.unwrap();
             assert_eq!(result.stop_reason, StopReason::Complete);
-            assert_eq!(h.view.retired_inventory.lock().unwrap().as_slice(), ["inventory-page-old"]);
-            assert_eq!(result.deleted_objects, 3);
+            let mut retired = h.view.retired_inventory.lock().unwrap().clone();
+            retired.sort();
+            assert_eq!(retired, ["inventory-page-old", "inventory-page-older", "inventory-page-oldest"]);
+            assert_eq!(result.deleted_objects, 5);
+            // Each aged page is confirmed by itself, not by surveying the inventory again.
+            assert_eq!(h.view.surveys.load(Ordering::SeqCst), 2);
         });
     }
 
@@ -2034,6 +2088,17 @@ pub(super) mod tests {
             provider.script_page(Collection::Snapshots, page("snapshot-a", None));
             provider.script_page(Collection::Checkpoints, page("snapshot-a", None));
             assert_eq!(view.snapshots(&Cancellation::default()).await.unwrap_err().kind, ErrorKind::Corrupt);
+
+            // Confirming one surveyed page reads that page and looks up its
+            // objects, without listing the inventory again.
+            let survey = view.read_inventory(&Cancellation::default()).await.unwrap();
+            let (requests, listings) = (provider.request_count(), provider.listing_count());
+            let current = view.inventory_page(&survey.pages[0].reference, &Cancellation::default()).await.unwrap().unwrap();
+            assert_eq!((current.operation_id.as_str(), current.all_objects_absent), (identity.job_id.as_str(), false));
+            assert_eq!((provider.request_count() - requests, provider.listing_count() - listings), (2, 0));
+            let mut gone = survey.pages[0].reference.clone();
+            gone.receipt.locator.object.push_str("-removed");
+            assert!(view.inventory_page(&gone, &Cancellation::default()).await.unwrap().is_none());
 
             tokio::time::pause();
             provider.delay_metadata(Duration::from_secs(90));
