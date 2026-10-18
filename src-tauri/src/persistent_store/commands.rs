@@ -792,9 +792,9 @@ pub(crate) fn pds_read_conversation(
     character_id: String,
     conversation_id: String,
     lease: Option<String>,
-) -> Result<Option<Versioned<Value>>, StoreError> {
+) -> Result<Option<Versioned<super::StoredConversation>>, StoreError> {
     logged("pds_read_conversation", with_store(state, |store| {
-        store.read_conversation(&character_id, &conversation_id, lease.as_deref())
+        store.read_stored_conversation(&character_id, &conversation_id, lease.as_deref())
     }))
 }
 
@@ -815,9 +815,9 @@ pub(crate) fn pds_read_conversation_window(
     state: State<'_, PersistentStoreState>,
     query: ConversationWindowQuery,
     lease: Option<String>,
-) -> Result<Option<Versioned<ConversationWindow>>, StoreError> {
+) -> Result<Option<Versioned<ConversationWindow<super::StoredJson>>>, StoreError> {
     logged("pds_read_conversation_window", with_store(state, |store| {
-        store.read_conversation_window(&query, lease.as_deref())
+        store.read_stored_conversation_window(&query, lease.as_deref())
     }))
 }
 
