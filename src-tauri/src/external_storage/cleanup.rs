@@ -610,6 +610,16 @@ pub(crate) struct ConnectedRepositoryView<'a> {
     pub now_ms: u64,
     pub unfinished: Vec<UnfinishedJob>,
     pub cache_root: &'a Path,
+    pub reads: RootReads,
+}
+/// The roots one view has already read. Every recheck lists the points again
+/// and downloads only what changed: a point is written once under its own
+/// name and a bundle is named by its content, so an equal receipt or identity
+/// still names the document read before.
+#[derive(Default)]
+pub(crate) struct RootReads {
+    points: std::sync::Mutex<BTreeMap<String, control::ListedBackupPoint>>,
+    bundles: std::sync::Mutex<BTreeMap<String, BundleSource>>,
 }
 pub(crate) struct UnfinishedJob {
     pub job_id: String,
@@ -689,33 +699,50 @@ impl ConnectedRepositoryView<'_> {
             Ok(roots)
     }
     async fn read_points(&self, cancel: &Cancellation) -> Result<Vec<control::ListedBackupPoint>> {
+        let connected = self.connected;
+        let mut earlier = std::mem::take(&mut *self.reads.points.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let mut current = BTreeMap::new();
         let mut points = Vec::new();
         let mut cursor: Option<String> = None;
         let mut tracker = PageTracker::default();
         let mut ids = BTreeSet::new();
         loop {
-            let page = leases::control_request(cancel, control::list_backup_points_page(
-                &self.connected.stored.descriptor, &self.connected.root_key,
-                self.connected.provider.as_ref(), &self.connected.handle,
-                cursor.as_deref(), 100, cancel,
-            )).await?;
-            let receipts = page.points.iter().map(|point| point.reference.receipt.clone()).collect::<Vec<_>>();
-            tracker.accept(&self.connected.handle, &receipts, page.next_cursor.as_deref())?;
-            for point in &page.points {
-                if !ids.insert(point.document.point_id.clone()) {
-                    return Err(ProviderError::new(ErrorKind::Corrupt));
+            let next = leases::control_request(cancel, async {
+                let page = connected.provider.list_objects(
+                    &connected.handle, Collection::BackupPoints, cursor.as_deref(), 100, cancel,
+                ).await?;
+                tracker.accept(&connected.handle, &page.objects, page.next_cursor.as_deref())?;
+                for receipt in page.objects {
+                    cancel.check()?;
+                    let key = locator_key(&receipt.locator)?;
+                    let point = match earlier.remove(&key).filter(|point| point.reference.receipt == receipt) {
+                        Some(point) => point,
+                        None => control::open_listed_point(
+                            receipt, &connected.stored.descriptor, &connected.root_key,
+                            connected.provider.as_ref(), &connected.handle, cancel,
+                        ).await?,
+                    };
+                    if !ids.insert(point.document.point_id.clone()) {
+                        return Err(ProviderError::new(ErrorKind::Corrupt));
+                    }
+                    current.insert(key, point.clone());
+                    points.push(point);
                 }
-            }
-            points.extend(page.points);
-            match page.next_cursor {
+                Ok(page.next_cursor)
+            }).await?;
+            match next {
                 Some(next) => cursor = Some(next),
-                None => return Ok(points),
+                None => break,
             }
         }
+        *self.reads.points.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = current;
+        Ok(points)
     }
     async fn bundle_sources(
         &self, points: &[control::ListedBackupPoint], cancel: &Cancellation,
     ) -> Result<BTreeMap<String, BundleSource>> {
+        let mut earlier = std::mem::take(&mut *self.reads.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let mut current = BTreeMap::new();
         let mut sources = BTreeMap::new();
         let mut identities = BTreeMap::new();
         for point in points {
@@ -726,14 +753,21 @@ impl ConnectedRepositoryView<'_> {
                     if previous != identity { return Err(ProviderError::new(ErrorKind::Corrupt)); }
                     continue;
                 }
-                let view = control::read_snapshot_document(self.connected, bundle, cancel).await?;
-                let source = match view.captured_by_device {
-                    Some(writer_id) => BundleSource::Device { writer_id },
-                    None => BundleSource::SyncState { commit_id: view.snapshot_id },
+                let source = match earlier.remove(&identity) {
+                    Some(source) => source,
+                    None => {
+                        let view = control::read_snapshot_document(self.connected, bundle, cancel).await?;
+                        match view.captured_by_device {
+                            Some(writer_id) => BundleSource::Device { writer_id },
+                            None => BundleSource::SyncState { commit_id: view.snapshot_id },
+                        }
+                    }
                 };
+                current.insert(identity, source.clone());
                 sources.insert(bundle.object_id.clone(), source);
             }
         }
+        *self.reads.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = current;
         Ok(sources)
     }
 
@@ -1394,7 +1428,7 @@ pub(super) mod tests {
             assert_eq!(f.sender.snapshot_listing(&cancel).await.unwrap().len(),2,"ordinary logical-scope backup coexists with the physical checkpoints");
             let sender_store=std::sync::Mutex::new(f.a.open_native_job_store().unwrap());
             let view=LwwRepositoryView::new(&f.sender,&sender_store,ConnectedRepositoryView{connected:&connected,writer_id:"sender",policy:RetentionPolicy::DEFAULT,
-                now_ms:1000,unfinished:vec![],cache_root:&cache},ConnectedDocuments{connected:&connected,cancel:&cancel,scratch:&scratch});
+                now_ms:1000,unfinished:vec![],cache_root:&cache,reads:Default::default()},ConnectedDocuments{connected:&connected,cancel:&cancel,scratch:&scratch});
             let observed=view.roots(&cancel).await.unwrap();let listed=view.snapshots(&cancel).await.unwrap();let known=view.known_objects().unwrap();
             let inventory=view.inventory(&cancel).await.unwrap();
             assert!(inventory.pages.iter().any(|page|page.reference.repository_id==checkpoint.reference.repository_id));
@@ -1424,17 +1458,17 @@ pub(super) mod tests {
                 root_key:&connected.root_key,provider:connected.provider.as_ref(),repository:&connected.handle,clock:&clock,protection_supported:true,ledger:None};
             let request=CleanupRequest{job_id:"first-finite-gc",cleanup_supported:true,limits:CleanupLimits{batch:1,per_run:1},connection_time:&available_time};
             let first=run_lww(&context,&request,&f.sender,&sender_store,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
-                now_ms:1000+leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+                now_ms:1000+leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache,reads:Default::default()},&scratch,&cancel).await.unwrap();
             assert!(first.deleted_objects<=1);assert!(f.provider.holds(&body.object_id),"a newly unmarked protected body retains its grace period");
             clock.advance(leases::UNREACHABLE_GRACE_MS);
             let request=CleanupRequest{job_id:"second-finite-gc",..request};
             let settled=run_lww(&context,&request,&f.sender,&sender_store,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
-                now_ms:1000+2*leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+                now_ms:1000+2*leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache,reads:Default::default()},&scratch,&cancel).await.unwrap();
             assert_eq!(settled.deleted_objects,1);assert!(!f.provider.holds(&body.object_id));
             assert!(view.snapshots(&cancel).await.unwrap().len()>=3,"partial deletion keeps signed discovery parents");
             let request=CleanupRequest{job_id:"retire-covered-pack",limits:CleanupLimits{batch:100,per_run:100},..request};
             run_lww(&context,&request,&f.sender,&sender_store,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
-                now_ms:1000+2*leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+                now_ms:1000+2*leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache,reads:Default::default()},&scratch,&cancel).await.unwrap();
             assert!(!f.provider.holds(&old_pack),"finite aged GC retires the saved equal-coverage pack");
             let mut receiver_connection=ConnectedRepository{stored:connected.stored.clone(),provider:connected.provider.clone(),handle:fake::repository(),
                 dependencies:fake::loopback_dependencies(fake::MemoryVault::default(),1).dependencies,root_key:zeroize::Zeroizing::new(*connected.root_key)};
@@ -1494,11 +1528,11 @@ pub(super) mod tests {
             root_key:&connected.root_key,provider:connected.provider.as_ref(),repository:&connected.handle,clock:&clock,protection_supported:true,ledger:None};
         let request=CleanupRequest{job_id:"mark-unreachable",cleanup_supported:true,limits:CleanupLimits::default(),connection_time:&available_time};
         let first=run_lww(&context,&request,&f.sender,&sender_store,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
-            now_ms:start,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+            now_ms:start,unfinished:vec![],cache_root:&cache,reads:Default::default()},&scratch,&cancel).await.unwrap();
         clock.advance(leases::UNREACHABLE_GRACE_MS);
         let request=CleanupRequest{job_id:"remove-unreachable",..request};
         let second=run_lww(&context,&request,&f.sender,&sender_store,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
-            now_ms:start+leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+            now_ms:start+leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache,reads:Default::default()},&scratch,&cancel).await.unwrap();
         (first,second)
     }
 
@@ -1595,7 +1629,7 @@ pub(super) mod tests {
                 let (segments_before,checkpoint_before)=(reads(&f,&segments),f.provider.read_attempts(&checkpoint));
                 let request=CleanupRequest{job_id:if run==0 {"idle-cleanup"} else {"idle-cleanup-again"},cleanup_supported:true,limits:CleanupLimits::default(),connection_time:&available_time};
                 let outcome=run_lww(&context,&request,&f.sender,&sender_store,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
-                    now_ms:super::super::runtime::now_ms(),unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+                    now_ms:super::super::runtime::now_ms(),unfinished:vec![],cache_root:&cache,reads:Default::default()},&scratch,&cancel).await.unwrap();
                 assert_eq!(outcome.stop_reason,StopReason::Complete);
                 assert_eq!(outcome.deleted_objects,0);
                 for ((id,before),after) in segments.iter().zip(&segments_before).zip(reads(&f,&segments)) {
@@ -1637,7 +1671,7 @@ pub(super) mod tests {
             let request=CleanupRequest{job_id:"idle-cleanup",cleanup_supported:true,limits:CleanupLimits::default(),connection_time:&available_time};
             let sender_store=std::sync::Mutex::new(f.a.open_native_job_store().unwrap());
             let outcome=run_lww(&context,&request,&f.sender,&sender_store,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
-                now_ms:super::super::runtime::now_ms(),unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+                now_ms:super::super::runtime::now_ms(),unfinished:vec![],cache_root:&cache,reads:Default::default()},&scratch,&cancel).await.unwrap();
             assert_eq!(outcome.stop_reason,StopReason::Complete);
             assert_eq!(outcome.deleted_objects,0);
             assert_eq!(reads(&f,&packs),packs_before,"no live pack or standalone body is downloaded");
@@ -2063,6 +2097,7 @@ pub(super) mod tests {
                 now_ms: NOW,
                 unfinished: Vec::new(),
                 cache_root: empty_cache.path(),
+                reads: Default::default(),
             };
 
             // Both listings of the snapshots folder may hand out one cursor, but

@@ -851,7 +851,7 @@ async fn upload_control_object(
     })
 }
 
-async fn open_listed_point(
+pub(super) async fn open_listed_point(
     receipt: ObjectReceipt,
     descriptor: &Descriptor,
     root_key: &[u8; 32],
