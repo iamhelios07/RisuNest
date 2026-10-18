@@ -196,13 +196,11 @@ impl Segment {
     }
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let value = serde_json::to_value(self).map_err(|_| corrupt())?;
-        risunest_sync_wire::canonical::encode(&value).map_err(|_| corrupt())
+        risunest_sync_wire::canonical::encode(self).map_err(|_| corrupt())
     }
     pub(super) fn encode_capture(&self) -> Result<Vec<u8>> {
         self.validate_inner(false)?;
-        let value = serde_json::to_value(self).map_err(|_| corrupt())?;
-        risunest_sync_wire::canonical::encode(&value).map_err(|_| corrupt())
+        risunest_sync_wire::canonical::encode(self).map_err(|_| corrupt())
     }
     pub(super) fn decode_capture(bytes: &[u8]) -> Result<Self> {
         let value: Self = risunest_sync_wire::canonical::decode(bytes, bytes.len()).map_err(|_| corrupt())?;
