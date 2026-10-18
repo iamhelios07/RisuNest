@@ -68,11 +68,18 @@ async function connect() {
   });
   const evaluate = async (expression) => {
     const result=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});
-    assert.ok(!result.exceptionDetails, 'Synthetic page evaluation failed');
+    assert.ok(!result.exceptionDetails, result.exceptionDetails?.exception?.description ?? 'Synthetic page evaluation failed');
     return result.result.value;
   };
   await call('Network.enable');
   await call('Network.setBlockedURLs',{urls:[...REALM_BLOCKED_URL_PATTERNS,'*update.rsyumi.workers.dev/translator/prompt-presets.json*']});
+  let ready=false;
+  for (let i=0;i<120;i++) {
+    ready=await evaluate(`typeof window.__TAURI_INTERNALS__?.invoke==='function' && typeof ${api}?.state==='function' && typeof ${api}?.receipt==='function'`);
+    if (ready) break;
+    await delay(250);
+  }
+  assert.ok(ready,'Synthetic publication API did not become ready');
   assert.equal(await evaluate("window.__TAURI_INTERNALS__.invoke('plugin:app|identifier')"),packageName);
   assert.equal(await evaluate('document.title'),title);
   return {pid,evaluate,call,async armBoundary(mode) {
