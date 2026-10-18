@@ -170,10 +170,24 @@ async function main() {
     assert.equal(environment.visible, true)
     const result = await client.evaluate(`window.__pluginReview.run(${JSON.stringify(token)}).catch(error => ({passed:false,assertion:error.message}))`, 180000)
     assert.equal(result.passed, true, 'Plugin Android acceptance failed')
+    const originalUrl = await client.evaluate('location.href')
+    await client.evaluate("location.href = 'https://example.invalid/blocked-document'; true")
     const downloads = await checkDownloads()
+    assert.equal(await client.evaluate('location.href'), originalUrl, 'External navigation replaced the app')
+    const openedUrl = await client.evaluate(`window.__pluginReview.externalLink(${JSON.stringify(token)})`)
+    const browserDeadline = Date.now() + 10000
+    let browserOpened = false
+    while (!browserOpened && Date.now() < browserDeadline) {
+        const activities = (await run(['shell', 'dumpsys', 'activity', 'activities'])).stdout
+        browserOpened = /^\s*(?:topResumedActivity=|mResumedActivity:|ResumedActivity:).*?(?:com\.android\.chrome|com\.android\.browser|ResolverActivity)/m.test(activities)
+        if (!browserOpened) await delay(100)
+    }
+    assert.ok(browserOpened, 'External link did not activate a browser or system chooser')
+    assert.equal(await client.evaluate('location.href'), originalUrl, 'Opening a browser replaced the app')
+    const navigation = { externalDocumentBlocked: true, externalBrowserOpened: browserOpened, openedUrl }
     const report = { timestamp: new Date().toISOString(), synthetic: true, platform: 'android-emulator', serial, avd,
         androidApi: Number((await run(['shell', 'getprop', 'ro.build.version.sdk'])).stdout.trim()),
-        apkSha256: createHash('sha256').update(await readFile(apk)).digest('hex'), environment, ...result, downloads }
+        apkSha256: createHash('sha256').update(await readFile(apk)).digest('hex'), environment, ...result, downloads, navigation }
     await mkdir(path.dirname(output), { recursive: true })
     await writeFile(output, JSON.stringify(report, null, 2) + '\n')
     console.log(JSON.stringify(report))

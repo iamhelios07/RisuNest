@@ -5,6 +5,7 @@ import { loadV3Plugins, getV3PluginInstance } from '../../src/ts/plugins/apiV3/v
 import { thoughtDriver } from './thoughtDriver'
 import { SandboxHost } from '../../src/ts/plugins/apiV3/factory'
 import { createPluginDownloadHandler } from '../../src/ts/plugins/apiV3/pluginDownload'
+import { installWebviewBridge } from '../../src/ts/webviewDownload'
 
 mount(Settings, { target: document.querySelector('#settings')! })
 const events: unknown[] = []
@@ -19,6 +20,7 @@ let downloadHost: SandboxHost | undefined
 const downloads = {
     files: [] as { name: string; bytes: number[] }[],
     errors: [] as string[],
+    opened: [] as string[],
     mode: 'save' as 'save' | 'cancel' | 'fail',
 }
 const driver = {
@@ -40,8 +42,17 @@ const driver = {
                 return true
             },
             reportError: error => { downloads.errors.push(String(error)) },
-        }) : undefined)
+        }) : undefined, native ? url => { downloads.opened.push(url) } : undefined)
         downloadHost.run(frame, script, 'synthetic-download')
+    },
+    installMainBridge(preservePopup = false) {
+        const save = createPluginDownloadHandler({
+            fetch: (url, options) => fetch(url, options),
+            save: async (name, bytes) => { downloads.files.push({ name, bytes: [...bytes] }); return true },
+            reportError: error => { downloads.errors.push(String(error)) },
+        })
+        installWebviewBridge((name, source) => save(name, source, new AbortController().signal),
+            error => { downloads.errors.push(String(error)) }, url => { downloads.opened.push(url) }, url => preservePopup && url.searchParams.has('popup'))
     },
     unloadDownload() { downloadHost?.terminate() },
     get downloadIdle() { return downloadHost?.isIdle() },

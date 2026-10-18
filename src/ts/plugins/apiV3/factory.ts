@@ -2,7 +2,8 @@ import { recordNativeLogError } from '../../nativeLog'
 import { isTauri } from '../../platform'
 import { consoleLog, installConsoleCapture, isConsoleLogLevel } from '../../consoleLog'
 import { attachPluginReadProvenance, collectPluginReadProvenance, type PluginReadProvenance } from '../pluginReadBaselines'
-import { installPluginDownloadBridge, type PluginDownloadHandler } from './pluginDownload'
+import { type PluginDownloadHandler } from './pluginDownload'
+import { installWebviewBridge } from '../../webviewDownload'
 
 type MsgType =
     | 'CALL_ROOT'
@@ -666,7 +667,7 @@ export class SandboxHost {
     private activeStreamCleanups = new Set<() => void>();
     private unreadStreamCleanups = new Set<() => void>();
 
-    constructor(apiFactory: any, private download?: PluginDownloadHandler) {
+    constructor(apiFactory: any, private download?: PluginDownloadHandler, private openExternal?: (url: string) => void | Promise<void>) {
         this.apiFactory = apiFactory;
     }
 
@@ -1196,7 +1197,12 @@ export class SandboxHost {
 
 
                     if (data.type === 'CALL_ROOT') {
-                        if (downloadSignal) {
+                        if (data.method === '_openExternal' && this.openExternal) {
+                            if (typeof args[0] !== 'string') throw new Error('Invalid external URL');
+                            const url = new URL(args[0]);
+                            if (!['http:', 'https:', 'mailto:', 'tel:'].includes(url.protocol)) throw new Error('Unsupported external URL');
+                            result = await this.openExternal(url.href);
+                        } else if (downloadSignal) {
                             result = await this.download!(args[0], args[1], downloadSignal);
                         } else {
                             const fn = this.apiFactory[data.method!];
@@ -1344,7 +1350,7 @@ export class SandboxHost {
             window.addEventListener('unhandledrejection', event => reportPluginError(event.reason));
             (async () => {
                 ${GUEST_BRIDGE_SCRIPT}
-                ${this.download ? `(${installPluginDownloadBridge.toString()})((name, source) => window.risuai._downloadFile(name, source), reportPluginError);` : ''}
+                ${this.download ? `(${installWebviewBridge.toString()})((name, source) => window.risuai._downloadFile(name, source), reportPluginError, ${this.openExternal ? '(url) => window.risuai._openExternal(url)' : 'undefined'});` : ''}
                     
                 const settled = () => {
                     flushConsole();
