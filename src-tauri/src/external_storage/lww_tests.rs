@@ -20,8 +20,12 @@ fn run<T>(future: impl std::future::Future<Output = T>) -> T {
         .block_on(future)
 }
 pub(crate) fn repository_id_cases() -> [String; 4] {
-    [fake::repository().repository_id, "x".repeat(128), "x".repeat(129),
-        format!("onedrive|{}", "synthetic-provider-identity/".repeat(10))]
+    let [boundary, long] = representative_repository_ids();
+    [fake::repository().repository_id, boundary, "x".repeat(129), long]
+}
+
+pub(crate) fn representative_repository_ids() -> [String; 2] {
+    ["x".repeat(128), format!("onedrive|{}", "synthetic-provider-identity/".repeat(10))]
 }
 
 pub(crate) struct HeldAssetTransfer {

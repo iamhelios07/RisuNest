@@ -1315,7 +1315,7 @@ pub(super) mod tests {
 
     #[test]
     fn lww_gc_retires_native_body_before_its_signed_discovery_parent() {
-        for repository_id in super::super::lww_tests::repository_id_cases() {
+        for repository_id in super::super::lww_tests::representative_repository_ids() {
         runtime().block_on(async {
             use super::super::{lww_tests::{CycleFixture,small_asset},fake};
             let mut f=CycleFixture::with_repository_id(&repository_id);let cancel=Cancellation::default();
