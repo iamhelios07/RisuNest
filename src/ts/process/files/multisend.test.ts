@@ -344,6 +344,23 @@ describe('postChatFile PO save destination', () => {
         expect(mocks.publishAndroidSafDownload).not.toHaveBeenCalled()
     })
 
+    it('writes the last checkpoint to the Android destination when the run stops partway', async () => {
+        mocks.platform = { runtime: 'tauri', os: 'android' }
+        const reservation = androidReservation()
+        const published: unknown[] = []
+        mocks.reserveAndroidSafDownload.mockResolvedValue(reservation)
+        mocks.publishAndroidSafDownload.mockImplementation(async (destination, name, data) => {
+            published.push([destination, name, decode(data)])
+            return true
+        })
+        const failure = new Error('provider failed')
+        mocks.sendChat.mockResolvedValueOnce(undefined).mockRejectedValueOnce(failure)
+
+        await expect(postChatFile({ name: 'input.po', data: input })).rejects.toBe(failure)
+
+        expect(published).toEqual([[reservation, 'translated.po', afterFirst]])
+    })
+
     it.each<[string, PlatformShape, () => void]>([
         ['desktop', { runtime: 'tauri', os: 'windows' }, () => vi.mocked(save).mockResolvedValue(null)],
         ['Android', { runtime: 'tauri', os: 'android' }, () => mocks.reserveAndroidSafDownload.mockResolvedValue(null)],

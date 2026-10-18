@@ -8,15 +8,15 @@ export interface PoSaveTarget {
     /** Saves the result so far, where the destination can be rewritten. */
     checkpoint(result: string): Promise<void>
     finish(result: string): Promise<void>
-    /** Releases a destination that was never written. */
+    /** Settles a destination that `finish` never wrote. */
     close(): Promise<void>
 }
 
 /**
  * Asks for the destination once. Desktop rewrites the chosen file after every
- * message and Android writes the destination picked up front at the end; iOS
- * and the web save the final file through the usual download. Resolves null
- * when the picker is cancelled.
+ * message and Android writes the destination picked up front when the run
+ * ends; iOS and the web save the final file through the usual download.
+ * Resolves null when the picker is cancelled.
  */
 export async function openPoSaveTarget(name: string): Promise<PoSaveTarget | null> {
     const encode = (result: string) => new TextEncoder().encode(result)
@@ -29,9 +29,11 @@ export async function openPoSaveTarget(name: string): Promise<PoSaveTarget | nul
     if (isTauriAndroid) {
         const reservation = await reserveAndroidSafDownload(name)
         if (!reservation) return null
+        // The picked file takes a single write, so a run that stops early writes its last checkpoint.
+        let checkpoint: string | null = null
         let used = false
         return {
-            checkpoint: async () => {},
+            checkpoint: async (result) => { checkpoint = result },
             async finish(result) {
                 used = true
                 await publishAndroidSafDownload(reservation, name, encode(result))
@@ -39,8 +41,11 @@ export async function openPoSaveTarget(name: string): Promise<PoSaveTarget | nul
             async close() {
                 if (used) return
                 used = true
-                await reservation.release().catch((error) => {
-                    console.error('PO save destination release failed', error)
+                const closing = checkpoint === null
+                    ? reservation.release()
+                    : publishAndroidSafDownload(reservation, name, encode(checkpoint))
+                await closing.catch((error) => {
+                    console.error('PO save destination could not be closed', error)
                 })
             },
         }
