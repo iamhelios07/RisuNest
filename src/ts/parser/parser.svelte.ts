@@ -1692,7 +1692,7 @@ function blockEndMatcher(p1:string,type:{type:blockMatch,type2?:string,mode?:str
     }
 }
 
-const plainTextRun = /(?:[^{}#]|\{(?![{#])|#(?!\})|\}(?!\}))+/y
+const blockBoundary = /\{[{#]|#\}|\}\}/g
 
 export function risuChatParser(da:string, arg:{
     chatID?:number
@@ -1961,11 +1961,12 @@ export function risuChatParser(da:string, arg:{
                 break
             }
             default:{
-                // Copy plain text in one step, including braces and hashes the cases above would only append.
-                plainTextRun.lastIndex = pointer
-                plainTextRun.test(da)
-                nested[0] += da.substring(pointer, plainTextRun.lastIndex)
-                pointer = plainTextRun.lastIndex - 1
+                // Copy plain text up to the next {{, {#, #} or }} in one step; the cases above
+                // would only append any other brace or hash.
+                blockBoundary.lastIndex = pointer
+                const end = blockBoundary.exec(da)?.index ?? da.length
+                nested[0] += da.substring(pointer, end)
+                pointer = end - 1
                 break
             }
         }
