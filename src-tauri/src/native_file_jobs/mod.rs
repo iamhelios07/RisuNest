@@ -13,6 +13,7 @@ pub mod screenshot_output;
 mod backup_source;
 mod legacy_backup;
 mod restore_receipts;
+mod portable_export_receipts;
 pub(crate) mod snapshot_bodies;
 mod snapshot_restore;
 #[cfg(test)]
@@ -997,6 +998,7 @@ fn cleanup_stale_handoffs_at(
     let canonical_root = handoffs_root
         .canonicalize()
         .map_err(|error| format!("native handoff root cannot be resolved: {error}"))?;
+    let retained = portable_export_receipts::retained_handoffs(handoffs_root.parent().unwrap_or(handoffs_root));
     let mut errors = Vec::new();
     for entry in fs::read_dir(&canonical_root)
         .map_err(|error| format!("native handoff root cannot be read: {error}"))?
@@ -1012,7 +1014,7 @@ fn cleanup_stale_handoffs_at(
             }
         };
         let path = entry.path();
-        if !is_owned_handoff_name(&path) {
+        if !is_owned_handoff_name(&path) || retained.contains(&path) {
             continue;
         }
         let metadata = match fs::symlink_metadata(&path) {
@@ -1418,6 +1420,10 @@ impl NativeFileJobState {
                 capability_error.get_or_insert(error);
             }
         }
+        let registry = Arc::new(JobRegistry::default());
+        if let Err(error) = portable_export_receipts::restore(&root, &registry) {
+            startup_warnings.push(NativeJobError::new("export-receipt-unavailable", error));
+        }
         if jobs_root.is_dir() {
             if let Err(error) = cleanup_owned_directories(&jobs_root) {
                 startup_warnings.push(NativeJobError::new("cleanup-failed", error));
@@ -1438,7 +1444,7 @@ impl NativeFileJobState {
             snapshot_body_start: Arc::new(Mutex::new(())),
             cleanup_closed: Arc::new(std::sync::RwLock::new(false)),
             root,
-            registry: Arc::new(JobRegistry::default()),
+            registry,
             admission: Arc::new(admission::Admission::default()),
             active_workers: Arc::new(AtomicUsize::new(0)),
             max_concurrent_jobs,
@@ -2491,7 +2497,7 @@ impl NativeFileJobState {
                 cleanup_errors.push(error);
             }
             release_worker_admission(&admission);
-            finish_worker_outcome(&job, kind, outcome, cleanup_errors);
+            finish_worker_outcome(&job, kind, outcome, cleanup_errors, Some(&root));
             let _ = registry.prune();
         });
         Ok(NativeFileJobStarted {
@@ -2692,6 +2698,14 @@ impl NativeFileJobState {
                         ));
                     }
                 }
+            }
+        }
+        if let Some(job) = self.registry.lookup(job_id).map_err(|error| NativeJobError::new("store-error", error))? {
+            let status = job.status();
+            if status.kind == JobKind::ExportPortableBackup && status.state == JobState::Succeeded
+                && status.result.as_ref().is_some_and(|result| result.handoff_path.is_some()) {
+                portable_export_receipts::forget(&self.root, job_id)
+                    .map_err(|error| NativeJobError::new("cleanup-failed", error))?;
             }
         }
         self.registry
@@ -3028,13 +3042,24 @@ fn finish_worker_outcome(
     kind: JobKind,
     outcome: Result<JobResultSummary, NativeJobError>,
     cleanup_errors: Vec<String>,
+    receipt_root: Option<&Path>,
 ) {
+    let finish_success = |result| {
+        let completed = job.finish_success_with_receipt(result, receipt_root);
+        if kind == JobKind::ExportPortableBackup {
+            if let Err(error) = completed {
+                if job.is_cancel_requested() { let _ = job.finish_cancelled(); }
+                else { let _ = job.finish_failure("export-receipt-write-failed", &error); }
+            }
+        }
+    };
     match (outcome, cleanup_errors.is_empty()) {
         (Ok(result), true) => {
             let _ = if kind == JobKind::OfficialPublicationUpload {
                 job.finish_official_publication_success(result)
             } else {
-                job.finish_success(result)
+                finish_success(result);
+                Ok(())
             };
         }
         (Ok(mut result), false) => {
@@ -3048,7 +3073,8 @@ fn finish_worker_outcome(
             let _ = if kind == JobKind::OfficialPublicationUpload {
                 job.finish_official_publication_success(result)
             } else {
-                job.finish_success(result)
+                finish_success(result);
+                Ok(())
             };
         }
         (Err(error), false) => {
@@ -5315,7 +5341,11 @@ impl JobControl {
         self.mark_terminal()
     }
 
-    pub(crate) fn finish_success(&self, mut result: JobResultSummary) -> Result<(), String> {
+    pub(crate) fn finish_success(&self, result: JobResultSummary) -> Result<(), String> {
+        self.finish_success_with_receipt(result, None)
+    }
+
+    fn finish_success_with_receipt(&self, mut result: JobResultSummary, receipt_root: Option<&Path>) -> Result<(), String> {
         validate_result(&result)?;
         if result.publication.is_some() {
             return Err("non-publication job returned publication metadata".to_owned());
@@ -5334,6 +5364,11 @@ impl JobControl {
             .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
         if status.state != JobState::Running || self.is_cancel_requested() {
             return Err("native job cannot succeed from its current state".to_owned());
+        }
+        if status.kind == JobKind::ExportPortableBackup && result.handoff_path.is_some() {
+            if let Some(root) = receipt_root {
+                portable_export_receipts::persist(root, &status.job_id, &result)?;
+            }
         }
         status.state = JobState::Succeeded;
         status.phase = JobPhase::Complete;
@@ -6678,6 +6713,7 @@ mod tests {
                 JobKind::RestoreBlockRisuSave,
                 Ok(result(4)),
                 Vec::new(),
+                None,
             );
         });
         assert!(admission.server().is_err());

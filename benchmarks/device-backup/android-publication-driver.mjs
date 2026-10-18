@@ -177,10 +177,20 @@ try {
         else report.destinationMetadata={unavailable:'Provider metadata did not include the generated synthetic filename and length'};
       } catch {report.destinationMetadata={unavailable:'Provider metadata query unavailable for the stopped synthetic app'};}
     }
+    if (mode==='copy' && report.destinationMetadata?.bytes===undefined
+      && report.stoppedRecord.destinationUri?.startsWith('content://com.android.providers.downloads.documents/document/')
+      && /^synthetic-publication-\d+\.risunest$/.test(report.pausedState.suggestedName??'')) {
+      const destinationPath=`/sdcard/Download/${report.pausedState.suggestedName}`;
+      try {
+        const bytes=(await run(['shell','stat','-c','%s',destinationPath])).trim();
+        assert.match(bytes,/^\d+$/);
+        report.destinationMetadata={name:report.pausedState.suggestedName,bytes:Number(bytes),method:'stat',path:destinationPath};
+      } catch {report.destinationMetadata={unavailable:'Exact synthetic Downloads file length was unavailable'};}
+    }
     report.classification=report.stoppedRecord.phase==='succeeded'?'completed-copy':
-      report.stoppedRecord.phase==='copying' && report.pausedState.copyBytes>0 && report.pausedState.copyBytes<report.pausedState.sourceBytes?'during-copy':'unconfirmed-boundary';
-    if (report.classification==='during-copy' && report.destinationMetadata?.bytes>=report.pausedState.sourceBytes) report.classification='completed-file-awaiting-receipt';
-    if (report.classification==='during-copy' && report.destinationMetadata?.bytes===0) report.classification='unconfirmed-boundary';
+      report.stoppedRecord.phase==='copying' && report.destinationMetadata?.bytes>=report.pausedState.sourceBytes?'completed-file-awaiting-receipt':
+      report.stoppedRecord.phase==='copying' && report.pausedState.copyBytes>0 && report.pausedState.copyBytes<report.pausedState.sourceBytes
+        && report.destinationMetadata?.bytes>0 && report.destinationMetadata.bytes<report.pausedState.sourceBytes?'during-copy':'unconfirmed-boundary';
     await save();
     assert.notEqual(report.classification,'unconfirmed-boundary','Native journal and byte progress must prove the boundary');
     if(mode==='terminal') assert.equal(report.classification,'completed-copy');

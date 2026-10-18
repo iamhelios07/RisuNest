@@ -18,6 +18,7 @@ const owner = "android-publication-probe";
 type ProbeState = {
   phase: string;
   requestId?: string;
+  suggestedName?: string;
   copyBytes?: number;
   sourceBytes?: number;
   terminal?: AndroidSafDestinationEvent;
@@ -101,10 +102,10 @@ export function androidPublicationProbe(dependencies: {
         value += chars.join("");
       }
       await writeNativePluginDeviceValues(owner, [{type: "set", space: "string", key: "payload", value}]);
-      state.phase = "exporting"; pauseAt = stopAt; save();
+      state.phase = "exporting"; state.suggestedName = `synthetic-publication-${Date.now()}.risunest`; pauseAt = stopAt; save();
       try {
         const result = await runNativeArchiveExport(await dependencies.runtime(),
-          {type: "androidSaf", suggestedName: `synthetic-publication-${Date.now()}.risunest`},
+          {type: "androidSaf", suggestedName: state.suggestedName},
           {library: true, deviceSections: [...nativePortableDeviceSections]}, {
             onStatus(status) {
               if (status.result) state.sourceBytes = status.result.sourceBytes;
