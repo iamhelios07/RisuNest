@@ -889,7 +889,8 @@ fn stage_payload_with_limit(
     let decoder = GzDecoder::new(BufReader::new(CancellationAwareIo::new(file, is_cancelled)));
     let mut limited = decoder.take(max_decoded_bytes.saturating_add(1));
     let payload = {
-        let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
+        // serde_json reads one byte at a time; unbuffered, each byte is its own inflate call.
+        let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(&mut limited));
         let payload = ArchivePayloadSeed {
             connection,
             is_cancelled,
