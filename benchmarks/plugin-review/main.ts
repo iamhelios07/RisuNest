@@ -4,6 +4,8 @@ import { join } from '@tauri-apps/api/path'
 import { nativeDataPath } from '../../src/ts/storage/nativePaths'
 import { exists, mkdir, readFile, remove } from '@tauri-apps/plugin-fs'
 import { SandboxHost } from '../../src/ts/plugins/apiV3/factory'
+import { createPluginDownloadHandler } from '../../src/ts/plugins/apiV3/pluginDownload'
+import { downloadFile } from '../../src/ts/globalApi.svelte'
 import { createPluginStorageStore } from '../../src/ts/plugins/pluginStorageStore'
 import { SqlitePersistentDataStore } from '../../src/ts/storage/sqlitePersistentDataStore'
 import type { Database } from '../../src/ts/storage/database.svelte'
@@ -111,8 +113,36 @@ async function paging() {
 }
 
 let running = false
+let verifiedToken = ''
+let downloadHost: SandboxHost | undefined
+let downloadResult: { done: boolean; saved?: boolean; error?: string } = { done: false }
 Object.assign(window, { __pluginReview: {
     marker: 'synthetic-plugin-review-v1',
+    get downloadResult() { return downloadResult },
+    download(token: string, name: string, size: number) {
+        check(token === verifiedToken && verifiedToken.length > 0, 'Synthetic ownership not verified')
+        check(name === `plugin-${token}.bin` && Number.isSafeInteger(size) && size > 0 && size <= 5 * 1024 * 1024, 'Invalid download fixture')
+        downloadHost?.terminate()
+        downloadResult = { done: false }
+        downloadHost = new SandboxHost({ _getPropertiesForInitialization: () => ({ list: [] }), _getAliases: () => ({}) },
+            createPluginDownloadHandler({
+                fetch: async () => { throw new Error('Unexpected fixture network request') },
+                save: async (filename, bytes) => {
+                    check(filename === name && bytes.length === size, 'Download metadata differs')
+                    const saved = await downloadFile(filename, bytes)
+                    downloadResult = { done: true, saved }
+                    return saved
+                },
+                reportError: error => { downloadResult = { done: true, error: String(error) } },
+            }))
+        downloadHost.run(document.body, `
+            const bytes = Uint8Array.from({length:${size}}, (_, index) => index % 251);
+            const url = URL.createObjectURL(new Blob([bytes], {type:'application/octet-stream'}));
+            const a = document.createElement('a');
+            a.href = url; a.download = ${JSON.stringify(name)};
+            a.click(); URL.revokeObjectURL(url);
+        `, 'synthetic-native-download')
+    },
     async run(token: string) {
         check(!running && /^[a-f0-9]{32}$/.test(token), 'Invalid synthetic ownership token')
         running = true
@@ -128,6 +158,7 @@ Object.assign(window, { __pluginReview: {
             check(typeof version === 'string' && version.length > 0, 'Trusted main-frame IPC failed')
             const boundary = await isolation(directory)
             const values = await paging()
+            verifiedToken = token
             return { passed: boundary.passed, trustedMainFrameIpc: true, boundary, values }
         } finally { await remove(directory, { recursive: true }) }
     },

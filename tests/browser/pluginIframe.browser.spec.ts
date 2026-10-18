@@ -1,4 +1,5 @@
 import { inflateSync } from 'node:zlib'
+import { readFile } from 'node:fs/promises'
 import type { Page } from '@playwright/test'
 import { test, expect } from './fixture'
 
@@ -174,4 +175,159 @@ test('production CSP and opaque origin block network, string compilation and par
         { key: 'network', value: true }, { key: 'eval', value: true },
         { key: 'function', value: true }, { key: 'parent', value: true }, { key: 'storage', value: true },
     ])
+})
+
+test('native download compatibility saves detached Blob anchors before immediate URL revocation', async ({ page }) => {
+    await page.goto('/')
+    await page.evaluate(() => window.boundary.loadDownload(`
+        const file = new File([new Uint8Array([0, 255, 13, 10])], 'original.bin');
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(file);
+        a.download = '한글.charx';
+        a.click();
+        URL.revokeObjectURL(a.href);
+    `))
+    await expect.poll(() => page.evaluate(() => window.boundary.downloads.files)).toEqual([{ name: '한글.charx', bytes: [0, 255, 13, 10] }])
+    await expect.poll(() => page.evaluate(() => window.boundary.downloadIdle)).toBe(true)
+    expect(await page.evaluate(() => window.boundary.downloads.errors)).toEqual([])
+})
+
+test('native compatibility handles real user clicks and data URLs in the opaque iframe', async ({ page }) => {
+    await page.goto('/')
+    await page.evaluate(() => window.boundary.loadDownload(`
+        const a = document.createElement('a');
+        a.href = 'data:application/octet-stream;base64,AP8NCg==';
+        a.download = 'export.risup';
+        a.textContent = 'Save';
+        document.body.append(a);
+    `))
+    await page.frameLocator('[data-risu-plugin-frame]').getByText('Save', { exact: true }).click()
+    await expect.poll(() => page.evaluate(() => window.boundary.downloads.files)).toEqual([{ name: 'export.risup', bytes: [0, 255, 13, 10] }])
+    await expect(page.locator('[data-risu-plugin-frame]')).toHaveAttribute('sandbox', 'allow-scripts allow-modals allow-downloads')
+})
+
+test('native compatibility preserves prevented clicks and ordinary links', async ({ page }) => {
+    await page.goto('/')
+    await page.evaluate(() => window.boundary.loadDownload(`
+        const a = document.createElement('a');
+        a.href = 'data:text/plain,blocked';
+        a.download = 'blocked.txt';
+        a.onclick = event => event.preventDefault();
+        a.click();
+        document.body.append(a);
+        a.click();
+        const ordinary = document.createElement('a');
+        ordinary.href = 'data:text/plain,ordinary';
+        document.body.append(ordinary);
+        window.addEventListener('click', event => {
+            if (!event.composedPath().includes(ordinary)) return;
+            parent.postMessage({ fixture: 'ordinary-link', prevented: event.defaultPrevented }, '*');
+            event.preventDefault();
+        });
+        ordinary.click();
+        document.body.dataset.done = 'yes';
+    `))
+    await expect(page.frameLocator('[data-risu-plugin-frame]').locator('body')).toHaveAttribute('data-done', 'yes')
+    await expect.poll(() => page.evaluate(() => window.boundary.downloadIdle)).toBe(true)
+    expect(await page.evaluate(() => window.boundary.downloads.files)).toEqual([])
+    expect(await page.evaluate(() => window.boundary.events)).toContainEqual({ fixture: 'ordinary-link', prevented: false })
+})
+
+test('native compatibility accepts FileSaver-style non-bubbling dispatched clicks', async ({ page }) => {
+    const engineDownloads: string[] = []
+    page.on('download', download => engineDownloads.push(download.suggestedFilename()))
+    await page.goto('/')
+    await page.evaluate(() => window.boundary.loadDownload(`
+        for (const attached of [false, true]) {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob(['dispatched']));
+            a.download = attached ? 'attached.txt' : 'detached.txt';
+            if (attached) document.body.append(a);
+            a.dispatchEvent(new MouseEvent('click'));
+            URL.revokeObjectURL(a.href);
+        }
+    `))
+    await expect.poll(() => page.evaluate(() => window.boundary.downloads.files)).toEqual([
+        { name: 'detached.txt', bytes: [...Buffer.from('dispatched')] },
+        { name: 'attached.txt', bytes: [...Buffer.from('dispatched')] },
+    ])
+    expect(engineDownloads).toEqual([])
+})
+
+test('another frame cannot submit a native download', async ({ page }) => {
+    await page.goto('/')
+    await page.evaluate(() => {
+        window.boundary.loadDownload('document.body.dataset.ready = "yes"')
+        const other = document.createElement('iframe')
+        other.sandbox.add('allow-scripts')
+        other.srcdoc = `<script>parent.postMessage({type:'CALL_ROOT',reqId:'forged-download',method:'_downloadFile',args:['forged.txt','data:text/plain,forged']},'*');parent.postMessage({fixture:'download-forgery-sent'},'*')<\/script>`
+        document.body.append(other)
+    })
+    await expect.poll(() => page.evaluate(() => window.boundary.events)).toContainEqual({ fixture: 'download-forgery-sent' })
+    await expect(page.frameLocator('[data-risu-plugin-frame]').locator('body')).toHaveAttribute('data-ready', 'yes')
+    expect(await page.evaluate(() => window.boundary.downloads.files)).toEqual([])
+})
+
+test('native compatibility delivers HTTP bytes and reports failed downloads', async ({ page, baseURL }) => {
+    await page.route('**/synthetic-download.bin', route => route.fulfill({ body: Buffer.from([0, 255, 7]), contentType: 'application/octet-stream' }))
+    await page.goto('/')
+    await page.evaluate(url => window.boundary.loadDownload(`
+        const a = document.createElement('a');
+        a.href = ${JSON.stringify(url)};
+        a.download = 'network.bin';
+        document.body.append(a);
+        a.click();
+    `), new URL('/synthetic-download.bin', baseURL).href)
+    await expect.poll(() => page.evaluate(() => window.boundary.downloads.files)).toEqual([{ name: 'network.bin', bytes: [0, 255, 7] }])
+    await page.evaluate(() => { window.boundary.downloads.mode = 'fail'; window.boundary.loadDownload(`
+        const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['fail']));
+        a.download = 'failed.txt'; a.click();
+    `) })
+    await expect.poll(() => page.evaluate(() => window.boundary.downloads.errors)).toEqual(['Error: Synthetic storage failure'])
+    await page.evaluate(() => { window.boundary.downloads.mode = 'cancel'; window.boundary.loadDownload(`
+        const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['cancel']));
+        a.download = 'cancelled.txt'; a.click();
+    `) })
+    await expect.poll(() => page.evaluate(() => window.boundary.downloadIdle)).toBe(true)
+    expect(await page.evaluate(() => window.boundary.downloads.files.length)).toBe(1)
+    expect(await page.evaluate(() => window.boundary.downloads.errors.length)).toBe(1)
+})
+
+test('unloading a plugin aborts its pending download without saving or reporting an error', async ({ page, baseURL }) => {
+    let release!: () => void
+    let started!: () => void
+    const ready = new Promise<void>(resolve => { started = resolve })
+    const response = new Promise<void>(resolve => { release = resolve })
+    await page.route('**/pending-download.bin', async route => {
+        started()
+        await response
+        await route.fulfill({ body: 'too late' }).catch(() => {})
+    })
+    await page.goto('/')
+    await page.evaluate(url => window.boundary.loadDownload(`
+        const a = document.createElement('a'); a.href = ${JSON.stringify(url)};
+        a.download = 'pending.bin'; a.click();
+    `), new URL('/pending-download.bin', baseURL).href)
+    await ready
+    await page.evaluate(() => window.boundary.unloadDownload())
+    release()
+    await expect.poll(() => page.evaluate(() => window.boundary.downloadIdle)).toBe(true)
+    expect(await page.evaluate(() => window.boundary.downloads.files)).toEqual([])
+    expect(await page.evaluate(() => window.boundary.downloads.errors)).toEqual([])
+})
+
+test('web mode leaves Blob downloads to the browser', async ({ page }) => {
+    await page.goto('/')
+    await page.evaluate(() => window.boundary.loadDownload(`
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob(['browser bytes']));
+        a.download = 'browser.txt'; a.textContent = 'Download';
+        document.body.append(a);
+    `, false))
+    const downloaded = page.waitForEvent('download')
+    await page.frameLocator('[data-risu-plugin-frame]').getByText('Download', { exact: true }).click()
+    const file = await downloaded
+    expect(file.suggestedFilename()).toBe('browser.txt')
+    expect(await readFile((await file.path())!, 'utf8')).toBe('browser bytes')
+    expect(await page.evaluate(() => window.boundary.downloads.files)).toEqual([])
 })
