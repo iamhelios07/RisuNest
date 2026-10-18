@@ -7,6 +7,7 @@ import type { ChatScreenshotRenderContext } from '../../../chatScreenshotRange'
 import { planChatParserHistory } from '../../../chatParserHistory'
 import { captureResidentCbsHistory, prepareCbsHistory, type CbsHistoryReader } from '../../../prepareCbsHistory'
 import { createCbsHistoryAccess, CbsHistoryAccessError } from '../../../cbsHistoryAccess'
+import { RevisionConflictError } from '../../../storage/persistentDataStore'
 import type { PersistentDataRuntime } from '../../../storage/persistentDataRuntime'
 
 vi.mock('../../../platform', async () => (await import('../../../platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
@@ -253,6 +254,45 @@ test.each(['navigate', 'stream', 'promote', 'unload'])('Plugin parsing retains i
     if (promoted) expect(await promoted).toBe('Live current')
     expect(release).toHaveBeenCalledOnce()
     if (action === 'stream') expect(await parseRisuChat('{{lastmessage}}')).toBe('next stream token')
+})
+
+test.each(['acquire', 'read'])('Plugin parsing maps a conflicting %s to a target change', async (stage) => {
+    const character = live.database.characters[0]
+    character.chats[0].id = 'conflicting-conversation'
+    character.chats[0] = createMetadataOnlySelectedConversation(character.chats[0])
+    let released = false
+    live.runtime = {
+        captureSelectedConversationAuthority: () => ({ totalMessages: 2, storeRevision: 1 }),
+        getActiveConversationViewportSource: () => null,
+        store: { acquireRevision: async () => {
+            if (stage === 'acquire') throw new RevisionConflictError(1, 2)
+            return {
+                revision: 1,
+                readConversationWindow: async () => { throw new RevisionConflictError(1, 2) },
+                release: async () => { released = true },
+            }
+        } },
+    } as unknown as PersistentDataRuntime
+    await expect(parseRisuChat('{{previouschatlog::0}}')).rejects.toMatchObject({ name: 'PluginParserTargetChangedError' })
+    expect(released).toBe(stage === 'read')
+})
+
+test.each([new Error('primary read failed'), 0, undefined])('Plugin parsing preserves a read error %s when lease cleanup fails', async (primary) => {
+    const character = live.database.characters[0]
+    character.chats[0].id = 'cleanup-conversation'
+    character.chats[0] = createMetadataOnlySelectedConversation(character.chats[0])
+    let released = false
+    live.runtime = {
+        captureSelectedConversationAuthority: () => ({ totalMessages: 2, storeRevision: 1 }),
+        getActiveConversationViewportSource: () => null,
+        store: { acquireRevision: async () => ({
+            revision: 1,
+            readConversationWindow: async () => { throw primary },
+            release: async () => { released = true; throw new Error('cleanup failed') },
+        }) },
+    } as unknown as PersistentDataRuntime
+    await expect(parseRisuChat('{{previouschatlog::0}}')).rejects.toBe(primary)
+    expect(released).toBe(true)
 })
 
 test('Plugin regex passes read only the history exposed by their actual output', async () => {
