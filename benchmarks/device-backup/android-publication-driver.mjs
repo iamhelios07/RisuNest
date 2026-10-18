@@ -25,11 +25,18 @@ const save = async () => { await mkdir(path.dirname(output), {recursive:true}); 
 let client;
 
 async function connect() {
-  const pid = (await run(['shell','pidof',packageName])).trim();
-  assert.match(pid, /^\d+$/);
-  await run(['forward',`tcp:${port}`,`localabstract:webview_devtools_remote_${pid}`]);
-  let target;
+  let pid, forwardedPid, target;
   for (let i = 0; i < 120; i++) {
+    pid = (await run(['shell','pidof',packageName]).catch(error=> {
+      assert.equal(error.code,1,'Package readiness check must finish normally');
+      assert.ok(!error.killed && !error.signal);return error.stdout;
+    })).trim();
+    if (!pid) {await delay(250);continue;}
+    assert.match(pid, /^\d+$/);
+    if (forwardedPid!==pid) {
+      await run(['forward',`tcp:${port}`,`localabstract:webview_devtools_remote_${pid}`]);
+      forwardedPid=pid;
+    }
     const pages = await fetch(`http://127.0.0.1:${port}/json/list`).then(r => r.json()).catch(() => []);
     target = pages.find(p => p.title === title && new URL(p.url).origin === 'http://tauri.localhost');
     if (target) break;
@@ -41,11 +48,11 @@ async function connect() {
   assert.equal(Number(url.port), port);
   const socket = new WebSocket(url);
   await new Promise((resolve,reject) => { socket.onopen = resolve; socket.onerror = reject; });
-  let sequence = 0, paused = false;
+  let sequence = 0, paused = false, callFrameId;
   const pending = new Map();
   socket.onmessage = ({data}) => {
     const message = JSON.parse(data);
-    if (message.method === 'Debugger.paused') paused = true;
+    if (message.method === 'Debugger.paused') { paused = true; callFrameId = message.params.callFrames[0]?.callFrameId; }
     const entry = pending.get(message.id);
     if (!entry) return;
     clearTimeout(entry.timer); pending.delete(message.id);
@@ -66,7 +73,10 @@ async function connect() {
   await call('Network.setBlockedURLs',{urls:[...REALM_BLOCKED_URL_PATTERNS,'*update.rsyumi.workers.dev/translator/prompt-presets.json*']});
   assert.equal(await evaluate("window.__TAURI_INTERNALS__.invoke('plugin:app|identifier')"),packageName);
   assert.equal(await evaluate('document.title'),title);
-  return {pid,evaluate,call,paused:()=>paused,close:()=>socket.close()};
+  return {pid,evaluate,call,paused:()=>paused,pausedState:async()=> {
+    const result=await call('Debugger.evaluateOnCallFrame',{callFrameId,expression:`${api}.state()`,returnByValue:true});
+    assert.ok(!result.exceptionDetails);return result.result.value;
+  },close:()=>socket.close()};
 }
 
 async function tapPicker() {
@@ -110,7 +120,7 @@ try {
   } else {
     assert.equal((await client.evaluate(`${api}.receipt()`)).intent,null,'No earlier publication may be pending');
     await client.call('Debugger.enable');
-    await client.evaluate(`void ${api}.start(${Number(options.mib??32)},${JSON.stringify(mode)},true); true`);
+    await client.evaluate(`void ${api}.start(${Number(options.mib??32)},${JSON.stringify(mode)}); true`);
     const deadline=Date.now()+180000;
     let lastPicker=0, pickerSaved=false;
     while (!client.paused() && Date.now()<deadline) {
@@ -120,13 +130,35 @@ try {
       }
     }
     assert.ok(client.paused(),'Requested real SAF boundary was not observed');
+    report.pausedState=await client.pausedState();
     const record=JSON.parse(await run(['shell','run-as',packageName,'cat','files/native-file-jobs/android-saf-destination.json']));
     report.killRecord=record;
     await run(['shell','am','force-stop',packageName]);
-    report.killedAt=Date.now();client.close();await save();
-    assert.equal(record.phase,mode==='terminal'?'succeeded':'copying','Native state must match the requested kill boundary');
+    report.killedAt=Date.now();client.close();
+    report.stoppedPid=(await run(['shell','pidof',packageName]).catch(error=> {
+      assert.equal(error.code,1,'Stopped-process check must finish normally');
+      assert.ok(!error.killed && !error.signal);return error.stdout;
+    })).trim();
+    assert.equal(report.stoppedPid,'','Process must be stopped before the native journal witness');
+    report.stoppedRecord=JSON.parse(await run(['shell','run-as',packageName,'cat','files/native-file-jobs/android-saf-destination.json']));
+    if (mode==='copy' && report.stoppedRecord.destinationUri) {
+      try {
+        const metadata=await run(['shell','run-as',packageName,'content','query','--uri',report.stoppedRecord.destinationUri,'--projection','_display_name:_size']);
+        const name=/_display_name=(synthetic-publication-\d+\.risunest)(?:,|$)/.exec(metadata)?.[1];
+        const bytes=/_size=(\d+)(?:,|$)/.exec(metadata)?.[1];
+        if (name && bytes) report.destinationMetadata={name,bytes:Number(bytes)};
+        else report.destinationMetadata={unavailable:'Provider metadata did not include the generated synthetic filename and length'};
+      } catch {report.destinationMetadata={unavailable:'Provider metadata query unavailable for the stopped synthetic app'};}
+    }
+    report.classification=report.stoppedRecord.phase==='succeeded'?'completed-copy':
+      report.stoppedRecord.phase==='copying' && report.pausedState.copyBytes>0 && report.pausedState.copyBytes<report.pausedState.sourceBytes?'during-copy':'unconfirmed-boundary';
+    if (report.classification==='during-copy' && report.destinationMetadata?.bytes>=report.pausedState.sourceBytes) report.classification='completed-file-awaiting-receipt';
+    if (report.classification==='during-copy' && report.destinationMetadata?.bytes===0) report.classification='unconfirmed-boundary';
+    await save();
+    assert.notEqual(report.classification,'unconfirmed-boundary','Native journal and byte progress must prove the boundary');
+    if(mode==='terminal') assert.equal(report.classification,'completed-copy');
     await run(['shell','am','start','-n',`${packageName}/.MainActivity`]);
-    await delay(15000);client=await connect();
+    client=await connect();
     const recoveryDeadline=Date.now()+60000;
     let state;
     do {state=await client.evaluate(`${api}.state()`);if(state.dialogs.length)break;await delay(100);}while(Date.now()<recoveryDeadline);
@@ -134,13 +166,14 @@ try {
     assert.equal(state.dialogs.length,1,'One product recovery dialog expected');
     assert.ok(!state.dialogs.some(d=>d.type==='error'),'Generic partial-file alert must remain silent');
     assert.ok(!state.dialogs.some(d=>d.message.includes('android-publication-retry-required')));
-    assert.equal(state.dialogs[0].type,mode==='terminal'?'normal':'select');
+    assert.equal(state.dialogs[0].type,report.classification==='completed-copy'?'normal':'select');
     await client.evaluate(`${api}.closeDialog('1')`);
     const settledDeadline=Date.now()+15000;
     let receipt;
     do {await delay(100);receipt=await client.evaluate(`${api}.receipt()`);}while(receipt.intent && Date.now()<settledDeadline);
     report.after=await client.evaluate(`${api}.state()`);report.receipt=receipt;
     assert.equal(receipt.intent,null);assert.equal(receipt.status,null);
+    if(mode==='copy') assert.equal(report.classification,'during-copy','Copy completed before force-stop; retry with a larger bounded fixture');
   }
   report.passed=true;
 } catch(error) {report.error=error.message;process.exitCode=1;}
