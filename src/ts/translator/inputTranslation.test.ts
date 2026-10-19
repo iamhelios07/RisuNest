@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const f = vi.hoisted(() => ({ fetch: vi.fn(), request: vi.fn(), alert: vi.fn(), translatorType: 'deepl', translator: 'ko' }))
 vi.mock('../storage/database.svelte', () => ({
@@ -16,7 +16,8 @@ vi.mock('localforage', async () => (await import('../plugins/localforage.testSup
 
 import { getDatabase } from '../storage/database.svelte'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
-import { translate, type TranslateHTMLContext } from './translator'
+import { doingChat } from '../process/generationState'
+import { translate, translateHTML, type TranslateHTMLContext } from './translator'
 
 function liveRowContext(): TranslateHTMLContext {
     return {
@@ -35,6 +36,10 @@ beforeEach(() => {
     f.translator = 'ko'
     f.fetch.mockResolvedValue({ ok: false, data: 'synthetic unavailable' })
     f.request.mockResolvedValue({ type: 'fail', result: 'synthetic unavailable' })
+})
+
+afterEach(() => {
+    doingChat.set(false)
 })
 
 describe('translation error ownership', () => {
@@ -70,6 +75,12 @@ describe('live chat rows', () => {
         await expect(translate(text, false, liveRowContext())).resolves.toBe('Live translated')
         await expect(translate(text, false, liveRowContext())).resolves.toBe('Live translated')
         expect(f.fetch).toHaveBeenCalledOnce()
+    })
+    it('leaves a live row untranslated while a reply is generated', async () => {
+        f.fetch.mockResolvedValue({ ok: true, data: { translations: [{ text: 'Streaming translated' }] } })
+        doingChat.set(true)
+        await expect(translateHTML('<p>streaming reply</p>', false, '', 0, false, liveRowContext())).resolves.toBe('<p>streaming reply</p>')
+        expect(f.fetch).not.toHaveBeenCalled()
     })
     it('translates the same text again for another target language', async () => {
         f.fetch.mockImplementation(async (_url: string, init: { body: { target_lang: string } }) => (

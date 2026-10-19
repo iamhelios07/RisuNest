@@ -332,7 +332,7 @@ export async function translateHTML(
             chaId: 'simple'
         }
     }
-    let DoingChat = captureContext ? false : get(doingChat)
+    let DoingChat = sharesLiveTranslation(captureContext) ? get(doingChat) : false
     const parser = captureContext?.scriptContext.parserContext
     if (parser?.prepareHistory) {
         const historyAccess = await parser.prepareHistory([
