@@ -1034,7 +1034,6 @@ fn replay_safe(method: &Method, path: &str) -> bool {
                 | "objects/pins"
                 | "objects/retention/release"
                 | "ack"
-                | "acks"
         ) || (path.starts_with("uploads/") && path.ends_with("/complete"))
             || (path.starts_with("staged-changes/") && path.ends_with("/seal")))
 }
