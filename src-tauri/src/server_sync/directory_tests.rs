@@ -163,18 +163,22 @@ fn authenticated_identity_rejection_does_not_try_registry_fallback() {
     identity_task.join().unwrap();
 }
 fn directory_server(body: String) -> (String, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    directory_server_requests(body, 1)
+}
+
+fn directory_server_requests(body: String, requests: usize) -> (String, std::thread::JoinHandle<()>) {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", server.server_addr());
     let task = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let input = request(&mut stream).to_lowercase();
-        assert!(input.starts_with("get /endpoints/"));
-        assert!(!input.contains("authorization"));
-        assert!(!input.contains("x-risu-library"));
-        response(&mut stream, &body, "200 OK");
+        for _ in 0..requests {
+            let request = server.recv_timeout(Duration::from_secs(10)).unwrap().expect("registry lookup");
+            assert_eq!(request.method(), &tiny_http::Method::Get);
+            assert!(request.url().starts_with("/endpoints/"));
+            assert!(!request.headers().iter().any(|header| {
+                header.field.equiv("authorization") || header.field.equiv("x-risu-library")
+            }));
+            request.respond(tiny_http::Response::from_string(body.clone())).unwrap();
+        }
     });
     (endpoint, task)
 }
@@ -224,7 +228,9 @@ fn offline_clients_share_registry_admission() {
     assert_eq!(task.join().unwrap().unwrap_err().code, "directory-response-error");
 }
 #[test]
-fn native_directory_recovery_accepts_http_after_verifying_identity() {
+fn configuring_through_directory_persists_only_the_verified_endpoint() {
+    use crate::server_sync::{binding, credentials::StoredConfig, lww_client::OperationLog, lww_tests::local};
+
     for device in ["device", "wrong-device"] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -246,26 +252,99 @@ fn native_directory_recovery_accepts_http_after_verifying_identity() {
         let envelope = risunest_sync_connect::seal_endpoint(&directory.uuid, &directory.key, &endpoint).unwrap();
         let (registry, registry_task) = directory_server(envelope);
         directory.base_url = registry;
-        let mut config = tests::config("http://127.0.0.1:1");
+        let retired = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = tests::config(&format!("http://{}", retired.local_addr().unwrap()));
+        drop(retired);
         config.directory = Some(directory);
-        let mut client = ServerClient::new(config).unwrap();
-        client.http = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let result = client.resolve_identity();
+        let (root, store) = local();
+        let previous = StoredConfig::persist(root.path(), &config).unwrap();
+        let log = OperationLog::open(root.path()).unwrap();
+        log.save_config("candidate", &previous).unwrap();
+        let result = binding::configure(&store, config.clone());
+        let stored = log.config("candidate").unwrap().unwrap();
         if device == "device" {
             assert!(result.is_ok(), "{}", result.unwrap_err().code);
-            assert_eq!(client.config().endpoint, endpoint);
+            let saved = stored.resolve(root.path()).unwrap();
+            assert_eq!(saved.endpoint, endpoint);
+            assert_eq!(saved.library_id, config.library_id);
+            assert_eq!(saved.device_id, config.device_id);
+            assert_eq!(saved.token, config.token);
+            assert_eq!(serde_json::to_value(saved.directory).unwrap(), serde_json::to_value(config.directory).unwrap());
         } else {
             assert_eq!(result.unwrap_err().code, "device-identity-mismatch");
-            assert_eq!(client.config().endpoint, "http://127.0.0.1:1");
+            assert_eq!(serde_json::to_value(stored).unwrap(), serde_json::to_value(previous).unwrap());
         }
         registry_task.join().unwrap();
         server.join().unwrap();
     }
+}
+
+#[test]
+fn separate_receive_and_ack_clients_recover_a_stored_old_endpoint() {
+    use axum::response::IntoResponse;
+    use crate::server_sync::{
+        credentials::StoredConfig,
+        lww_tests::{drain_publications, header, local, save, LocalServerFixture},
+    };
+
+    let lost_reply = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let lose_first_reply = lost_reply.clone();
+    let server = LocalServerFixture::with_router(|router| {
+        router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let lose_first_reply = lose_first_reply.clone();
+                async move {
+                    let ack = request.uri().path() == "/ack";
+                    let response = next.run(request).await;
+                    if ack && response.status().is_success()
+                        && lose_first_reply.swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        response
+                    }
+                }
+            },
+        ))
+    });
+    let (_source_root, mut source) = local();
+    let (_target_root, mut target) = local();
+    let sender = server.client(&source);
+    let receiver = server.client(&target);
+    let mut config = receiver.client.config();
+    drop(receiver);
+    let mut directory = directory();
+    let envelope = risunest_sync_connect::seal_endpoint(&directory.uuid, &directory.key, &server.endpoint).unwrap();
+    let (registry, registry_task) = directory_server_requests(envelope, 4);
+    directory.base_url = registry;
+    config.directory = Some(directory);
+    let retired = TcpListener::bind("127.0.0.1:0").unwrap();
+    config.endpoint = format!("http://{}", retired.local_addr().unwrap());
+    drop(retired);
+    let stored = StoredConfig::persist(target.repository_root(), &config).unwrap();
+    target.server_save_config(&stored).unwrap();
+
+    for language in ["ja", "de"] {
+        save(&mut source, &["root", "language"], serde_json::json!(language));
+        drain_publications(&sender, &mut source, &[]).unwrap();
+        let receiver = LocalServerFixture::reopen_client(&target, Arc::new(TestIoCounters::default())).unwrap();
+        let request = header(&target);
+        let page = receiver.receive_page(&mut target, &request).unwrap();
+        target.lww_stage_receive(&page).unwrap();
+        target.lww_apply_receive(&crate::persistent_store::lww::ApplyReceive {
+            header: page.header.clone(),
+            generating: vec![],
+        }).unwrap();
+        target.lww_finish_receive(&page.header).unwrap();
+        drop(receiver);
+
+        // The production ACK command opens another client from the stored registration.
+        let acknowledger = LocalServerFixture::reopen_client(&target, Arc::new(TestIoCounters::default())).unwrap();
+        acknowledger.finish_receive(&target, &page.header).unwrap();
+        assert_eq!(target.read_root(None).unwrap().value["language"], language);
+    }
+    assert!(!lost_reply.load(std::sync::atomic::Ordering::Relaxed));
+    registry_task.join().unwrap();
 }
 
 #[test]

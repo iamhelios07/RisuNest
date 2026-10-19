@@ -65,6 +65,13 @@ struct VerifiedClaim {
     receipt: NewDeviceClaimReceipt,
 }
 
+pub(crate) fn configure(store: &PersistentStore, config: super::client::ServerConfig) -> Result<()> {
+    let client = super::client::ServerClient::new(config)?;
+    client.resolve_configured_identity()?;
+    let stored = StoredConfig::persist(store.repository_root(), &client.config())?;
+    OperationLog::open(store.repository_root())?.save_config("candidate", &stored)
+}
+
 fn candidate(store: &PersistentStore) -> Result<LwwClient> {
     let log = OperationLog::open(store.repository_root())?;
     let config = log

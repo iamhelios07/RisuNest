@@ -365,7 +365,7 @@ pub(crate) async fn server_sync_status(app:AppHandle)->Result<LwwStatus> {
 }
 #[tauri::command]
 pub(crate) async fn server_sync_configure(app:AppHandle,config:super::client::ServerConfig)->Result<()> {
-    logged_blocking("configure",move|| {let _permit=claim_library(&app)?;let store=job_store(&app)?;let client=super::client::ServerClient::new(config.clone())?;client.resolve_configured_identity()?;let stored=super::credentials::StoredConfig::persist(store.repository_root(),&config)?;super::lww_client::OperationLog::open(store.repository_root())?.save_config("candidate",&stored)?;Ok(())}).await
+    logged_blocking("configure",move|| {let _permit=claim_library(&app)?;let store=job_store(&app)?;super::binding::configure(&store,config)}).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_lww_push(app:AppHandle,request:crate::persistent_store::lww::Header,generating:Vec<crate::persistent_store::lww::MessageLocator>)->Result<Option<risunest_sync_wire::lww::PushReceipt>> {
