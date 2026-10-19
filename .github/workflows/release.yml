@@ -298,7 +298,6 @@ jobs:
       - name: Run Rust test inventory in an iOS simulator
         shell: bash
         run: bash scripts/ios-native-tests.sh
-      - run: pnpm ios:build:simulator:agent
 
   sync-gui-tests:
     if: inputs.product == 'sync'
