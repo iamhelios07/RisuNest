@@ -1924,6 +1924,11 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        imageFormats: {
+            unsupported: 'Unsupported image format. Use PNG, JPEG, GIF, WebP, or AVIF images.',
+            damaged: 'The image file is damaged and cannot be opened.',
+            portraitExportFailed: 'The portrait image could not be read, so the card could not be exported.',
+        },
         pluginStartup: {
             delayLabel: 'Load plugins after sync',
             delayHelp: 'Plugins load after synchronization completes when the app starts. Turning this off may cause plugin data to be overwritten with older values.',

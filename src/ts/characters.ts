@@ -1,3 +1,4 @@
+import { imageAliases, imageFormatFromBytes, stripImageExtension } from './media/imageFormats'
 import { offerHtmlClipboardExport } from './htmlClipboardExport'
 import { defaultChatToggleBinding } from './toggleBindings'
 import DOMPurify from 'dompurify'
@@ -7,9 +8,8 @@ import { alertAddCharacter, alertCheckboxConfirm, alertError, alertNormal, alert
 import { language } from "../lang";
 import { isArchivedCharacter } from "./storage/workingSetCatalog";
 import { restoreArchivedCharacterWithConfirmation } from "./storage/characterArchive";
-import { checkNullish, findCharacterbyId, getUserName, selectMultipleFile, selectSingleFile } from "./util";
+import { checkNullish, findCharacterbyId, getUserName, selectMultipleFile, selectSingleFile, mapSelectedFiles, fileAccept } from "./util";
 import { v4 as uuidv4, v4 } from 'uuid';
-import { getImageType } from "./media";
 import { DBState, MobileGUIStack, OpenRealmStore, selectedCharID } from "./stores.svelte";
 import { AppendableBuffer, changeChatTo, checkCharOrder, createChatCopyName, downloadFile, getFileSrc } from "./globalApi.svelte";
 import { updateInlayScreen } from "./process/inlayScreen";
@@ -40,7 +40,7 @@ import { safeStructuredClone } from './polyfill'
 import { isConversationSummaryStub } from './storage/conversationResidency'
 import { isMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
 import { open } from './storage/fileSelection'
-import { readFile } from '@tauri-apps/plugin-fs'
+import { readFile, open as openFile } from '@tauri-apps/plugin-fs'
 import { isTauriDesktop } from './platform'
 import {
     archiveCurrentCharacterImage,
@@ -119,21 +119,34 @@ export async function selectCharImg(charIndex:number) {
             const selected = await open({
                 multiple: false,
                 directory: false,
-                filters: [{
-                    name: 'png, webp, gif, jpg, jpeg',
-                    extensions: ['png', 'webp', 'gif', 'jpg', 'jpeg'],
+                filters: fileAccept(imageAliases) === '*' ? undefined : [{
+                    name: imageAliases.join(', '),
+                    extensions: imageAliases,
                 }],
             })
             return typeof selected === 'string' ? selected : null
         },
         readDesktopPath: readFile,
-        chooseLegacyFile: async () => selectSingleFile(['png', 'webp', 'gif', 'jpg', 'jpeg']),
+        readDesktopHeader: async path => {
+            const file = await openFile(path, { read: true })
+            try {
+                const header = new Uint8Array(3)
+                let offset = 0
+                while (offset < header.length) {
+                    const read = await file.read(header.subarray(offset))
+                    if (!read) break
+                    offset += read
+                }
+                return header.subarray(0, offset)
+            } finally { await file.close() }
+        },
+        chooseLegacyFile: async () => selectSingleFile(imageAliases, { image: true }),
         nativeImport: input => runContentImport(input.displayName, {}, options => importNativeJpegAsset(input, options)),
         legacyImport: async (img) => {
-            const type = getImageType(img)
+            const type = imageFormatFromBytes(img)?.ext
             const pngExif: Record<string, string> = {}
             try {
-                if(type === 'PNG'){
+                if(type === 'png'){
                     const gen = PngChunk.readGenerator(img)
                     const allowedChunk = [
                         'parameters', 'Comment', 'Title', 'Description', 'Author', 'Software', 'Source', 'Disclaimer', 'Warning', 'Copyright',
@@ -196,13 +209,15 @@ export async function addCharEmotion(charId:number) {
     if (!characterId || get(addingEmotion)) return
     addingEmotion.set(true)
     try {
-        const selected = await selectMultipleFile(['png', 'webp', 'gif'])
+        const failures: string[] = []
+        const selected = await selectMultipleFile(imageAliases, { image: true, failures })
         if (!selected?.length) return
         const images: [string, string][] = []
-        for (const f of selected) {
+        await mapSelectedFiles(selected, async f => {
             const imgp = await saveImage(f.data)
-            images.push([f.name.replace('.png', '').replace('.webp', ''), imgp])
-        }
+            images.push([stripImageExtension(f.name), imgp])
+        }, failures)
+        if (!images.length) return
         await mutatePersistentCharacterDetail(characterId, 'add-character-emotions', ({ character }) => {
             character.emotionImages.push(...images)
         })

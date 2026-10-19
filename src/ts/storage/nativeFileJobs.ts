@@ -1,3 +1,4 @@
+import type { PortraitRenditionDescriptor } from './characterPortraitRendition'
 import type { ExportExclusions } from './exportExcludedReport'
 import { nativeRestoreDeadline, NativeRestoreControlTimeout, type NativeRestoreClock } from './nativeRestoreDeadline'
 import { exportIOSFile } from './iosFiles'
@@ -627,6 +628,7 @@ export interface NativeFileExportJobOptions extends NativeFileJobOptions {
 }
 
 export interface NativeCharacterCharxExportInput {
+    portraitRendition?: PortraitRenditionDescriptor
     characterId: string
     destination: NativeCharacterCharxExportDestination
     expectedRevision: number
@@ -636,6 +638,7 @@ export interface NativeCharacterCharxExportInput {
 }
 
 export interface NativeCharacterCardExportInput {
+    portraitRendition?: PortraitRenditionDescriptor
     characterId: string
     destination: NativeCharacterCharxExportDestination
     expectedRevision: number
@@ -2428,6 +2431,7 @@ export function runNativeCharacterCharxExport(
                     : {}),
                 expectedRevision: input.expectedRevision,
                 characterId: input.characterId,
+                ...(input.portraitRendition ? { portraitRendition: input.portraitRendition } : {}),
                 ...(input.container ? { container: input.container } : {}),
                 card: input.card,
                 module: input.module,
@@ -2456,6 +2460,7 @@ export function runNativeCharacterCardExport(
                     : {}),
                 expectedRevision: input.expectedRevision,
                 characterId: input.characterId,
+                ...(input.portraitRendition ? { portraitRendition: input.portraitRendition } : {}),
                 format: input.format,
                 metadata: input.metadata,
             }),
