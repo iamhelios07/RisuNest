@@ -539,6 +539,8 @@ export function failureReason(code: string, direction: 'import' | 'export' = 'im
             return copy.reasonInvalidSource
         case 'truncated-input':
             return copy.reasonTruncated
+        case 'damaged-image':
+            return language.risuNest.imageFormats.damaged
         case 'corrupt-input':
             return copy.reasonCorrupt
         case 'revision-conflict':

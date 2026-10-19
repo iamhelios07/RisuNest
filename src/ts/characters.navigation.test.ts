@@ -73,7 +73,8 @@ vi.mock('./alert', () => ({
     alertStore: { set: mocks.presentAlert },
     alertWait: vi.fn(),
 }))
-vi.mock('./util', () => ({
+vi.mock('./util', async importOriginal => ({
+    ...await importOriginal<typeof import('./util')>(),
     checkNullish: (value: unknown) => value === null || value === undefined,
     findCharacterbyId: mocks.findCharacterbyId,
     findCharacterIndexbyId: vi.fn(),
@@ -202,7 +203,9 @@ describe('runtime chat identity', () => {
         mocks.database.characters = [{ type: 'character', chaId: 'first', emotionImages: [], chats: [] }]
         mocks.selectMultipleFile.mockResolvedValueOnce([{ name: 'synthetic.png', data: new Uint8Array([1]) }])
         mocks.saveImage.mockRejectedValueOnce(new Error('Synthetic save failure'))
-        await expect(addCharEmotion(0)).rejects.toThrow('Synthetic save failure')
+        await addCharEmotion(0)
+        expect(mocks.alertError).toHaveBeenCalledWith('synthetic.png: Synthetic save failure')
+        expect(mocks.database.characters[0].emotionImages).toEqual([])
         expect(get(addingEmotion)).toBe(false)
     })
 

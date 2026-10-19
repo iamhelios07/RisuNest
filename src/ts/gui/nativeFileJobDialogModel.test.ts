@@ -1,3 +1,4 @@
+import { language } from 'src/lang'
 import { describe, expect, it } from 'vitest'
 
 import { languageEnglish } from 'src/lang/en'
@@ -903,6 +904,7 @@ describe('nativeFileJobDialogModel', () => {
             expect(reason.length).toBeGreaterThan(0)
             expect(reason).not.toContain(code)
         }
+        expect(failureReason('damaged-image')).toBe(language.risuNest.imageFormats.damaged)
         expect(failureReason('whatever')).toBe(copy.reasonUnknown)
     })
 

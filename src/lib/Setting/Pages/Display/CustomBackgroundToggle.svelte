@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { imageAliases } from "src/ts/media/imageFormats"
     import { language } from 'src/lang';
     import { saveImage } from 'src/ts/storage/database.svelte';
     import { DBState } from 'src/ts/stores.svelte';
@@ -12,7 +13,7 @@
         onChange={async (check) => {
             if (check) {
                 DBState.db.customBackground = '-';
-                const d = await selectSingleFile(['png', 'webp', 'gif']);
+                const d = await selectSingleFile(imageAliases, { image: true });
                 if (!d) {
                     DBState.db.customBackground = '';
                     return;

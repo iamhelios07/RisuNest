@@ -1740,6 +1740,11 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        imageFormats: {
+            unsupported: '지원하지 않는 이미지 형식입니다. PNG, JPEG, GIF, WebP, AVIF 이미지만 사용할 수 있습니다.',
+            damaged: '이미지 파일이 손상되어 열 수 없습니다.',
+            portraitExportFailed: '초상화 이미지를 읽을 수 없어 내보낼 수 없습니다.',
+        },
         pluginStartup: {
             delayLabel: '동기화 후 플러그인 불러오기',
             delayHelp: '앱을 실행하면 동기화가 완료될 때까지 플러그인을 불러오지 않습니다. 체크를 해제하는 경우 플러그인 데이터가 이전 값으로 덮어씌워질 수 있습니다.',

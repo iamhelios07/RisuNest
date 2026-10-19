@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PlatformShape } from './platform.testSupport'
 
+const alertError = vi.hoisted(() => vi.fn())
+vi.mock('./alert', () => ({ alertError }))
 const settings = vi.hoisted(() => ({ allowAllExtentionFiles: false }))
 const native = vi.hoisted(() => ({
     platform: { runtime: 'web', os: 'windows' } as PlatformShape,
@@ -18,10 +20,12 @@ vi.mock('./platform', async () => (await import('./platform.testSupport')).platf
 vi.mock('src/lib/UI/PopupList.svelte', () => ({ default: {} }))
 
 import { language } from 'src/lang'
-import { selectFileByDom, selectSingleFile, selectMultipleFile } from './util'
+import { selectFileByDom, selectSingleFile, selectMultipleFile, mapSelectedFiles } from './util'
 import { isLibraryFileOperationReserved } from './storage/libraryFileOperation'
 import { selectDomFiles } from './storage/fileSelection'
 import { readableFile } from './storage/tauriFs.testSupport'
+import { imageAliases } from './media/imageFormats'
+import { imageFixture } from '../../tests/support/imageFixtures'
 
 const bytes = new Uint8Array([0, 128, 255])
 const picked = (name: string) => ({ path: `/owned/${name}/source`, name, bytes: bytes.length, mimeType: '' })
@@ -34,6 +38,7 @@ function input(): HTMLInputElement {
 
 beforeEach(() => {
     vi.spyOn(HTMLInputElement.prototype, 'click').mockImplementation(() => {})
+    alertError.mockReset()
     settings.allowAllExtentionFiles = false
     native.platform = { runtime: 'web', os: 'windows' }
     native.invoke.mockReset().mockResolvedValue(undefined)
@@ -41,6 +46,47 @@ beforeEach(() => {
 })
 
 describe('mobile file wrappers', () => {
+    it.each(['image/avif', 'application/octet-stream', ''])('accepts an extensionless Android image with MIME %j and validates its bytes', async mimeType => {
+        native.platform = { runtime: 'tauri', os: 'android' }
+        const data = imageFixture('avif')
+        window.RisuNativeFileSelection = {
+            pick: async () => ({ cancelled: false, files: [{ ...picked('provider-item'), bytes: data.length, mimeType }] }),
+            discard: async () => {},
+        }
+        native.open.mockImplementation(async () => readableFile(data))
+        try {
+            expect((await selectSingleFile(imageAliases, { image: true }))?.data).toEqual(data)
+            native.open.mockImplementation(async () => readableFile(new Uint8Array(data.length)))
+            await expect(selectSingleFile(imageAliases, { image: true })).rejects.toThrow(language.risuNest.imageFormats.unsupported)
+        } finally { delete window.RisuNativeFileSelection }
+    })
+
+    it('keeps valid Android images and reports rejected metadata and headers together', async () => {
+        native.platform = { runtime: 'tauri', os: 'android' }
+        const data = imageFixture('webp')
+        const good = { ...picked('valid.WEBP'), bytes: data.length }
+        window.RisuNativeFileSelection = {
+            pick: async () => ({ cancelled: false, files: [good, picked('broken.PNG'), { ...picked('file.pdf'), mimeType: 'application/pdf' }] }),
+            discard: async () => {},
+        }
+        native.open.mockImplementation(async path => readableFile(path === good.path ? data : bytes))
+        try {
+            const failures: string[] = []
+            const files = await selectMultipleFile(imageAliases, { image: true, failures })
+            expect(files).toEqual([{ name: good.name, data, mimeType: '' }])
+            expect(alertError).toHaveBeenCalledExactlyOnceWith([
+                `file.pdf: ${language.risuNest.imageFormats.unsupported}`,
+                `broken.PNG: ${language.risuNest.imageFormats.unsupported}`,
+            ].join('\n'))
+            await mapSelectedFiles(files!, async () => { throw new Error('cannot store') }, failures)
+            expect(alertError).toHaveBeenLastCalledWith([
+                `file.pdf: ${language.risuNest.imageFormats.unsupported}`,
+                `broken.PNG: ${language.risuNest.imageFormats.unsupported}`,
+                'valid.WEBP: cannot store',
+            ].join('\n'))
+        } finally { delete window.RisuNativeFileSelection }
+    })
+
     it('returns the picked bytes for single and multiple selection without a WebView file read', async () => {
         native.platform = { runtime: 'tauri', os: 'ios' }
         native.invoke.mockImplementation(async (command: string) => command === 'plugin:ios-native|pick_files'
@@ -86,6 +132,17 @@ afterEach(() => {
 })
 
 describe('DOM file picker', () => {
+    it.each([false, true])('validates image content with allow-all %s', async allowAll => {
+        settings.allowAllExtentionFiles = allowAll
+        const data = imageFixture('jpg')
+        const pending = selectSingleFile(imageAliases, { image: true })
+        const element = input()
+        expect(element.accept).toBe(allowAll ? '*' : imageAliases.map(ext => `.${ext}`).join(','))
+        Object.defineProperty(element, 'files', { value: [new File([data], 'renamed.PNG')] })
+        element.dispatchEvent(new Event('change'))
+        expect((await pending)?.data).toEqual(data)
+    })
+
     it('keeps admission through focus and visibility events until the actual picker result', async () => {
         const pending = selectFileByDom(['png'])
         expect(isLibraryFileOperationReserved()).toBe(true)
