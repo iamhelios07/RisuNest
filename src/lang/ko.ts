@@ -2675,6 +2675,7 @@ export const languageKorean = {
             reasonTooLarge: '{0} 크기가 너무 커서 가져오지 못했습니다.',
             reasonExportTooLarge: '{0} 크기가 너무 커서 내보내지 못했습니다.',
             reasonCompatibleDatabaseTooLarge: '데이터 크기가 너무 커서 호환 백업으로 내보내지 못했습니다. RisuNest 백업을 사용하세요.',
+            reasonCompatibleUnsupportedValue: '대상 앱이 지원하지 않는 값이 있어 호환 백업으로 내보내지 못했습니다. RisuNest 백업을 사용하세요.',
             tooLargeItems: {
                 root: '설정', preset: '프리셋', character: '캐릭터', conversation: '대화', message: '메시지', 'plugin-value': '플러그인 데이터',
                 record: '데이터 항목', backup: '백업 데이터', 'backup-entry': '백업 항목', card: '캐릭터 카드', module: '모듈', content: '카드 또는 모듈', 'owner-manifest': '추가 에셋 목록', 'compatible-database': '데이터',

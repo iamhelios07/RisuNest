@@ -2860,6 +2860,7 @@ export const languageEnglish = {
             reasonTooLarge: '{0} is too large to import.',
             reasonExportTooLarge: '{0} is too large to export.',
             reasonCompatibleDatabaseTooLarge: 'The data is too large to export as a compatible backup. Use a RisuNest backup.',
+            reasonCompatibleUnsupportedValue: 'The data contains a value the target app does not support, so it could not be exported as a compatible backup. Use a RisuNest backup.',
             tooLargeItems: {
                 root: 'Settings data', preset: 'A preset', character: 'A character', conversation: 'A chat', message: 'A message', 'plugin-value': 'Plugin data',
                 record: 'A data item', backup: 'Backup data', 'backup-entry': 'A backup entry', card: 'The character card', module: 'The module', content: 'The card or module', 'owner-manifest': 'The additional asset list', 'compatible-database': 'The data',

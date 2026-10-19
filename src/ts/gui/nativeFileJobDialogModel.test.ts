@@ -178,6 +178,7 @@ describe('nativeFileJobDialogModel', () => {
         ['server-status-unavailable', 'reasonServerStatus'],
         ['remote-asset-unavailable', 'reasonRemoteAssetUnavailable'],
         ['asset-missing', 'reasonAssetMissing'],
+        ['unsupported-projection', 'reasonCompatibleUnsupportedValue'],
     ] as const)('presents actionable file failure %s while keeping diagnostics secondary', (code, key) => {
         const model = buildNativeFileJobDialogModel(null, outcome({ state: 'failed', error: { code, message: 'synthetic detail', recoveryRequired: false } }), 0)
         expect(model.terminal?.reason).toBe(copy[key])
@@ -1141,6 +1142,15 @@ it.each([
     ] as const)('maps official publication phase %s to its visible %s stage', (phase, expected) => {
         expect(resolveNativeFileJobStage(status({ kind: 'official-publication-upload', phase }))).toBe(expected)
     })
+
+    it.each([['succeeded', 'finalizing-export'], ['failed', null], ['cancelled', null]] as const)(
+        'leaves the stopped stage current when an export job ends %s',
+        (state, expected) => {
+            for (const kind of ['export-compatible-local-backup', 'official-publication-upload'] as const) {
+                expect(resolveNativeFileJobStage(status({ kind, phase: 'complete', state }))).toBe(expected)
+            }
+        },
+    )
 
     it('shows official asset counts followed by database byte progress in the active upload stage', () => {
         const assetStatus = status({
