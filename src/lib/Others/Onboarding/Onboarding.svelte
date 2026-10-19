@@ -150,8 +150,11 @@
         && $nativeFileOperationOutcome.status.portableBodyRetry?.pending === true
         && $nativeFileOperationOutcome.status.portableBodyRetry.available === true
         && !$nativeFileOperationOutcome.status.portableBodyRetry.sourceRequired)
+    const stoppedAccountRestore = $derived($nativeFileOperationOutcome?.state === 'cancelled'
+        && $nativeFileOperationOutcome.status?.officialAssets?.state === 'cancelled'
+        && $nativeFileOperationOutcome.status.activationRevision !== undefined)
     // The restored data is in place, so the reader can move on unless the screen still waits for a refresh or the result is unknown.
-    const committedRecovery = $derived(jobRecoveryRequired
+    const committedRecovery = $derived((jobRecoveryRequired || stoppedAccountRestore)
         && $nativeFileOperationOutcome?.error?.code !== 'activation-outcome-unresolved'
         && $persistentWorkingSetRefreshRevision === null)
     const jobTicking = $derived(jobShown && job.terminal === null)
