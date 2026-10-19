@@ -300,7 +300,8 @@ export function createNativeOfficialAccountFlowService(
             })
         },
         inspectAssets() {
-            return credential && dependencies.inspectRestoreAssets ? dependencies.inspectRestoreAssets(credential.id) : Promise.resolve({ kind: 'none' })
+            return serialize(async () => credential && dependencies.inspectRestoreAssets
+                ? dependencies.inspectRestoreAssets(credential.id) : { kind: 'none' as const })
         },
         async stopAssets(operationId) {
             if (credential) await dependencies.stopRestoreAssets?.(credential.id, operationId)

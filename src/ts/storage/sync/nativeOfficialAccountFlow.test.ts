@@ -58,8 +58,9 @@ function createHarness(loggedIn = false, useNativeRestore = false) {
     let pendingRestoreAccount: string | null = null
     const prepareRestoreAssets = async (accountId: string) => { pendingRestoreAccount = accountId }
     const clearRestoreAssets = vi.fn(async () => { pendingRestoreAccount = null })
+    const inspectRestoreAssets = vi.fn<NonNullable<NativeOfficialAccountFlowDependencies['inspectRestoreAssets']>>(async () => ({ kind: 'none' }))
     const flow = createNativeOfficialAccountFlow({
-        prepareRestoreAssets, completeRestoreAssets, clearRestoreAssets,
+        prepareRestoreAssets, completeRestoreAssets, clearRestoreAssets, inspectRestoreAssets,
         credentialVault: vault,
         adapter,
         initialCredential: loggedIn ? {
@@ -79,7 +80,7 @@ function createHarness(loggedIn = false, useNativeRestore = false) {
     })
     return {
         get pendingRestoreAccount() { return pendingRestoreAccount },
-        completeRestoreAssets, clearRestoreAssets,
+        completeRestoreAssets, clearRestoreAssets, inspectRestoreAssets,
         adapter,
         clearLegacyFallback,
         clearMetadata,
@@ -308,8 +309,13 @@ describe('explicit native official account flow', () => {
         expect(harness.events).toEqual(['flush', 'metadata:flush', 'restart'])
     })
 
-    it('serializes concurrent restore, publish, and logout operations', async () => {
+    it('serializes recovery inspection with concurrent restore, publish, and logout operations', async () => {
         const harness = createHarness(true)
+        let finishInspection!: () => void
+        harness.inspectRestoreAssets.mockImplementationOnce(async () => {
+            await new Promise<void>(resolve => { finishInspection = resolve })
+            return { kind: 'none' }
+        })
         let resolvePull: (result: OfficialPullResult) => void = () => undefined
         harness.adapter.pull.mockImplementationOnce(async () => {
             harness.events.push('pull')
@@ -320,16 +326,23 @@ describe('explicit native official account flow', () => {
 
         const restore = harness.flow.restore()
         await vi.waitFor(() => expect(harness.adapter.pull).toHaveBeenCalledOnce())
+        const inspection = harness.flow.inspectAssets()
         const publish = harness.flow.publish()
         const logout = harness.flow.logout()
         await new Promise((resolve) => setTimeout(resolve, 0))
 
+        expect(harness.inspectRestoreAssets).not.toHaveBeenCalled()
         expect(harness.adapter.pin).not.toHaveBeenCalled()
         expect(harness.vault.clear).not.toHaveBeenCalled()
 
         resolvePull({ kind: 'missing' })
-        await expect(Promise.all([restore, publish, logout])).resolves.toEqual([
+        await vi.waitFor(() => expect(harness.inspectRestoreAssets).toHaveBeenCalledOnce())
+        expect(harness.adapter.pin).not.toHaveBeenCalled()
+        expect(harness.vault.clear).not.toHaveBeenCalled()
+        finishInspection()
+        await expect(Promise.all([restore, inspection, publish, logout])).resolves.toEqual([
             { kind: 'missing' },
+            { kind: 'none' },
             undefined,
             undefined,
         ])
