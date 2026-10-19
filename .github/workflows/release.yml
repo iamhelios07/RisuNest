@@ -359,7 +359,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'wasm-bindgen installation failed' }
       - run: pnpm test:wasm
       - name: Recheck native artifacts after the standalone WASM build
-        run: dbus-run-session -- bash scripts/linux-native-tests.sh --lib external_storage -- --test-threads=1
+        run: dbus-run-session -- bash scripts/linux-native-tests.sh --lib external_storage
 
   prepare-draft:
     if: >-
@@ -445,10 +445,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path $nativeTestTemp | Out-Null
           "TEMP=$nativeTestTemp" >> $env:GITHUB_ENV
           "TMP=$nativeTestTemp" >> $env:GITHUB_ENV
+      # The app crate under test compiles unoptimized; its dependencies keep the release optimization.
       - if: runner.os == 'Linux'
-        run: dbus-run-session -- bash scripts/linux-native-tests.sh --release --target ${{ matrix.target }}
+        run: dbus-run-session -- bash scripts/linux-native-tests.sh --release --config profile.release.package.risunest.opt-level=0 --target ${{ matrix.target }}
       - if: runner.os == 'macOS'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target ${{ matrix.target }}
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --config profile.release.package.risunest.opt-level=0 --target ${{ matrix.target }}
       - name: Run Windows native tests with isolated storage stress cases
         if: runner.os == 'Windows'
         shell: bash
@@ -461,8 +462,8 @@ jobs:
           )
           skips=()
           for test in "${isolated[@]}"; do skips+=(--skip "$test"); done
-          cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target '${{ matrix.target }}' -- "${skips[@]}"
-          cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target '${{ matrix.target }}' --lib -- --exact "${isolated[@]}" --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/native-storage-tests.log"
+          cargo test --manifest-path src-tauri/Cargo.toml --release --locked --config profile.release.package.risunest.opt-level=0 --target '${{ matrix.target }}' -- "${skips[@]}"
+          cargo test --manifest-path src-tauri/Cargo.toml --release --locked --config profile.release.package.risunest.opt-level=0 --target '${{ matrix.target }}' --lib -- --exact "${isolated[@]}" --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/native-storage-tests.log"
           grep -F 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/native-storage-tests.log"
       - run: cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --release --locked --target ${{ matrix.target }} --lib
       - if: runner.os == 'Linux'
