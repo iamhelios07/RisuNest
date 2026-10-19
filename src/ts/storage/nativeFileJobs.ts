@@ -1,5 +1,6 @@
 import type { PortraitRenditionDescriptor } from './characterPortraitRendition'
 import type { ExportExclusions } from './exportExcludedReport'
+import type { OfficialAccountAssetProgress } from './sync/officialAccountAssetOutcome'
 import { nativeRestoreDeadline, NativeRestoreControlTimeout, type NativeRestoreClock } from './nativeRestoreDeadline'
 import { exportIOSFile } from './iosFiles'
 import { MAX_CONTENT_METADATA_BYTES } from './contentImportLimits'
@@ -241,6 +242,10 @@ export interface NativeSnapshotBodiesStarted {
 }
 
 export type NativeFileJobStage =
+    | 'downloading-account-backup'
+    | 'checking-account-assets'
+    | 'downloading-account-assets'
+    | 'finishing-account-restore'
     | 'reading-archive'
     | 'requesting-backup-key'
     | 'decrypting-database'
@@ -436,6 +441,7 @@ export interface NativePortableBodyRetryRequest {
 }
 
 export interface NativeFileJobStatus {
+    officialAssets?: OfficialAccountAssetProgress
     exportCaptureRevision?: number
     portableBodyRetry?: {stagingId: string; catalogSha256: string; pending: boolean; available: boolean; sourceRequired: boolean}
     jobId: string

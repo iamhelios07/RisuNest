@@ -3719,6 +3719,7 @@ pub(crate) struct JobProgress {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobStage {
+    DownloadingAccountBackup,
     ReadingArchive,
     RequestingBackupKey,
     DecryptingDatabase,
