@@ -209,7 +209,7 @@ export async function createNativeOfficialAssetLedger(
     const flush = async () => {
         const results = await Promise.allSettled([...entries.values()].map(async entry => {
             disarm(entry)
-            if (entry.pending) await entry.pending
+            if (entry.pending) await entry.pending.catch(() => {})
             while (entry.generation !== entry.persisted) await write(entry)
         }))
         const errors = results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])

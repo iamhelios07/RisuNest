@@ -85,16 +85,21 @@ describe('native official publication checkpoints', () => {
         await ledger.clearAll()
     })
 
-    it('flushes a later generation after an overlapping checkpoint without concurrent snapshots', async () => {
+    it.each(['success', 'failed-once', 'failed-again'] as const)('flushes a later generation after an overlapping checkpoint: %s', async checkpoint => {
         vi.useFakeTimers()
         const h = device()
         const write = h.storage.patch
         let release!: () => void
         let active = 0
+        let failWrites = checkpoint === 'failed-again'
         h.storage.patch = async (key, entries) => {
             if (++active !== 1) throw new Error('Overlapping ledger writes')
             try {
-                if (!release) await new Promise<void>(resolve => { release = resolve })
+                if (!release) {
+                    await new Promise<void>(resolve => { release = resolve })
+                    if (checkpoint !== 'success') throw new Error('checkpoint write failed')
+                }
+                if (failWrites) throw new Error('settlement write failed')
                 await write(key, entries)
             } finally { active-- }
         }
@@ -103,8 +108,14 @@ describe('native official publication checkpoints', () => {
         await vi.advanceTimersByTimeAsync(30_000)
         ledger.record('second', 'two')
         const settled = ledger.flush()
+        const checked = checkpoint === 'failed-again' ? expect(settled).rejects.toThrow() : expect(settled).resolves.toBeUndefined()
         release()
-        await settled
+        await checked
+        if (checkpoint === 'failed-again') {
+            expect(h.reader('a').publishedAs('second')).toBeNull()
+            failWrites = false
+            await ledger.flush()
+        }
         expect(h.reader('a').publishedAs('first')).toBe('one')
         expect(h.reader('a').publishedAs('second')).toBe('two')
         await ledger.clearAll()

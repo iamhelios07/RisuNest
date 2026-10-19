@@ -28,7 +28,7 @@
     import { alertConfirm, alertError, alertNormal, openRisuAccountLogin } from 'src/ts/alert'
     import { restoreNativeOfficialAccountBackup } from 'src/ts/storage/sync/nativeOfficialAccountOperations'
     import { NativeAccountLoginError } from 'src/ts/storage/sync/nativeOfficialAccountFlow'
-    import { presentFileOperationError } from 'src/ts/storage/fileOperationErrorPresentation'
+    import { fileOperationErrorWasPresented, presentFileOperationError } from 'src/ts/storage/fileOperationErrorPresentation'
     import { hubURL } from 'src/ts/characterCards'
     import { getVersionString } from 'src/ts/globalApi.svelte'
     import { updateTextThemeAndCSS } from 'src/ts/gui/colorscheme'
@@ -777,7 +777,9 @@
                             {:else}
                                 {#if accountRetryAvailable}
                                     <button class="btn" type="button" onclick={() => {
+                                        const startedAt = Date.now()
                                         void import('src/ts/storage/sync/nativeOfficialAccountOperations').then(module => module.retryNativeOfficialAccountAssetsFromOutcome()).then(continueAfterImport).catch(async error => {
+                                            if (fileOperationErrorWasPresented('import', startedAt)) return
                                             const { failureReason } = await import('src/ts/gui/nativeFileJobDialogModel')
                                             alertError(failureReason(error?.code ?? ''))
                                         })

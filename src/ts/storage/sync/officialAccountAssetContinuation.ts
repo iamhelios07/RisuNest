@@ -16,6 +16,7 @@ export interface OfficialAssetContinuation {
     accountId: string
     state: 'awaiting-activation' | 'interrupted' | 'stopped' | 'failed'
     library?: string
+    preActivationLibrary?: string
     manifest?: string[]
     manifestId?: string
     failedKeys: string[]
@@ -62,7 +63,8 @@ export function createOfficialAccountAssetContinuation(dependencies: {
     const prepare = async (accountId: string) => {
         const current = await read()
         const previous = current?.state === 'awaiting-activation' ? current.previous : current ?? undefined
-        await settings.set(key, { version: 1, operationId: v4(), accountId, state: 'awaiting-activation', failedKeys: [], previous } satisfies OfficialAssetContinuation)
+        const preActivationLibrary = await store.readLibraryIdentity?.()
+        await settings.set(key, { version: 1, operationId: v4(), accountId, state: 'awaiting-activation', failedKeys: [], previous, preActivationLibrary } satisfies OfficialAssetContinuation)
     }
     const cancelPreparation = async () => {
         const receipt = await read()
@@ -71,7 +73,7 @@ export function createOfficialAccountAssetContinuation(dependencies: {
     const bind = async (accountId: string, status?: NativeFileJobStatus) => {
         const prepared = await read()
         if (!prepared || prepared.state !== 'awaiting-activation' || prepared.accountId !== accountId) throw new OfficialAssetOwnershipError('receipt')
-        const { previous: _previous, ...receipt } = prepared
+        const { previous: _previous, preActivationLibrary: _preActivationLibrary, ...receipt } = prepared
         receipt.library = await store.readLibraryIdentity?.()
         await guard(receipt)
         const lease = await store.acquireRevision(await readCurrentRevision(store))
@@ -91,8 +93,9 @@ export function createOfficialAccountAssetContinuation(dependencies: {
         }
         if (raw.accountId !== accountId) { await clear(); return { kind: 'none' } }
         if (raw.state === 'awaiting-activation') {
-            if (raw.previous?.accountId === accountId && raw.previous.library
-                && raw.previous.library === await store.readLibraryIdentity?.()) {
+            const library = await store.readLibraryIdentity?.()
+            if ((raw.preActivationLibrary && raw.preActivationLibrary === library)
+                || (raw.previous?.accountId === accountId && raw.previous.library && raw.previous.library === library)) {
                 await cancelPreparation()
                 return inspect(accountId)
             }

@@ -86,6 +86,30 @@ describe('native restored account assets', () => {
         expect(h.values.size).toBe(3)
     })
 
+    it.each([false, true])('discards a first restore interrupted before activation without losing a legacy marker (%s)', async legacy => {
+        const h = harness()
+        if (legacy) await h.settings.set(nativeOfficialAccountKeys.pendingAssets, { accountId: 'account' })
+        await h.assets.prepare('account')
+        const reopened = createNativeOfficialAccountAssets(h.dependencies)
+        expect(await reopened.inspect('account')).toEqual({ kind: legacy ? 'current-library' : 'none' })
+        expect(await h.settings.get(nativeOfficialAccountKeys.assetContinuation)).toBeNull()
+        expect(await reopened.inspect('account')).toEqual({ kind: legacy ? 'current-library' : 'none' })
+    })
+
+    it.each([false, true])('preserves uncertain activation recovery without a previous receipt (older receipt: %s)', async older => {
+        const h = harness()
+        await h.assets.prepare('account')
+        if (older) {
+            const receipt = await h.settings.get(nativeOfficialAccountKeys.assetContinuation) as Record<string, unknown>
+            delete receipt.preActivationLibrary
+            await h.settings.set(nativeOfficialAccountKeys.assetContinuation, receipt)
+        } else h.replaceLibrary()
+        const reopened = createNativeOfficialAccountAssets(h.dependencies)
+        expect(await reopened.inspect('account')).toEqual({ kind: 'current-library' })
+        await reopened.bind('account')
+        expect(await reopened.complete('account')).toMatchObject({ state: 'succeeded', counts: { installed: 3 } })
+    })
+
     it('does not revive an old retry after the new database has activated', async () => {
         const h = harness()
         await h.assets.prepare('account'); await h.assets.bind('account')
