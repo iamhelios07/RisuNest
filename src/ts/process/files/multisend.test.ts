@@ -79,6 +79,7 @@ import { postChatFile } from './multisend'
 import { InlayInputTooLargeError } from './inlays'
 import { doingChat, reserveGeneration } from '../generationState'
 import { language } from 'src/lang'
+import { selectMultipleFile } from 'src/ts/util'
 
 function createDatabase(): Database {
     const conversation = {
@@ -399,6 +400,19 @@ describe('postChatFile attachment errors', () => {
         mocks.sendChat.mockClear()
         mocks.postInlayAsset.mockReset()
         mocks.alertError.mockReset()
+    })
+
+    it.each([false, true])('does not repeat selection failures when attachment storage fails: %s', async storageFails => {
+        vi.mocked(selectMultipleFile).mockImplementationOnce(async (_extensions, options) => {
+            options!.failures!.push('rejected.png: damaged')
+            mocks.alertError('rejected.png: damaged')
+            return [{ name: 'valid.png', data: imageFixture('png') }]
+        })
+        if (storageFails) mocks.postInlayAsset.mockRejectedValueOnce(new Error('cannot store'))
+        else mocks.postInlayAsset.mockResolvedValueOnce('inlay-id')
+        expect(await postChatFile('')).toEqual(storageFails ? [] : [{ type: 'asset', data: 'inlay-id' }])
+        expect(mocks.alertError.mock.calls.map(([message]) => message)).toEqual(storageFails
+            ? ['rejected.png: damaged', 'valid.png: cannot store'] : ['rejected.png: damaged'])
     })
 
     it.each(['gif', 'png'])('skips an oversized %s attachment without appending an asset or message', async (extension) => {

@@ -6,7 +6,7 @@ import { recordNativeLogError } from '../nativeLog'
 import { isTauriAndroid, isTauriIOS } from '../platform'
 import { withLibraryFileSelection } from './libraryFileOperation'
 import { nativeRoots } from './nativePaths'
-import { imageFormatForName } from '../media/imageFormats'
+import { ImageFormatError, imageFormatForName } from '../media/imageFormats'
 
 export interface NativeSelectedFile {
     path: string
@@ -106,7 +106,7 @@ async function withNativeSelection<T>(options: FileSelectionOptions, consume: (f
             }
             const accepted = selected.filter(file => {
                 if (accepts(file, options.accept, options.image)) return true
-                const error = new Error(options.image ? language.risuNest.imageFormats.unsupported : language.risuNest.importDialog.reasonUnsupportedFormat)
+                const error = options.image ? new ImageFormatError('unsupported') : new Error(language.risuNest.importDialog.reasonUnsupportedFormat)
                 if (!options.onRejected) throw error
                 options.onRejected(file, error)
                 return false

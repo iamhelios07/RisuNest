@@ -13,7 +13,7 @@ import type { Attachment } from "svelte/attachments"
 import { mount, unmount, type Snippet } from "svelte"
 import PopupList from "src/lib/UI/PopupList.svelte"
 import { indexCharactersById } from "./characterIndex"
-import { imageAliases, requireImage, selectedImageFormat } from './media/imageFormats'
+import { imageAliases, ImageFormatError, requireImage, selectedImageFormat } from './media/imageFormats'
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 
 export interface Messagec extends Message{
@@ -51,9 +51,16 @@ export function checkNullish(data:any){
 const domSelect = true
 export function selectSingleFile(ext:string[], options: { image?: boolean } = {}){
     return withLibraryFileSelection(async () => {
-        const file = await readSingleFile(ext, options)
-        if (file && options.image) requireImage(file.data)
-        return file
+        try {
+            const file = await readSingleFile(ext, options)
+            if (file && options.image) requireImage(file.data)
+            return file
+        } catch (error) {
+            if (!options.image || !(error instanceof ImageFormatError)) throw error
+            const { alertError } = await import('./alert')
+            void alertError(error.message)
+            return null
+        }
     })
 }
 
@@ -70,7 +77,7 @@ async function readSingleFile(ext:string[], options: { image?: boolean }){
     }
 
     const selected = await open({
-        filters: [{
+        filters: fileAccept(ext) === '*' ? undefined : [{
             name: ext.join(', '),
             extensions: ext
         }]
@@ -87,25 +94,26 @@ async function readSingleFile(ext:string[], options: { image?: boolean }){
 export function selectMultipleFile(ext:string[], options: { image?: boolean; failures?: string[] } = {}){
     return withLibraryFileSelection(async () => {
         const errors = options.failures ?? []
+        const reportFrom = errors.length
         const files = await readMultipleFiles(ext, options, errors)
         if (!files) return files
         return mapSelectedFiles(files, async file => {
             if (options.image) requireImage(file.data)
             else if (ext.some(alias => imageAliases.includes(alias))) selectedImageFormat(file.data, file.name)
             return file
-        }, errors)
+        }, errors, reportFrom)
     })
 }
 
-export async function mapSelectedFiles<T, F extends { name: string }>(files: F[], consume: (file: F) => Promise<T>, errors: string[] = []): Promise<T[]> {
+export async function mapSelectedFiles<T, F extends { name: string }>(files: F[], consume: (file: F) => Promise<T>, errors: string[] = [], reportFrom = errors.length): Promise<T[]> {
     const results: T[] = []
     for (const file of files) {
         try { results.push(await consume(file)) }
         catch (error) { errors.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`) }
     }
-    if (errors.length) {
+    if (errors.length > reportFrom) {
         const { alertError } = await import('./alert')
-        void alertError(errors.join('\n'))
+        void alertError(errors.slice(reportFrom).join('\n'))
     }
     return results
 }
@@ -129,9 +137,9 @@ async function readMultipleFiles(ext:string[], options: { image?: boolean }, err
     }
 
     const selected = await open({
-        filters: [{
+        filters: fileAccept(ext) === '*' ? undefined : [{
             name: ext.join(', '),
-            extensions: fileAccept(ext) === '*' ? ['*'] : ext,
+            extensions: ext,
         }],
         multiple: true
     });

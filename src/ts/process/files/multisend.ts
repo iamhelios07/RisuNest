@@ -280,6 +280,7 @@ export async function postChatFile(query:string|{
 
     const xquery = typeof(query) === 'string' ? query : ''
     const results: postFileResult[] = []
+    const reportFrom = failures.length
 
     for(const file of files){
         let extention = file.name.split('.').at(-1)?.toLowerCase()
@@ -378,7 +379,7 @@ export async function postChatFile(query:string|{
             failures.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`)
         }
     }
-    if (failures.length) void alertError(failures.join('\n'))
+    if (failures.length > reportFrom) void alertError(failures.slice(reportFrom).join('\n'))
 
     return results
 }

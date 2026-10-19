@@ -119,9 +119,9 @@ export async function selectCharImg(charIndex:number) {
             const selected = await open({
                 multiple: false,
                 directory: false,
-                filters: [{
+                filters: fileAccept(imageAliases) === '*' ? undefined : [{
                     name: imageAliases.join(', '),
-                    extensions: fileAccept(imageAliases) === '*' ? ['*'] : imageAliases,
+                    extensions: imageAliases,
                 }],
             })
             return typeof selected === 'string' ? selected : null
