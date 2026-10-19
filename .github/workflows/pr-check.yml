@@ -125,4 +125,4 @@ jobs:
       - run: pnpm test:protocol
       - run: pnpm test:wasm
       - name: Recheck native artifacts after the standalone WASM build
-        run: dbus-run-session -- bash scripts/linux-native-tests.sh --lib external_storage -- --test-threads=1
+        run: dbus-run-session -- bash scripts/linux-native-tests.sh --lib external_storage
