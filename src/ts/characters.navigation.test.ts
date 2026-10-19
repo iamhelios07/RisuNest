@@ -103,6 +103,7 @@ vi.mock('./globalApi.svelte', () => ({
 vi.mock('./process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
 vi.mock('./parser/parser.svelte', async () => (await import('./parser/parser.testSupport')).parserStubModule())
 vi.mock('./translator/translator', () => ({ translateHTML: vi.fn() }))
+vi.mock('./mobileBackgroundTask', async () => (await import('./mobileBackgroundTask.testSupport')).mobileBackgroundTaskModule())
 vi.mock('./process/index.svelte', async () => {
     const { writable } = await import('svelte/store')
     return { doingChat: writable(false) }
@@ -158,6 +159,7 @@ import {
     addCharEmotion,
     addingEmotion,
 } from './characters'
+import { beginMobileBackgroundTask } from './mobileBackgroundTask'
 import { createMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
 import { language } from 'src/lang'
 import { SelectedConversationPromotionStaleError } from './storage/activeWorkingSet.svelte'
@@ -1488,9 +1490,17 @@ describe('chat list operations', () => {
         // HTML file, then the default '0' answers translate the content and keep names.
         mocks.alertSelect.mockResolvedValueOnce('2')
         vi.mocked(translateHTML).mockResolvedValue('<p>translated <img src="x" onerror="alert(1)"></p>')
+        const events: string[] = []
+        vi.mocked(beginMobileBackgroundTask).mockImplementationOnce(kind => {
+            events.push(`hold ${kind}`)
+            return { progress() {}, async dispose() { events.push('release') } }
+        })
+        mocks.downloadFile.mockImplementationOnce(async () => { events.push('download'); return true })
 
         await exportChat(0)
 
+        // Translation holds the background task, which ends before the save picker opens.
+        expect(events).toEqual(['hold export', 'release', 'download'])
         const exported = Buffer.from(mocks.downloadFile.mock.calls[0][1]).toString()
         expect(exported).toContain('<p>translated <img src="x"></p>')
         expect(exported).not.toContain('onerror')

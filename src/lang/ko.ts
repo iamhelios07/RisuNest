@@ -1740,6 +1740,7 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        backgroundWorkMayStop: '앱 화면을 벗어날 경우 작업이 중단될 수 있습니다.',
         imageFormats: {
             unsupported: '지원하지 않는 이미지 형식입니다. PNG, JPEG, GIF, WebP, AVIF 이미지만 사용할 수 있습니다.',
             damaged: '이미지 파일이 손상되어 열 수 없습니다.',
@@ -2799,8 +2800,8 @@ export const languageKorean = {
             keepAlive: '응답 생성 중 앱 유지',
             keepAliveHelp:
                 '알림을 사용해 백그라운드에서도 생성을 이어가도록 돕습니다. Android가 앱을 일시 중지하거나 종료할 수 있습니다.',
-            keepAliveNeedsNotifications:
-                '알림이 꺼져 있으면 이 기능이 동작하지 않습니다.',
+            keepAliveWithoutNotification:
+                '알림이 꺼져 있으면 알림 없이 동작합니다.',
             operatingSystem: '운영체제',
             webView: 'WebView',
             refreshScreen: '화면 새로고침',

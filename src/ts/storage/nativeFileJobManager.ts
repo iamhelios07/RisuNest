@@ -1,5 +1,5 @@
 import { isBackgroundExpiryReason } from '../iosNative'
-import { measuredTaskPercent, runWithMobileBackgroundTask } from '../mobileBackgroundTask'
+import { measuredTaskPercent, runWithDeferredMobileBackgroundTask, runWithMobileBackgroundTask, type MobileBackgroundTask } from '../mobileBackgroundTask'
 import { Mutex } from '../mutex'
 import { get, writable } from 'svelte/store'
 import { invoke } from '@tauri-apps/api/core'
@@ -161,7 +161,8 @@ function backgroundTaskPercent({ kind, phase, progress, detail }: NativeFileJobS
         return phase === 'reading-source' ? measuredTaskPercent(progress.completedBytes, progress.totalBytes) : null
     }
     const percent = measuredTaskPercent(progress.completedBytes, progress.totalBytes)
-    return percent === null && detail?.stage === 'copying-source' && detail.stageUnit === 'bytes'
+    return percent === null && (detail?.stage === 'copying-source' && detail.stageUnit === 'bytes'
+        || detail?.stage === 'publishing-destination' && detail.stageUnit === 'items')
         ? measuredTaskPercent(detail.stageCompleted, detail.stageTotal) : percent
 }
 
@@ -378,7 +379,7 @@ function runSharedNativeFileOperationWithAdmission<T>(
     try {
         const taskKind = options.format === 'library-backup' || options.format === 'risu-save'
             ? (kind === 'export' ? 'backup' : 'restore') : kind
-        runWithMobileBackgroundTask(taskKind, async task => {
+        const protectedOperation = async (task: MobileBackgroundTask) => {
             taskSignal = task.signal ?? context.signal
             try {
                 const waiting = bodyOnly ? null : waitForLibraryFileOperation(task.signal ?? context.signal)
@@ -396,7 +397,12 @@ function runSharedNativeFileOperationWithAdmission<T>(
                     },
                 })
             } finally { await finalize() }
-        }, controller.signal, options.userInitiated ?? true).finally(finalize).then(
+        }
+        // Automatic work is protected only if the app leaves the screen while it runs.
+        void (options.userInitiated === false
+            ? runWithDeferredMobileBackgroundTask(taskKind, protectedOperation, controller.signal)
+            : runWithMobileBackgroundTask(taskKind, protectedOperation, controller.signal, true)
+        ).finally(finalize).then(
             value => { settle({ value }); resolveOperation(value) },
             error => { settle({ error }); rejectOperation(error) },
         )

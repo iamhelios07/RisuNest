@@ -47,7 +47,10 @@ import {
     invalidateAssetSourceCache,
     setUsingSw
 } from "./globalApi.svelte";
-import { isTauri, isTauriAndroid, isTauriDesktop } from "./platform";
+import { isTauri, isTauriAndroid, isTauriDesktop, isTauriIOS } from "./platform";
+import { expireMobileDeferredHolds, mobileDeferredHoldsSettled } from "./mobileBackgroundTask";
+import { setGenerationBackground } from "./process/generationState";
+import { beginGenerationBackground } from "./process/generationBackground";
 import { registerModelDynamic } from "./model/modellist";
 import {
     prepareDatabaseForPersistence,
@@ -907,9 +910,13 @@ export async function loadData() {
             alertNormal(language.risuNest.backup.restoreInterrupted)
             await waitAlert()
         }
+        if (isTauriAndroid || isTauriIOS) setGenerationBackground(beginGenerationBackground)
         if (isTauri) {
           schedulePeriodicNativeSnapshot();
-          installIOSPersistenceLifecycle((reason) => flushLifecycle(reason, true));
+          installIOSPersistenceLifecycle((reason) => flushLifecycle(reason, true), {
+            settled: mobileDeferredHoldsSettled,
+            expire: expireMobileDeferredHolds,
+          });
         }
         if (!excluded('modules')) moduleUpdate()
         void alertTOS().then(async (accepted) => {
