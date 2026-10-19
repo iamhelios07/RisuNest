@@ -1128,9 +1128,13 @@ fn write_block(
             .write(checked, Compression::default());
         // The encoder runs deflate on every write; the buffer spares it one call per JSON token.
         let mut buffered = BufWriter::with_capacity(64 * 1024, &mut encoder);
-        let written = write_json(&mut buffered)
-            .and_then(|()| buffered.flush().map_err(StoreError::from));
-        drop(buffered);
+        // into_inner drains the buffer without flushing the encoder, which would add a sync block.
+        let written = write_json(&mut buffered).and_then(|()| {
+            buffered
+                .into_inner()
+                .map(drop)
+                .map_err(|error| StoreError::from(error.into_error()))
+        });
         if let Err(error) = written {
             check_export_cancelled(is_cancelled)?;
             return Err(error);
