@@ -23,7 +23,7 @@ import { ByteBudgetLru } from "../util/byteBudgetLru"
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from "../runtimePerformanceProfile"
 
 // Translations made this session. A key carries the settings the request
-// depends on, so a changed language or translator translates again.
+// depends on, so a changed language, translator or DeepLX server translates again.
 let translationCache: ByteBudgetLru<string, string> | null = null
 subscribeRuntimePerformanceProfile(() => { translationCache = null })
 
@@ -35,7 +35,8 @@ function cachedTranslations(): ByteBudgetLru<string, string> {
 }
 
 function translationCacheKey(db: Database, from: string, target: string, reverse: boolean, text: string): string {
-    return JSON.stringify([reverse, db.translatorType, db.translatorInputLanguage, from, target]) + text
+    const server = db.translatorType === 'deeplX' ? db.deeplXOptions?.url ?? null : null
+    return JSON.stringify([reverse, db.translatorType, db.translatorInputLanguage, from, target, server]) + text
 }
 
 function rememberTranslation(key: string, value: string): void {
