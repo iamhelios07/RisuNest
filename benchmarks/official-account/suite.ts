@@ -105,7 +105,7 @@ export async function runOfficialAccountMeasurements(store: PersistentDataStore,
     const ledgerSamples: unknown[] = []
     for (const count of [1000, 4000, 8000, 34000, 100000]) {
         let serializedCharacters = 0, snapshots = 0, last = ''
-        const storage = { get: async () => null, patch: async (_key: string, entries: Record<string, string | null>) => {
+        const storage = { get: async () => null, set: async () => { last = '' }, patch: async (_key: string, entries: Record<string, string | null>) => {
             for (const value of Object.values(entries)) if (value !== null) { last = value; serializedCharacters += value.length; snapshots++ }
         } }
         const ledger = await createNativeOfficialAssetLedger(storage, 'synthetic', () => 'synthetic')
@@ -119,7 +119,7 @@ export async function runOfficialAccountMeasurements(store: PersistentDataStore,
     const nativeLedgerSamples: unknown[] = []
     for (const count of [1000, 4000, 8000, 34000, 100000]) {
         let writes = 0, writeMs = 0, characters = 0
-        const settings = { get: nativeSettings.get.bind(nativeSettings), patch: async (key: string, entries: Record<string, string | null>) => {
+        const settings = { get: nativeSettings.get.bind(nativeSettings), set: nativeSettings.set.bind(nativeSettings), patch: async (key: string, entries: Record<string, string | null>) => {
             const start = performance.now()
             await nativeSettings.patch(key, entries)
             writeMs += performance.now() - start
@@ -189,7 +189,7 @@ export async function runOfficialAccountMeasurements(store: PersistentDataStore,
         schedulerSamples.push({ count, elapsedMs: performance.now() - scheduling, note: 'Production scheduler with immediate synthetic missing responses; no network or storage.' })
     }
     let checkpoints = 0, checkpointWriteMs = 0
-    const checkpointsLedger = await createNativeOfficialAssetLedger({ get: async () => null,
+    const checkpointsLedger = await createNativeOfficialAssetLedger({ get: async () => null, set: nativeSettings.set.bind(nativeSettings),
         patch: async (key, entries) => { const start = performance.now(); await nativeSettings.patch(key, entries); checkpoints++; checkpointWriteMs += performance.now() - start },
     }, nativeOfficialAccountKeys.assetLedger, () => 'synthetic')
     const checkpointStart = performance.now()

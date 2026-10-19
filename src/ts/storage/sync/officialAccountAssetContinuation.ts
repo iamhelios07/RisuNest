@@ -20,6 +20,7 @@ export interface OfficialAssetContinuation {
     manifestId?: string
     failedKeys: string[]
     status?: NativeFileJobStatus
+    previous?: Omit<OfficialAssetContinuation, 'previous'>
 }
 export type OfficialAssetRecovery = { kind: 'none' | 'current-library' | 'retry' | 'interrupted'; operationId?: string }
 const digest = (keys: string[]) => hashPayloadBytes(new TextEncoder().encode(JSON.stringify(keys)))
@@ -59,12 +60,18 @@ export function createOfficialAccountAssetContinuation(dependencies: {
         if (failure?.status === 'rejected') throw failure.reason
     }
     const prepare = async (accountId: string) => {
-        await settings.set(key, { version: 1, operationId: v4(), accountId, state: 'awaiting-activation', failedKeys: [] } satisfies OfficialAssetContinuation)
-        await settings.set(nativeOfficialAccountKeys.pendingAssets, null)
+        const current = await read()
+        const previous = current?.state === 'awaiting-activation' ? current.previous : current ?? undefined
+        await settings.set(key, { version: 1, operationId: v4(), accountId, state: 'awaiting-activation', failedKeys: [], previous } satisfies OfficialAssetContinuation)
+    }
+    const cancelPreparation = async () => {
+        const receipt = await read()
+        if (receipt?.state === 'awaiting-activation') await settings.set(key, receipt.previous ?? null)
     }
     const bind = async (accountId: string, status?: NativeFileJobStatus) => {
-        const receipt = await read()
-        if (!receipt || receipt.state !== 'awaiting-activation' || receipt.accountId !== accountId) throw new OfficialAssetOwnershipError('receipt')
+        const prepared = await read()
+        if (!prepared || prepared.state !== 'awaiting-activation' || prepared.accountId !== accountId) throw new OfficialAssetOwnershipError('receipt')
+        const { previous: _previous, ...receipt } = prepared
         receipt.library = await store.readLibraryIdentity?.()
         await guard(receipt)
         const lease = await store.acquireRevision(await readCurrentRevision(store))
@@ -74,6 +81,7 @@ export function createOfficialAccountAssetContinuation(dependencies: {
         await guard(receipt)
         receipt.state = 'interrupted'
         await settings.set(key, receipt)
+        await settings.set(nativeOfficialAccountKeys.pendingAssets, null)
     }
     const inspect = async (accountId: string): Promise<OfficialAssetRecovery> => {
         const raw = await read()
@@ -82,7 +90,14 @@ export function createOfficialAccountAssetContinuation(dependencies: {
             return { kind: legacy?.accountId === accountId ? 'current-library' : 'none' }
         }
         if (raw.accountId !== accountId) { await clear(); return { kind: 'none' } }
-        if (raw.state === 'awaiting-activation') return { kind: 'current-library' }
+        if (raw.state === 'awaiting-activation') {
+            if (raw.previous?.accountId === accountId && raw.previous.library
+                && raw.previous.library === await store.readLibraryIdentity?.()) {
+                await cancelPreparation()
+                return inspect(accountId)
+            }
+            return { kind: 'current-library' }
+        }
         try {
             const receipt = await load(accountId)
             return { kind: receipt?.state === 'interrupted' ? 'interrupted' : 'retry', operationId: receipt!.operationId }
@@ -92,9 +107,14 @@ export function createOfficialAccountAssetContinuation(dependencies: {
             return { kind: 'none' }
         }
     }
-    return { prepare, bind, clear, load, guard, inspect,
+    return { prepare, bind, cancelPreparation, clear, load, guard, inspect,
         async stop(accountId: string, operationId: string) {
-            const receipt = await load(accountId, operationId)
+            let receipt: Awaited<ReturnType<typeof load>>
+            try { receipt = await load(accountId, operationId) }
+            catch (error) {
+                if (error instanceof OfficialAssetOwnershipError) return
+                throw error
+            }
             if (receipt && receipt.state !== 'stopped') await settings.set(key, { ...receipt, state: 'stopped' })
         },
         async start(receipt: OfficialAssetContinuation) {

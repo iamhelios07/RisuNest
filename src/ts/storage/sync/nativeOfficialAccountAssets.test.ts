@@ -16,7 +16,7 @@ vi.mock('../../globalApi.svelte', () => ({ forageStorage: {} }))
 
 afterEach(() => vi.useRealTimers())
 let harnessSequence = 0
-function harness(extra = 0) {
+function harness(extra = 0, concurrency: 1 | 2 = 1) {
     let library = 'library-1'
     let accountId = 'account'
     const values = new Map<string, Uint8Array>()
@@ -46,21 +46,79 @@ function harness(extra = 0) {
         putVerified: vi.fn(async (key, bytes, _metadata, beforeActivate) => { await beforeActivate?.(); values.set(key, bytes.slice()) }),
         resolveUrl: vi.fn(async key => values.has(key) ? `asset://${key}` : null),
     } as unknown as BlobStore
-    const readItem = vi.fn(async key => key === 'assets/missing'
+    const readItem = vi.fn<AccountStorage['readItem']>(async key => key === 'assets/missing'
         ? { kind: 'missing' as const } : { kind: 'value' as const, bytes: Uint8Array.of(1, 2, 3) })
     const ledger = { record: vi.fn(), publishedAs: vi.fn(), reset: vi.fn(), clear: vi.fn() }
-    const dependencies = { settings, store, getAccountId: () => accountId, account: { readItem } as Pick<AccountStorage, 'readItem'>, ledger, resolveBlobs: async () => blobs, flushMetadata: vi.fn(async () => {}), origin: `https://synthetic-${harnessSequence++}.invalid`, concurrency: 1 as const }
+    const dependencies = { settings, store, getAccountId: () => accountId, account: { readItem } as Pick<AccountStorage, 'readItem'>, ledger, resolveBlobs: async () => blobs, flushMetadata: vi.fn(async () => {}), origin: `https://synthetic-${harnessSequence++}.invalid`, concurrency }
     return { values, settings, lease, blobs, readItem, ledger, dependencies, assets: createNativeOfficialAccountAssets(dependencies),
         replaceLibrary: () => { library = 'library-2' }, changeAccount: () => { accountId = 'other' } }
 }
 
 describe('native restored account assets', () => {
+    it('keeps in-flight interrupted objects out of the persisted failed set', async () => {
+        const h = harness(0, 2)
+        await h.assets.prepare('account'); await h.assets.bind('account')
+        const controller = new AbortController()
+        let reading = 0
+        h.readItem.mockImplementation((_key, options) => new Promise((_resolve, reject) => {
+            reading++
+            options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), { once: true })
+        }))
+        const running = h.assets.complete('account', { signal: controller.signal })
+        await vi.waitFor(() => expect(reading).toBe(2))
+        controller.abort()
+        expect(await running).toMatchObject({ state: 'cancelled', counts: { failed: 0, notAttempted: 4 }, failedKeys: [] })
+        expect(await h.settings.get(nativeOfficialAccountKeys.assetContinuation)).toMatchObject({ state: 'stopped', failedKeys: [] })
+    })
+
+    it.each(['cancel', 'reopen'] as const)('preserves the previous retry when a new restore ends before activation: %s', async ending => {
+        const h = harness()
+        await h.assets.prepare('account'); await h.assets.bind('account')
+        h.readItem.mockRejectedValueOnce(new AccountReadError('http', 401))
+        await h.assets.complete('account')
+        const before = await h.settings.get(nativeOfficialAccountKeys.assetContinuation)
+        await h.assets.prepare('account')
+        if (ending === 'cancel') await h.assets.cancelPreparation()
+        const reopened = createNativeOfficialAccountAssets(h.dependencies)
+        expect(await reopened.inspect('account')).toMatchObject({ kind: 'retry' })
+        expect(await h.settings.get(nativeOfficialAccountKeys.assetContinuation)).toEqual(before)
+        await reopened.complete('account')
+        expect(h.values.size).toBe(3)
+    })
+
+    it('does not revive an old retry after the new database has activated', async () => {
+        const h = harness()
+        await h.assets.prepare('account'); await h.assets.bind('account')
+        await h.assets.prepare('account')
+        h.replaceLibrary()
+        const reopened = createNativeOfficialAccountAssets(h.dependencies)
+        expect(await reopened.inspect('account')).toEqual({ kind: 'current-library' })
+        await reopened.bind('account')
+        const receipt = await h.settings.get(nativeOfficialAccountKeys.assetContinuation)
+        expect(receipt).toMatchObject({ library: 'library-2', state: 'interrupted' })
+        expect(receipt).not.toHaveProperty('previous')
+    })
+
+    it.each(['account', 'library', 'operation'] as const)('does not replace a cancellation outcome when its %s ownership became obsolete', async changed => {
+        const h = harness()
+        await h.assets.prepare('account'); await h.assets.bind('account')
+        const pending = await h.assets.inspect('account')
+        if (changed === 'account') h.changeAccount()
+        if (changed === 'library') h.replaceLibrary()
+        if (changed === 'operation') { await h.assets.prepare('account'); await h.assets.bind('account') }
+        const before = await h.settings.get(nativeOfficialAccountKeys.assetContinuation)
+        await expect(h.assets.stop('account', pending.operationId!)).resolves.toBeUndefined()
+        expect(await h.settings.get(nativeOfficialAccountKeys.assetContinuation)).toEqual(before)
+    })
+
     it('does not automatically assign a released account-only marker to the current library', async () => {
         const h = harness()
         await h.settings.set(nativeOfficialAccountKeys.pendingAssets, { accountId: 'account' })
         expect(await h.assets.inspect('account')).toEqual({ kind: 'current-library' })
         await expect(h.assets.complete('account')).rejects.toMatchObject({ reason: 'receipt' })
         expect(h.values.size).toBe(0)
+        await h.assets.prepare('account'); await h.assets.cancelPreparation()
+        expect(await h.assets.inspect('account')).toEqual({ kind: 'current-library' })
         await h.assets.prepare('account'); await h.assets.bind('account')
         expect(await h.settings.get(nativeOfficialAccountKeys.pendingAssets)).toBeNull()
         expect(await h.assets.complete('account')).toMatchObject({ state: 'succeeded', counts: { installed: 3 } })

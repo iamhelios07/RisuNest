@@ -549,7 +549,7 @@ export async function loadData() {
                 inspectRestoreAssets: restoredAssets.inspect,
                 stopRestoreAssets: restoredAssets.stop,
                 completeRestoreAssets,
-                clearRestoreAssets: restoredAssets.clear,
+                clearRestoreAssets: restoredAssets.cancelPreparation,
                 nativeRestore: async (initialCredential, options) => {
                     let credential = initialCredential
                     for (let attempt = 0; attempt < 3; attempt += 1) {

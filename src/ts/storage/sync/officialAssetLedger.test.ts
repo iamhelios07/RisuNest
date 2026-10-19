@@ -52,6 +52,7 @@ describe('native official publication checkpoints', () => {
         const values: Record<string, string> = {}
         const storage = {
             get: async () => ({ ...values }),
+            set: async (_key: string, _value: unknown) => { for (const key of Object.keys(values)) delete values[key] },
             patch: async (_key: string, entries: Record<string, string | null>) => {
                 for (const [key, value] of Object.entries(entries)) {
                     if (value === null) delete values[key]
@@ -132,7 +133,35 @@ describe('native official publication checkpoints', () => {
         await ledger.clearAll()
     })
 
-    it('orders clearing after an older in-flight snapshot so it cannot reappear', async () => {
+    it('accepts a durable flush after a timer checkpoint failed', async () => {
+        vi.useFakeTimers()
+        const h = device()
+        const write = h.storage.patch
+        h.storage.patch = vi.fn().mockRejectedValueOnce(new Error('disk full')).mockImplementation(write)
+        const ledger = await createNativeOfficialAssetLedger(h.storage, 'ledger', () => 'a')
+        ledger.record('asset', 'remote')
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(h.reader('a').publishedAs('asset')).toBeNull()
+        await expect(ledger.flush()).resolves.toBeUndefined()
+        expect(h.reader('a').publishedAs('asset')).toBe('remote')
+        await ledger.clearAll()
+    })
+
+    it('clears unreadable persisted metadata on logout', async () => {
+        let stored: unknown = ['unreadable']
+        const storage = {
+            get: async () => stored,
+            set: async (_key: string, value: unknown) => { stored = value },
+            patch: async () => { throw new Error('unreadable metadata cannot be patched') },
+        }
+        const ledger = await createNativeOfficialAssetLedger(storage, 'ledger', () => 'a')
+        await expect(ledger.clearAll()).resolves.toBeUndefined()
+        expect(stored).toBeNull()
+        const reopened = await createNativeOfficialAssetLedger(storage, 'ledger', () => 'a')
+        await expect(reopened.flush()).resolves.toBeUndefined()
+    })
+
+    it.each(['account', 'all'] as const)('orders %s clearing after an older in-flight snapshot so it cannot reappear', async scope => {
         vi.useFakeTimers()
         const h = device()
         const write = h.storage.patch
@@ -144,8 +173,8 @@ describe('native official publication checkpoints', () => {
         const ledger = await createNativeOfficialAssetLedger(h.storage, 'ledger', () => 'a')
         ledger.record('asset', 'remote')
         await vi.advanceTimersByTimeAsync(30_000)
-        ledger.clear()
-        const cleared = ledger.flush()
+        if (scope === 'account') ledger.clear()
+        const cleared = scope === 'account' ? ledger.flush() : ledger.clearAll()
         release()
         await cleared
         await vi.advanceTimersByTimeAsync(60_000)

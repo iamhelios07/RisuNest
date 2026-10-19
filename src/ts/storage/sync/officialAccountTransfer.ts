@@ -76,9 +76,9 @@ export async function transferOfficialAccountAssets(options: {
                     bytes += count; rate.add(Date.now(), bytes)
                 } })
             } catch (error) {
-                if (controller.signal.aborted) { options.settled(item.key, 'failed'); return }
+                if (controller.signal.aborted) return
                 if (error instanceof OfficialAssetOwnershipError) { options.settled(item.key, 'failed'); stop(error.reason === 'receipt' ? 'local' : error.reason); return }
-                if (!(error instanceof AccountReadError)) { options.settled(item.key, 'failed'); stop('authentication'); return }
+                if (!(error instanceof AccountReadError)) { options.settled(item.key, 'failed'); stop('local'); return }
                 if (error.kind === 'local') { options.settled(item.key, 'failed'); stop('local'); return }
                 if (error.kind === 'account-changed' || error.status === 401 || error.status === 403) {
                     options.settled(item.key, 'failed'); stop(error.kind === 'account-changed' ? 'account-changed' : 'authentication'); return
@@ -111,8 +111,10 @@ export async function transferOfficialAccountAssets(options: {
                 await install
                 options.settled(item.key, 'installed')
             } catch (error) {
-                options.settled(item.key, 'failed')
-                if (!controller.signal.aborted) stop(error instanceof OfficialAssetOwnershipError && error.reason !== 'receipt' ? error.reason : 'local')
+                if (!controller.signal.aborted) {
+                    options.settled(item.key, 'failed')
+                    stop(error instanceof OfficialAssetOwnershipError && error.reason !== 'receipt' ? error.reason : 'local')
+                }
             }
         })().finally(() => { active.delete(task); notify(); progress() })
         active.add(task)

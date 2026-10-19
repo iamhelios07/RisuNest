@@ -1495,9 +1495,7 @@ describe('AccountStorage structured wire contract', () => {
 
         await expect(restore).resolves.toEqual({ kind: 'missing' })
         await expect(logout).resolves.toBeUndefined()
-        await expect(liveRead).rejects.toThrow(
-            'Native official account session changed during reauthentication',
-        )
+        await expect(liveRead).rejects.toMatchObject({ kind: 'account-changed' })
         expect(flow.getToken()).toBeNull()
         expect(vault.stored).toBeNull()
         expect(setRouting).toHaveBeenCalledTimes(1)
@@ -1813,6 +1811,17 @@ describe('AccountStorage structured wire contract', () => {
         await expect(result).rejects.toBeInstanceOf(AccountReadError)
         await expect(result).rejects.toMatchObject({ kind: 'http', status })
         expect(mocks.alertLogin).toHaveBeenCalledOnce()
+    })
+
+    it('classifies an account change during native asset reauthentication as an ownership change', async () => {
+        const { service, options } = nativeReauthenticationFixture()
+        mocks.fetchProtectedResource.mockResolvedValueOnce(response(null, 403))
+        mocks.alertLogin.mockImplementationOnce(async () => {
+            await service.flow.login({ id: 'account-b', token: 'other-token', data: {} })
+            return JSON.stringify({ id: 'account-a', token: 'fresh-token', data: {} })
+        })
+        const { AccountStorage } = await loadStorage()
+        await expect(new AccountStorage(options).readItem('assets/failure')).rejects.toMatchObject({ kind: 'account-changed' })
     })
 
     it.each([429, 503, 404])('preserves HTTP %s and Retry-After in a native asset failure', async status => {

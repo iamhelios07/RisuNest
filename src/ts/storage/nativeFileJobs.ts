@@ -391,7 +391,6 @@ export function syntheticNativeFileJobStatus(
 ): NativeFileJobStatus {
     const { counts, progress, ...detailPatch } = patch
     return {
-        ...base,
         jobId: base.jobId ?? `synthetic-${base.kind}`,
         kind: base.kind,
         state: base.state ?? 'running',

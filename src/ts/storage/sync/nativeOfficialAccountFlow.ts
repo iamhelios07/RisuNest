@@ -204,12 +204,12 @@ export function createNativeOfficialAccountFlowService(
                 onRestoreStatus(status) { if (status) { lastStatus = status; activationRevision = status.activationRevision ?? activationRevision } },
                 onProgress(progress) {
                     const counts = progress.counts
-                    const status = syntheticNativeFileJobStatus(
+                    const status = { ...lastStatus, ...syntheticNativeFileJobStatus(
                         { ...lastStatus, kind: 'restore-official-account-snapshot', state: 'running', phase: 'reading-source', activationRevision: activationRevision },
                         progress.phase === 'checking' ? 'checking-account-assets'
                             : progress.phase === 'downloading' ? 'downloading-account-assets' : 'finishing-account-restore',
                         { stageCompleted: counts.required - counts.notAttempted, stageTotal: counts.required, stageUnit: 'items' },
-                    )
+                    ), activationRevision }
                     status.officialAssets = progress
                     lastStatus = status
                     options.onStatus?.(status)
@@ -230,9 +230,9 @@ export function createNativeOfficialAccountFlowService(
         if (!failed && !missingAssets) {
             failureCode = 'activation-committed-refresh-failed'
             try {
-                options.onStatus?.(syntheticNativeFileJobStatus(
+                options.onStatus?.({ ...lastStatus, ...syntheticNativeFileJobStatus(
                     { ...lastStatus, kind: 'restore-official-account-snapshot', state: 'running', phase: 'reading-source' }, 'restarting-app',
-                ))
+                ) })
                 await dependencies.restart()
             } catch (error) {
                 failed = true

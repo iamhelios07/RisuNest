@@ -13,6 +13,36 @@ function setup(count = 12, concurrency: 1 | 2 | 4 = 2) {
 }
 
 describe('official account GET scheduling', () => {
+    it.each(['read', 'install'] as const)('does not mark interrupted %s work as failed', async boundary => {
+        const h = setup(4)
+        const controller = new AbortController()
+        const pending: (() => void)[] = []
+        const interrupted = (signal?: AbortSignal) => new Promise<never>((_resolve, reject) => {
+            pending.push(() => reject(signal?.reason))
+            signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+        const run = transferOfficialAccountAssets({ ...h, signal: controller.signal,
+            read: boundary === 'read' ? (_key, options) => interrupted(options.signal) : h.read,
+            install: boundary === 'install' ? (_key, _bytes, signal) => interrupted(signal) : h.install,
+        })
+        await vi.waitFor(() => expect(pending).toHaveLength(boundary === 'read' ? 2 : 1))
+        controller.abort()
+        expect(await run).toMatchObject({ cancelled: true })
+        expect(h.results).toEqual({})
+    })
+
+    it.each([new AccountReadError('http', 401), new Error('unexpected read failure')])('counts only the cause of an internal stop as failed', async failure => {
+        const h = setup(4)
+        const run = transferOfficialAccountAssets({ ...h,
+            read: async (key, options) => {
+                if (key === '0') throw failure
+                return new Promise((_resolve, reject) => options.signal!.addEventListener('abort', () => reject(options.signal!.reason), { once: true }))
+            },
+        })
+        expect(await run).toMatchObject({ reason: failure instanceof AccountReadError ? 'authentication' : 'local' })
+        expect(h.results).toEqual({ '0': 'failed' })
+    })
+
     it('stops immediately on a local cache failure without retrying other files', async () => {
         const h = setup(12, 1)
         h.read.mockRejectedValue(new AccountReadError('local'))

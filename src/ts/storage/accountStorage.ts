@@ -414,7 +414,12 @@ export class AccountStorage{
                 await discardResponseBody(da)
                 deadline?.dispose()
                 if (nativeAssetRead && reauthenticated) throw new AccountReadError('http', da.status)
-                await this.reauthenticate(options.signal, expectedAccountId, expectedToken)
+                try { await this.reauthenticate(options.signal, expectedAccountId, expectedToken) }
+                catch (error) {
+                    checkReadOwner()
+                    if (nativeAssetRead) throw new AccountReadError('http', da.status)
+                    throw error
+                }
                 reauthenticated = true
                 expectedToken = this.auth
             }

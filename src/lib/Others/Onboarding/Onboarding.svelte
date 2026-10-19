@@ -774,7 +774,10 @@
                             {:else}
                                 {#if accountRetryAvailable}
                                     <button class="btn" type="button" onclick={() => {
-                                        void import('src/ts/storage/sync/nativeOfficialAccountOperations').then(module => module.retryNativeOfficialAccountAssetsFromOutcome()).then(continueAfterImport).catch(() => {})
+                                        void import('src/ts/storage/sync/nativeOfficialAccountOperations').then(module => module.retryNativeOfficialAccountAssetsFromOutcome()).then(continueAfterImport).catch(async error => {
+                                            const { failureReason } = await import('src/ts/gui/nativeFileJobDialogModel')
+                                            alertError(failureReason(error?.code ?? ''))
+                                        })
                                     }}>{strings.retry}</button>
                                 {/if}
                                 {#if bodyRetryAvailable}

@@ -203,7 +203,10 @@
                     {#if model.closeVisible}
                         {#if accountRetryAvailable}
                             <SettingButton variant="secondary" onclick={() => {void import('src/ts/storage/sync/nativeOfficialAccountOperations')
-                                .then(({ retryNativeOfficialAccountAssetsFromOutcome }) => retryNativeOfficialAccountAssetsFromOutcome()).catch(() => {})}}>{language.retry}</SettingButton>
+                                .then(({ retryNativeOfficialAccountAssetsFromOutcome }) => retryNativeOfficialAccountAssetsFromOutcome()).catch(async error => {
+                                    const { alertError } = await import('src/ts/alert')
+                                    alertError(failureReason(error?.code ?? ''))
+                                })}}>{language.retry}</SettingButton>
                         {/if}
                         {#if snapshotRetryAvailable}
                             <SettingButton variant="secondary" onclick={() => {void retrySnapshotRestoreBodiesFromOutcome().catch(async error => {

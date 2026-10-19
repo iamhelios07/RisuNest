@@ -4,6 +4,13 @@ import { language } from 'src/lang'
 import { nativeFileOperationOutcome } from 'src/ts/storage/nativeFileJobManager'
 import NativeFileJobDialog from './NativeFileJobDialog.svelte'
 import { syntheticNativeFileJobStatus } from 'src/ts/storage/nativeFileJobs'
+import { failureReason } from 'src/ts/gui/nativeFileJobDialogModel'
+
+const h = vi.hoisted(() => ({ alertError: vi.fn<typeof import('src/ts/alert')['alertError']>() }))
+vi.mock('src/ts/alert', () => ({ alertError: h.alertError }))
+vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
+    getServerSyncController: () => ({ assertFileOperationAvailable() { throw Object.assign(new Error('server-sync-busy'), { code: 'server-sync-busy' }) } }),
+}))
 
 let component: ReturnType<typeof mount> | undefined
 let target: HTMLDivElement | undefined
@@ -13,6 +20,7 @@ afterEach(async () => {
     component = undefined
     target?.remove()
     nativeFileOperationOutcome.set(null)
+    h.alertError.mockClear()
     vi.restoreAllMocks()
 })
 
@@ -30,6 +38,10 @@ describe('file operation error details', () => {
             await tick()
             const retry = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === language.retry)
             expect(!!retry).toBe(reason === 'service')
+            if (reason === 'service') {
+                retry!.click()
+                await vi.waitFor(() => expect(h.alertError).toHaveBeenCalledWith(failureReason('server-sync-busy')))
+            }
         }
     })
     it.each([true, false])('shows and copies diagnostics with raw error available: %s', async rawError => {

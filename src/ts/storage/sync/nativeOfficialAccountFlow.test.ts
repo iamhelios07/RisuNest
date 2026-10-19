@@ -538,6 +538,7 @@ describe('explicit native official account flow', () => {
             state: 'succeeded', activationRevision: 8, activationAuthority: 'authority', warningCodes: ['synthetic-warning'],
             result: { revision: 8, sourceBytes: 100, sourceSha256: 'a'.repeat(64), sourceFingerprintKind: 'whole-file-sha256', characterCount: 3, presetCount: 2, warningCodes: ['synthetic-warning'] },
         }, 'reloading-plugins', { counts: { characters: 3, presets: 2 } })
+        Object.assign(native, { activationRevision: 8, activationAuthority: 'authority' })
         h.nativeRestore.mockImplementationOnce(async (_credential, options) => {
             options.onStatus?.(native)
             return { kind: 'activated', revision: 8 }
@@ -566,6 +567,7 @@ describe('explicit native official account flow', () => {
         h.adapter.pull.mockImplementation(async () => { throw new Error('Retry must not restore the database') })
         h.nativeRestore.mockImplementation(async () => { throw new Error('Retry must not restore the database') })
         const original = syntheticNativeFileJobStatus({ kind: 'restore-official-account-snapshot', jobId: 'original', activationRevision: 5, activationAuthority: 'binding' }, 'cleaning-up')
+        Object.assign(original, { activationRevision: 5, activationAuthority: 'binding' })
         h.completeRestoreAssets.mockImplementationOnce(async (_account, options) => {
             expect(options.operationId).toBe('receipt')
             options.onRestoreStatus?.(original)
@@ -591,6 +593,15 @@ describe('explicit native official account flow', () => {
         expect(harness.restart).not.toHaveBeenCalled()
         expect(blocking.mock.calls).toEqual([[true], [false]])
         expect(harness.clearRestoreAssets).not.toHaveBeenCalled()
+    })
+
+    it.each(['restore', 'resumeAssets'] as const)('keeps a missing-only %s outcome visible without restarting', async operation => {
+        const h = createHarness(true, true)
+        h.completeRestoreAssets.mockResolvedValue({ phase: 'finishing', state: 'succeeded', failedKeys: [],
+            counts: { ...emptyOfficialAccountAssetCounts(), required: 1, missing: 1 } })
+        await h.flow[operation]()
+        expect(h.flushMetadata).toHaveBeenCalledOnce()
+        expect(h.restart).not.toHaveBeenCalled()
     })
 
     it.each([
