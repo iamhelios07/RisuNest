@@ -82,6 +82,17 @@ describe('live chat rows', () => {
         await expect(translateHTML('<p>streaming reply</p>', false, '', 0, false, liveRowContext())).resolves.toBe('<p>streaming reply</p>')
         expect(f.fetch).not.toHaveBeenCalled()
     })
+    it('keeps the translations made earlier for a live row while a reply is generated', async () => {
+        f.fetch.mockImplementation(async (_url: string, init: { body: { text: string[] } }) => (
+            { ok: true, data: { translations: [{ text: `KO ${init.body.text[0]}` }] } }
+        ))
+        await expect(translateHTML('<p>earlier reply</p>', false, '', 0, false, liveRowContext())).resolves.toBe('<p>KO earlier reply</p>')
+        doingChat.set(true)
+        await expect(translateHTML('<p>earlier reply</p>', false, '', 0, false, liveRowContext())).resolves.toBe('<p>KO earlier reply</p>')
+        await expect(translateHTML('<p>earlier reply</p><p>newer reply</p>', false, '', 0, false, liveRowContext()))
+            .resolves.toBe('<p>earlier reply</p><p>newer reply</p>')
+        expect(f.fetch).toHaveBeenCalledOnce()
+    })
     it('translates the same text again for another target language', async () => {
         f.fetch.mockImplementation(async (_url: string, init: { body: { target_lang: string } }) => (
             { ok: true, data: { translations: [{ text: `in ${init.body.target_lang}` }] } }
