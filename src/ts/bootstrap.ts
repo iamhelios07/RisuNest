@@ -1030,7 +1030,7 @@ async function cleanChunks() {
                     }
                 }
             } catch (error) {
-                console.log('error', remote.name)
+                console.warn('Remote asset cleanup failed:', remote.name, error)
             }
         }
     }
