@@ -50,6 +50,26 @@ describe('mobile background task lifetime', () => {
         expect(bridge.end.mock.calls).toEqual([[id(1)], [id(0)]])
     })
 
+    it('asks native again to end a hold while its control channel is full, a bounded number of times', async () => {
+        vi.useFakeTimers()
+        try {
+            const busy = new Error('android-control-busy')
+            bridge.end.mockRejectedValueOnce(busy).mockRejectedValueOnce(busy)
+            const ended = await beginMobileBackgroundTask('backup')
+            const ending = ended.dispose(true)
+            await vi.runAllTimersAsync()
+            await ending
+            expect(bridge.end.mock.calls).toEqual([[id(0)], [id(0)], [id(0)]])
+            bridge.end.mockReset().mockRejectedValue(busy)
+            const refused = await beginMobileBackgroundTask('backup')
+            const giving = refused.dispose(true)
+            await vi.runAllTimersAsync()
+            await giving
+            expect(bridge.end).toHaveBeenCalledTimes(5)
+            expect(hasMobileBackgroundTasks()).toBe(false)
+        } finally { vi.useRealTimers() }
+    })
+
     it.each([
         ['background', { state: 'refused', reason: 'background' }],
         ['failed', { state: 'refused', reason: 'failed' }],

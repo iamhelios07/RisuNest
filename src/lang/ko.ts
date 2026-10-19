@@ -2801,7 +2801,7 @@ export const languageKorean = {
             keepAliveHelp:
                 '알림을 사용해 백그라운드에서도 생성을 이어가도록 돕습니다. Android가 앱을 일시 중지하거나 종료할 수 있습니다.',
             keepAliveWithoutNotification:
-                '알림이 꺼져 있으면 알림 없이 동작합니다.',
+                '알림이 꺼져 있는 경우 알림 없이 동작합니다.',
             operatingSystem: '운영체제',
             webView: 'WebView',
             refreshScreen: '화면 새로고침',

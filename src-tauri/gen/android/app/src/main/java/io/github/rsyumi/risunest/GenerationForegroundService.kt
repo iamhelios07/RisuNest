@@ -142,6 +142,11 @@ internal class BackgroundTaskRegistry {
     // A refused hold stays registered, so the next time the app leaves the screen protects it.
     start()?.let { return it }
     entry.holding = true
+    // Holds a failed start left unprotected join the service this hold started again.
+    for (other in tasks.values.filter { !it.holding && (!it.deferred || !visible) }) {
+      if (start() != null) break
+      other.holding = true
+    }
     runCatching(refresh)
     return BACKGROUND_ACTIVE
   }

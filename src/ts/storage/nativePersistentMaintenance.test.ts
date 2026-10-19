@@ -22,6 +22,7 @@ import {
     applyNativeDataHealthRepair,
     completeNativeDataHealthIntent,
     deepScanNativeDataHealth,
+    holdNativeDataHealthScan,
     scanNativeDataHealth,
     previewNativeDataHealthRepair,
     undoNativeDataHealthRepair,
@@ -135,7 +136,12 @@ describe('native persistent maintenance', () => {
             await executeNativePersistentAssetGc()
             await createNativePersistentSnapshot('manual')
             await scanNativeDataHealth()
-            await deepScanNativeDataHealth(true)
+            expect(held).toEqual(Array(3).fill('maintenance'))
+            // A deep scan's pages run under the one hold the whole scan keeps.
+            await holdNativeDataHealthScan(async () => {
+                expect(held).toEqual(Array(4).fill('maintenance'))
+                await deepScanNativeDataHealth(true)
+            })
             expect(held).toEqual(Array(4).fill('maintenance'))
         } finally {
             mocks.os = 'windows'

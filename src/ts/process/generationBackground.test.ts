@@ -106,8 +106,29 @@ describe('model calls outside a reserved generation', () => {
         await vi.waitFor(() => expect(held.dispose).toHaveBeenCalledOnce())
     })
 
+    it('stop the call when its hold expires, as a cancel from the caller would', async () => {
+        const expiry = new AbortController()
+        const held = hold(expiry.signal)
+        vi.mocked(beginDeferredMobileBackgroundTask).mockReturnValue(held)
+        const caller = new AbortController()
+        let received: AbortSignal | undefined
+        const call = holdModelCall(signal => new Promise((_resolve, reject) => {
+            received = signal
+            signal!.addEventListener('abort', () => reject(signal!.reason), { once: true })
+        }), caller.signal)
+        await vi.waitFor(() => expect(received).toBeDefined())
+        await Promise.resolve()
+        expect(received!.aborted).toBe(false)
+        expiry.abort(new BackgroundExecutionExpiredError())
+        await expect(call).rejects.toBeInstanceOf(BackgroundExecutionExpiredError)
+        await vi.waitFor(() => expect(held.dispose).toHaveBeenCalledOnce())
+        expect(caller.signal.aborted).toBe(false)
+    })
+
     it('take no hold on desktop, with the keep-alive setting off, or inside a reserved generation', async () => {
         mocks.os = 'windows'
+        const caller = new AbortController()
+        await expect(holdModelCall(async signal => signal, caller.signal)).resolves.toBe(caller.signal)
         await expect(holdModelCall(async () => 'desktop')).resolves.toBe('desktop')
         mocks.os = 'android'
         mocks.keepAlive = false

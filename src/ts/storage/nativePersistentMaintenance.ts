@@ -142,7 +142,12 @@ export function scanNativeDataHealth(): Promise<DataHealthResult> {
 }
 
 export function deepScanNativeDataHealth(resume: boolean): Promise<DataHealthResult> {
-    return runUserMaintenance('pds_data_health_deep_scan', { resume })
+    return invoke('pds_data_health_deep_scan', { resume })
+}
+
+/** A deep scan runs page by page under one hold, so it keeps running off screen between pages. */
+export function holdNativeDataHealthScan<T>(operation: (signal?: AbortSignal) => Promise<T>): Promise<T> {
+    return runWithMobileBackgroundTask('maintenance', task => operation(task.signal), undefined, true)
 }
 
 export function getNativeDataHealthResult(): Promise<DataHealthResult | null> {

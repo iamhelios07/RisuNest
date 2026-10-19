@@ -174,6 +174,22 @@ class GenerationForegroundServiceTest {
   }
 
   @Test
+  fun `a hold that starts the service again takes back the holds a failed start left`() {
+    val host = Hosted()
+    host.begin(taskId(1), "backup")
+    host.begin(taskId(2), "sync", deferred = true)
+    host.lifecycle.stopAll { true }
+    host.registry.release()
+    host.begin(taskId(3), "restore")
+    // The deferred hold still waits for the app to leave the screen.
+    assertEquals(listOf(BackgroundTaskStatus("backup"), BackgroundTaskStatus("restore")), host.registry.snapshot())
+    assertTrue(host.end(taskId(3)))
+    assertEquals(0, host.stops)
+    assertTrue(host.end(taskId(1)))
+    assertEquals(1, host.stops)
+  }
+
+  @Test
   fun `an end from a page that was torn down cannot stop a fresh hold`() {
     val host = Hosted()
     host.begin(taskId(1), "generation")

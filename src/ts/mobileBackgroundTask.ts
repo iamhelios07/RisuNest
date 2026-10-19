@@ -1,6 +1,9 @@
 import './androidNativeControl'
 import { isTauriAndroid, isTauriIOS } from './platform'
 import { beginIOSBackgroundTask, BackgroundExecutionExpiredError, isBackgroundExpiryReason } from './iosNative'
+import { measuredTaskPercent } from './taskPercent'
+
+export { measuredTaskPercent }
 
 export type MobileTaskKind = 'backup' | 'restore' | 'sync' | 'import' | 'export' | 'maintenance' | 'generation'
 export type MobileTaskRefusal = 'background' | 'unavailable' | 'timeout' | 'failed'
@@ -32,10 +35,6 @@ export function subscribeMobileBackgroundTasks(listener: () => void): () => void
     return () => listeners.delete(listener)
 }
 function publish() { for (const listener of listeners) listener() }
-export function measuredTaskPercent(completed: number, total?: number): number | null {
-    return Number.isFinite(completed) && Number.isFinite(total) && total! > 0
-        ? Math.max(0, Math.min(100, Math.round(completed * 100 / total!))) : null
-}
 
 interface IOSDeferredHold { controller: AbortController; settled: Promise<void> }
 const iosDeferredHolds = new Set<IOSDeferredHold>()
@@ -154,7 +153,16 @@ function beginTask(
                         window.removeEventListener('risunest-background-expired', expired)
                         signal?.removeEventListener('abort', abort)
                         await pending
-                        await bridge.end(id)
+                        // Native keeps the hold, and its notification, until it hears the end, so a full channel is asked again.
+                        for (let attempt = 1; ; attempt += 1) {
+                            try {
+                                await bridge.end(id)
+                                return
+                            } catch (error) {
+                                if (attempt >= 5 || !(error instanceof Error) || error.message !== 'android-control-busy') throw error
+                            }
+                            await new Promise(resolve => setTimeout(resolve, attempt * 250))
+                        }
                     },
                 }
             }
