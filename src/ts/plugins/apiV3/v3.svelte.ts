@@ -33,6 +33,7 @@ import { beginGenerationEndRun, type GenerationEndRun } from "src/ts/process/gen
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
+import { holdModelCall } from "src/ts/process/generationBackground";
 import { getModuleLorebooks } from "src/ts/process/modules";
 import {
     registerTTSPreprocessor,
@@ -1557,7 +1558,7 @@ const makeRisuaiAPIV3 = (
             staticModel?: string
             allowPlugins?: boolean
         }) => {
-            return requestChatDataMain({
+            return holdModelCall(signal => requestChatDataMain({
                 formated: options.messages,
                 bias: {},
                 staticModel: options.staticModel,
@@ -1570,7 +1571,7 @@ const makeRisuaiAPIV3 = (
                 // explicitly with `allowPlugins: true`, accepting responsibility
                 // for avoiding provider-to-provider call loops.
                 blockPlugins: !options.allowPlugins,
-            }, options.mode, pluginLifetime.signal)
+            }, options.mode, signal), pluginLifetime.signal)
         },
         sendChat: async (message: string) => {
             const authorityEpoch = getPersistentStorageAuthorityEpoch();

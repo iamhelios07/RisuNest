@@ -1924,6 +1924,7 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        backgroundWorkMayStop: 'The task may stop if you leave the app screen.',
         imageFormats: {
             unsupported: 'Unsupported image format. Use PNG, JPEG, GIF, WebP, or AVIF images.',
             damaged: 'The image file is damaged and cannot be opened.',
@@ -2984,8 +2985,8 @@ export const languageEnglish = {
             keepAlive: 'Keep app alive while generating',
             keepAliveHelp:
                 "Uses a notification to help generation continue in the background. Android can still suspend or stop the app.",
-            keepAliveNeedsNotifications:
-                "This feature doesn't work while notifications are off.",
+            keepAliveWithoutNotification:
+                'While notifications are off, this works without showing a notification.',
             operatingSystem: 'Operating system',
             webView: 'WebView',
             refreshScreen: 'Refresh screen',

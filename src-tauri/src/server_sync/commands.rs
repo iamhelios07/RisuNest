@@ -134,8 +134,8 @@ impl ServerSyncCommandState {
         *slot=Some(spawn(NotificationJob(self.notification_active.clone())));
         Ok(())
     }
-    // The first-binding stage holds the library permit outside the transport lanes. Hiding the
-    // app stops those lanes but not the stage; only a reload of the page that awaits it does.
+    // The first-binding stage holds the library permit outside the transport lanes. A sync cancel
+    // stops those lanes but not the stage; only a reload of the page that awaits it does.
     fn claim_stage(&self) -> Result<(StageJob<'_>, Arc<AtomicBool>)> {
         let flag=Arc::new(AtomicBool::new(false));
         *self.stage.lock().map_err(|_|SyncError::new("server-sync-state-unavailable",503))?=Some(flag.clone());

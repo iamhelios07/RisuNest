@@ -21,6 +21,7 @@ const f = vi.hoisted(() => ({
     revision: undefined as undefined | ((revision: number, cause?: string) => void),
     conversation: null as null | { characterId: string; conversationId: string },
     mobile: vi.fn(),
+    deferredMobile: vi.fn(),
     flush: vi.fn(),
     paused: vi.fn(),
     guard: vi.fn(),
@@ -65,7 +66,7 @@ vi.mock('../persistentDataRuntime.svelte', () => ({
     flushPendingDataLocally: f.flush,
     getPersistentDataRuntime: () => f.runtime,
 }))
-vi.mock('../../mobileBackgroundTask', () => ({ runWithMobileBackgroundTask: f.mobile, beginMobileBackgroundTask: vi.fn(), measuredTaskPercent: vi.fn(() => null) }))
+vi.mock('../../mobileBackgroundTask', async () => ({ ...(await import('../../mobileBackgroundTask.testSupport')).mobileBackgroundTaskModule(), runWithMobileBackgroundTask: f.mobile, runWithDeferredMobileBackgroundTask: f.deferredMobile }))
 vi.mock('src/ts/plugins/apiV3/v3.svelte', () => ({ fencePluginExecutionForAuthorityReplacement: vi.fn(), invalidatePluginCachesAfterAuthorityReplacement: vi.fn(), restartPluginsAfterAuthorityReplacement: vi.fn() }))
 vi.mock('../persistentRevisionEvents', () => ({ subscribeLocalPersistentRevision: (callback: (revision: number, cause?: string) => void) => { f.revision = callback; return () => {} } }))
 vi.mock('../generatingConversationRegistry', () => ({ generatingConversations: { snapshot: () => f.generating } }))
@@ -75,6 +76,7 @@ beforeEach(async () => {
     vi.resetModules(); vi.clearAllMocks(); vi.useFakeTimers(); f.events.clear()
     f.native = true; f.transport = undefined; f.dependencies = undefined; f.generating = []; f.selectedIndex = 0; f.viewport = undefined; f.revision = undefined; f.conversation = null
     f.mobile.mockImplementation(async (_kind: string, operation: (task: object) => Promise<unknown>) => operation({ progress() {}, async dispose() {} }))
+    f.deferredMobile.mockImplementation(async (_kind: string, operation: (task: object) => Promise<unknown>) => operation({ progress() {}, async dispose() {} }))
     f.flush.mockResolvedValue(undefined)
     const document = new EventTarget() as EventTarget & { visibilityState: string }
     document.visibilityState = 'hidden'
@@ -463,16 +465,17 @@ describe('production server LWW composition', () => {
         await controller.ensureStatus()
         expect(controller.snapshot().status.assetPolicy).toBe('full')
     })
-    it('resumes interrupted Full hydration on foreground after the cancelled lane settles', async () => {
+    it('keeps Full hydration running while hidden and starts no second one beside it on return', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
-        let reject!: (error: unknown) => void
-        f.invoke.mockImplementation(async command => command === 'server_sync_lww_hydrate' ? new Promise<void>((_resolve, fail) => { reject = fail }) : command === 'server_sync_lww_pull' ? emptyReceive() : null)
+        let finish!: () => void
+        f.invoke.mockImplementation(async command => command === 'server_sync_lww_hydrate' ? new Promise<void>(resolve => { finish = resolve }) : command === 'server_sync_lww_pull' ? emptyReceive() : null)
         visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
         expect(hydrationCalls()).toHaveLength(1)
-        visible(false); await settle(); expect(f.invoke).toHaveBeenCalledWith('server_sync_cancel')
+        visible(false); await settle()
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_notify_stop')
+        expect(f.invoke).not.toHaveBeenCalledWith('server_sync_cancel')
         visible(true); await settle(); expect(hydrationCalls()).toHaveLength(1)
-        reject({ code: 'cancelled' }); await settle()
-        expect(hydrationCalls()).toHaveLength(2)
+        finish(); await settle()
         expect(production.getServerSyncController().snapshot().error).toBe('')
     })
     it('retains a transient hydration failure through conversation open and retries after the shared cooldown', async () => {
@@ -914,16 +917,67 @@ describe('production server LWW composition', () => {
             if (command === 'server_sync_lww_push') return unsent-- > 0 ? { operationId: 'hidden' } : null
             return command === 'server_sync_lww_pull' ? emptyReceive() : null
         })
-        f.invoke.mockClear(); f.mobile.mockClear()
+        f.invoke.mockClear(); f.deferredMobile.mockClear()
         f.revision!(32, 'edit')
         visible(false); await settle()
-        expect(f.mobile).toHaveBeenCalledWith('sync', expect.any(Function))
+        expect(f.deferredMobile).toHaveBeenCalledWith('sync', expect.any(Function))
         expect(f.flush).toHaveBeenCalledOnce()
         expect(unsent).toBeLessThan(0)
         expect(callOrder('server_sync_lww_push')).toBeLessThan(callOrder('server_sync_notify_stop'))
         expect(f.flush.mock.invocationCallOrder[0]).toBeLessThan(callOrder('server_sync_lww_push'))
         await vi.advanceTimersByTimeAsync(5000)
         expect(f.invoke.mock.calls.filter(([command]) => command === 'server_sync_lww_push')).toHaveLength(3)
+    })
+    it('keeps routine sync held from a push in flight at hide through the hide-time publication', async () => {
+        const mobile = await import('../../mobileBackgroundTask')
+        let holds = 0, publishing = false, unheld = false
+        vi.mocked(mobile.beginDeferredMobileBackgroundTask).mockImplementation(() => {
+            holds++
+            return { progress() {}, async dispose() { if (--holds === 0 && !publishing) unheld = true } }
+        })
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        let finishPush!: () => void, pushes = 0
+        f.invoke.mockImplementation(async command => {
+            if (command === 'server_sync_lww_push') {
+                if (++pushes === 1) { await new Promise<void>(resolve => { finishPush = resolve }); return null }
+                publishing = true
+                return null
+            }
+            return command === 'server_sync_lww_pull' ? emptyReceive() : null
+        })
+        f.revision!(32, 'edit')
+        await vi.advanceTimersByTimeAsync(2000)
+        expect(pushes).toBe(1)
+        unheld = false
+        visible(false); await settle()
+        finishPush(); await settle()
+        expect(publishing).toBe(true)
+        expect(unheld).toBe(false)
+    })
+    it('stops routine sync where it stands when the platform time runs out and resumes on return', async () => {
+        const mobile = await import('../../mobileBackgroundTask')
+        const { BackgroundExecutionExpiredError } = await import('../../iosNative')
+        const expiry = new AbortController()
+        vi.mocked(mobile.beginDeferredMobileBackgroundTask).mockImplementation(() => ({ signal: expiry.signal, progress() {}, async dispose() {} }))
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        let finishPull!: () => void
+        f.invoke.mockImplementation(async command => command === 'server_sync_lww_pull'
+            ? new Promise(resolve => { finishPull = () => resolve(emptyReceive()) }) : null)
+        f.events.get('risu-server-sync-remote-hint')!({ payload: null })
+        await settle()
+        expect(finishPull).toBeTypeOf('function')
+        visible(false); await settle()
+        expect(f.invoke).not.toHaveBeenCalledWith('server_sync_cancel')
+        expiry.abort(new BackgroundExecutionExpiredError())
+        await settle()
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_cancel')
+        finishPull(); await settle()
+        f.invoke.mockClear()
+        f.invoke.mockImplementation(async command => command === 'server_sync_lww_pull' ? emptyReceive() : null)
+        visible(true); await settle()
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_pull', expect.anything())
     })
     it('keeps a failed binding visible as a paused connection that 지금 동기화 resumes', async () => {
         const { bindSyncTarget } = await import('./bindingRegistry')

@@ -15,6 +15,7 @@ import { AppendableBuffer, changeChatTo, checkCharOrder, createChatCopyName, dow
 import { updateInlayScreen } from "./process/inlayScreen";
 import { parseMarkdownSafe } from "./parser/parser.svelte";
 import { translateHTML } from "./translator/translator";
+import { beginMobileBackgroundTask, type MobileBackgroundTask } from "./mobileBackgroundTask";
 import { doingChat } from "./process/index.svelte";
 import { importCharacter } from "./characterCards";
 import { PngChunk } from "./pngChunk";
@@ -262,6 +263,13 @@ function hideNameInExportedHtml(html: string, name: string) {
 }
 
 export async function exportChat(page:number){
+    // Translating every message can take long, so it holds the background task until the save step.
+    let translation: MobileBackgroundTask | Promise<MobileBackgroundTask> | undefined
+    const endTranslation = async () => {
+        const task = await translation
+        translation = undefined
+        await task?.dispose()
+    }
     try {
 
         const mode = await alertSelect(['Export as JSON', "Export as TXT", "Export as HTML File", "Export as HTML Embed"])
@@ -279,6 +287,7 @@ export async function exportChat(page:number){
             v = parseMarkdownSafe(v)
 
             if(doTranslate){
+                translation ??= beginMobileBackgroundTask('export', undefined, true)
                 // Translation can return new markup, so it gets the same filter as parseMarkdownSafe.
                 v = DOMPurify.sanitize(await translateHTML(v, false, '', -1), exportedChatSanitizeConfig)
             }
@@ -374,6 +383,7 @@ export async function exportChat(page:number){
             `
 
 
+            await endTranslation()
             await downloadFile(`${char.name}_${date}_chat`.replace(/[<>:"/\\|?*\.\,]/g, "") + '.html', Buffer.from(doc, 'utf-8'))
         }
         else if(mode === '3'){
@@ -405,6 +415,7 @@ export async function exportChat(page:number){
                 <p>Chat from RisuNest</p>
             `
 
+            await endTranslation()
             offerHtmlClipboardExport(template, `${char.name}_${date}_chat`.replace(/[<>:"/\\|?*\.\,]/g, "") + '.html', {
                 present: value => alertStore.set(value),
                 download: downloadFile,
@@ -434,6 +445,8 @@ export async function exportChat(page:number){
         alertNormal(language.successExport)
     } catch (error) {
         alertError(error)
+    } finally {
+        await endTranslation()
     }
 }
 
