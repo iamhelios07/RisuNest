@@ -321,6 +321,8 @@ export function resolveNativeFileJobStage(
         return 'assign-plugin-values'
     }
     if (status.detail) return status.detail.stage
+    // A failed or cancelled job also reports `complete`; the stage it stopped in stays current.
+    const endedEarly = status.state === 'failed' || status.state === 'cancelled'
     if (status.kind === 'official-publication-upload') {
         switch (status.phase) {
             case 'queued':
@@ -332,8 +334,9 @@ export function resolveNativeFileJobStage(
             case 'awaiting-publication-retry':
                 return 'publishing-destination'
             case 'finalizing-publication':
-            case 'complete':
                 return 'finalizing-export'
+            case 'complete':
+                return endedEarly ? null : 'finalizing-export'
             default:
                 return null
         }
@@ -349,8 +352,9 @@ export function resolveNativeFileJobStage(
             case 'publishing-destination':
                 return 'publishing-destination'
             case 'finalizing-export':
-            case 'complete':
                 return 'finalizing-export'
+            case 'complete':
+                return endedEarly ? null : 'finalizing-export'
             default:
                 return null
         }

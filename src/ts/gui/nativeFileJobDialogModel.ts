@@ -574,6 +574,8 @@ export function failureReason(code: string, direction: 'import' | 'export' = 'im
         case 'invalid-source':
         case 'invalid-input':
             return copy.reasonInvalidSource
+        case 'unsupported-projection':
+            return copy.reasonCompatibleUnsupportedValue
         case 'truncated-input':
             return copy.reasonTruncated
         case 'damaged-image':
