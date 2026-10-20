@@ -38,3 +38,31 @@ pnpm benchmark:tokenizer:core
 ```
 
 The harness does not access RisuRealm or account services.
+
+## Gemma 4
+
+The application's Gemma Vitest tests use the real WASM engine and read the
+bundled, minified tokenizer from
+[`public/token/gemma`](../../public/token/gemma/SOURCE.md), which includes its
+license and source hashes. External requests are rejected by the test boundary.
+Reference IDs are stored in `tests/fixtures/tokenizer/gemma4.json`.
+
+Verify the expected IDs independently with Python 3.9 or later:
+
+```sh
+python -m pip install tokenizers==0.22.2
+python benchmarks/tokenizer/verifyGemmaTokenizer.py
+```
+
+This check validates the bundled file's SHA-256 and reference IDs without network
+requests or fixture edits. Python is not required for the regular Vitest suite.
+
+Measure the bundled JSON's compressed sizes locally:
+
+```sh
+node benchmarks/tokenizer/gemmaArtifactSizes.mjs
+```
+
+This checks the bundled file's hash and minified form, then reports raw, gzip and
+Brotli sizes at qualities 2, 9 and 11 using Node's codecs. These are artifact sizes,
+not measured installer or APK size changes. It does not modify product assets.

@@ -1,4 +1,7 @@
+import { readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import gemma4Reference from '../../tests/fixtures/tokenizer/gemma4.json'
 
 const harness = vi.hoisted(() => ({
     nativeBatch: vi.fn(),
@@ -7,6 +10,7 @@ const harness = vi.hoisted(() => ({
     aiModel: 'gpt-4',
     modelTokenizer: 1,
     modelInternalID: 'synthetic-count-model',
+    customTokenizer: 'tik',
     googleClaudeTokenizing: false,
     transformersTokenizer: vi.fn(),
 }))
@@ -21,7 +25,7 @@ vi.mock('./storage/database.svelte', () => ({
     getDatabase: () => ({
         aiModel: harness.aiModel,
         currentPluginProvider: '',
-        customTokenizer: 'tik',
+        customTokenizer: harness.customTokenizer,
         googleClaudeTokenizing: harness.googleClaudeTokenizing,
         useTokenizerCaching: harness.useTokenizerCaching,
     }),
@@ -391,4 +395,79 @@ describe('encodeWithTokenizer', () => {
             expected.free()
         }
     })
+})
+
+describe('Gemma and Llama tokenizers', () => {
+    const turnText = '<|turn>user\nHello<turn|>'
+    const turnIds = [105, 2364, 107, 9259, 106]
+
+    beforeEach(() => {
+        harness.aiModel = 'gemini-2.5-flash'
+        harness.modelTokenizer = 10
+        harness.customTokenizer = 'gemma'
+        harness.googleClaudeTokenizing = false
+        harness.useTokenizerCaching = false
+        pluginV2.providerOptions.clear()
+        vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+            if (input.startsWith('https://generativelanguage.googleapis.com/')) {
+                return new Response('', { status: 503 })
+            }
+            if (!input.startsWith('/token/') || input.includes('..')) {
+                throw new Error(`Unexpected tokenizer asset: ${input}`)
+            }
+            const bytes = await readFile(resolve('public', input.slice(1)))
+            return new Response(bytes)
+        }))
+    })
+
+    afterEach(() => {
+        vi.unstubAllGlobals()
+        harness.aiModel = 'gpt-4'
+        harness.modelTokenizer = 1
+        harness.customTokenizer = 'tik'
+        harness.googleClaudeTokenizing = false
+        pluginV2.providerOptions.clear()
+    })
+
+    it.each(gemma4Reference.cases)('matches the Gemma 4 reference IDs for $name', async ({ text, ids }) => {
+        expect([...await encode(text)]).toEqual(ids)
+        expect([...await encodeWithTokenizer(text, 'gemma')]).toEqual(ids)
+    })
+
+    it.each(['openrouter', 'reverse_proxy', 'custom'])(
+        'uses Gemma 4 when %s selects gemma',
+        async (aiModel) => {
+            harness.aiModel = aiModel
+            pluginV2.providerOptions.set('', { tokenizer: 'gemma' })
+            expect([...await encode(turnText)]).toEqual(turnIds)
+        },
+    )
+
+    it('uses Gemma 4 for the built-in Gemma tokenizer', async () => {
+        harness.modelTokenizer = 9
+        expect([...await encode(turnText)]).toEqual(turnIds)
+    })
+
+    it('uses the same Gemma 4 IDs when the Google token count API fails', async () => {
+        harness.googleClaudeTokenizing = true
+        expect([...await encode(turnText)]).toEqual(turnIds)
+    })
+
+    it('keeps a successful Google token count when the API is enabled', async () => {
+        harness.googleClaudeTokenizing = true
+        vi.stubGlobal('fetch', vi.fn(async () => Response.json({ totalTokens: 7 })))
+        expect((await encode('API count')).length).toBe(7)
+    })
+
+    it.each(['openrouter', 'reverse_proxy', 'custom'])(
+        'uses Llama 3 IDs when %s selects llama3',
+        async (aiModel) => {
+            harness.aiModel = aiModel
+            harness.customTokenizer = 'llama3'
+            pluginV2.providerOptions.set('', { tokenizer: 'llama3' })
+            const expected = [...await encodeWithTokenizer('Hello, world!', 'llama3')]
+            expect([...await encodeWithTokenizer('Hello, world!', 'llama')]).not.toEqual(expected)
+            expect([...await encode('Hello, world!')]).toEqual(expected)
+        },
+    )
 })
