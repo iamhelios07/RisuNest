@@ -218,12 +218,18 @@ fn startup_keeps_the_active_generation_and_hands_abandoned_stages_to_the_purge()
     let present = |store: &PersistentStore| store.connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)", [&old_page], |row| row.get::<_, bool>(0),
     ).unwrap();
-    assert!(present(&store), "opening preserves objects still held by another generation");
+    let now = 1_900_000_000_000i64;
+    for time in [now, now + ASSET_GC_PRODUCT_MINIMUM_GRACE_MS] {
+        assert!(store.sweep_message_page_objects(
+            super::super::MessageObjectStore::Library, time, super::super::MESSAGE_PAGE_SWEEP_LIMIT,
+        ).unwrap().wrapped);
+    }
+    assert!(present(&store), "sweeps preserve objects still held by another generation");
     purge_all(&mut store);
     assert_eq!(rows(&store, &abandoned), 0);
     assert_eq!(state(&store, &abandoned), None);
-    let now = 1_900_000_000_000i64;
-    for time in [now, now + ASSET_GC_PRODUCT_MINIMUM_GRACE_MS] {
+    let after_purge = now + 2 * ASSET_GC_PRODUCT_MINIMUM_GRACE_MS;
+    for time in [after_purge, after_purge + ASSET_GC_PRODUCT_MINIMUM_GRACE_MS] {
         assert!(store.sweep_message_page_objects(
             super::super::MessageObjectStore::Library, time, super::super::MESSAGE_PAGE_SWEEP_LIMIT,
         ).unwrap().wrapped);

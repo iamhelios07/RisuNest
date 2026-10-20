@@ -2005,7 +2005,7 @@ export const languageEnglish = {
             "zipSaved": "The archive was saved.",
             "zipSkipped": "The archive was saved. {0} unreadable items were skipped.",
             "fileSaved": "The file was saved.",
-            "unavailable": "The attachment could not be loaded"
+            "unavailable": "The file could not be loaded"
         },
         pluginStartup: {
             delayLabel: 'Load plugins after sync',
