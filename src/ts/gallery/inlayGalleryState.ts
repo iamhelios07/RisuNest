@@ -75,4 +75,3 @@ export function galleryOriginIds(metadata: Record<string, unknown> | undefined):
     if (typeof characterId !== 'string' || !characterId || typeof conversationId !== 'string' || !conversationId) return null
     return { characterId, conversationId }
 }
-

@@ -46,4 +46,3 @@ async function resolveOriginalGalleryMedia(item: GalleryItem): Promise<GalleryMe
 export function releaseGalleryMedia(source: GalleryMediaSource | null): void {
     if (source?.objectUrl) URL.revokeObjectURL(source.url)
 }
-

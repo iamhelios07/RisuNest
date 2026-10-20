@@ -440,4 +440,3 @@ try {
         throw new Error('--action=seed-images|seed-aliases|archive-fixture|memory|metadata|scan|scroll required')
     }
 } finally { client.close() }
-
