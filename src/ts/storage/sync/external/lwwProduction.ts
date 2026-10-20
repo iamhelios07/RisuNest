@@ -141,14 +141,15 @@ function createAdapter(connectionId: string): Adapter {
         const joined = joinAbortSignals([signal, active?.signal])
         try { return await run({ state, signal: joined.signal }) } finally { joined.dispose() }
     }
-    // Native code returns one bounded page per call until none remain.
-    const receive = async (binding: BindingContext, turnLimit?: number): Promise<LwwTurn> => {
+    // Native code returns one bounded page per call until the listed batch is done;
+    // with `completeAvailable` it lists again after each batch until nothing is left.
+    const receive = async (binding: BindingContext, turnLimit?: number, completeAvailable = false): Promise<LwwTurn> => {
         const progress = beginExternalProgress(connectionId, 'sync')
         let received = 0
         try {
             for (;;) {
                 binding.signal.throwIfAborted()
-                const request = await progress.invoke<LwwStageReceive | null>('external_lww_receive', { request: header(connectionId, binding) }, binding.state.targetAuthority)
+                const request = await progress.invoke<LwwStageReceive | null>('external_lww_receive', { request: { ...header(connectionId, binding), ...(completeAvailable ? { completeAvailable } : {}) } }, binding.state.targetAuthority)
                 binding.signal.throwIfAborted()
                 if (!request) { progress.finish('complete', received > 0); notifySyncReceiveCompleted(); return { count: received, more: false } }
                 binding.signal.throwIfAborted()
@@ -277,7 +278,7 @@ function createAdapter(connectionId: string): Adapter {
         async receiveAvailableChanges(binding) {
             if (!active || active.signal.aborted || active.state.targetAuthority !== binding.state.targetAuthority || active.state.selectionEpoch !== binding.state.selectionEpoch) throw new Error('Sync is stopped')
             const joined = joinAbortSignals([binding.signal, active.signal])
-            try { await receive({ ...binding, signal: joined.signal }) } finally { joined.dispose() }
+            try { await receive({ ...binding, signal: joined.signal }, undefined, true) } finally { joined.dispose() }
         },
     }
     const unregister = registerSyncBindingTransport({ kind: 'external', connectionId }, transport)

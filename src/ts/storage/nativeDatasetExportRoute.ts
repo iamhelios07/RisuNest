@@ -11,6 +11,7 @@ import {
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 import {
     prepareNativeContentExportFromPicker,
+    withNativeContentExportDestination,
     type NativeContentExportPickerDependencies,
 } from './nativeContentExportPicker'
 import { NativeFileOperationBusyError, runSharedNativeFileOperation } from './nativeFileJobManager'
@@ -70,10 +71,10 @@ export async function exportNativeDataset(
                 }, sharedOptions, dependencies)
                 if (flow.kind === 'unsupported') throw new Error('Native dataset export is unavailable')
                 if (flow.kind === 'cancelled') throw new Error('The Downloads folder is unavailable')
-                return await dependencies.runExport({
+                return await withNativeContentExportDestination(flow.destination, () => dependencies.runExport({
                     destination: flow.destination,
                     expectedRevision: flow.expectedRevision,
-                }, sharedOptions)
+                }, sharedOptions))
             } finally {
                 for (const source of signals) source.removeEventListener('abort', abort)
             }

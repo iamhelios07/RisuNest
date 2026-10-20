@@ -1,6 +1,7 @@
 import {isTauriDesktop, isTauriAndroid, isTauriIOS} from '../platform'
 import {save} from '../storage/fileSelection'
-import {prepareNativeContentExportFromPicker} from '../storage/nativeContentExportPicker'
+import {prepareNativeContentExportFromPicker, withNativeContentExportDestination,
+    type NativeContentExportPickerDependencies} from '../storage/nativeContentExportPicker'
 import type {NativeGalleryExportInput, NativeFileJobOptions, NativeFileJobResult} from '../storage/nativeFileJobs'
 import {getBlobStore} from '../storage/platformBlobStore'
 import type {GalleryItem} from './types'
@@ -25,6 +26,7 @@ export interface GalleryDownloadDependencies {
     isAndroid(): boolean
     isIOS(): boolean
     runtime(): {readonly revision: number; flushPendingData(reason: string): Promise<void>}
+    reserveAndroidDestination?: NativeContentExportPickerDependencies['reserveAndroidDestination']
     chooseDestination(name: string): Promise<string | null>
     runExport(input: NativeGalleryExportInput, options: NativeFileJobOptions): Promise<NativeFileJobResult>
     downloadWeb(item: GalleryItem): Promise<void>
@@ -77,34 +79,37 @@ export async function downloadGallery(input: GalleryDownloadInput, options: Gall
         const suggestedName = !input.archive && input.item
             ? galleryDownloadName(input.item.name, input.item.key, input.item.ext) : input.suggestedName
         const flow = await prepareNativeContentExportFromPicker({suggestedName, flushReason: 'gallery-download',
-            chooseDestination: () => deps.chooseDestination(suggestedName)}, options, deps)
+            androidSourceKind: 'download', chooseDestination: () => deps.chooseDestination(suggestedName)}, options, deps)
         if (flow.kind === 'cancelled') return cancelled
         if (flow.kind === 'unsupported') {
             if (input.archive || !input.item) throw new Error('Gallery download is unavailable')
             await deps.downloadWeb(input.item)
             return {cancelled: false, skipped: 0}
         }
-        let revision = flow.expectedRevision
-        for (let attempt = 0; attempt < 2; attempt++) {
-            try {
-                const selection: NativeGalleryExportInput['selection'] = input.kind === 'asset'
-                    ? {kind: 'asset', entries: input.captureEntries ? await input.captureEntries(revision) : input.entries ?? []}
-                    : {kind: 'inlay', keys: input.keys ?? []}
-                const result = await deps.runExport({destination: flow.destination, expectedRevision: revision,
-                    archive: input.archive, selection}, {signal: options.signal,
-                    onStatus: status => options.onProgress?.({done: status.progress.completedItems,
-                        total: status.progress.totalItems ?? 0})})
-                const skipped = Number(result.warningCodes.find(code => code.startsWith('gallery-skipped:'))?.split(':')[1] ?? 0)
-                return {cancelled: false, skipped}
-            } catch (error) {
-                const staleRevision = error instanceof RevisionConflictError ||
-                    !!error && typeof error === 'object' && 'code' in error && error.code === 'revision-conflict'
-                if (attempt !== 0 || !staleRevision) throw error
-                await deps.runtime().flushPendingData('gallery-download-retry')
-                revision = deps.runtime().revision
+        // The retry keeps the destination the user already picked.
+        return await withNativeContentExportDestination(flow.destination, async () => {
+            let revision = flow.expectedRevision
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    const selection: NativeGalleryExportInput['selection'] = input.kind === 'asset'
+                        ? {kind: 'asset', entries: input.captureEntries ? await input.captureEntries(revision) : input.entries ?? []}
+                        : {kind: 'inlay', keys: input.keys ?? []}
+                    const result = await deps.runExport({destination: flow.destination, expectedRevision: revision,
+                        archive: input.archive, selection}, {signal: options.signal,
+                        onStatus: status => options.onProgress?.({done: status.progress.completedItems,
+                            total: status.progress.totalItems ?? 0})})
+                    const skipped = Number(result.warningCodes.find(code => code.startsWith('gallery-skipped:'))?.split(':')[1] ?? 0)
+                    return {cancelled: false, skipped}
+                } catch (error) {
+                    const staleRevision = error instanceof RevisionConflictError ||
+                        !!error && typeof error === 'object' && 'code' in error && error.code === 'revision-conflict'
+                    if (attempt !== 0 || !staleRevision) throw error
+                    await deps.runtime().flushPendingData('gallery-download-retry')
+                    revision = deps.runtime().revision
+                }
             }
-        }
-        throw new Error('Gallery download failed')
+            throw new Error('Gallery download failed')
+        })
     } catch (error) {
         if (options.signal?.aborted || error instanceof Error && error.name === 'AbortError') return cancelled
         throw error

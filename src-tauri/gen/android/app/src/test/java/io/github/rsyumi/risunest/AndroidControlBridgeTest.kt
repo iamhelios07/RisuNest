@@ -96,7 +96,7 @@ class AndroidControlBridgeTest {
 
   @Test fun dispatchSurfaceIsExplicitAndKeepsExistingArgumentShapes() {
     assertEquals(0, androidControlArgumentCount("generation.notificationsEnabled"))
-    assertEquals(2, androidControlArgumentCount("background.begin"))
+    assertEquals(3, androidControlArgumentCount("background.begin"))
     assertEquals(2, androidControlArgumentCount("background.defer"))
     assertEquals(1, androidControlArgumentCount("lifecycle.onFlushHold"))
     assertEquals(1, androidControlArgumentCount("saf.acknowledgeExport"))

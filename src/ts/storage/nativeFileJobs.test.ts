@@ -5306,3 +5306,23 @@ it.each([
     expect(holding).toBe(false)
     expect(result.handoffPath).toBeUndefined()
 })
+
+it('neither reopens nor releases an Android destination its caller reserved', async () => {
+    const picker = androidSafReservationFixture()
+    const reservation = await picker.reserve('photo.png', 'download')
+    const input = {destination: {type: 'androidSaf' as const, suggestedName: 'photo.png', reservation},
+        expectedRevision: 42, archive: false, selection: {kind: 'inlay' as const, keys: ['selected-inlay']}}
+    const dependencies = {
+        isTauri: () => true,
+        invoke: async () => { throw new Error('expected data revision 42, but current revision is 43') },
+        wait: async () => {},
+        reserveAndroidDestination: picker.reserve,
+        copyToAndroidSaf: async () => { throw new Error('A failed export publishes nothing') },
+    }
+    // A gallery retry after a revision conflict publishes to the destination the user already picked.
+    for (let attempt = 0; attempt < 2; attempt++) {
+        await expect(runNativeGalleryExport(input, {}, dependencies)).rejects.toThrow('current revision is 43')
+    }
+    expect(picker.bridge.reserveExport).toHaveBeenCalledOnce()
+    expect(picker.bridge.releaseExport).not.toHaveBeenCalled()
+})
