@@ -3578,6 +3578,7 @@ export function runNativeGalleryExport(
 ): Promise<NativeFileJobResult> {
     return runNativeManagedExport({
         operation: 'Native gallery export',
+        holdsBackground: true,
         safLengthMismatchLabel: 'gallery download',
         handoffCleanupCommand: 'native_download_handoff_cleanup',
         androidSourceKind: 'download',

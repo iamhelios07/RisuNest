@@ -7,6 +7,7 @@
     import { isTauri } from 'src/ts/platform'
     import { gallerySize } from 'src/ts/gallery/preferences'
     import { selectMultipleFile, selectSingleFile } from 'src/ts/util'
+    import { imageAliases, selectedImageFormat, stripImageExtension } from 'src/ts/media/imageFormats'
     import { selectCharImg } from 'src/ts/characters'
     import { alertActionConfirm, alertError, alertToast } from 'src/ts/alert'
     import { commitPreparedUnitIntent, mutatePersistentCharacterDetail, readPersistentCharacterDetail } from 'src/ts/storage/persistentDataRuntime.svelte'
@@ -57,8 +58,7 @@
     let progressTitle = $state('')
     let progress = $state<{ done: number; total: number } | null>(null)
     let downloadAbort: AbortController | undefined
-    const imageExtensions = ['png', 'webp', 'gif', 'jpeg', 'jpg', 'avif', 'svg', 'bmp']
-    const allExtensions = [...imageExtensions, 'mp4', 'webm', 'mov', 'mp3', 'wav', 'ogg', 'flac', 'm4a', 'ttf', 'otf', 'css', 'woff', 'woff2']
+    const allExtensions = [...imageAliases, 'svg', 'bmp', 'mp4', 'webm', 'mov', 'mp3', 'wav', 'ogg', 'flac', 'm4a', 'ttf', 'otf', 'css', 'woff', 'woff2']
     const currentOwner = $derived(owner.kind === 'character'
         ? DBState.db.characters.find(value => value.chaId === owner.id)
         : DBState.db.modules.find(value => value.id === owner.id))
@@ -198,13 +198,20 @@
         busy = true
         try { await operation() } catch (error) { await report(error) } finally { busy = false }
     }
+    // An identified image is stored and declared under its canonical extension, like the other asset selectors.
+    async function storeFile(file: { name: string; data: Uint8Array }) {
+        const format = selectedImageFormat(file.data, file.name)
+        const ext = format?.ext ?? assetExtension(file.name)
+        return { key: await saveAsset(file.data, '', format ? `${stripImageExtension(file.name)}.${ext}` : file.name), ext }
+    }
     async function add() {
         const targetSection = section
         await action(async () => {
-            const files = await selectMultipleFile(targetSection === 'assets' ? allExtensions : imageExtensions)
+            const files = targetSection === 'assets' ? await selectMultipleFile(allExtensions)
+                : await selectMultipleFile(imageAliases, { image: true })
             if (!files?.length) return
             const prepared: { name: string; key: string; ext: string }[] = []
-            for (const file of files) prepared.push({ name: file.name, key: await saveAsset(file.data, '', file.name), ext: assetExtension(file.name) })
+            for (const file of files) prepared.push({ name: file.name, ...await storeFile(file) })
             await mutate('add-assets', value => addGalleryAssets(owner, value, targetSection, prepared))
         })
     }
@@ -225,10 +232,11 @@
                 if (index >= 0) await selectCharImg(index, value => assertAssetSnapshots(owner, value, [target]))
                 return
             }
-            const file = await selectSingleFile(target.section === 'assets' ? allExtensions : imageExtensions)
+            const file = target.section === 'assets' ? await selectSingleFile(allExtensions)
+                : await selectSingleFile(imageAliases, { image: true })
             if (!file) return
-            const key = await saveAsset(file.data, '', file.name)
-            await mutate('replace-asset', value => replaceGalleryAsset(owner, value, target, key, assetExtension(file.name)))
+            const { key, ext } = await storeFile(file)
+            await mutate('replace-asset', value => replaceGalleryAsset(owner, value, target, key, ext))
         })
     }
     function startRename(target: AssetGalleryItem) { renameTarget = target; renameValue = target.name; renameError = '' }

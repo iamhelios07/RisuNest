@@ -5261,15 +5261,17 @@ describe('native snapshot restore', () => {
 
 it.each([
     ['androidSaf', false], ['androidSaf', true], ['iosFiles', false], ['iosFiles', true],
-] as const)('publishes gallery downloads through %s (archive=%s) and cleans their handoff', async (platform, archive) => {
+] as const)('publishes gallery downloads through %s (archive=%s) under a background hold and cleans their handoff', async (platform, archive) => {
     const kind = archive ? 'export-gallery-zip' : 'export-gallery-file'
     const handoffPath = '/synthetic/native-file-jobs/handoffs/risu-download-123e4567-e89b-42d3-a456-426614174004.bin'
     let published = false
     let cleaned = false
+    let holding = false
     const selection = {kind: 'inlay' as const, keys: ['selected-inlay']}
     const publish = async (request: {sourcePath: string; suggestedName: string}) => {
         expect(request.sourcePath).toBe(handoffPath)
         expect(request.suggestedName).toBe(archive ? 'images.zip' : 'photo.png')
+        expect(holding).toBe(true)
         published = true
         return {bytes: 10, warningCodes: []}
     }
@@ -5279,6 +5281,7 @@ it.each([
         invoke: async (command, args) => {
             if (command === 'native_file_job_start') {
                 expect(args?.request).toEqual({kind, expectedRevision: 42, selection})
+                expect(holding).toBe(true)
                 return {jobId: 'gallery'}
             }
             if (command === 'native_file_job_status') return {jobId: 'gallery', kind, state: 'succeeded', phase: 'complete',
@@ -5291,10 +5294,15 @@ it.each([
         },
         wait: async () => {},
         reserveAndroidDestination: androidSafReservationFixture().reserve,
+        holdExport: async (operation, signal) => {
+            holding = true
+            try { return await operation(signal) } finally { holding = false }
+        },
         copyToAndroidSaf: publish,
         copyToIOSFiles: publish,
     })
     expect(published).toBe(true)
     expect(cleaned).toBe(true)
+    expect(holding).toBe(false)
     expect(result.handoffPath).toBeUndefined()
 })
