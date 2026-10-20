@@ -9,6 +9,7 @@ const harness = vi.hoisted(() => ({
     useTokenizerCaching: false,
     aiModel: 'gpt-4',
     modelTokenizer: 1,
+    modelInternalID: 'synthetic-count-model',
     customTokenizer: 'tik',
     googleClaudeTokenizing: false,
     transformersTokenizer: vi.fn(),
@@ -37,7 +38,7 @@ vi.mock('./process/transformers', () => ({
 }))
 vi.mock('./globalApi.svelte', () => ({ globalFetch: vi.fn() }))
 vi.mock('./model/modellist', () => ({
-    getModelInfo: () => ({ tokenizer: harness.modelTokenizer }),
+    getModelInfo: () => ({ tokenizer: harness.modelTokenizer, internalID: harness.modelInternalID }),
     LLMTokenizer: {
         Unknown: 0,
         tiktokenCl100kBase: 1,
@@ -63,6 +64,7 @@ vi.mock('./plugins/plugins.svelte', () => ({
 
 import { ChatTokenizer, encode, encodeWithTokenizer, strongBan } from './tokenizer'
 import { pluginV2 } from './plugins/plugins.svelte'
+import type { OpenAIChat } from './process/index.svelte'
 
 describe('chat tokenizer native count batching', () => {
     beforeEach(() => {
@@ -71,37 +73,79 @@ describe('chat tokenizer native count batching', () => {
         harness.useTokenizerCaching = false
         harness.aiModel = 'gpt-4'
         harness.modelTokenizer = 1
+        harness.modelInternalID = 'synthetic-count-model'
+        harness.googleClaudeTokenizing = false
         harness.transformersTokenizer.mockReset()
     })
 
+    afterEach(() => vi.unstubAllGlobals())
+
     it('preserves arbitrary plugin tokenizer calls even with generation reuse enabled', async () => {
         harness.aiModel = 'custom'
-        const tokenizerFunc = vi.fn(async () => [1, 2])
+        const tokenizerFunc = vi.fn().mockResolvedValueOnce([1, 2]).mockResolvedValueOnce([1, 2, 3])
         pluginV2.providerOptions.set('', { tokenizer: 'custom', tokenizerFunc })
         const tokenizer = new ChatTokenizer(2, 'noName', true)
         const chat = { role: 'user' as const, content: 'synthetic' }
         await expect(tokenizer.tokenizeChat(chat)).resolves.toBe(4)
-        await expect(tokenizer.tokenizeChat(chat)).resolves.toBe(4)
+        await expect(tokenizer.tokenizeChat(chat)).resolves.toBe(5)
         expect(tokenizerFunc).toHaveBeenCalledTimes(2)
     })
 
-    it('reuses generation-local text counts but invalidates changed content and tokenizer settings', async () => {
-        harness.aiModel = 'hf:::synthetic/model-a'
-        harness.modelTokenizer = 12
-        harness.transformersTokenizer.mockResolvedValue([1, 2, 3])
+    it.each([false, true])('preserves exact generation counts across edits and tokenizer changes (global cache: %s)', async (globalCache) => {
+        harness.useTokenizerCaching = globalCache
+        const tokenizer = new ChatTokenizer(2, 'name', true)
+        const chat: OpenAIChat = { role: 'user', content: '첫 번째 답변 🙂', name: '사용자' }
+        const check = async (tokenizerId: string) => {
+            const expected = (await encodeWithTokenizer(chat.content, tokenizerId)).length + 2
+                + (chat.name ? (await encodeWithTokenizer(chat.name, tokenizerId)).length + 1 : 0)
+            expect(await tokenizer.tokenizeChat(chat)).toBe(expected)
+            expect(await tokenizer.tokenizeChat(chat)).toBe(expected)
+        }
+        await check('tik')
+        chat.content = 'A changed answer with more words, punctuation and Unicode: 한글 🙂.'
+        await check('tik')
+        chat.name = 'A longer speaker name'
+        await check('tik')
+        delete chat.name
+        await check('tik')
+        harness.modelTokenizer = 2
+        await check('o200k_base')
+        harness.aiModel = 'custom'
+        pluginV2.providerOptions.set('', { tokenizer: 'cl100k_base' })
+        await check('tik')
+        pluginV2.providerOptions.set('', { tokenizer: 'o200k_base' })
+        await check('o200k_base')
+    })
+
+    it('recomputes multimodal and requested thought adjustments around cached text counts', async () => {
         const tokenizer = new ChatTokenizer(2, 'noName', true)
-        const chat = { role: 'user' as const, content: 'synthetic' }
-        await expect(tokenizer.tokenizeChat(chat)).resolves.toBe(5)
-        await expect(tokenizer.tokenizeChat(chat)).resolves.toBe(5)
-        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(1)
-        chat.content = 'edited'
-        await tokenizer.tokenizeChat(chat)
-        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(2)
-        harness.aiModel = 'hf:::synthetic/model-b'
-        await tokenizer.tokenizeChat(chat)
-        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(3)
-        await new ChatTokenizer(2, 'noName', true).tokenizeChat(chat)
-        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(4)
+        const chat: OpenAIChat = { role: 'assistant', content: 'synthetic response' }
+        const text = (await encodeWithTokenizer(chat.content, 'tik')).length + 2
+        expect(await tokenizer.tokenizeChat(chat)).toBe(text)
+        chat.multimodals = [{ type: 'image', base64: 'synthetic' }]
+        expect(await tokenizer.tokenizeChat(chat)).toBe(text + 2)
+        chat.multimodals.push({type: 'image', base64: 'synthetic-second'})
+        expect(await tokenizer.tokenizeChat(chat)).toBe(text + 4)
+        delete chat.multimodals
+        chat.thoughts = ['first thought', '두 번째 생각']
+        const thoughts = (await Promise.all(chat.thoughts.map(async thought =>
+            (await encodeWithTokenizer(thought, 'tik')).length + 1))).reduce((total, count) => total + count, 0)
+        expect(await tokenizer.tokenizeChat(chat, {countThoughts: true})).toBe(text + thoughts)
+        expect(await tokenizer.tokenizeChat(chat)).toBe(text)
+    })
+
+    it('preserves remote tokenizer routing changes when generation reuse is enabled', async () => {
+        harness.aiModel = 'google-test'
+        harness.modelTokenizer = 10
+        harness.googleClaudeTokenizing = true
+        const fetchCount = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({totalTokens: 7})))
+            .mockResolvedValueOnce(new Response(JSON.stringify({totalTokens: 11})))
+        vi.stubGlobal('fetch', fetchCount)
+        const tokenizer = new ChatTokenizer(2, 'noName', true)
+        const chat: OpenAIChat = {role: 'user', content: 'synthetic remote count'}
+        expect(await tokenizer.tokenizeChat(chat)).toBe(9)
+        harness.modelInternalID = 'synthetic-count-model-other'
+        expect(await tokenizer.tokenizeChat(chat)).toBe(13)
     })
 
     it('keeps count reuse opt-in and never reuses a failed count', async () => {

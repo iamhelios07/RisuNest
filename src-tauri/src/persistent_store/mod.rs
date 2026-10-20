@@ -2071,7 +2071,11 @@ impl PersistentStore {
         commit: &WorkingSetCommit,
         asset_aliases: &[AssetAlias],
     ) -> StoreResult<RevisionResult> {
-        self.lww_commit(commit, asset_aliases)
+        let document = crate::generation_diagnostics::commit_document();
+        let mut committed_revision = None;
+        let result = self.lww_commit(commit, asset_aliases, &mut committed_revision);
+        crate::generation_diagnostics::commit_finished(document, commit.expected_revision, &result, committed_revision);
+        result
     }
 
     pub(crate) fn commit_asset_alias(
@@ -2079,7 +2083,7 @@ impl PersistentStore {
         alias: &AssetAlias,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        self.lww_commit(&WorkingSetCommit{expected_revision,..Default::default()}, &[alias.clone()])
+        self.lww_commit(&WorkingSetCommit{expected_revision,..Default::default()}, &[alias.clone()], &mut None)
     }
 
     pub(crate) fn delete_asset_alias(
@@ -2088,7 +2092,7 @@ impl PersistentStore {
         key: &str,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        self.lww_commit(&WorkingSetCommit{expected_revision,unit_mutations:Some(vec![lww::UnitMutation::Delete{key:lww::unit_key(&[kind,key])?}]),..Default::default()}, &[])
+        self.lww_commit(&WorkingSetCommit{expected_revision,unit_mutations:Some(vec![lww::UnitMutation::Delete{key:lww::unit_key(&[kind,key])?}]),..Default::default()}, &[], &mut None)
     }
 
     pub(crate) fn archive_preview(

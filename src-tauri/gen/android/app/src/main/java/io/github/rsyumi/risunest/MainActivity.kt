@@ -549,6 +549,8 @@ private val postNotificationsRequestedInProcess = AtomicBoolean(false)
 class MainActivity : TauriActivity(), RendererRecoveryHost {
   @androidx.annotation.Keep
   private external fun cancelIncompleteBoot()
+  @androidx.annotation.Keep
+  private external fun recordRendererExit(didCrash: Boolean)
 
   private fun finishForUserExit() {
     runCatching { cancelIncompleteBoot() }.onFailure { Log.e(TAG, "Boot cancellation failed", it) }
@@ -716,6 +718,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   override fun recoverRenderer(webView: WebView, didCrash: Boolean): Boolean {
+    runCatching { recordRendererExit(didCrash) }
     frontendReady.cancel()
     commitBridge?.close()
     commitBridge = null
