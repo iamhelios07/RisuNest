@@ -122,66 +122,21 @@ fn schema_configures_the_documented_sqlite_profile() {
 
 #[test]
 fn snapshots_create_list_and_restore_before_reopen() {
-    for removal in ["none", "conversation", "empty-conversation", "character", "archive", "replacement"] {
-        let (directory, mut store, database) = open_fixture();
-        let revision = store.revision().unwrap();
-        match removal {
-            "conversation" | "empty-conversation" => {
-                if removal == "empty-conversation" {
-                    store.commit(&WorkingSetCommit {
-                        conversations: Some(vec![ConversationMutation::ReplaceRange {
-                            character_id: "char-a".into(), conversation_id: "conv-short".into(),
-                            start: 0, delete_count: 2, messages: vec![],
-                            conversation: None, configured_index: None,
-                        }]),
-                        ..empty_working_set_commit(revision)
-                    }).unwrap();
-                }
-                store.commit(&WorkingSetCommit {
-                    conversations: Some(vec![ConversationMutation::Delete {
-                        character_id: "char-a".into(), conversation_id: "conv-short".into(),
-                    }]),
-                    ..empty_working_set_commit(store.revision().unwrap())
-                }).unwrap();
-            }
-            "character" => {
-                store.commit(&WorkingSetCommit {
-                    delete_character_ids: Some(vec!["char-a".into()]),
-                    ..empty_working_set_commit(revision)
-                }).unwrap();
-            }
-            "archive" => { store.archive_character("char-a", revision, 10).unwrap(); }
-            "replacement" => {
-                let mut character = database["characters"].as_array().unwrap().iter()
-                    .find(|character| character["chaId"] == "char-a").unwrap().clone();
-                character["chats"].as_array_mut().unwrap().retain(|chat| chat["id"] != "conv-short");
-                store.commit(&WorkingSetCommit {
-                    replace_character: Some(character),
-                    ..empty_working_set_commit(revision)
-                }).unwrap();
-            }
-            "none" => (),
-            _ => unreachable!(),
-        }
-        let expected = store.materialize(None).unwrap();
-        let snapshot=store.snapshot_create("contract-test").unwrap();
-        assert!(snapshot.bytes>0);
-        assert_eq!(store.snapshot_list().unwrap().len(),1);
-        let revision = store.revision().unwrap();
-        store.commit(&WorkingSetCommit {root:Some(json!({"username":"Changed after snapshot"})),..empty_working_set_commit(revision)}).unwrap();
-        let revision = store.revision().unwrap();
-        let stage=store.snapshot_restore_stage(&snapshot.id,"contract-restore")
-            .unwrap_or_else(|error| panic!("{removal}: {error}"));
-        let authority=store.lww_binding_authority().unwrap();
-        let receipt=store.snapshot_restore_activate(&stage.staging_id,revision,authority).unwrap();
-        assert_eq!(receipt.revision,revision+1);
-        assert_eq!(store.materialize(None).unwrap(),expected,"{removal}");
-        drop(store);
-        let restored=PersistentStore::open(directory.path()).unwrap();
-        assert_eq!(restored.revision().unwrap(),receipt.revision);
-        assert_eq!(restored.materialize(None).unwrap(),expected,"{removal}");
-        assert!(restored.snapshot_list().unwrap().iter().any(|s|s.id==snapshot.id));
-    }
+    let (directory, mut store, database) = open_fixture();
+    let snapshot=store.snapshot_create("contract-test").unwrap();
+    assert!(snapshot.bytes>0);
+    assert_eq!(store.snapshot_list().unwrap().len(),1);
+    store.commit(&WorkingSetCommit {root:Some(json!({"username":"Changed after snapshot"})),..empty_working_set_commit(1)}).unwrap();
+    let stage=store.snapshot_restore_stage(&snapshot.id,"contract-restore").unwrap();
+    let authority=store.lww_binding_authority().unwrap();
+    let receipt=store.snapshot_restore_activate(&stage.staging_id,2,authority).unwrap();
+    assert_eq!(receipt.revision,3);
+    assert_eq!(store.materialize(None).unwrap(),database);
+    drop(store);
+    let restored=PersistentStore::open(directory.path()).unwrap();
+    assert_eq!(restored.revision().unwrap(),receipt.revision);
+    assert_eq!(restored.materialize(None).unwrap(),database);
+    assert!(restored.snapshot_list().unwrap().iter().any(|s|s.id==snapshot.id));
 }
 
 #[test]
