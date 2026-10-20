@@ -85,6 +85,7 @@ export async function exportCompatibilityBackupFromSystemPicker(
                     destination = { type: 'desktopPath', path }
                 }
                 let report: NativeCompatibilityReport | undefined
+                let destinationChosen = false
                 const result = await runNativeCompatibleLocalBackupExport(
                     getPersistentDataRuntime(),
                     target,
@@ -99,11 +100,24 @@ export async function exportCompatibilityBackupFromSystemPicker(
                             options.onStatus?.(status)
                         },
                         onDestinationChosen: () => {
+                            destinationChosen = true
                             protect()
                             options.onDestinationChosen?.()
                         },
                     },
-                )
+                ).catch((error: unknown) => {
+                    // Backing out of the Android save picker ends like a dismissed
+                    // desktop dialog; a cancelled export still rejects.
+                    if (
+                        !destinationChosen &&
+                        !controller.signal.aborted &&
+                        error instanceof DOMException &&
+                        error.name === 'AbortError'
+                    )
+                        return null
+                    throw error
+                })
+                if (!result) return null
                 if (report) options.onReport?.(report)
                 return {
                     ...result,

@@ -165,6 +165,26 @@ describe('compatibility backup production picker', () => {
         expect(mocks.resume).toHaveBeenCalledOnce()
     })
 
+    it('ends quietly when the Android save picker is backed out of and rejects a failure or a later cancellation', async () => {
+        mocks.platform = 'android'
+        const cancelled = () => new DOMException('Android SAF export was cancelled', 'AbortError')
+        const onReport = vi.fn()
+        mocks.runExport.mockRejectedValueOnce(cancelled())
+        await expect(exportCompatibilityBackupFromSystemPicker('risuai', { onReport })).resolves.toBeNull()
+        expect(mocks.protect).not.toHaveBeenCalled()
+        expect(onReport).not.toHaveBeenCalled()
+        expect(mocks.resume).toHaveBeenCalledOnce()
+        mocks.runExport.mockRejectedValueOnce(new Error('synthetic reservation failure'))
+        await expect(exportCompatibilityBackupFromSystemPicker('risuai')).rejects.toThrow('synthetic reservation failure')
+        mocks.runExport.mockImplementationOnce(
+            async (_runtime, _target, _destination, options: NativeFileJobOptions) => {
+                options.onDestinationChosen?.()
+                throw cancelled()
+            },
+        )
+        await expect(exportCompatibilityBackupFromSystemPicker('risuai')).rejects.toMatchObject({ name: 'AbortError' })
+    })
+
     it('bridges manager cancellation while the system picker is open', async () => {
         mocks.save.mockImplementation(async () => {
             mocks.managedController.abort()

@@ -819,5 +819,18 @@ describe('RisuSave picker route', () => {
         expect(deps.runNativeImport).not.toHaveBeenCalled()
         expect(deps.runNativeExport).not.toHaveBeenCalled()
         expect(chosen).not.toHaveBeenCalled()
+
+        // Backing out of the Android save picker ends the same way, while a cancelled export still rejects.
+        const picker = androidSafReservationFixture()
+        picker.bridge.reserveExport.mockImplementation((requestId: string) => { picker.backOut(requestId) })
+        deps.platform = () => 'native-android'
+        deps.reserveAndroidDestination = picker.reserve
+        deps.withFlushedExport = vi.fn()
+        await expect(exportRisuSaveFromPicker({ onDestinationChosen: chosen }, deps)).resolves.toBeNull()
+        expect(picker.bridge.reserveExport).toHaveBeenCalledOnce()
+        expect(deps.withFlushedExport).not.toHaveBeenCalled()
+        expect(chosen).not.toHaveBeenCalled()
+        await expect(exportRisuSaveFromPicker({ signal: AbortSignal.abort() }, deps))
+            .rejects.toMatchObject({ name: 'AbortError' })
     })
 })
