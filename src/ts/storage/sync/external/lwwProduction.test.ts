@@ -300,7 +300,8 @@ describe('native external LWW adapter', () => {
         const next = { header: { bindingAuthority: '4', requestId: 'synthetic-receive-next' }, changes: [] }
         fixture.invoke.mockClear(); fixture.apply.mockClear()
         fixture.invoke.mockResolvedValueOnce(request).mockResolvedValueOnce(next); await transport.receiveAvailableChanges(context())
-        expect(fixture.invoke.mock.calls.map(call => call[0])).toEqual(['external_lww_receive', 'external_lww_receive', 'external_lww_receive'])
+        // Every call asks native code to list again after a batch, so the final null means nothing is left.
+        expect(fixture.invoke.mock.calls.map(([command, args]) => [command, args.request.completeAvailable])).toEqual(Array(3).fill(['external_lww_receive', true]))
         expect(fixture.apply.mock.calls).toEqual([[request], [next]])
         fixture.invoke.mockRejectedValueOnce({ kind: 'corrupt' })
         await expect(transport.receiveAvailableChanges(context())).rejects.toEqual({ kind: 'corrupt' })
