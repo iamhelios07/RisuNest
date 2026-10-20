@@ -353,7 +353,7 @@ describe('encodeWithTokenizer', () => {
     })
 })
 
-describe('Gemma tokenizer', () => {
+describe('Gemma and Llama tokenizers', () => {
     const turnText = '<|turn>user\nHello<turn|>'
     const turnIds = [105, 2364, 107, 9259, 106]
 
@@ -414,4 +414,16 @@ describe('Gemma tokenizer', () => {
         vi.stubGlobal('fetch', vi.fn(async () => Response.json({ totalTokens: 7 })))
         expect((await encode('API count')).length).toBe(7)
     })
+
+    it.each(['openrouter', 'reverse_proxy', 'custom'])(
+        'uses Llama 3 IDs when %s selects llama3',
+        async (aiModel) => {
+            harness.aiModel = aiModel
+            harness.customTokenizer = 'llama3'
+            pluginV2.providerOptions.set('', { tokenizer: 'llama3' })
+            const expected = [...await encodeWithTokenizer('Hello, world!', 'llama3')]
+            expect([...await encodeWithTokenizer('Hello, world!', 'llama')]).not.toEqual(expected)
+            expect([...await encode('Hello, world!')]).toEqual(expected)
+        },
+    )
 })
