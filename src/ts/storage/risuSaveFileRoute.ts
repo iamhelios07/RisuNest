@@ -142,6 +142,7 @@ async function exportThroughAndroidSaf(
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult> {
     const reservation = await dependencies.reserveAndroidDestination(name, 'risuSave', options.signal)
+    options.onDestinationChosen?.()
     return withAndroidSafDestination(reservation, () =>
         exportToReservedAndroidSaf(runtime, name, options, dependencies, reservation))
 }
@@ -478,6 +479,7 @@ export async function exportRisuSaveFromPicker(
     if (platform === 'native-desktop' || platform === 'native-ios') {
         const destination = await dependencies.chooseNativeExport(name)
         if (!destination) return null
+        options.onDestinationChosen?.()
         let result: NativeFileJobResult
         try {
             result = await dependencies.runNativeExport(
