@@ -637,7 +637,7 @@ describe('selected conversation eviction correctness corpus', () => {
             getPersistentDataRuntime: () => runtime,
             invalidateActiveConversationSession: () => runtime.invalidateActiveConversationSession(),
         }))
-        // Generation recognizes the runtime's metadata-only shells only when both load the same modules.
+        // Later imports recognize the runtime's metadata-only shells only when they share its lifecycle module.
         vi.doMock('./selectedConversationLifecycle', () => selectedConversationLifecycle)
         vi.doMock('../process/request/request', () => ({
             requestChatData: vi.fn(async () => ({
@@ -877,19 +877,9 @@ describe('selected conversation eviction correctness corpus', () => {
         const { captureCurrentHypaMessageById } = await import(
             '../../lib/Others/HypaV3Modal/utils'
         )
-        const { createMetadataOnlySelectedConversation } = await import(
-            './selectedConversationLifecycle'
-        )
-        const hypaOwner = fixture.workingCopy.characters[0]
-        const hypaChatIndex = hypaOwner.chatPage ?? 0
-        const runtimeMetadataShell = hypaOwner.chats[hypaChatIndex]
-        hypaOwner.chats[hypaChatIndex] = createMetadataOnlySelectedConversation(
-            runtimeMetadataShell,
-        )
         const hypaRevisionSpy = vi.spyOn(store, 'acquireRevision')
         const hypaCompleteSpy = vi.spyOn(runtime, 'acquireCompleteConversation')
         const hypa = await captureCurrentHypaMessageById('message-3888')
-        hypaOwner.chats[hypaChatIndex] = runtimeMetadataShell
         expect(hypa?.kind).toBe('persistent')
         expect(hypa?.message).toEqual(oracle.message.find((message) => message.chatId === 'message-3888'))
         expect(hypaRevisionSpy).toHaveBeenCalledWith(expectedRevision)
