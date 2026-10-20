@@ -25,6 +25,7 @@ import { CONVERSATION_RANGE_MAX_LIMIT, RevisionConflictError, type WorkingSetCom
 import {
     createPersistentDataRuntime,
 } from './persistentDataRuntime'
+import * as selectedConversationLifecycle from './selectedConversationLifecycle'
 import { createPluginDatabaseAccess } from '../plugins/pluginDatabaseAccess'
 import { createEvictionFixture, makeConversation, VIEWPORT_ROW_BUDGET } from './tests/selectedConversationEvictionFixture'
 
@@ -43,7 +44,7 @@ const interfaceMockModules = [
     '../process/models/modelString', '../process/inlayScreen', '../process/transformers',
     '../process/memory/hanuraiMemory', '../process/memory/hypav2', '../process/memory/hypav3',
     '../process/scriptings', '../plugins/plugins.svelte', '../process/presetChain',
-    '../model/modellist',
+    '../model/modellist', './selectedConversationLifecycle',
 ]
 
 afterEach(() => {
@@ -636,6 +637,8 @@ describe('selected conversation eviction correctness corpus', () => {
             getPersistentDataRuntime: () => runtime,
             invalidateActiveConversationSession: () => runtime.invalidateActiveConversationSession(),
         }))
+        // Generation recognizes the runtime's metadata-only shells only when both load the same modules.
+        vi.doMock('./selectedConversationLifecycle', () => selectedConversationLifecycle)
         vi.doMock('../process/request/request', () => ({
             requestChatData: vi.fn(async () => ({
                 type: 'streaming',
