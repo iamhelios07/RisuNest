@@ -91,7 +91,10 @@ describe('portrait rendition preparation through native IPC', () => {
         png.set(imageFixture('png'))
         const result = await prepareCharacterPortraitRendition(character, 7, 'png-card')
         expect(result?.descriptor.sourceHash).toBe(sourceHash)
-        expect(staging.get(result!.descriptor.path)).toEqual(png)
+        // toEqual walks a megabyte array element by element and takes seconds; the digest compares the same bytes.
+        const staged = staging.get(result!.descriptor.path)!
+        expect(staged.length).toBe(png.length)
+        expect(createHash('sha256').update(staged).digest('hex')).toBe(createHash('sha256').update(png).digest('hex'))
         expect(leases.size).toBe(0)
         await result!.release()
         expect(staging.size).toBe(0)
