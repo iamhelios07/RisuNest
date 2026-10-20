@@ -1,4 +1,5 @@
 pub(crate) mod archive;
+pub(crate) mod gallery;
 pub(crate) mod asset_object_catalog;
 pub(crate) mod asset_residency;
 pub(crate) mod commands;
@@ -957,6 +958,7 @@ pub(super) struct ReadTarget {
 
 pub(crate) struct PersistentStore {
     gc_instance: String,
+    gallery: gallery::GallerySession,
     revision_leases: HashMap<String, snapshot::RevisionReadLease>,
     active_readers: Arc<snapshot::ActiveReaderRegistry>,
     connection: Connection,
@@ -1657,6 +1659,7 @@ impl PersistentStore {
         let device_store = open_device_store(&persistent_dir);
         let mut store = Self {
             gc_instance: uuid::Uuid::new_v4().to_string(),
+            gallery: gallery::GallerySession::default(),
             revision_leases: HashMap::new(),
             active_readers,
             connection,
@@ -1688,6 +1691,7 @@ impl PersistentStore {
         let device_store = open_device_store(&self.repository_root.join("persistent"));
         Ok(Self {
             gc_instance: uuid::Uuid::new_v4().to_string(),
+            gallery: gallery::GallerySession::default(),
             revision_leases: HashMap::new(),
             active_readers: Arc::clone(&self.active_readers),
             connection,

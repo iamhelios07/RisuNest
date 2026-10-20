@@ -98,6 +98,7 @@ function aliasBlobMetadata(alias: AssetAlias): BlobMetadata {
         name: alias.name,
         ext: alias.ext,
         inlayType: alias.inlayType,
+        ...(alias.metadata === undefined ? {} : { metadata: alias.metadata }),
         ...(alias.width === undefined ? {} : { width: alias.width }),
         ...(alias.height === undefined ? {} : { height: alias.height }),
     }
@@ -253,7 +254,7 @@ export interface NewInlayImageEncoder {
     encodeNewInlayImage(
         key: string,
         data: Uint8Array,
-        input: { name: string, options?: InlayEncodeOptions },
+        input: { name: string, options?: InlayEncodeOptions, metadata?: Record<string, unknown> },
     ): Promise<NewInlayImageEncoding>
 }
 
@@ -304,7 +305,7 @@ export type CompleteAssetRepositoryBlobStore = BlobStore &
         prepareOwnedNewInlayImage(
             key: string,
             ownedData: Uint8Array,
-            input: { name: string, options?: InlayEncodeOptions },
+            input: { name: string, options?: InlayEncodeOptions, metadata?: Record<string, unknown> },
         ): Promise<PreparedCompleteAssetWrite>
     }
 
@@ -319,7 +320,7 @@ export interface CompleteTypedAssetRepository {
     prepareOwnedNewInlayImage(
         identity: AssetAliasIdentity,
         ownedData: Uint8Array,
-        input: { name: string, options?: InlayEncodeOptions },
+        input: { name: string, options?: InlayEncodeOptions, metadata?: Record<string, unknown> },
     ): Promise<PreparedCompleteAssetWrite>
     put(
         identity: AssetAliasIdentity,
@@ -329,7 +330,7 @@ export interface CompleteTypedAssetRepository {
     putNewInlayImage(
         identity: AssetAliasIdentity,
         data: Uint8Array,
-        input: { name: string, options?: InlayEncodeOptions },
+        input: { name: string, options?: InlayEncodeOptions, metadata?: Record<string, unknown> },
     ): Promise<InlayBlobMetadata>
     read(identity: AssetAliasIdentity, range?: BlobReadRange): Promise<Uint8Array | null>
     stat(identity: AssetAliasIdentity): Promise<BlobMetadata | null>
@@ -496,7 +497,7 @@ export function createCompleteTypedAssetRepository(
     const prepareNewInlayImage = async (
         identity: AssetAliasIdentity,
         ownedData: Uint8Array,
-        input: { name: string },
+        input: { name: string, metadata?: Record<string, unknown> },
     ): Promise<PreparedCompleteAssetWrite> => {
         validateAssetAliasIdentity(identity)
         if (identity.kind !== 'inlay') {
@@ -514,7 +515,7 @@ export function createCompleteTypedAssetRepository(
             throw new TypeError('New Inlay image encoder must return Inlay metadata')
         }
         const { preservationReason, ...metadata } = encoded.metadata
-        const prepared = await preparePublish(identity, encoded.data, metadata)
+        const prepared = await preparePublish(identity, encoded.data, { ...metadata, ...(input.metadata === undefined ? {} : { metadata: input.metadata }) })
         return {
             ...prepared,
             async activate(expectedAlias?: AssetAlias) {
