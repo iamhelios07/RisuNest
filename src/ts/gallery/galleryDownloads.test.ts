@@ -39,6 +39,24 @@ describe('gallery downloads', () => {
         expect(requests.map(request => request.expectedRevision)).toEqual([4, 5])
         expect(requests[1].selection).toEqual({kind: 'asset', entries: [{key: 'assets/shared.png', name: 'at-5', section: 'icons'}]})
     })
+    it('picks the Android destination once and keeps it for the stale-revision retry', async () => {
+        const events: unknown[] = []
+        const reservation = {requestId: 'synthetic-request', bind: async () => {}, release: async () => {events.push('release')}}
+        const requests: NativeGalleryExportInput[] = []
+        const deps = dependencies(async request => {
+            requests.push(request)
+            if (requests.length === 1) throw {code: 'revision-conflict'}
+            return result
+        })
+        deps.isDesktop = () => false
+        deps.isAndroid = () => true
+        deps.reserveAndroidDestination = async (name, kind) => { events.push(['pick', name, kind]); return reservation }
+        await expect(downloadGallery({kind: 'inlay', keys: ['first'], archive: true, suggestedName: 'attachments.zip'}, {}, deps))
+            .resolves.toEqual({cancelled: false, skipped: 0})
+        expect(requests.map(request => request.destination))
+            .toEqual(Array(2).fill({type: 'androidSaf', suggestedName: 'attachments.zip', reservation}))
+        expect(events).toEqual([['pick', 'attachments.zip', 'download'], 'release'])
+    })
     it('retries a caller snapshot lease conflict before starting any native job', async () => {
         let captures = 0
         let exports = 0

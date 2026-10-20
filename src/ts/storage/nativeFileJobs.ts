@@ -671,7 +671,8 @@ export interface NativeDatasetExportInput {
 
 export type NativeCharacterCharxExportDestination =
     | { type: 'desktopPath'; path: string }
-    | { type: 'androidSaf'; suggestedName: string }
+    /** A destination reserved by the caller stays the caller's to release. */
+    | { type: 'androidSaf'; suggestedName: string; reservation?: AndroidSafDestinationReservation }
     | { type: 'iosFiles'; suggestedName: string }
 
 export type NativeBackupDestination =
@@ -2241,16 +2242,18 @@ async function runNativeManagedExport(
         throw new Error(`${spec.operation} requires Tauri`)
     }
     if (options.signal?.aborted) throw abortError()
-    let reservation = spec.reservation
+    let reservation = spec.reservation ?? (spec.destination.type === 'androidSaf' ? spec.destination.reservation : undefined)
+    let owned = false
     if (spec.destination.type === 'androidSaf' && !reservation) {
         if (!dependencies.reserveAndroidDestination) throw new NativeFileJobError('unsupported', 'Android SAF destination reservation is unavailable')
         reservation = await dependencies.reserveAndroidDestination(spec.destination.suggestedName, spec.androidSourceKind ?? 'risuSave', options.signal)
+        owned = true
     }
     const run = (signal = options.signal) =>
         runNativeManagedExportToDestination(spec, { ...options, signal }, dependencies, reservation)
     // The destination is chosen by now, so the picker never holds the background task.
-    return withAndroidSafDestination(reservation, () => spec.holdsBackground && dependencies.holdExport
-        ? dependencies.holdExport(run, options.signal) : run())
+    const work = () => spec.holdsBackground && dependencies.holdExport ? dependencies.holdExport(run, options.signal) : run()
+    return owned ? withAndroidSafDestination(reservation, work) : work()
 }
 
 async function runNativeManagedExportToDestination(
