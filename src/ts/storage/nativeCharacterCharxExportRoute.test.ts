@@ -181,6 +181,20 @@ describe('native character CharX export route', () => {
             runtime: () => ({ revision, flushPendingData: async () => { throw new Error('flush failed') } }),
         })).rejects.toThrow('flush failed')
         expect(calls).toEqual([['pick', 'Android character.charx', 'risuSave'], ['release']])
+
+        // Backing out of the save picker ends the export without an error, while a cancelled job still rejects.
+        const backedOut = {
+            ...dependencies,
+            reserveAndroidDestination: async (name: string, kind: string) => {
+                calls.push(['pick', name, kind])
+                throw new DOMException('Android SAF export was cancelled', 'AbortError')
+            },
+        }
+        calls.length = 0
+        await expect(exportNativeCharacterCharxFromPicker(input, {}, backedOut)).resolves.toBeNull()
+        expect(calls).toEqual([['pick', 'Android character.charx', 'risuSave']])
+        await expect(exportNativeCharacterCharxFromPicker(input, { signal: AbortSignal.abort() }, backedOut))
+            .rejects.toMatchObject({ name: 'AbortError' })
     })
 
     it('matches the desktop dialog filter to the requested container', async () => {

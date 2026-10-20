@@ -65,6 +65,12 @@ export async function prepareNativeContentExportFromPicker(
         ? undefined
         : await (dependencies.reserveAndroidDestination ?? reserveAndroidSafDestination)(
             input.suggestedName, input.androidSourceKind ?? 'risuSave', options.signal)
+            .catch((error: unknown) => {
+                // Backing out of the save picker cancels like a desktop picker; a cancelled job still rejects.
+                if (!options.signal?.aborted && error instanceof DOMException && error.name === 'AbortError') return null
+                throw error
+            })
+    if (reservation === null) return { kind: 'cancelled' }
     try {
         const runtime = dependencies.runtime()
         await runtime.flushPendingData(input.flushReason)

@@ -70,7 +70,11 @@ export async function exportNativeDataset(
                     chooseDestination: () => dependencies.desktopDestination(DATASET_EXPORT_FILE_NAME),
                 }, sharedOptions, dependencies)
                 if (flow.kind === 'unsupported') throw new Error('Native dataset export is unavailable')
-                if (flow.kind === 'cancelled') throw new Error('The Downloads folder is unavailable')
+                if (flow.kind === 'cancelled') {
+                    // Desktop writes into Downloads without a picker, so only Android can be backed out of.
+                    if (dependencies.isDesktop()) throw new Error('The Downloads folder is unavailable')
+                    return null
+                }
                 return await withNativeContentExportDestination(flow.destination, () => dependencies.runExport({
                     destination: flow.destination,
                     expectedRevision: flow.expectedRevision,

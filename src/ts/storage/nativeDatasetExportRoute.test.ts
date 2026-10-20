@@ -89,6 +89,18 @@ describe('native dataset export route', () => {
         expect(get(nativeFileOperationOutcome)).toMatchObject({ state: 'failed', format: 'dataset' })
         expect(isLibraryFileOperationReserved()).toBe(false)
     })
+    it('ends without an outcome when the Android save picker is backed out of', async () => {
+        const calls: unknown[] = []
+        const deps = { ...dependencies('android', calls), reserveAndroidDestination: async () => {
+            calls.push(['reserve'])
+            throw new DOMException('Android SAF export was cancelled', 'AbortError')
+        } }
+        dismissNativeFileOperationOutcome()
+        await expect(exportNativeDataset({}, deps)).resolves.toBeNull()
+        expect(calls).toEqual([['reserve']])
+        expect(get(nativeFileOperationOutcome)).toBeNull()
+        expect(isLibraryFileOperationReserved()).toBe(false)
+    })
     it('writes the desktop dataset into Downloads after flushing pending edits', async () => {
         const calls: unknown[] = []
 
