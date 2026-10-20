@@ -612,7 +612,8 @@ async fn dispatch_ready(
     };
     let retry_after = super::providers::common::retry_after_ms(&response.headers, after)
         .map(|until| Duration::from_millis(until.saturating_sub(after)));
-    if (200..300).contains(&response.status) && response.headers.get("content-type")
+    // Creation acknowledgements may contain HTML; 204 responses have no content.
+    if !matches!(response.status, 201 | 204) && (200..300).contains(&response.status) && response.headers.get("content-type")
         .is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/html")) {
         return Err(super::providers::common::error(ErrorKind::EndpointRejected, response.status)
             .caused("The server returned an HTML page instead of storage data (Content-Type: text/html)"));
@@ -1040,11 +1041,11 @@ mod tests {
             std::task::Poll::Ready(Ok(()))
         }
     }
-    struct SyntheticResponse { html: bool }
+    struct SyntheticResponse { status: u16, html: bool }
     impl HttpTransport for SyntheticResponse {
         fn send<'a>(&'a self, _: HttpRequest, _: &'a Cancellation) -> ProviderFuture<'a, HttpResponse> {
             Box::pin(async move { Ok(HttpResponse {
-                status: 200,
+                status: self.status,
                 headers: if self.html { BTreeMap::from([("content-type".into(), "text/html; charset=utf-8".into())]) } else { BTreeMap::new() },
                 body: Box::pin(SlowResponseBody { wait: Box::pin(tokio::time::sleep(Duration::from_secs(50))) }),
             }) })
@@ -1058,13 +1059,15 @@ mod tests {
             let cancel = Cancellation::default();
             let mut download = request("onedrive", "synthetic");
             download.operation = ProviderOperation::DownloadUrl;
-            let mut response = dispatch_ready(&SyntheticResponse { html: false }, &boundary, &RequestState::default(), download, &cancel, Some(Instant::now() + CONTROL_REQUEST_TIMEOUT)).await.unwrap();
+            let mut response = dispatch_ready(&SyntheticResponse { status: 200, html: false }, &boundary, &RequestState::default(), download, &cancel, Some(Instant::now() + CONTROL_REQUEST_TIMEOUT)).await.unwrap();
             for _ in 0..6 {
                 assert_eq!(response.body.read(&mut [0]).await.unwrap(), 1);
             }
-            let error = dispatch_ready(&SyntheticResponse { html: true }, &boundary, &RequestState::default(), request("webdav", "synthetic"), &cancel, None).await.err().unwrap();
-            assert_eq!(error.kind, ErrorKind::EndpointRejected);
-            assert_eq!(error.http_status, Some(200));
+            for status in [200, 206] {
+                let error = dispatch_ready(&SyntheticResponse { status, html: true }, &boundary, &RequestState::default(), request("webdav", "synthetic"), &cancel, None).await.err().unwrap();
+                assert_eq!(error.kind, ErrorKind::EndpointRejected);
+                assert_eq!(error.http_status, Some(status));
+            }
         });
     }
     #[test]
