@@ -40,7 +40,7 @@ export async function exportCompatibilityBackupFromSystemPicker(
     return runSharedNativeFileOperation(
         'export',
         `compatibility-backup-export:${target}`,
-        async ({ signal: managedSignal, onStatus }) => {
+        async ({ signal: managedSignal, onStatus, protect }) => {
             const controller = new AbortController()
             const cancel = () => controller.abort()
             const signals = [
@@ -98,6 +98,10 @@ export async function exportCompatibilityBackupFromSystemPicker(
                             onStatus(status)
                             options.onStatus?.(status)
                         },
+                        onDestinationChosen: () => {
+                            protect()
+                            options.onDestinationChosen?.()
+                        },
                     },
                 )
                 if (report) options.onReport?.(report)
@@ -111,6 +115,6 @@ export async function exportCompatibilityBackupFromSystemPicker(
             }
         },
         // Full-library admission prevents sync while the snapshot is captured.
-        { presentation: 'dialog', format: 'library-backup' },
+        { presentation: 'dialog', format: 'library-backup', protectAfterPicker: true },
     ).finally(resumeServerSyncAfterBackup)
 }
