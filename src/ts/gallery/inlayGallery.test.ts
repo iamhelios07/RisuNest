@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { deleteUnusedGallerySelection, galleryInlayItem, galleryOriginIds, galleryWindow, sortGalleryInlays, type UnusedDeletePorts } from './inlayGalleryState'
+import { deleteUnusedGallerySelection, galleryInlayItem, galleryOriginIds, galleryWindow, sortGalleryInlays, retainGallerySelection, readGallerySelectionRange, type UnusedDeletePorts } from './inlayGalleryState'
 import type { GalleryItem } from './types'
 
 function item(key: string, size = 1): GalleryItem {
@@ -7,6 +7,25 @@ function item(key: string, size = 1): GalleryItem {
 }
 
 describe('attachment gallery', () => {
+    it('keeps unrelated selections when a viewer delete is rechecked or completed', () => {
+        const selected = new Set(['selected-a', 'selected-b'])
+        expect([...retainGallerySelection(selected, new Set(['viewer']), new Set(['viewer']))]).toEqual([...selected])
+        expect([...retainGallerySelection(selected, new Set(['viewer']), new Set())]).toEqual([...selected])
+        expect([...retainGallerySelection(selected, new Set(['selected-a']), new Set())]).toEqual(['selected-b'])
+    })
+    it('selects only the requested range in bounded pages and rejects mixed scan results', async () => {
+        const records = Array.from({ length: 1200 }, (_, index) => item(String(index)))
+        const read = async (offset: number, limit: number) => {
+            expect(limit).toBeLessThanOrEqual(512)
+            expect(offset).toBeGreaterThanOrEqual(100)
+            expect(offset + limit).toBeLessThanOrEqual(1101)
+            return { revision: 1, scanId: 'scan-a', items: records.slice(offset, offset + limit) }
+        }
+        expect(await readGallerySelectionRange(1100, 100, read)).toEqual(records.slice(100, 1101).map(value => value.key))
+        await expect(readGallerySelectionRange(100, 1100, async (offset, limit) => ({
+            ...await read(offset, limit), scanId: offset === 100 ? 'scan-a' : 'scan-b',
+        }))).rejects.toThrow('Gallery changed')
+    })
     it('uses creation metadata precedence, filters signatures and breaks date ties by key', () => {
         const created = galleryInlayItem({ key: 'b', kind: 'inlay', inlayType: 'image', name: 'b', ext: 'png', mime: 'image/png', size: 1, metadata: { createdAt: 100, pocketRisu: { createdAt: 200 } } })
         const imported = galleryInlayItem({ key: 'a', kind: 'inlay', inlayType: 'image', name: 'a', ext: 'png', mime: 'image/png', size: 1, metadata: { createdAt: -1, pocketRisu: { createdAt: 100 } } })

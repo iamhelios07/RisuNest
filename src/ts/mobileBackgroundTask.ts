@@ -36,6 +36,15 @@ export function subscribeMobileBackgroundTasks(listener: () => void): () => void
 }
 function publish() { for (const listener of listeners) listener() }
 
+/** Register work whose platform assertion is managed by a specialized adapter. */
+export function retainMobileBackgroundActivity(): () => void {
+    if (!isTauriAndroid && !isTauriIOS) return () => {}
+    const owner = {}
+    active.add(owner)
+    publish()
+    return () => { if (active.delete(owner)) publish() }
+}
+
 interface IOSDeferredHold { controller: AbortController; settled: Promise<void> }
 const iosDeferredHolds = new Set<IOSDeferredHold>()
 
@@ -70,10 +79,7 @@ function beginTask(
     })
     if ((!isTauriAndroid && !isTauriIOS) || signal?.aborted) return unprotected('unavailable')
     // Register before awaiting native admission so Home cannot cancel work during acquisition.
-    const owner = {}
-    active.add(owner)
-    publish()
-    const release = () => { if (active.delete(owner)) publish() }
+    const release = retainMobileBackgroundActivity()
     const settle = (task: MobileBackgroundTask): MobileBackgroundTask => {
         if (userInitiated && task.protection?.state === 'refused' && task.protection.reason !== 'unavailable') {
             noticeRefusedProtection()

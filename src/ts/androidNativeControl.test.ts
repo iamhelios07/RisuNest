@@ -66,6 +66,7 @@ describe('scoped Android control transport', () => {
             tasks.begin('third', 'sync', true, false),
         ])
         const holds = sent.filter(item => item.method.startsWith('background.'))
+        expect(sent[0]).toEqual({ method: 'lifecycle.onFrontendReady', args: [] })
         expect(holds.map(({ method, args }) => [method, args])).toEqual([
             ['background.begin', ['first', 'export', 'true']],
             ['background.begin', ['second', 'generation', 'false']],

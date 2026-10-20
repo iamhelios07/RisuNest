@@ -1,6 +1,27 @@
 import type { InlayBlobMetadata } from '../storage/blobStore'
 import type { GalleryItem } from './types'
 import type { InlayGalleryQuery } from './inlayGallery'
+
+export function retainGallerySelection(selected: ReadonlySet<string>, targets: ReadonlySet<string>, retained: ReadonlySet<string>): Set<string> {
+    return new Set([...selected].filter(key => !targets.has(key) || retained.has(key)))
+}
+
+export async function readGallerySelectionRange(
+    start: number, end: number,
+    read: (offset: number, limit: number) => Promise<{ revision: number; scanId?: string | null; items: GalleryItem[] }>,
+): Promise<string[]> {
+    const keys: string[] = []
+    let snapshot: { revision: number; scanId?: string | null } | undefined
+    for (let offset = Math.min(start, end), last = Math.max(start, end); offset <= last;) {
+        const page = await read(offset, Math.min(512, last - offset + 1))
+        if (snapshot && (snapshot.revision !== page.revision || snapshot.scanId !== page.scanId)) throw new Error('Gallery changed during range selection')
+        snapshot = page
+        if (!page.items.length) break
+        keys.push(...page.items.map(item => item.key))
+        offset += page.items.length
+    }
+    return keys
+}
 export function galleryInlayItem(value: InlayBlobMetadata & { sortTime?: number; objectHash?: string | null }, revision?: number): GalleryItem {
     const pocket = value.metadata?.pocketRisu as Record<string, unknown> | undefined
     const recorded = value.metadata?.createdAt

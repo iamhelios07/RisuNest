@@ -289,6 +289,10 @@ export class ConditionalAssetWriteConflictError extends Error {
     constructor() { super('Asset source changed before conditional publication'); this.name = 'ConditionalAssetWriteConflictError' }
 }
 
+export class AssetAliasSizeMismatchError extends Error {
+    constructor(readonly key: string) { super(`Asset alias size mismatch for ${key}`) }
+}
+
 export interface PreparedCompleteAssetWrite {
     activate(expectedAlias?: AssetAlias): Promise<BlobMetadata>
     abort(): Promise<void>
@@ -341,7 +345,7 @@ export interface CompleteTypedAssetRepository {
 
 function blobIdentity(key: string): AssetAliasIdentity {
     return {
-        kind: key.startsWith('assets/') ? 'asset' : 'inlay',
+        kind: /^assets[/\\]/.test(key) ? 'asset' : 'inlay',
         key,
     }
 }
@@ -727,7 +731,7 @@ export function createCompleteAssetRepositoryBlobStore(
                     for (const alias of aliases) {
                         const size = alias.objectHash ? known.get(alias.objectHash) : null
                         if (size == null) continue
-                        if (size !== alias.size) throw new Error(`Asset alias size mismatch for ${alias.key}`)
+                        if (size !== alias.size) throw new AssetAliasSizeMismatchError(alias.key)
                         found.set(alias.key, aliasBlobMetadata(alias))
                     }
                 }

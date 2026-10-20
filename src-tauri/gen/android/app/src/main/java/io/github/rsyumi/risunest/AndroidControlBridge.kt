@@ -11,6 +11,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.lang.ref.WeakReference
 import java.net.URI
 
 internal val CONTROL_ORIGINS = setOf("http://tauri.localhost", "https://tauri.localhost")
@@ -75,6 +76,18 @@ internal class AndroidControlCopyProgress(
   }
 }
 
+/** AndroidX gives each injected document object one canonical reply proxy. */
+internal class AndroidDocumentReadyGate {
+  private val announced = mutableListOf<WeakReference<Any>>()
+
+  fun admit(reply: Any): Boolean {
+    announced.removeAll { it.get() == null }
+    if (announced.any { it.get() === reply }) return false
+    announced.add(WeakReference(reply))
+    return true
+  }
+}
+
 /** Control messages carry no file bytes and never accept requests from plugin frames. */
 internal class AndroidControlBridge private constructor(
   private val view: WebView,
@@ -85,6 +98,7 @@ internal class AndroidControlBridge private constructor(
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
   private var closed = false
   private var pending = 0
+  private val documentReady = AndroidDocumentReadyGate()
 
   private fun register() {
     WebViewCompat.addWebMessageListener(view, name, origins) { _, message, origin, mainFrame, reply ->
@@ -116,7 +130,10 @@ internal class AndroidControlBridge private constructor(
               if (!closed) runCatching { reply.postMessage(message) }
             }
           }
-          val result = runCatching { dispatch(method, args, progress::report) }
+          val result = runCatching {
+            if (method == "lifecycle.onFrontendReady" && !documentReady.admit(reply)) Unit
+            else dispatch(method, args, progress::report)
+          }
           if (!closed && id != null) {
             val response = JSONObject().put("id", id)
             result.fold(

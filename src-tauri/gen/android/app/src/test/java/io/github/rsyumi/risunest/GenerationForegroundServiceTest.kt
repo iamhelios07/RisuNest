@@ -190,6 +190,31 @@ class GenerationForegroundServiceTest {
   }
 
   @Test
+  fun `every document clears previous holds before the already ready early return`() {
+    val source = File("src/main/java/io/github/rsyumi/risunest/MainActivity.kt").readText()
+    val ready = source.substringAfter("private fun onFrontendReady() {").substringBefore("private suspend fun dispatchControl")
+    val reset = ready.indexOf("GenerationForegroundService.stopAll(this)")
+    assertTrue(reset >= 0)
+    assertTrue(reset < ready.indexOf("if (!frontendReady.markReady()) return"))
+
+    val host = Hosted()
+    host.begin(taskId(1), "sync", deferred = true)
+    host.begin(taskId(2), "backup")
+    host.registry.clearAll()
+    host.lifecycle.stopAll { host.stops++; true }
+    host.registry.promote(host.start)
+    host.registry.demote(host.stop)
+    host.registry.promote(host.start)
+    assertEquals(1, host.starts)
+    assertTrue(host.registry.snapshot().isEmpty())
+    assertFalse(host.end(taskId(1)))
+    host.begin(taskId(3), "sync", deferred = true)
+    assertEquals(2, host.starts)
+    assertEquals(listOf(BackgroundTaskStatus("sync")), host.registry.snapshot())
+    assertTrue(host.end(taskId(3)))
+  }
+
+  @Test
   fun `an end from a page that was torn down cannot stop a fresh hold`() {
     val host = Hosted()
     host.begin(taskId(1), "generation")

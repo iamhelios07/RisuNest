@@ -160,7 +160,10 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     }
     const connect = () => {
         if (waiting()) { scheduleOutage(); return }
-        if (!foreground || blocked || connecting || !available()) return
+        if (!foreground || blocked || !available()) return
+        // A stop from the previous hidden session must finish before the new channel starts.
+        if (disconnecting) { void disconnecting.then(connect, () => {}); return }
+        if (connecting) return
         const epoch = outageEpoch
         const attempt: Promise<void> = dependencies.connect(notificationOperationId ??= crypto.randomUUID()).then(() => succeeded('connect', epoch), error => { fail(error, 'connect'); socket(false) })
             .finally(() => { if (connecting === attempt) connecting = undefined })

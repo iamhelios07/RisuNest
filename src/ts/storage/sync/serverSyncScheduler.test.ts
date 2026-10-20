@@ -193,6 +193,32 @@ describe('server LWW foreground scheduler', () => {
         expect(f.disconnect).toHaveBeenCalledOnce()
         f.scheduler.dispose()
     })
+    it.each([false, true])('reconnects after returning while the hidden notification stop is pending (old start pending: %s)', async pendingStart => {
+        const f = fixture()
+        let stopped!: () => void
+        let started: (() => void) | undefined
+        let notificationsRunning = false
+        f.connect.mockImplementation(async () => { notificationsRunning = true })
+        if (pendingStart) f.connect.mockImplementationOnce(() => new Promise<void>(resolve => {
+            started = () => { notificationsRunning = true; resolve() }
+        }))
+        f.stopNotifications.mockImplementation(async () => { notificationsRunning = false })
+        f.stopNotifications.mockImplementationOnce(() => new Promise<void>(resolve => {
+            stopped = () => { notificationsRunning = false; resolve() }
+        }))
+        await f.scheduler.foreground(true)
+        await vi.advanceTimersByTimeAsync(0)
+        const hidden = f.scheduler.foreground(false)
+        await vi.advanceTimersByTimeAsync(0)
+        const returned = f.scheduler.foreground(true)
+        await vi.advanceTimersByTimeAsync(0)
+        stopped()
+        started?.()
+        await Promise.all([hidden, returned])
+        await vi.advanceTimersByTimeAsync(0)
+        expect(notificationsRunning).toBe(true)
+        f.scheduler.dispose()
+    })
     it('immediately pulls on notification, conversation open, foreground return and socket loss', async () => {
         const f = fixture(); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0); f.pull.mockClear()
         f.scheduler.remoteHint(); await vi.advanceTimersByTimeAsync(0); f.scheduler.conversationOpened(); await vi.advanceTimersByTimeAsync(0); f.scheduler.socket(false); await vi.advanceTimersByTimeAsync(0)

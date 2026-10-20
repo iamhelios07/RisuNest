@@ -49,6 +49,99 @@ fn large_originals_have_bounded_previews_without_changing_source_bytes_or_identi
 }
 
 #[test]
+fn phone_photos_and_wide_images_fit_the_unchanged_working_budget() {
+    for (width, height, expected) in [(4032, 3024, (512, 384)), (16384, 16, (512, 1))] {
+        let source = image_bytes(width, height, 7);
+        let preview = encode(&source).unwrap();
+        let decoded = image::load_from_memory(&preview).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), expected);
+    }
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+        .encode_image(&image::RgbImage::from_pixel(4032, 3024, image::Rgb([100, 120, 140]))).unwrap();
+    jpeg.resize(jpeg.len() + 4 * 1024 * 1024, 0);
+    let preview = image::load_from_memory(&encode(&jpeg).unwrap()).unwrap();
+    assert_eq!((preview.width(), preview.height()), (512, 384));
+}
+
+#[test]
+fn progressive_and_multiscan_jpeg_coefficients_are_reserved_before_image_decoding() {
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut jpeg).encode_image(&image::RgbImage::new(32, 24)).unwrap();
+    let frame = jpeg.windows(2).position(|bytes| bytes == [0xff, 0xc0]).unwrap();
+    jpeg[frame + 5..frame + 7].copy_from_slice(&4096_u16.to_be_bytes());
+    jpeg[frame + 7..frame + 9].copy_from_slice(&4096_u16.to_be_bytes());
+    let scan = jpeg.windows(2).position(|bytes| bytes == [0xff, 0xda]).unwrap();
+    let scan_end = scan + 2 + usize::from(u16::from_be_bytes([jpeg[scan + 2], jpeg[scan + 3]]));
+    let mut progressive = jpeg.clone();
+    progressive[frame + 1] = 0xc2;
+    progressive[scan_end - 2] = 0;
+    assert!(matches!(encode(&progressive), Err(ThumbnailError::Fallback)));
+    let first_component = jpeg[scan + 5];
+    let first_table = jpeg[scan + 6];
+    jpeg.splice(scan + 2..scan_end, [0, 8, 1, first_component, first_table, 0, 63, 0]);
+    assert!(matches!(encode(&jpeg), Err(ThumbnailError::Fallback)));
+    jpeg[frame + 5..frame + 7].copy_from_slice(&3500_u16.to_be_bytes());
+    jpeg[frame + 7..frame + 9].copy_from_slice(&3500_u16.to_be_bytes());
+    let frame_length = usize::from(u16::from_be_bytes([jpeg[frame + 2], jpeg[frame + 3]]));
+    jpeg[frame + 2..frame + 4].copy_from_slice(&((frame_length + 3) as u16).to_be_bytes());
+    jpeg[frame + 9] = 4;
+    jpeg.splice(frame + 2 + frame_length..frame + 2 + frame_length, [
+        4, 0x11, 0,
+        0xff, 0xee, 0, 14, b'A', b'd', b'o', b'b', b'e', 0, 100, 0, 0, 0, 0, 1,
+    ]);
+    assert!(matches!(encode(&jpeg), Err(ThumbnailError::Fallback)));
+}
+
+#[test]
+fn preview_keeps_exif_orientation_after_bounded_sampling() {
+    let pixels = image::RgbImage::from_pixel(1024, 512, image::Rgb([200, 80, 10]));
+    let mut source = Vec::new();
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut source);
+    encoder.set_exif_metadata(vec![
+        b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0,
+        0x12, 1, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
+    ]).unwrap();
+    encoder.write_image(pixels.as_raw(), 1024, 512, image::ExtendedColorType::Rgb8).unwrap();
+    let preview = image::load_from_memory(&encode(&source).unwrap()).unwrap();
+    assert_eq!((preview.width(), preview.height()), (256, 512));
+}
+
+#[test]
+fn high_bit_depth_surfaces_are_charged_at_their_decoded_size() {
+    let image = image::ImageBuffer::from_pixel(64, 32, image::Rgba([0_u16, 100, 200, u16::MAX]));
+    let mut source = Vec::new();
+    DynamicImage::ImageRgba16(image).write_to(&mut Cursor::new(&mut source), ImageFormat::Png).unwrap();
+    let budget = 64 * 32 * 36 + 2 * source.len() as u64;
+    assert!(matches!(encode_with_budget(&source, budget), Err(ThumbnailError::Fallback)));
+    assert!(encode_with_budget(&source, budget * 2).is_ok());
+}
+
+#[test]
+fn verified_fallbacks_avoid_body_reads_but_recheck_availability_and_stay_bounded() {
+    use crate::asset_repository::body_io::{reset_body_io, take_body_io};
+    let root = TempDir::new().unwrap();
+    let mut cache = ThumbnailCache::new(root.path().join("cache"));
+    cache.decode_bytes = 256;
+    cache.max_entries = 1;
+    let source = image_bytes(32, 16, 1);
+    let hash = stored(root.path(), &source);
+    let request_original = || request(&hash, source.len() as u64, Method::GET, None);
+    assert!(cache.response(root.path(), request_original()).is_none());
+    reset_body_io();
+    assert!(cache.response(root.path(), request_original()).is_none());
+    let work = take_body_io();
+    assert!(work.domains.is_empty(), "verified fallback must not reread the original: {work:?}");
+    let other = image_bytes(32, 16, 2);
+    let other_hash = stored(root.path(), &other);
+    assert!(cache.response(root.path(), request(&other_hash, other.len() as u64, Method::GET, None)).is_none());
+    assert_eq!(cache.index.lock().unwrap().fallbacks.len(), 1);
+    let path = PayloadCas::new(root.path()).unwrap().object_path(&other_hash).unwrap().unwrap();
+    fs::remove_file(path).unwrap();
+    assert_eq!(cache.response(root.path(), request(&other_hash, other.len() as u64, Method::GET, None)).unwrap().status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
 fn cached_responses_revalidate_source_availability_without_reading_original_bodies() {
     use crate::asset_repository::body_io::{reset_body_io, take_body_io};
     use crate::server_sync::residency::{Residency, test_remote};
@@ -157,9 +250,11 @@ fn corrupt_original_and_wrong_declared_size_are_refused() {
     let path = PayloadCas::new(root.path()).unwrap().object_path(&hash).unwrap().unwrap();
     let replaced = (2..=255).map(|seed| image_bytes(16, 16, seed))
         .find(|bytes| bytes.len() == source.len()).unwrap();
-    fs::write(path, replaced).unwrap();
+    fs::write(&path, replaced).unwrap();
     assert!(cache.get(root.path(), &hash, source.len() as u64).is_err());
     assert_eq!(fs::read_dir(&cache.directory).unwrap().count(), 0);
+    fs::write(path, &source).unwrap();
+    assert!(cache.get(root.path(), &hash, source.len() as u64).is_ok());
 }
 
 #[test]
@@ -281,6 +376,33 @@ fn remote_source_uses_existing_transient_reader_and_keeps_cas_empty() {
     assert_eq!(cache.response(root.path(), request(&hash, source.len() as u64, Method::GET, Some(&validator))).unwrap().status(), StatusCode::NOT_FOUND);
     residency.finish_release(&object).unwrap();
     assert_eq!(cache.response(root.path(), request(&hash, source.len() as u64, Method::HEAD, Some(&validator))).unwrap().status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn remote_spooling_progresses_while_another_request_owns_the_decoder() {
+    use crate::server_sync::residency::test_remote;
+    let root = TempDir::new().unwrap();
+    let _store = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+    let source = image_bytes(32, 16, 1);
+    let hash = hex::encode(Sha256::digest(&source));
+    let size = source.len() as u64;
+    test_remote::hold(root.path(), &[(&hash, size)]);
+    test_remote::serve(root.path(), &hash, source);
+    let cache = ThumbnailCache::new(root.path().join("cache"));
+    cache.cached(&hash).unwrap();
+    let generation = cache.generation.lock().unwrap();
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| cache.get(root.path(), &hash, size));
+        let started = std::time::Instant::now();
+        while test_remote::fetched(root.path()) == 0 && started.elapsed() < Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        let fetched_while_decoder_busy = test_remote::fetched(root.path()) > 0;
+        drop(generation);
+        let preview = read(waiting.join().unwrap().unwrap());
+        assert_eq!(image::load_from_memory(&preview).unwrap().width(), 32);
+        assert!(fetched_while_decoder_busy);
+    });
 }
 
 #[test]

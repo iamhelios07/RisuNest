@@ -7,6 +7,7 @@ import {
     createCompleteAssetRepositoryBlobStore,
     createCompleteTypedAssetRepository,
     ConditionalAssetWriteConflictError,
+    AssetAliasSizeMismatchError,
     type CompleteAssetAliasStore,
     type DurableAssetWriteSessionFactory,
     type RemoteAssetReader,
@@ -130,14 +131,16 @@ describe('complete AssetRepository BlobStore facade', () => {
         expect(results.slice(0, 5).map(result => result?.size ?? null)).toEqual([4, 4, null, null, null])
         expect(results.slice(5).every(result => result === null)).toBe(true)
         aliases[0].size = 5
-        await expect(facade.statMany!([aliases[0].key])).rejects.toThrow('size mismatch')
+        const mismatch = facade.statMany!([aliases[0].key])
+        await expect(mismatch).rejects.toBeInstanceOf(AssetAliasSizeMismatchError)
+        await expect(mismatch).rejects.toMatchObject({ key: aliases[0].key })
     })
 
-    it('verifies downloaded content before replacing an alias without rereading the body', async () => {
+    it.each(['assets/photo.bin', 'assets\\photo.bin'])('verifies downloaded content before replacing %s without rereading the body', async key => {
         const data = Uint8Array.of(1, 2, 3)
         const { hashPayloadBytes } = await import('./payloadCas')
         const hash = await hashPayloadBytes(data)
-        const original = assetAlias()
+        const original = assetAlias({ key })
         let current = original
         let nativeHash = 'f'.repeat(64)
         const outcomes: string[] = []

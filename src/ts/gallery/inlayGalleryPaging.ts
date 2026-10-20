@@ -14,6 +14,7 @@ export class InlayGalleryPaging {
     private desired: InlayGalleryQuery | null = null
     private epoch = 0
     private appliedEpoch = -1
+    private scanId: string | null = null
     private revision = -1
     private minimumRevision = -1
     private total = 0
@@ -35,7 +36,7 @@ export class InlayGalleryPaging {
         const previous = this.desired
         if (refresh || !previous || previous.type !== query.type || previous.sort !== query.sort
             || previous.usage !== query.usage || previous.characterId !== query.characterId) this.epoch++
-        this.desired = { ...query, limit: Math.max(1, Math.min(512, query.limit)) }
+        this.desired = { ...query, limit: Math.max(1, query.limit) }
         if (!this.running) {
             this.running = Promise.resolve().then(() => this.drain()).then(() => {
                 this.running = null
@@ -58,7 +59,11 @@ export class InlayGalleryPaging {
         while (!this.disposed && this.desired && !this.covered(this.desired)) {
             const epoch = this.epoch
             const minimumRevision = this.minimumRevision
-            const request = { ...this.desired, ...inlayGalleryPageRange(this.desired.offset, this.desired.limit) }
+            let offset = this.desired.offset
+            if (this.appliedEpoch === epoch && this.revision >= minimumRevision) {
+                while (offset < Math.min(this.total, this.desired.offset + this.desired.limit) && this.items.has(offset)) offset++
+            }
+            const request = { ...this.desired, ...inlayGalleryPageRange(offset, this.desired.offset + this.desired.limit - offset) }
             let page: InlayGalleryPage
             try { page = await this.read(request) }
             catch (error) {
@@ -73,10 +78,10 @@ export class InlayGalleryPaging {
             }
             const desired = this.desired
             const range = inlayGalleryPageRange(desired.offset, desired.limit)
-            const end = range.offset + range.limit
+            const end = Math.max(range.offset + range.limit, desired.offset + desired.limit)
             const overlaps = request.offset < desired.offset + desired.limit && request.offset + page.items.length > desired.offset
             if (page.items.length && !overlaps && desired.offset < page.total) continue
-            const sameSnapshot = this.appliedEpoch === epoch && this.revision === page.revision
+            const sameSnapshot = this.appliedEpoch === epoch && this.revision === page.revision && this.scanId === (page.scanId ?? null)
             const retained = new Map<number, GalleryItem>()
             if (sameSnapshot) {
                 for (const [index, item] of this.items) if (index >= range.offset && index < end) retained.set(index, item)
@@ -86,6 +91,7 @@ export class InlayGalleryPaging {
                 if (index >= range.offset && index < end) retained.set(index, retained.get(index)?.key === item.key ? retained.get(index)! : item)
             })
             this.appliedEpoch = epoch
+            this.scanId = page.scanId ?? null
             this.revision = page.revision
             this.observeRevision(page.revision)
             this.total = page.total

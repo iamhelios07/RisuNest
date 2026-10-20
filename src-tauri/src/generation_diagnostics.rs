@@ -71,7 +71,16 @@ struct CommitSlot {
     outcome: &'static str, error_code: Option<&'static str>, time_ms: u64,
 }
 #[derive(Default)]
-struct Slots { phase: Option<PhaseSlot>, commit: Option<CommitSlot> }
+struct Slots {
+    phase: Option<PhaseSlot>, commit: Option<CommitSlot>,
+    admission: Option<Event>, persistence: Option<Event>,
+}
+#[derive(Serialize)]
+struct FailureEvent<'a> {
+    #[serde(flatten)]
+    event: &'a Event,
+    admission: Option<Event>, persistence: Option<Event>, commit: Option<CommitSlot>,
+}
 #[derive(Default)]
 struct Diagnostics {
     document: AtomicU64,
@@ -95,10 +104,22 @@ fn with_context<T>(operation: impl FnOnce(&Diagnostics, &crate::native_log::Nati
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis().min(u64::MAX as u128) as u64).unwrap_or_default()
 }
-fn emit(sink: &crate::native_log::NativeLogState, level: &str, value: impl Serialize) {
+trait DiagnosticSink {
+    fn write(&self, level: &'static str, message: String);
+}
+impl DiagnosticSink for crate::native_log::NativeLogState {
+    fn write(&self, level: &'static str, message: String) {
+        self.record(level, "generation-diagnostic", message);
+    }
+}
+struct DiagnosticWriter<F>(F);
+impl<F: Fn(&'static str, String)> DiagnosticSink for DiagnosticWriter<F> {
+    fn write(&self, level: &'static str, message: String) { (self.0)(level, message); }
+}
+fn emit(sink: &impl DiagnosticSink, level: &'static str, value: impl Serialize) {
     if let Ok(message) = serde_json::to_string(&value) {
         if message.len() <= MAX_EVENT_BYTES {
-            sink.record(level, "generation-diagnostic", message);
+            sink.write(level, message);
         }
     }
 }
@@ -119,11 +140,13 @@ fn phase_slot(slots: &mut Slots, document: u64, generation: u64, sequence: u64) 
     slots.phase.as_mut()
 }
 impl Diagnostics {
-    fn document_started(&self, sink: &crate::native_log::NativeLogState) {
+    fn document_started(&self, sink: &impl DiagnosticSink) {
         let document = {
             let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
             let document = self.document.fetch_add(1, Ordering::SeqCst).saturating_add(1);
             slots.phase = None;
+            slots.admission = None;
+            slots.persistence = None;
             document
         };
         let recovered = self.recovery.swap(false, Ordering::SeqCst);
@@ -137,7 +160,7 @@ impl Diagnostics {
             "platform":std::env::consts::OS, "osVersion":os_version,
             "rendererRecovery":recovered}));
     }
-    fn record(&self, event: Event, sink: &crate::native_log::NativeLogState) -> Result<u64, &'static str> {
+    fn record(&self, event: Event, sink: &impl DiagnosticSink) -> Result<u64, &'static str> {
         let current = self.document.load(Ordering::SeqCst);
         let document = match &event {
             Event::DocumentStart {} => {
@@ -162,6 +185,15 @@ impl Diagnostics {
         };
         if event_sequence == 0 { return Err("invalid-diagnostic-number"); }
         match &event {
+            Event::Admission { event_sequence, .. } => {
+                let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+                if document != self.document.load(Ordering::SeqCst) { return Err("stale-diagnostic-document"); }
+                if slots.admission.as_ref().is_none_or(|previous|
+                    matches!(previous, Event::Admission { event_sequence: sequence, .. } if sequence < event_sequence)
+                ) {
+                    slots.admission = Some(event.clone());
+                }
+            }
             Event::Phase { document_sequence, event_sequence, generation_sequence, phase, edge, outcome, save_path, .. } => {
                 let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
                 if document != self.document.load(Ordering::SeqCst) { return Err("stale-diagnostic-document"); }
@@ -188,13 +220,37 @@ impl Diagnostics {
                         slot.path_event_sequence = *event_sequence;
                     }
                 }
+                if slots.persistence.as_ref().is_none_or(|previous|
+                    matches!(previous, Event::Persistence { event_sequence: sequence, .. } if sequence < event_sequence)
+                ) {
+                    slots.persistence = Some(event.clone());
+                }
             }
             _ => {}
         }
-        emit(sink, "info", event);
+        // Successful high-frequency events only update the crash context. Keep
+        // failures and lifecycle boundaries in the user-visible log.
+        match &event {
+            Event::Phase { outcome: Some(Outcome::Failed), generation_sequence, .. } => {
+                let context = {
+                    let slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+                    FailureEvent { event: &event,
+                        admission: slots.admission.as_ref().filter(|value| matches!(value,
+                            Event::Admission { document_sequence: owner, generation_sequence: generation, .. }
+                                if *owner == document && generation == generation_sequence)).cloned(),
+                        persistence: slots.persistence.as_ref().filter(|value| matches!(value,
+                            Event::Persistence { document_sequence: owner, generation_sequence: generation, .. }
+                                if *owner == document && generation == generation_sequence)).cloned(),
+                        commit: slots.commit.as_ref().filter(|slot| slot.document_sequence == document).cloned() }
+                };
+                emit(sink, "error", context);
+            }
+            Event::Lifecycle { .. } => emit(sink, "info", event),
+            _ => {}
+        }
         Ok(current)
     }
-    fn commit(&self, document: u64, expected: i64, result: &Result<RevisionResult, StoreError>, committed_revision: Option<i64>, sink: &crate::native_log::NativeLogState) {
+    fn commit(&self, document: u64, expected: i64, result: &Result<RevisionResult, StoreError>, committed_revision: Option<i64>, sink: &impl DiagnosticSink) {
         let (revision, outcome, error_code) = match result {
             Ok(value) => (Some(value.revision), "ok", None),
             Err(error) => {
@@ -213,7 +269,7 @@ impl Diagnostics {
         self.slots.lock().unwrap_or_else(|error| error.into_inner()).commit = Some(slot.clone());
         if result.is_err() { emit(sink, "error", serde_json::json!({"kind":"native-commit", "commit":slot})); }
     }
-    fn reload_result(&self, outcome: &'static str, sink: &crate::native_log::NativeLogState) {
+    fn reload_result(&self, outcome: &'static str, sink: &impl DiagnosticSink) {
         match outcome {
             "requested" => self.reload_pending.store(true, Ordering::SeqCst),
             "failed" if self.reload_pending.swap(false, Ordering::SeqCst) => {},
@@ -222,31 +278,36 @@ impl Diagnostics {
         emit(sink, "info", serde_json::json!({"kind":"renderer-reload",
             "documentSequence":self.document.load(Ordering::SeqCst), "outcome":outcome}));
     }
-    fn renderer_exit(&self, reason: RendererExit, sink: &crate::native_log::NativeLogState) {
+    fn renderer_exit(&self, reason: RendererExit, sink: &impl DiagnosticSink) {
         self.recovery.store(true, Ordering::SeqCst);
         let now = now_ms();
-        let (current, phase, commit) = {
+        let (current, phase, commit, admission, persistence) = {
             let slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
             let current = self.document.load(Ordering::SeqCst);
             (current,
                 slots.phase.as_ref().filter(|slot| current != 0 && slot.document_sequence == current).cloned(),
-                slots.commit.as_ref().filter(|slot| current != 0 && slot.document_sequence == current).cloned())
+                slots.commit.as_ref().filter(|slot| current != 0 && slot.document_sequence == current).cloned(),
+                slots.admission.clone(), slots.persistence.clone())
         };
         emit(sink, "error", serde_json::json!({"kind":"renderer-exit", "documentSequence":current,
             "reason":reason, "phaseAgeMs":phase.as_ref().map(|value| now.saturating_sub(value.time_ms)),
             "commitAgeMs":commit.as_ref().map(|value| now.saturating_sub(value.time_ms)),
-            "phase":phase, "commit":commit}));
+            "phase":phase, "commit":commit, "admission":admission, "persistence":persistence}));
     }
 }
 
 #[derive(Serialize)]
 #[serde(tag = "platform", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 pub(crate) enum RendererExit {
+    #[cfg(any(target_os = "macos", target_os = "ios", test))]
     #[cfg_attr(target_os = "ios", serde(rename = "ios"))]
     #[cfg_attr(not(target_os = "ios"), serde(rename = "macos"))]
     Apple { reason: &'static str },
+    #[cfg(any(windows, test))]
     Windows { kind: i32, reason: Option<i32>, exit_code: Option<i32> },
+    #[cfg(any(target_os = "linux", test))]
     Linux { reason: &'static str },
+    #[cfg(any(target_os = "android", test))]
     Android { did_crash: bool },
 }
 pub(crate) fn document_started() { with_context(|state, sink| state.document_started(sink)); }
@@ -261,7 +322,10 @@ pub(crate) fn reload_result(outcome: &'static str) { with_context(|state, sink| 
 pub(crate) fn native_generation_diagnostic(window: tauri::WebviewWindow, event: Event) -> Result<u64, &'static str> {
     // Existing IPC origin and main-frame invoke-key checks isolate plugin frames from native commands.
     if window.label() != "main" { return Err("diagnostic-main-document-required"); }
-    with_context(|state, sink| state.record(event, sink))
+    with_context(|state, sink| state.record(event, &DiagnosticWriter(|level, message| {
+        let sink = sink.clone();
+        tauri::async_runtime::spawn_blocking(move || sink.record(level, "generation-diagnostic", message));
+    })))
 }
 
 #[cfg(target_os = "android")]
@@ -312,10 +376,9 @@ mod tests {
         assert_eq!(tail(&sink)["outcome"], "failed");
         let old_path = serde_json::from_value(serde_json::json!({"kind":"persistence", "documentSequence":1,
             "eventSequence":1, "generationSequence":1, "boundary":"checkpoint", "savePath":"fallback"})).unwrap();
+        let before = sink.tail(None).len();
         state.record(old_path, &sink).unwrap();
-        assert_eq!(tail(&sink)["kind"], "persistence");
-        assert_eq!(tail(&sink)["eventSequence"], 1);
-        assert_eq!(tail(&sink)["savePath"], "fallback");
+        assert_eq!(sink.tail(None).len(), before);
         state.renderer_exit(RendererExit::Apple { reason: "unknown" }, &sink);
         assert_eq!(tail(&sink)["phase"]["phase"], "final-acknowledgement");
         assert_eq!(tail(&sink)["phase"]["phaseEventSequence"], 3);
@@ -324,9 +387,9 @@ mod tests {
             "generationSequence":2, "phase":"send-admitted", "edge":"enter"})).unwrap(), &sink).unwrap();
         state.renderer_exit(RendererExit::Apple { reason: "unknown" }, &sink);
         assert!(tail(&sink)["phase"]["savePath"].is_null());
+        let before = sink.tail(None).len();
         state.record(phase(1), &sink).unwrap();
-        assert_eq!(tail(&sink)["generationSequence"], 1);
-        assert_eq!(tail(&sink)["eventSequence"], 1);
+        assert_eq!(sink.tail(None).len(), before);
         state.renderer_exit(RendererExit::Apple { reason: "unknown" }, &sink);
         assert_eq!(tail(&sink)["phase"]["generationSequence"], 2);
         assert_eq!(tail(&sink)["phase"]["phase"], "send-admitted");
@@ -384,19 +447,109 @@ mod tests {
         assert_eq!(store.read_root(None).unwrap().value["username"], "synthetic-durable");
     }
     #[test]
-    fn diagnostic_events_use_existing_rotation_and_bounded_ring() {
+    fn alias_and_gallery_commits_publish_the_actual_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = crate::persistent_store::PersistentStore::open(directory.path()).unwrap();
+        document_started();
+        let alias = crate::persistent_store::AssetAlias {
+            key: "synthetic-inlay".into(), object_hash: None, kind: "inlay".into(), size: 0,
+            mime: "image/png".into(), name: "synthetic".into(), ext: "png".into(),
+            inlay_type: Some("image".into()), width: None, height: None,
+            metadata: serde_json::json!({}),
+        };
+        let mut revision = store.revision().unwrap();
+        for operation in 0..4 {
+            let expected = revision;
+            revision = match operation {
+                0 | 2 => store.commit_asset_alias(&alias, expected).unwrap().revision,
+                1 => store.delete_asset_alias("inlay", &alias.key, expected).unwrap().revision,
+                _ => store.gallery_delete(&[alias.key.clone()], expected, None).unwrap().revision,
+            };
+            renderer_exit(RendererExit::Linux { reason:"crashed" });
+            let value = with_context(|_, sink| tail(sink));
+            assert_eq!(value["commit"]["expectedRevision"], expected);
+            assert_eq!(value["commit"]["revision"], revision);
+            assert_eq!(value["commit"]["outcome"], "ok");
+            assert_eq!(store.revision().unwrap(), revision);
+        }
+        assert!(matches!(store.delete_asset_alias("inlay", &alias.key, revision - 1),
+            Err(StoreError::RevisionConflict { .. })));
+        assert_eq!(with_context(|_, sink| tail(sink))["commit"]["errorCode"], "revision-conflict");
+    }
+    #[test]
+    fn frontend_readiness_never_changes_the_native_document_sequence() {
+        let state = Diagnostics::default();
+        let sink = crate::native_log::NativeLogState::for_tests();
+        assert_eq!(state.record(Event::DocumentStart {}, &sink).unwrap(), 0);
+        state.document_started(&sink);
+        // The first document never became ready. The next frontend can arrive
+        // before its native page callback without claiming that callback's epoch.
+        assert_eq!(state.record(Event::DocumentStart {}, &sink).unwrap(), 1);
+        state.document_started(&sink);
+        state.record(phase(2), &sink).unwrap();
+        assert_eq!(state.record(Event::DocumentStart {}, &sink).unwrap(), 2);
+        assert_eq!(state.record(Event::DocumentStart {}, &sink).unwrap(), 2);
+        state.renderer_exit(RendererExit::Android { did_crash:true }, &sink);
+        assert_eq!(tail(&sink)["documentSequence"], 2);
+        assert_eq!(tail(&sink)["phase"]["documentSequence"], 2);
+        assert!(state.record(phase(1), &sink).is_err());
+    }
+    #[test]
+    fn delayed_log_writes_do_not_reassign_a_new_documents_phase() {
+        let state = Diagnostics::default();
+        let sink = crate::native_log::NativeLogState::for_tests();
+        let pending = std::cell::RefCell::new(Vec::new());
+        let deferred = DiagnosticWriter(|level, message| pending.borrow_mut().push((level, message)));
+        state.document_started(&deferred);
+        assert_eq!(state.record(Event::DocumentStart {}, &deferred).unwrap(), 1);
+        state.record(phase(1), &deferred).unwrap();
+        state.document_started(&deferred);
+        assert_eq!(state.record(Event::DocumentStart {}, &deferred).unwrap(), 2);
+        state.record(phase(2), &deferred).unwrap();
+        assert!(sink.tail(None).is_empty());
+        for (level, message) in pending.into_inner().into_iter().rev() {
+            sink.write(level, message);
+        }
+        state.renderer_exit(RendererExit::Android { did_crash:true }, &sink);
+        assert_eq!(tail(&sink)["documentSequence"], 2);
+        assert_eq!(tail(&sink)["phase"]["documentSequence"], 2);
+        assert_eq!(tail(&sink)["phase"]["phase"], "final-acknowledgement");
+        assert!(state.record(phase(2), &sink).is_ok());
+        assert!(state.record(phase(1), &sink).is_err());
+    }
+    #[test]
+    fn routine_diagnostics_preserve_errors_and_crash_context_without_filling_the_log() {
         let directory = tempfile::tempdir().unwrap();
         let sink = crate::native_log::NativeLogState::initialize(directory.path());
         std::fs::write(sink.file_path(), vec![b'x'; crate::native_log::FILE_ROTATE_BYTES + 1]).unwrap();
         let state = Diagnostics::default();
         state.document_started(&sink);
         assert!(sink.file_path().with_extension("log.1").exists());
+        sink.record("error", "synthetic", "earlier failure");
+        let before = sink.tail(None).len();
         for sequence in 1..=crate::native_log::RING_CAPACITY + 2 {
             let mut event = phase(1);
             if let Event::Phase { event_sequence, .. } = &mut event { *event_sequence = sequence as u64; }
             state.record(event, &sink).unwrap();
         }
-        assert_eq!(sink.tail(None).len(), crate::native_log::RING_CAPACITY);
+        assert_eq!(sink.tail(None).len(), before);
+        assert_eq!(sink.tail(Some(1))[0].message, "earlier failure");
+        state.record(serde_json::from_value(serde_json::json!({
+            "kind":"admission", "documentSequence":1, "eventSequence":2000, "generationSequence":1,
+            "intent":"normal", "displayMode":"normal", "profile":"normal",
+            "historyLimitEnabled":true, "route":"history-window", "admittedMessages":12
+        })).unwrap(), &sink).unwrap();
+        state.renderer_exit(RendererExit::Linux { reason:"crashed" }, &sink);
+        assert_eq!(tail(&sink)["phase"]["phaseEventSequence"], crate::native_log::RING_CAPACITY + 2);
+        assert_eq!(tail(&sink)["admission"]["admittedMessages"], 12);
+        let mut failure = phase(1);
+        if let Event::Phase { outcome, event_sequence, .. } = &mut failure {
+            *outcome = Some(Outcome::Failed);
+            *event_sequence = 2001;
+        }
+        state.record(failure, &sink).unwrap();
+        assert_eq!(tail(&sink)["outcome"], "failed");
+        assert_eq!(tail(&sink)["admission"]["route"], "history-window");
         assert!(std::fs::read_to_string(sink.file_path()).unwrap().contains("generation-diagnostic"));
     }
     #[test]
@@ -411,7 +564,8 @@ mod tests {
         }
         state.record(serde_json::from_value(serde_json::json!({"kind":"phase", "documentSequence":1,
             "eventSequence":2, "generationSequence":1, "phase":"completion-processing", "edge":"enter"})).unwrap(), &sink).unwrap();
-        assert_eq!(tail(&sink)["phase"], "completion-processing");
+        state.renderer_exit(RendererExit::Linux { reason:"crashed" }, &sink);
+        assert_eq!(tail(&sink)["phase"]["phase"], "completion-processing");
         let entry = sink.tail(Some(1)).pop().unwrap();
         assert_eq!(entry.target, "generation-diagnostic");
         assert!(serde_json::from_str::<serde_json::Value>(&entry.message).is_ok());

@@ -20,7 +20,7 @@ export interface InlayGalleryQuery {
     limit: number
 }
 export interface GalleryLocation {
-    kind: 'message' | 'character' | 'conversation' | 'settings' | 'plugin' | 'archive'
+    kind: 'message' | 'character' | 'conversation' | 'settings' | 'plugin' | 'archive' | 'pending'
     characterId?: string
     characterName?: string
     conversationId?: string
@@ -52,6 +52,7 @@ export interface GalleryLocations {
     locations: GalleryLocation[]
 }
 export interface InlayGalleryPage {
+    scanId?: string | null
     revision: number
     total: number
     totalBytes: number

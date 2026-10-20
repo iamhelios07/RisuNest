@@ -1822,8 +1822,12 @@ impl NativeFileJobState {
                 selection.validate(archive)?;
                 let destination = destination.map(PathBuf::from);
                 if let Some(path) = destination.as_deref() { validate_desktop_destination(path)?; }
+                let selected_alias = if archive { None } else { Some(selection.single_alias()?) };
                 let prepared = crate::persistent_store::commands::with_store_mut(app.state(), |store| {
-                    store.prepare_risu_save_export(expected_revision)
+                    match selected_alias {
+                        Some((kind, key)) => store.prepare_gallery_file_export(expected_revision, kind, key),
+                        None => store.prepare_risu_save_export(expected_revision),
+                    }
                 }).map_err(native_store_error)?;
                 NativeFileJobTask::ExportGallery { destination, prepared, selection, archive }
             }

@@ -222,3 +222,73 @@ fn gallery_scan_hydrates_a_remote_archive_before_resolving_locations() {
     assert_eq!(used.state.as_deref(), Some("used"));
     assert!(used.locations.iter().any(|location| location.archived && location.message_id.as_deref() == Some("message")));
 }
+
+#[test]
+fn dropping_a_prepared_gallery_scan_releases_running_state_and_keeps_the_last_result() {
+    let (_directory, mut store) = fixture();
+    put(&mut store, &alias("unused", "image", json!({})));
+    let complete = scan(&mut store);
+    let (_, prepared) = store.prepare_gallery_scan(store.revision().unwrap()).unwrap();
+    drop(prepared);
+    assert_eq!(store.gallery_scan_status().unwrap().unwrap().state, "cancelled");
+    assert_eq!(store.gallery_scan_result().unwrap().unwrap().id, complete.id);
+    assert_eq!(store.gallery_keys(&GalleryQuery { usage: "unused".into(), ..query() }).unwrap().keys, ["unused"]);
+    assert_ne!(scan(&mut store).id, complete.id);
+}
+
+#[test]
+fn cold_storage_references_never_prove_unlocated_attachments_unused() {
+    for root in [json!({"data":"\u{ef01}COLDSTORAGE\u{ef01}synthetic"}), json!({"coldstorage":"synthetic"}), json!({"coldStoragedChats":["synthetic"]})] {
+        let (_directory, mut store) = fixture();
+        put(&mut store, &alias("unused", "image", json!({})));
+        store.commit(&WorkingSetCommit { expected_revision: store.revision().unwrap(), root: Some(root), ..Default::default() }).unwrap();
+        let status = scan(&mut store);
+        assert!(status.unchecked_records > 0);
+        assert_eq!((status.counts.unused, status.counts.unknown), (0, 1));
+        assert_eq!(store.gallery_locations("unused").unwrap().state.as_deref(), Some("unknown"));
+    }
+}
+
+#[test]
+fn pending_sync_references_and_same_revision_receives_guard_unused_deletion() {
+    use super::super::lww::{self, ApplyReceive, Change, Header, Progress, StageReceive};
+    use risunest_sync_wire::stamp::Stamp;
+    let (_directory, mut store) = fixture();
+    for key in ["held", "deferred", "unused"] { put(&mut store, &alias(key, "image", json!({}))); }
+    character(&mut store);
+    let original = scan(&mut store);
+    let header = Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "gallery-pending".into() };
+    let stamp = Stamp { physical_ms: (store.lww_clock_state().unwrap().issued.unwrap().physical_ms.0 + 1).into(), logical: 0, writer_id: "00000000-0000-4000-8000-000000000001".into() };
+    let (_source_directory, mut source) = fixture();
+    character(&mut source);
+    source.commit(&WorkingSetCommit { expected_revision: source.revision().unwrap(), conversations: Some(vec![super::super::ConversationMutation::ReplaceRange {
+        character_id: "character".into(), conversation_id: "conversation".into(), start: 0, delete_count: 1,
+        messages: vec![json!({"chatId":"pending-message","role":"user","data":"{{inlay::deferred}}"})], conversation: None, configured_index: None,
+    }]), ..Default::default() }).unwrap();
+    let mut objects = source.connection.prepare("SELECT hash,body FROM message_page_objects").unwrap();
+    for object in objects.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?))).unwrap() {
+        let (hash, body) = object.unwrap(); store.lww_put_object(&hash, &body).unwrap();
+    }
+    let message_key = lww::unit_key(&["messages", "character", "conversation"]).unwrap();
+    let value = lww::read_unit(&source.connection, &message_key).unwrap().unwrap().1;
+    store.lww_stage_receive(&StageReceive { header: header.clone(), changes: vec![
+        Change { key: lww::unit_key(&["character", "missing-parent", "desc"]).unwrap(), stamp: stamp.clone(), value: lww::inline(&json!("{{inlay::held}}")).unwrap() },
+        Change { key: message_key, stamp, value },
+    ], progress: Progress { kind: "server".into(), cursor: 1.into(), writer_id: None }, admitted_time_upper_ms: u64::MAX.into() }).unwrap();
+    let applied = store.lww_apply_receive(&ApplyReceive { header: header.clone(), generating: vec![super::super::lww::MessageLocator { character_id: "character".into(), conversation_id: "conversation".into(), start: None }] }).unwrap();
+    assert_eq!((applied.held_keys.len(), applied.deferred_keys.len()), (1, 1));
+    store.lww_finish_receive(&header).unwrap();
+    assert_eq!(store.revision().unwrap(), original.revision);
+    assert!(matches!(store.gallery_delete(&["held".into(), "deferred".into()], original.revision, Some(&original.id)), Err(StoreError::RevisionConflict {..})));
+    assert!(store.gallery_missing_keys(&["held".into(), "deferred".into()]).unwrap().is_empty());
+    let rescanned = scan(&mut store);
+    assert_eq!((rescanned.counts.used, rescanned.counts.unused, rescanned.unchecked_records), (2, 1, 0));
+    for key in ["held", "deferred"] {
+        let locations = store.gallery_locations(key).unwrap();
+        assert_eq!(locations.state.as_deref(), Some("used"));
+        assert_eq!(locations.locations[0].kind, "pending");
+    }
+    let page = store.gallery_page(&GalleryQuery { usage: "unused".into(), ..query() }).unwrap();
+    assert_eq!(page.scan_id.as_deref(), Some(rescanned.id.as_str()));
+    assert_eq!(page.items.iter().map(|item| item.alias.key.as_str()).collect::<Vec<_>>(), ["unused"]);
+}

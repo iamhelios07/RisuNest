@@ -19,6 +19,19 @@ describe('gallery downloads', () => {
         expect(galleryDownloadName('', 'id', 'mp4')).toBe('id.mp4')
         expect(galleryDownloadName('../bad:name. ', 'id', 'png')).toBe('.._bad_name.png')
         expect(galleryDownloadName('x'.repeat(130), 'id', 'png')).toBe(`${'x'.repeat(120)}.png`)
+        for (const [name, extension, expected] of [
+            ['한'.repeat(120), 'png', `${'한'.repeat(83)}.png`],
+            ['😀'.repeat(120), 'png', `${'😀'.repeat(62)}.png`],
+            ['한'.repeat(120), '한'.repeat(120), `${'한'.repeat(44)}.${'한'.repeat(40)}`],
+            ['CON', 'png', '_CON.png'],
+            ['aux.other', 'png', '_aux.other.png'],
+            ['LPT¹', 'png', '_LPT¹.png'],
+            ['COM10', 'png', 'COM10.png'],
+        ]) {
+            const actual = galleryDownloadName(name, 'id', extension)
+            expect(actual).toBe(expected)
+            expect(new TextEncoder().encode(actual).length).toBeLessThanOrEqual(255)
+        }
         expect(galleryArchiveDate(new Date(2026, 9, 20, 0, 30))).toBe('2026-10-20')
         expect(galleryArchiveDate(new Date(2026, 0, 5, 23, 59))).toBe('2026-01-05')
     })

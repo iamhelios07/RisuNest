@@ -1,6 +1,7 @@
 use super::*;
 use crate::asset_repository::PayloadCas;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub(crate) struct PreparedScan {
     reader: snapshot::RevisionReadLease,
@@ -34,6 +35,15 @@ impl PersistentStore {
     }
 }
 
+impl Drop for PreparedScan {
+    fn drop(&mut self) {
+        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(status) = session.status.as_mut().filter(|status| status.id == self.status.id && status.state == "running") {
+            status.state = "cancelled".into();
+        }
+    }
+}
+
 impl PreparedScan {
     pub(crate) fn cancellation(&self) -> Arc<AtomicBool> { Arc::clone(&self.cancel) }
     fn check(&self) -> StoreResult<()> { if self.cancel.load(Ordering::Acquire) { Err(invalid("attachment usage scan cancelled")) } else { Ok(()) } }
@@ -57,7 +67,7 @@ impl PreparedScan {
                 Ok(mut result) => {
                     self.status.state = "complete".into();
                     result.status = self.status.clone();
-                    *status = self.status;
+                    *status = self.status.clone();
                     session.result = Some(result);
                 }
                 Err(_) => { status.state = "failed".into(); status.error = Some("attachment usage scan failed".into()); }
@@ -68,7 +78,7 @@ impl PreparedScan {
         self.check()?;
         let db = &self.reader.connection;
         let generation = &self.reader.target.generation;
-        let mut result = UsageResult { id: self.status.id.clone(), revision: self.reader.target.revision, status: self.status.clone(), keys: HashSet::new(), locations: HashMap::new(), unchecked_archives: 0, unchecked_records: 0, device_fence: None };
+        let mut result = UsageResult { id: self.status.id.clone(), revision: self.reader.target.revision, status: self.status.clone(), keys: HashSet::new(), locations: HashMap::new(), unchecked_archives: 0, unchecked_records: 0, pending_fence: pending_fence(db)?, device_fence: None };
         let mut aliases_by_hash: HashMap<String, Vec<String>> = HashMap::new();
         {
             let mut statement = db.prepare("SELECT logical_key,object_hash FROM asset_aliases WHERE generation=?1 AND kind='inlay' AND inlay_type IN ('image','video','audio')")?;
@@ -86,11 +96,12 @@ impl PreparedScan {
             let location = GalleryLocation { kind: kind.into(), ..Default::default() };
             while let Some(row) = rows.next()? { self.check()?; observe_column(row, 0, &location, &mut result, &self.cancel)?; }
         }
+        observe_pending(db, &mut result, &self.cancel)?;
         let plugin = GalleryLocation { kind: "plugin".into(), ..Default::default() };
         match self.device.take() {
             Some((fence, roots)) => {
                 for key in &roots.inlay_ids { self.check()?; add_location(&mut result, key, &plugin); }
-                if roots.retain_all_objects { result.unchecked_records += 1; }
+                if roots.retain_all_objects || !roots.cold_keys.is_empty() { result.unchecked_records += 1; }
                 result.device_fence = Some(fence);
             }
             None => result.unchecked_records += 1,
@@ -198,6 +209,7 @@ fn observe_column(row: &rusqlite::Row<'_>, index: usize, location: &GalleryLocat
     }
 }
 fn observe_text(text: &str, location: &GalleryLocation, result: &mut UsageResult) {
+    if text.strip_prefix("\u{ef01}COLDSTORAGE\u{ef01}").is_some_and(|key| !key.is_empty()) { result.unchecked_records += 1; }
     for prefix in ["{{inlay::", "{{inlayed::", "{{inlayeddata::"] {
         let mut rest = text;
         while let Some(start) = rest.find(prefix) {
@@ -213,8 +225,61 @@ fn observe_value(value: &Value, location: &GalleryLocation, result: &mut UsageRe
     match value {
         Value::String(text) => observe_text(text, location, result),
         Value::Array(values) => for value in values { observe_value(value, location, result, cancel)?; },
-        Value::Object(values) => for value in values.values() { observe_value(value, location, result, cancel)?; },
+        Value::Object(values) => for (key, value) in values {
+            if (key == "coldstorage" && value.as_str().is_some_and(|key| !key.is_empty()))
+                || (key == "coldStoragedChats" && value.as_array().is_some_and(|keys| !keys.is_empty())) { result.unchecked_records += 1; }
+            observe_value(value, location, result, cancel)?;
+        },
         _ => {}
+    }
+    Ok(())
+}
+
+// Receiving rows can change without changing the projected library revision.
+pub(in crate::persistent_store) fn pending_fence(db: &Connection) -> StoreResult<[u8; 32]> {
+    let mut hash = Sha256::new();
+    let mut statement = db.prepare("SELECT request_id,key,stamp,value,status FROM lww_receive_rows WHERE status IN ('staged','held','deferred') ORDER BY request_id,key")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        for index in 0..5 {
+            let value: String = row.get(index)?;
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(value.as_bytes());
+        }
+    }
+    Ok(hash.finalize().into())
+}
+
+fn observe_pending(db: &Connection, result: &mut UsageResult, cancel: &AtomicBool) -> StoreResult<()> {
+    use risunest_sync_wire::unit::{UnitKey, UnitValue};
+    let location = GalleryLocation { kind: "pending".into(), ..Default::default() };
+    let mut statement = db.prepare("SELECT key,value FROM lww_receive_rows WHERE status IN ('staged','held','deferred') ORDER BY request_id,key")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if cancel.load(Ordering::Acquire) { return Err(invalid("attachment usage scan cancelled")); }
+        let outcome = (|| -> StoreResult<()> {
+            let key: UnitKey = row.get::<_, String>(0)?.try_into().map_err(|_| invalid("invalid pending unit key"))?;
+            let value: UnitValue = serde_json::from_str(&row.get::<_, String>(1)?)?;
+            if matches!(value, UnitValue::Deleted) { return Ok(()); }
+            if key.components().first().is_some_and(|kind| kind == "messages") {
+                super::super::message_pages::validate_manifest(db, &value)?;
+                let UnitValue::Object { descriptor, .. } = value else { return Err(invalid("invalid pending messages")); };
+                let body = super::super::message_pages::object_body(db, &descriptor.object_hash)?.ok_or_else(|| invalid("pending messages unavailable"))?;
+                let manifest = risunest_external_storage_format::message_pages::MessageManifest::decode(&body).map_err(|_| invalid("invalid pending manifest"))?;
+                for page in manifest.pages {
+                    let body = super::super::message_pages::object_body(db, &page.hash)?.ok_or_else(|| invalid("pending page unavailable"))?;
+                    let messages = risunest_external_storage_format::logical_records::decode_message_page(&body).map_err(|_| invalid("invalid pending page"))?;
+                    for message in messages { observe_value(&message, &location, result, cancel)?; }
+                }
+            } else if matches!(value, UnitValue::Inline { .. }) || super::super::external_capture::is_large_unit(&key) {
+                if let Some(value) = super::super::lww::json_value_resolved(db, &value)? { observe_value(&value, &location, result, cancel)?; }
+            } else {
+                // Opaque or archived pending objects have not been projected into scannable records.
+                result.unchecked_records += 1;
+            }
+            Ok(())
+        })();
+        if outcome.is_err() { result.unchecked_records += 1; }
     }
     Ok(())
 }

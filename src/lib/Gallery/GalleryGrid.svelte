@@ -21,17 +21,28 @@
     let mounted = $state(false)
     let touchSelection = $state(false)
     let pendingFocus = $state<number | null>(null)
+    let focusRequest = 0
     let suppressClick = false
     let press:ReturnType<typeof setTimeout> | undefined
     let pressX = 0, pressY = 0
     const text = galleryText()
     const layout = $derived(galleryWindow({ total,width,viewportHeight,scrollOffset,large:size === 'large',mobile,captions }))
     const indices = $derived(Array.from({ length:layout.limit },(_,i) => layout.offset + i))
+    function viewportTop() {
+        const top = Math.max(0,scroller?.getBoundingClientRect().top ?? 0)
+        let inset = 0
+        for (const toolbar of (scroller ?? document).querySelectorAll<HTMLElement>('[data-gallery-toolbar]')) {
+            const style = getComputedStyle(toolbar)
+            if (style.position !== 'sticky' || !toolbar.parentElement?.contains(root)) continue
+            inset = Math.max(inset, (parseFloat(style.top) || 0) + toolbar.getBoundingClientRect().height)
+        }
+        return top + inset
+    }
     function measure() {
         if (!root) return
         const bounds = root.getBoundingClientRect()
         const scrollBounds = scroller?.getBoundingClientRect()
-        const top = Math.max(0,scrollBounds?.top ?? 0)
+        const top = viewportTop()
         const bottom = Math.min(window.innerHeight,scrollBounds?.bottom ?? window.innerHeight)
         width = bounds.width
         viewportHeight = Math.max(1,bottom-top)
@@ -52,7 +63,7 @@
         window.addEventListener('scroll',update,true)
         window.addEventListener('resize',update)
         measure(); mounted = true
-        return () => { pendingFocus = null; resize.disconnect(); cancelAnimationFrame(frame); clearTimeout(press); window.removeEventListener('scroll',update,true); window.removeEventListener('resize',update) }
+        return () => { focusRequest++; pendingFocus = null; resize.disconnect(); cancelAnimationFrame(frame); clearTimeout(press); window.removeEventListener('scroll',update,true); window.removeEventListener('resize',update) }
     })
     $effect(() => {
         if (!mounted) return
@@ -60,20 +71,28 @@
         untrack(() => onwindow(offset,limit || columns * 8))
     })
     export async function scrollToIndex(index:number) {
+        focusRequest++; pendingFocus = null
+        await scrollIndex(index)
+    }
+    async function scrollIndex(index:number) {
         const row = Math.floor(Math.max(0,Math.min(total-1,index))/layout.columns)
         const rect = root.getBoundingClientRect()
-        const top = scroller?.getBoundingClientRect().top ?? 0
+        const top = viewportTop()
         const delta = rect.top - top + layout.padding + row * layout.rowHeight
         if (scroller) scroller.scrollTop += delta
         else window.scrollBy(0,delta)
         measure(); await tick()
     }
     export async function focusItem(index:number) {
+        const request = ++focusRequest
+        pendingFocus = null
         if (!total) return
-        pendingFocus = Math.max(0,Math.min(total-1,index))
-        if (!root.querySelector(`[data-gallery-index="${pendingFocus}"]`)) await scrollToIndex(pendingFocus)
+        const target = Math.max(0,Math.min(total-1,index))
+        if (!root.querySelector(`[data-gallery-index="${target}"]`)) await scrollIndex(target)
+        if (request === focusRequest) pendingFocus = target
     }
     $effect(() => {
+        if (pendingFocus !== null && pendingFocus >= total) pendingFocus = null
         if (pendingFocus === null || !items.has(pendingFocus) || !indices.includes(pendingFocus)) return
         const target = pendingFocus
         void tick().then(() => {
@@ -84,6 +103,7 @@
     })
     $effect(() => { if (!selecting && selected.size === 0) touchSelection = false })
     function click(event:MouseEvent,item:GalleryItem,index:number) {
+        focusRequest++; pendingFocus = null
         if (suppressClick) { suppressClick = false; return }
         if (selecting || (touchSelection && selected.size > 0) || event.ctrlKey || event.metaKey || event.shiftKey) ontoggle(item,index,event.shiftKey)
         else onopen(item,index)
@@ -120,12 +140,12 @@
     .window { position:absolute; display:grid; align-items:start; }
     .entry { display:flex; flex-direction:column; min-width:0; gap:4px; }
     .cell { position:relative; width:100%; aspect-ratio:1; flex:none; border-radius:.375rem; background:var(--risu-theme-bgcolor); border-width:1px; border-style:solid; border-color:color-mix(in srgb,var(--risu-theme-darkborderc) 55%,transparent); overflow:hidden; }
-    .cell.selected { outline:2px solid var(--risu-theme-primary-500,#3b82f6); outline-offset:-2px; }
-    .open { width:100%; height:100%; position:absolute; inset:0; cursor:pointer; }
+    .cell.selected { outline:2px solid var(--risu-theme-borderc); outline-offset:-2px; }
+    .open { width:100%; height:100%; position:absolute; inset:0; cursor:pointer; -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; }
     .open:focus-visible { outline:2px solid var(--risu-theme-borderc); outline-offset:-3px; }
-    .checkbox { position:absolute; z-index:1; top:.375rem; left:.375rem; display:flex; width:1.25rem; height:1.25rem; align-items:center; justify-content:center; border:2px solid var(--risu-theme-darkborderc); border-radius:.375rem; background:color-mix(in srgb,var(--risu-theme-darkbutton) 88%,transparent); color:white; opacity:0; cursor:pointer; }
+    .checkbox { position:absolute; z-index:1; top:.375rem; left:.375rem; display:flex; width:1.75rem; height:1.75rem; align-items:center; justify-content:center; border:2px solid var(--risu-theme-darkborderc); border-radius:.375rem; background:color-mix(in srgb,var(--risu-theme-darkbutton) 88%,transparent); color:var(--risu-theme-textcolor); opacity:0; cursor:pointer; }
     .cell:hover .checkbox,.checkbox:focus-visible,.checkbox.shown { opacity:1; }
-    .checkbox.checked { background:var(--risu-theme-primary-500,#3b82f6); border-color:var(--risu-theme-primary-500,#3b82f6); }
+    .checkbox.checked { background:var(--risu-theme-selected); border-color:var(--risu-theme-borderc); }
     .caption { font-size:13px; line-height:18px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:0 .125rem; }
     .portrait { position:absolute; right:.375rem; top:.375rem; padding:.0625rem .45rem; border-radius:999px; border:1px solid var(--risu-theme-darkborderc); background:var(--risu-theme-darkbg); font-size:11px; font-weight:600; color:var(--risu-theme-textcolor2); pointer-events:none; }
     @media (hover:none) { .checkbox { opacity:1; } }

@@ -43,6 +43,13 @@ impl GallerySelection {
         }
         Ok(())
     }
+    pub(crate) fn single_alias(&self) -> Result<(&'static str, &str), NativeJobError> {
+        self.validate(false)?;
+        Ok(match self {
+            Self::Asset { entries } => ("asset", entries[0].key.as_str()),
+            Self::Inlay { keys } => ("inlay", keys[0].as_str()),
+        })
+    }
     fn into_entries(
         self,
     ) -> (
@@ -63,7 +70,17 @@ impl GallerySelection {
     }
 }
 
-fn clean_component(value: &str, fallback: &str) -> String {
+const MAX_COMPONENT_BYTES: usize = 255;
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn clean_component(value: &str, fallback: &str, max_bytes: usize) -> String {
     let cleaned: String = value
         .chars()
         .map(|c| {
@@ -77,11 +94,20 @@ fn clean_component(value: &str, fallback: &str) -> String {
     let cleaned = cleaned.trim_end_matches(['.', ' ']);
     let cleaned: String = cleaned.chars().take(120).collect();
     let cleaned = cleaned.trim_end_matches(['.', ' ']);
-    if cleaned.is_empty() {
-        fallback.to_owned()
+    let cleaned = if cleaned.is_empty() { fallback } else { cleaned };
+    let base = cleaned.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            base.strip_prefix(*prefix).is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+            })
+        });
+    let cleaned = if reserved {
+        format!("_{cleaned}")
     } else {
         cleaned.to_owned()
-    }
+    };
+    utf8_prefix(&cleaned, max_bytes).trim_end_matches(['.', ' ']).to_owned()
 }
 fn filename(name: &str, key: &str, ext: &str) -> String {
     let name = if name.trim().is_empty() || name == key {
@@ -113,8 +139,8 @@ fn filename(name: &str, key: &str, ext: &str) -> String {
         }
         _ => name,
     };
-    let ext = clean_component(ext.trim_start_matches('.'), "bin");
-    format!("{}.{}", clean_component(stem, "file"), ext)
+    let ext = clean_component(ext.trim_start_matches('.'), "bin", 120);
+    format!("{}.{}", clean_component(stem, "file", MAX_COMPONENT_BYTES - ext.len() - 1), ext)
 }
 struct Names {
     connection: rusqlite::Connection,
@@ -129,6 +155,28 @@ impl Names {
             CREATE TABLE suffixes(name TEXT PRIMARY KEY, next INTEGER NOT NULL) WITHOUT ROWID;")
             .map_err(|error| store_error(error.into()))?;
         Ok(Self { connection })
+    }
+
+    fn trim_cache(&self) -> rusqlite::Result<()> {
+        let mut current = 0;
+        let mut highwater = 0;
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                self.connection.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED,
+                &mut current,
+                &mut highwater,
+                0,
+            )
+        };
+        if code != rusqlite::ffi::SQLITE_OK {
+            return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None));
+        }
+        // The bundled SQLite global LRU can lend this cache pages beyond cache_size.
+        if current > 512 * 1024 {
+            self.connection.release_memory()?;
+        }
+        Ok(())
     }
 }
 fn unique_path(folder: &str, name: &str, names: &mut Names) -> Result<String, NativeJobError> {
@@ -145,7 +193,10 @@ fn unique_path(folder: &str, name: &str, names: &mut Names) -> Result<String, Na
             let basename = if number == 1 {
                 name.to_owned()
             } else {
-                format!("{stem} ({number}).{ext}")
+                let suffix = format!(" ({number})");
+                let stem = utf8_prefix(stem, MAX_COMPONENT_BYTES - ext.len() - suffix.len() - 1)
+                    .trim_end_matches(['.', ' ']);
+                format!("{stem}{suffix}.{ext}")
             };
             let path = if folder.is_empty() {
                 basename
@@ -160,6 +211,7 @@ fn unique_path(folder: &str, name: &str, names: &mut Names) -> Result<String, Na
             {
                 names.connection.prepare_cached("INSERT INTO suffixes(name,next) VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET next=excluded.next")?
                     .execute(params![identity, number + 1])?;
+                names.trim_cache()?;
                 return Ok(path);
             }
             number += 1;
@@ -242,7 +294,7 @@ impl<W: Write + Seek> StoredZip<W> {
         let offset = self.output.stream_position().map_err(io_error)?;
         let mut header = Vec::with_capacity(64 + name.len());
         u32le(&mut header, 0x04034b50);
-        for value in [45, 0x0800, 0, 0, 0] {
+        for value in [45, 0x0800, 0, 0, 0x0021] {
             u16le(&mut header, value);
         }
         u32le(&mut header, crc);
@@ -265,7 +317,7 @@ impl<W: Write + Seek> StoredZip<W> {
         }
         header.clear();
         u32le(&mut header, 0x02014b50);
-        for value in [45, 45, 0x0800, 0, 0, 0] {
+        for value in [45, 45, 0x0800, 0, 0, 0x0021] {
             u16le(&mut header, value);
         }
         u32le(&mut header, crc);
@@ -451,7 +503,7 @@ pub(crate) fn export_gallery(
                     &alias.ext,
                 );
                 let folder = if archive && kind == "asset" {
-                    clean_component(&entry.section, "assets")
+                    clean_component(&entry.section, "assets", MAX_COMPONENT_BYTES)
                 } else {
                     String::new()
                 };
@@ -577,6 +629,19 @@ mod tests {
         assert_eq!(filename("theme.CSS", "id", "css"), "theme.css");
         assert_eq!(filename("", "id", "mp4"), "id.mp4");
         assert_eq!(filename("../bad:name. ", "id", "png"), ".._bad_name.png");
+        for (name, ext, expected) in [
+            ("한".repeat(120), "png".to_owned(), format!("{}.png", "한".repeat(83))),
+            ("😀".repeat(120), "png".to_owned(), format!("{}.png", "😀".repeat(62))),
+            ("한".repeat(120), "한".repeat(120), format!("{}.{}", "한".repeat(44), "한".repeat(40))),
+            ("CON".to_owned(), "png".to_owned(), "_CON.png".to_owned()),
+            ("aux.other".to_owned(), "png".to_owned(), "_aux.other.png".to_owned()),
+            ("LPT¹".to_owned(), "png".to_owned(), "_LPT¹.png".to_owned()),
+            ("COM10".to_owned(), "png".to_owned(), "COM10.png".to_owned()),
+        ] {
+            let actual = filename(&name, "id", &ext);
+            assert_eq!(actual, expected);
+            assert!(actual.len() <= MAX_COMPONENT_BYTES);
+        }
         let directory = tempfile::TempDir::new().unwrap();
         let mut used = Names::new(&directory.path().join("names.sqlite")).unwrap();
         assert_eq!(
@@ -670,6 +735,51 @@ mod tests {
     }
 
     #[test]
+    fn zip_names_extract_with_multibyte_suffixes_and_windows_reserved_names() {
+        use crate::native_file_jobs::{JobKind, JobRegistry};
+        let (directory, mut store, revision, mut alias) = fixture();
+        alias.name = "한".repeat(120);
+        let revision = store.commit_asset_alias(&alias, revision).unwrap().revision;
+        alias.key = "inlay-2".into();
+        alias.name = "CON".into();
+        let revision = store.commit_asset_alias(&alias, revision).unwrap().revision;
+        let owned = directory.path().join("owned");
+        fs::create_dir(&owned).unwrap();
+        let target = directory.path().join("chosen.zip");
+        let job = JobRegistry::default().create(JobKind::ExportGalleryZip).unwrap();
+        let mut keys = vec!["inlay-1".into(); 12];
+        keys.push("inlay-2".into());
+        export_gallery(
+            store.prepare_risu_save_export(revision).unwrap(),
+            GallerySelection::Inlay { keys },
+            true,
+            &owned,
+            &directory.path().join("handoffs"),
+            Some(&target),
+            &job,
+        ).unwrap();
+        let mut archive = zip::ZipArchive::new(File::open(&target).unwrap()).unwrap();
+        assert_eq!(archive.len(), 13);
+        let mut expected = vec![format!("{}.png", "한".repeat(83))];
+        expected.extend((2..=12).map(|number| format!("{} ({number}).png", "한".repeat(82))));
+        expected.push("_CON.png".into());
+        for (index, name) in expected.iter().enumerate() {
+            let entry = archive.by_index(index).unwrap();
+            assert_eq!(entry.name(), name);
+            assert!(entry.name().len() <= MAX_COMPONENT_BYTES);
+            let date = entry.last_modified();
+            assert_eq!((date.year(), date.month(), date.day()), (1980, 1, 1));
+        }
+        let extracted = directory.path().join("extracted");
+        archive.extract(&extracted).unwrap();
+        for name in expected {
+            assert_eq!(fs::read(extracted.join(name)).unwrap(), b"original synthetic image");
+        }
+        let bytes = fs::read(target).unwrap();
+        assert_eq!(&bytes[12..14], &0x0021u16.to_le_bytes());
+    }
+
+    #[test]
     fn single_download_hydrates_remote_bytes_and_returns_an_owned_mobile_handoff() {
         use crate::native_file_jobs::{JobKind, JobRegistry};
         use crate::server_sync::residency::test_remote;
@@ -686,8 +796,10 @@ mod tests {
         let job = JobRegistry::default()
             .create(JobKind::ExportGalleryFile)
             .unwrap();
+        let prepared = store.prepare_gallery_file_export(revision, "inlay", &alias.key).unwrap();
+        let readers = prepared.reader().unwrap().active_readers();
         let result = export_gallery(
-            store.prepare_risu_save_export(revision).unwrap(),
+            prepared,
             GallerySelection::Inlay {
                 keys: vec![alias.key],
             },
@@ -698,6 +810,8 @@ mod tests {
             &job,
         )
         .unwrap();
+        assert_eq!(readers.active_count(), 0);
+        assert!(readers.detached_asset_roots().unwrap().is_empty());
         assert_eq!(test_remote::fetched(directory.path()), 1);
         let handoff = std::path::PathBuf::from(result.handoff_path.unwrap());
         assert_eq!(handoff.parent(), Some(handoffs.as_path()));
@@ -720,8 +834,10 @@ mod tests {
         let job = JobRegistry::default()
             .create(JobKind::ExportGalleryFile)
             .unwrap();
+        let prepared = store.prepare_gallery_file_export(revision, "inlay", "missing").unwrap();
+        let readers = prepared.reader().unwrap().active_readers();
         let error = export_gallery(
-            store.prepare_risu_save_export(revision).unwrap(),
+            prepared,
             GallerySelection::Inlay {
                 keys: vec!["missing".into()],
             },
@@ -732,14 +848,18 @@ mod tests {
             &job,
         )
         .unwrap_err();
+        assert_eq!(readers.active_count(), 0);
+        assert!(readers.detached_asset_roots().unwrap().is_empty());
         assert_eq!(error.code, "unreadable-item");
         assert_eq!(fs::read(&target).unwrap(), b"existing");
         let registry = JobRegistry::default();
         let job = registry.create(JobKind::ExportGalleryFile).unwrap();
         job.cancellation_flag()
             .store(true, std::sync::atomic::Ordering::Release);
+        let prepared = store.prepare_gallery_file_export(revision, "inlay", "inlay-1").unwrap();
+        let readers = prepared.reader().unwrap().active_readers();
         let error = export_gallery(
-            store.prepare_risu_save_export(revision).unwrap(),
+            prepared,
             GallerySelection::Inlay {
                 keys: vec!["inlay-1".into()],
             },
@@ -750,6 +870,8 @@ mod tests {
             &job,
         )
         .unwrap_err();
+        assert_eq!(readers.active_count(), 0);
+        assert!(readers.detached_asset_roots().unwrap().is_empty());
         assert_eq!(error.code, "cancelled");
         assert_eq!(fs::read(&target).unwrap(), b"existing");
         assert!(!directory.path().join("handoffs").exists());
@@ -899,6 +1021,12 @@ mod tests {
     #[test]
     fn filename_index_spills_large_selections_and_keeps_its_cache_bounded() {
         let directory = tempfile::TempDir::new().unwrap();
+        // Other live stores share SQLite's global LRU pool in bundled builds.
+        let other = crate::sqlite_open::open(directory.path().join("other.sqlite")).unwrap();
+        other.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-8192;
+            CREATE TABLE payload(value BLOB);
+            WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<1024)
+            INSERT INTO payload SELECT zeroblob(4096) FROM rows;").unwrap();
         let mut names = Names::new(&directory.path().join("names.sqlite")).unwrap();
         for index in 0..20_000 {
             let name = format!("image-{}-{index}.png", "x".repeat(80));

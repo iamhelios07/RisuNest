@@ -13,6 +13,7 @@
     import '../../Gallery/gallery.css'
     import { galleryText, galleryFormat as fmt } from 'src/ts/gallery/strings'
     import { InlayGalleryPaging } from 'src/ts/gallery/inlayGalleryPaging'
+    import { retainGallerySelection, readGallerySelectionRange } from 'src/ts/gallery/inlayGalleryState'
     import { gallerySize } from 'src/ts/gallery/preferences'
     import { galleryBytes, type GalleryItem } from 'src/ts/gallery/types'
     import { downloadGallery, galleryArchiveDate } from 'src/ts/gallery/galleryDownloads'
@@ -43,6 +44,7 @@
     let selected = $state(new Set<string>())
     let selecting = $state(false)
     let anchor = -1
+    let selectionGeneration = 0
     let loading = $state(true)
     let error = $state(false)
     let busy = $state(false)
@@ -137,20 +139,33 @@
         refreshTimer = setTimeout(() => { refreshTimer = undefined; if (mounted) void refresh() }, 250)
     }
     function requestWindow(offset: number, limit: number) {
-        const count = Math.max(1, Math.min(512, limit))
+        const count = Math.max(1, limit)
         if (query.offset === offset && query.limit === count) return
         query.offset = offset
         query.limit = count
         void load()
     }
-    function changeFilter() { query.offset = 0; anchor = -1; items = new Map(); void load(false, true); grid?.scrollToIndex(0) }
-    async function selectAll() { try { selected = new Set(await readInlayGalleryKeys(query)) } catch (cause) { report(cause) } }
+    function clearSelection() { selectionGeneration++; selected = new Set(); selecting = false; anchor = -1 }
+    function changeFilter() { query.offset = 0; clearSelection(); items = new Map(); void load(false, true); void grid?.scrollToIndex(0).catch(report) }
+    async function selectAll() {
+        const token = generation
+        const selectionToken = ++selectionGeneration
+        try {
+            const keys = await readInlayGalleryKeys({ ...query })
+            if (mounted && token === generation && selectionToken === selectionGeneration) selected = new Set(keys)
+        } catch (cause) { report(cause) }
+    }
     async function toggle(item: GalleryItem, index: number, range: boolean) {
         try {
-            const keys = range && anchor >= 0 ? await readInlayGalleryKeys(query) : null
+            const token = generation
+            const selectionToken = ++selectionGeneration
+            const currentQuery = { ...query }
+            const keys = range && anchor >= 0 ? await readGallerySelectionRange(anchor, index,
+                (offset, limit) => readInlayGalleryPage({ ...currentQuery, offset, limit })) : null
+            if (!mounted || token !== generation || selectionToken !== selectionGeneration) return
             const next = new Set(selected)
             if (keys) {
-                for (let position = Math.min(index, anchor); position <= Math.max(index, anchor); position++) if (keys[position]) next.add(keys[position])
+                for (const key of keys) next.add(key)
             } else if (next.has(item.key)) next.delete(item.key)
             else next.add(item.key)
             selected = next
@@ -248,12 +263,13 @@
         busy = true
         try {
             if (isTauri && query.usage === 'unused') {
-                await deleteUnusedGallerySelection(new Set(keys), {
+                const targets = new Set(keys)
+                await deleteUnusedGallerySelection(targets, {
                     flush: () => flushPendingData('gallery-delete-unused'), revision: galleryRevision,
                     scanRevision: () => completedScan?.revision ?? null,
                     rescan: runScan, unusedKeys: () => readInlayGalleryKeys({ ...query, type: 'all', usage: 'unused', characterId: undefined }),
                     confirm: confirmDelete, remove: (keys, revision) => deleteGalleryKeys(keys, revision, completedScan?.id),
-                    selection: value => { selected = value }, isConflict: isGalleryRevisionConflict,
+                    selection: value => { selected = retainGallerySelection(selected, targets, value) }, isConflict: isGalleryRevisionConflict,
                     allDropped: count => alertToast(fmt(text.recheckDropped, count)),
                 })
             } else {
@@ -324,9 +340,14 @@
         const character = location.characterName ?? DBState.db.characters.find(value => value.chaId === location.characterId)?.name
         if (character) return [character, location.conversationName].filter(Boolean).join(' · ')
         if (location.kind === 'settings') return text.settingsLocation
+        if (location.kind === 'pending') return text.pendingLocation
         if (location.kind === 'plugin') return text.pluginData
         if (location.kind === 'character') return text.characterSettings
         return text.archived
+    }
+    async function jump(location: GalleryLocation, origin = false) {
+        try { await jumpToGalleryLocation(location, () => { void closeViewer() }, origin) }
+        catch (cause) { report(cause) }
     }
     onMount(() => {
         mounted = true
@@ -353,9 +374,9 @@
     </div>
     <p class="attachment-summary text-sm text-textcolor2">{language.risuNest.inlay.inventoryTotal.replace('{count}', String(total)).replace('{size}', galleryBytes(totalBytes))}</p>
     <div class="g-panel attachment-panel">
-    <div class="attachment-toolbar">
+    <div class="attachment-toolbar" data-gallery-toolbar>
         {#if selected.size}
-            <GalleryToolbar selectedCount={selected.size} {total} onselectall={selectAll} onclear={() => { selected = new Set(); selecting = false }}>
+            <GalleryToolbar selectedCount={selected.size} {total} onselectall={selectAll} onclear={clearSelection}>
                 {#if isTauri}<button class="g-button" disabled={disabled || downloadRunning} onclick={() => download([...selected])}>{text.download}</button>{/if}
                 <button class="g-button" disabled={disabled} onclick={optimize}>{text.optimize}</button>
                 <button class="g-button danger" disabled={disabled} onclick={() => remove([...selected])}>{text.remove}</button>
@@ -389,10 +410,10 @@
             {#if resultText}<SettingNotice tone="info" text={resultText} />{/if}
             {#if downloadResult}<SettingNotice tone="info" text={downloadResult} />{/if}
         </div>
-        {#if scanRunning && scan}<SettingProgress label={text.scanTitle} detail={fmt(text.scanDetail, scan.completedConversations, scan.totalConversations)} fraction={scan.totalItems ? scan.completedItems / scan.totalItems : null}>{#snippet actions()}<button class="g-button" onclick={() => cancelGalleryScan()}>{text.cancel}</button>{/snippet}</SettingProgress>{/if}
+        {#if scanRunning && scan}<SettingProgress label={text.scanTitle} detail={fmt(text.scanDetail, scan.completedConversations, scan.totalConversations)} fraction={scan.totalItems ? scan.completedItems / scan.totalItems : null}>{#snippet actions()}<button class="g-button" onclick={() => { void cancelGalleryScan().catch(report) }}>{text.cancel}</button>{/snippet}</SettingProgress>{/if}
         {#if optimizing}<SettingProgress label={text.optimize} detail={inlayOptimizationProgressMessage(shownOptimizationProgress)} fraction={shownOptimizationProgress.total ? shownOptimizationProgress.scanned / shownOptimizationProgress.total : null}>{#snippet actions()}<button class="g-button" onclick={() => { optimizeCancel = true; optimization.cancel() }}>{text.cancel}</button>{/snippet}</SettingProgress>{/if}
         {#if downloadRunning}<SettingProgress label={downloadArchive ? text.zipTitle : text.download} detail={fmt(text.zipProgress, downloadProgress.done, downloadProgress.total)} fraction={downloadProgress.total ? downloadProgress.done / downloadProgress.total : null}>{#snippet actions()}<button class="g-button" onclick={() => downloadAbort?.abort()}>{text.cancel}</button>{/snippet}</SettingProgress>{/if}
-    {#if !loading && !total}<p class="p-6 text-textcolor2">{text.empty}</p>{/if}
+    {#if !loading && !total}<p class="p-6 text-textcolor2">{query.type !== 'all' || query.usage !== 'all' || query.characterId ? text.emptyFiltered : text.empty}</p>{/if}
     <GalleryGrid bind:this={grid} {items} {total} size={$gallerySize} {selected} {selecting} onwindow={requestWindow} onopen={openViewer} ontoggle={toggle} />
     </div>
 </div>
@@ -407,7 +428,7 @@
                 <dt class="origin-label">{text.origin}</dt>
                 <dd class="origin-value">
                     <span><b>{origin.characterName}</b>{#if origin.conversationName} · {origin.conversationName}{/if}{#if origin.archived}<span class="location-pill">{text.archived}</span>{:else if origin.trashed}<span class="location-pill">{text.trash}</span>{/if}</span>
-                    {#if !origin.archived && !origin.trashed}<button class="g-button small" onclick={() => origin && jumpToGalleryLocation(origin, () => { void closeViewer() }, true)}><ArrowRightIcon size={13} />{text.jump}</button>{/if}
+                    {#if !origin.archived && !origin.trashed}<button class="g-button small" onclick={() => origin && jump(origin, true)}><ArrowRightIcon size={13} />{text.jump}</button>{/if}
                 </dd>
             {/if}
         {/snippet}
@@ -420,7 +441,7 @@
                         {#if locations?.state && !scanRunning}<button class="g-button small quiet usage-recheck" disabled={!scanInitialized} onclick={() => runScan()}>{text.recheck}</button>{/if}
                     </h3>
                     {#if scanRunning && scan}
-                        <SettingProgress label={text.scanTitle} detail={fmt(text.scanDetail, scan.completedConversations, scan.totalConversations)} fraction={scan.totalItems ? scan.completedItems / scan.totalItems : null}>{#snippet actions()}<button class="g-button small" onclick={() => cancelGalleryScan()}>{text.cancel}</button>{/snippet}</SettingProgress>
+                        <SettingProgress label={text.scanTitle} detail={fmt(text.scanDetail, scan.completedConversations, scan.totalConversations)} fraction={scan.totalItems ? scan.completedItems / scan.totalItems : null}>{#snippet actions()}<button class="g-button small" onclick={() => { void cancelGalleryScan().catch(report) }}>{text.cancel}</button>{/snippet}</SettingProgress>
                     {:else if !locations?.state}
                         <p class="usage-help">{text.findLocationsHelp}</p>
                         <button class="g-button small" disabled={!scanInitialized} onclick={() => runScan()}><MapPinIcon size={13} />{text.findUsage}</button>
@@ -435,7 +456,7 @@
                                 {@const characterName = location.characterName ?? DBState.db.characters.find(value => value.chaId === location.characterId)?.name}
                                 <div class="usage-location">
                                     <span class="location-who">{#if characterName}<b>{characterName}</b>{#if location.conversationName} · {location.conversationName}{/if}{:else}{locationLabel(location)}{/if}{#if location.archived}<span class="location-pill">{text.archived}</span>{:else if location.trashed}<span class="location-pill">{text.trash}</span>{/if}</span>
-                                    {#if !location.archived && !location.trashed && location.kind === 'message'}<button class="g-button small" onclick={() => jumpToGalleryLocation(location, () => { void closeViewer() })}><ArrowRightIcon size={13} />{text.jump}</button>{:else}<span></span>{/if}
+                                    {#if !location.archived && !location.trashed && location.kind === 'message'}<button class="g-button small" onclick={() => jump(location)}><ArrowRightIcon size={13} />{text.jump}</button>{:else}<span></span>{/if}
                                     {#if location.messageIndex !== undefined}<small>{fmt(text.messageNumber, location.messageIndex + 1)}</small>{:else if location.kind === 'character'}<small>{text.characterSettings}</small>{:else if location.kind === 'conversation'}<small>{text.conversationLocation}</small>{/if}
                                 </div>
                             {/each}

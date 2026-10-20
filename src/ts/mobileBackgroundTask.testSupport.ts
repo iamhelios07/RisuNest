@@ -21,6 +21,7 @@ export function mobileBackgroundTaskModule() {
     return {
         hasMobileBackgroundTasks: vi.fn(() => false),
         subscribeMobileBackgroundTasks: vi.fn((_listener: () => void) => () => {}),
+        retainMobileBackgroundActivity: vi.fn(() => () => {}),
         measuredTaskPercent: vi.fn(measuredTaskPercent),
         mobileDeferredHoldsSettled: vi.fn(async () => {}),
         expireMobileDeferredHolds: vi.fn(),

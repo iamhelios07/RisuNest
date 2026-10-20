@@ -122,6 +122,30 @@ export function deleteGalleryAssets(owner: AssetOwner, data: AssetOwnerData, sna
     }
     removeUnusedExclusions(owner, data, new Set(removable.map(entry => entry.key)))
 }
+export function selectionAfterAssetDelete(owner: AssetOwner, data: AssetOwnerData, selected: readonly AssetGalleryItem[], removed: readonly AssetGalleryItem[]): Map<string, AssetGalleryItem> {
+    const result = new Map<string, AssetGalleryItem>()
+    const deleted = new Set(removed.map(entry => entry.id))
+    const positions = new Map<AssetSection, number[]>()
+    for (const entry of removed) {
+        const values = positions.get(entry.section) ?? []
+        values.push(entry.position); positions.set(entry.section, values)
+    }
+    for (const values of positions.values()) values.sort((a, b) => a - b)
+    for (const entry of selected) {
+        if (deleted.has(entry.id)) continue
+        const values = positions.get(entry.section) ?? []
+        let low = 0, high = values.length
+        while (low < high) {
+            const middle = (low + high) >>> 1
+            if (values[middle] < entry.position) low = middle + 1
+            else high = middle
+        }
+        const position = entry.position - low
+        const current = assetAt(owner, data, entry.section, position)
+        if (current && current.key === entry.key && current.name === entry.name && current.ext === entry.ext) result.set(current.id, current)
+    }
+    return result
+}
 export function renameGalleryAsset(owner: AssetOwner, data: AssetOwnerData, snapshot: AssetGalleryItem, name: string): void {
     assertAssetSnapshots(owner, data, [snapshot])
     if (snapshot.portrait) return

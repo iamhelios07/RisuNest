@@ -2892,11 +2892,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
 
     try {
     if(!responseApplication.hasOutputOwnership()){
+        lifecycle.diagnosticOutcome = 'stale'
         return false
     }
     let needsAutoContinue = false
     const resultTokens = await tokenize(result) + (arg.usedContinueTokens || 0)
     if(!responseApplication.hasOutputOwnership()){
+        lifecycle.diagnosticOutcome = 'stale'
         return false
     }
     if(DBState.db.autoContinueMinTokens > 0 && resultTokens < DBState.db.autoContinueMinTokens){
@@ -2933,6 +2935,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             ...message,
             data: message.data + rq,
         }))){
+            lifecycle.diagnosticOutcome = 'stale'
             return false
         }
     }
@@ -2947,6 +2950,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
 
     if(resendChat){
         if(!responseApplication.hasOutputOwnership()){
+            lifecycle.diagnosticOutcome = 'stale'
             return false
         }
         stageTimings.stage4Duration = Date.now() - stageTimings.stage4Start
@@ -2963,6 +2967,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             ...message,
             generationInfo,
         }))) {
+            lifecycle.diagnosticOutcome = 'stale'
             return false
         }
 
@@ -3209,6 +3214,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     }
     
     if(!responseApplication.hasOutputOwnership()){
+        lifecycle.diagnosticOutcome = 'stale'
         return false
     }
     const currentOutput = responseApplication.readOutput()
@@ -3216,6 +3222,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         ...message,
         generationInfo,
     }))) {
+        lifecycle.diagnosticOutcome = 'stale'
         return false
     }
 

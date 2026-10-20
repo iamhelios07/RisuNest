@@ -16,7 +16,7 @@
         else onselectall()
     }
 </script>
-<div class="g-toolbar" data-gallery-selection>
+<div class="g-toolbar" data-gallery-selection data-gallery-toolbar>
     <label class="select-all"><input type="checkbox" checked={allSelected} indeterminate={someSelected} onchange={change} aria-label={text.selectAll} /><span>{text.selectAll}</span></label>
     <span class="count">{galleryFormat(text.selected, selectedCount)}</span>
     <div class="g-grow"></div>
@@ -25,6 +25,6 @@
 </div>
 <style>
     .select-all { display:flex; align-items:center; gap:.5rem; font-size:.875rem; cursor:pointer; }
-    input { width:1.25rem; height:1.25rem; accent-color:var(--risu-theme-primary-500,#3b82f6); }
+    input { width:1.5rem; height:1.5rem; accent-color:var(--risu-theme-borderc); }
     .count { font-size:.875rem; font-variant-numeric:tabular-nums; }
 </style>

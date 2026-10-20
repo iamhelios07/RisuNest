@@ -57,41 +57,74 @@ export interface GenerationDiagnosticTrace {
 
 type DiagnosticInvoke = (command: string, args: Record<string, unknown>) => Promise<unknown>
 
-export function createGenerationDiagnostics(options: { enabled: boolean; invoke: DiagnosticInvoke }) {
+export function createGenerationDiagnostics(options: { enabled: boolean; invoke: DiagnosticInvoke; signal?: AbortSignal }) {
     let documentSequence: number | null = null
     let generationSequence = 0
     let eventSequence = 0
     let started = false
-    const send = (event: Record<string, unknown>) => {
-        if (!options.enabled) return
+    let pendingHandshake: Promise<void> | null = null
+    let handshakeUnavailable = false
+    const active = () => options.enabled && !options.signal?.aborted
+    const handshake = (): Promise<void> => {
+        if (!active() || handshakeUnavailable) return Promise.resolve()
+        if (pendingHandshake) return pendingHandshake
         try {
-            void options.invoke('native_generation_diagnostic', {
-                event: { ...event, eventSequence: ++eventSequence },
-            }).catch(() => {})
+            pendingHandshake = options.invoke('native_generation_diagnostic', { event: { kind: 'document-start' } })
+                .then((value) => {
+                    pendingHandshake = null
+                    if (!active()) return
+                    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+                        documentSequence = value
+                    } else {
+                        documentSequence = null
+                        handshakeUnavailable = value !== 0
+                    }
+                }, () => {
+                    pendingHandshake = null
+                    documentSequence = null
+                    handshakeUnavailable = true
+                })
+            return pendingHandshake
         } catch {
-            // Diagnostics cannot affect the operation being observed.
+            documentSequence = null
+            handshakeUnavailable = true
+            return Promise.resolve()
+        }
+    }
+    const recoverStale = async (error: unknown, event: Record<string, unknown>) => {
+        if (error !== 'stale-diagnostic-document' || !active()) return
+        if (documentSequence === event.documentSequence) await handshake()
+        if (!active() || documentSequence === null || documentSequence === event.documentSequence) return
+        try {
+            // A delayed native page-start can invalidate the initial handshake.
+            // Retry only this event, retaining its ordering against later phases.
+            await options.invoke('native_generation_diagnostic', { event: { ...event, documentSequence } })
+        } catch {}
+    }
+    const send = (event: Record<string, unknown>) => {
+        if (!active()) return
+        if (documentSequence === null) {
+            if (started) void handshake()
+            return
+        }
+        const sequenced = { ...event, documentSequence, eventSequence: ++eventSequence }
+        try {
+            void options.invoke('native_generation_diagnostic', { event: sequenced })
+                .catch(error => recoverStale(error, sequenced))
+        } catch (error) {
+            void recoverStale(error, sequenced)
         }
     }
     return {
         startDocument(): void {
-            if (!options.enabled || started) return
+            if (!active() || started) return
             started = true
-            try {
-                void options.invoke('native_generation_diagnostic', { event: { kind: 'document-start' } })
-                    .then((value) => {
-                        if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
-                            documentSequence = value
-                        }
-                    }).catch(() => {})
-            } catch {
-                // An unavailable native boundary leaves diagnostics disabled.
-            }
+            void handshake()
         },
         generation(): GenerationDiagnosticTrace {
             const sequence = ++generationSequence
             const emit = (event: Record<string, unknown>) => {
-                if (documentSequence === null) return
-                send({ ...event, documentSequence, generationSequence: sequence })
+                send({ ...event, generationSequence: sequence })
             }
             return {
                 admission: (value) => emit({
@@ -115,10 +148,13 @@ export function createGenerationDiagnostics(options: { enabled: boolean; invoke:
             }
         },
         lifecycle(event: 'background' | 'stop' | 'exit' | 'expiry' | 'memory-warning' | 'trim-memory', trimLevel?: number): void {
-            if (documentSequence === null) return
-            send({ kind: 'lifecycle', documentSequence, event, ...(trimLevel === undefined ? {} : { trimLevel }) })
+            send({ kind: 'lifecycle', event, ...(trimLevel === undefined ? {} : { trimLevel }) })
         },
     }
 }
 
-export const generationDiagnostics = createGenerationDiagnostics({ enabled: isTauri, invoke })
+const documentLifetime = new AbortController()
+if (isTauri && typeof window !== 'undefined') {
+    window.addEventListener('pagehide', () => documentLifetime.abort(), { once: true })
+}
+export const generationDiagnostics = createGenerationDiagnostics({ enabled: isTauri, invoke, signal: documentLifetime.signal })

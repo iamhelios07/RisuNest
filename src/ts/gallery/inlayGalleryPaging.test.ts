@@ -204,3 +204,35 @@ it('publishes a shortened total so the visible window can clamp after deleting t
     expectCovered(shown, 838, 60)
     expect(shown.has(898)).toBe(false)
 })
+
+it('fills a wide viewport using bounded pages and retains all visible rows', async () => {
+    const requests: InlayGalleryQuery[] = []
+    let shown = new Map<number, GalleryItem>()
+    const paging = new InlayGalleryPaging(async request => { requests.push(request); return page(request) },
+        (_, items) => { shown = items })
+    await paging.request(query(31, 900))
+    for (let index = 31; index < 931; index++) expect(shown.get(index)?.key).toBe(`all-${index}`)
+    expect(requests.every(request => request.limit <= 512)).toBe(true)
+    expect(requests.length).toBeGreaterThan(1)
+    await paging.request(query(20_000, 900))
+    expect(shown.has(31)).toBe(false)
+    for (let index = 20_000; index < 20_900; index++) expect(shown.has(index)).toBe(true)
+})
+
+it('never combines two scan orders at the same metadata revision', async () => {
+    let scanId = 'before'
+    let shown = new Map<number, GalleryItem>()
+    const paging = new InlayGalleryPaging(async request => {
+        const result = page(request)
+        result.scanId = scanId
+        if (scanId === 'after') result.items = result.items.map((item, index) => ({ ...item, key: `all-${request.offset + index - 200}` }))
+        return result
+    }, (_, items) => {
+        shown = items
+        expect(new Set([...items.values()].map(item => item.key)).size).toBe(items.size)
+    })
+    await paging.request(query(0))
+    scanId = 'after'
+    await paging.request(query(200, 100))
+    for (let index = 200; index < 300; index++) expect(shown.get(index)?.key).toBe(`all-${index - 200}`)
+})

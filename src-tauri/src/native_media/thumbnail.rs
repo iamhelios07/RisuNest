@@ -1,6 +1,6 @@
 use super::{base_response, prepare_file_response, ResolvedBlob};
 use crate::trust_boundary::{is_link_like, is_lower_hex_256, open_regular_source};
-use image::{imageops::FilterType, metadata::Orientation, DynamicImage, ImageDecoder, ImageReader};
+use image::{metadata::Orientation, DynamicImage, ImageDecoder, ImageReader};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -47,6 +47,7 @@ struct Index {
     entries: HashMap<String, Entry>,
     bytes: u64,
     clock: u64,
+    fallbacks: HashMap<String, u64>,
 }
 
 enum Source {
@@ -79,6 +80,7 @@ pub(super) struct ThumbnailCache {
     closed: Arc<AtomicBool>,
     max_bytes: u64,
     max_entries: usize,
+    decode_bytes: u64,
 }
 
 fn unavailable() -> io::Error {
@@ -94,6 +96,7 @@ impl ThumbnailCache {
             closed: Arc::new(AtomicBool::new(false)),
             max_bytes: DISK_BYTES,
             max_entries: DISK_ENTRIES,
+            decode_bytes: DECODE_BYTES,
         }
     }
 
@@ -203,11 +206,7 @@ impl ThumbnailCache {
         if !is_lower_hex_256(hash) { return Err(ThumbnailError::Unavailable); }
         self.check()?;
         if let Some(file) = self.cached(hash)? { return Ok(file); }
-        // All requests already own a bounded media-transfer slot. Only one of
-        // them may allocate a decoder, and another alias reuses its result.
-        let _generation = self.generation.lock().map_err(|_| unavailable())?;
-        self.check()?;
-        if let Some(file) = self.cached(hash)? { return Ok(file); }
+        if self.is_fallback(hash, size)? { return Err(ThumbnailError::Fallback); }
         let check = || self.check().map_err(|_| crate::server_sync::SyncError::new("cancelled", 409));
         let mut source = match crate::server_sync::residency::open_transient_server_with_check(root, &self.directory, hash, &check)
             .map_err(|_| unavailable())?
@@ -223,10 +222,16 @@ impl ThumbnailCache {
             },
         };
         if source.len()? != size { return Err(ThumbnailError::Unavailable); }
+        // Remote spooling owns a bounded media-transfer slot, but must not hold
+        // the decoder lock while unrelated local previews are ready to decode.
+        let _generation = self.generation.lock().map_err(|_| unavailable())?;
+        self.check()?;
+        if let Some(file) = self.cached(hash)? { return Ok(file); }
+        if self.is_fallback(hash, size)? { return Err(ThumbnailError::Fallback); }
         // This is a derivative working-memory budget, not an import limit.
         // Verify oversized sources with a fixed buffer before using their
         // original response path, just as normal-sized derivatives are verified.
-        if size > DECODE_BYTES / 4 {
+        if size > self.decode_bytes / 4 {
             let mut digest = Sha256::new();
             let mut received = 0_u64;
             let mut buffer = [0_u8; 64 * 1024];
@@ -239,17 +244,36 @@ impl ThumbnailCache {
                 digest.update(&buffer[..count]);
             }
             if received != size || hex::encode(digest.finalize()) != hash { return Err(ThumbnailError::Unavailable); }
+            self.remember_fallback(hash, size)?;
             return Err(ThumbnailError::Fallback);
         }
         let mut bytes = Vec::with_capacity(size as usize);
         (&mut source).take(size + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 != size || hex::encode(Sha256::digest(&bytes)) != hash { return Err(ThumbnailError::Unavailable); }
         self.check()?;
-        let encoded = encode(&bytes)?;
+        let encoded = match encode_with_budget(&bytes, self.decode_bytes) {
+            Err(ThumbnailError::Fallback) => {
+                self.remember_fallback(hash, size)?;
+                return Err(ThumbnailError::Fallback);
+            }
+            result => result?,
+        };
         drop(source);
         drop(bytes);
         self.publish(hash, &encoded)?;
         self.cached(hash)?.ok_or(ThumbnailError::Unavailable)
+    }
+
+    fn is_fallback(&self, hash: &str, size: u64) -> io::Result<bool> {
+        Ok(self.index.lock().map_err(|_| unavailable())?.fallbacks.get(hash) == Some(&size))
+    }
+
+    fn remember_fallback(&self, hash: &str, size: u64) -> io::Result<()> {
+        let mut index = self.index.lock().map_err(|_| unavailable())?;
+        self.check()?;
+        if index.fallbacks.len() >= self.max_entries { index.fallbacks.clear(); }
+        if self.max_entries != 0 { index.fallbacks.insert(hash.to_owned(), size); }
+        Ok(())
     }
 
     fn publish(&self, hash: &str, bytes: &[u8]) -> io::Result<()> {
@@ -333,6 +357,7 @@ fn ensure_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)
 }
 
+#[cfg(test)]
 fn encode(bytes: &[u8]) -> Result<Vec<u8>, ThumbnailError> {
     encode_with_budget(bytes, DECODE_BYTES)
 }
@@ -340,13 +365,23 @@ fn encode(bytes: &[u8]) -> Result<Vec<u8>, ThumbnailError> {
 fn encode_with_budget(bytes: &[u8], decode_bytes: u64) -> Result<Vec<u8>, ThumbnailError> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|_| unavailable())?;
     if reader.format().is_none() { return Err(ThumbnailError::Unavailable); }
+    let jpeg_working = if reader.format() == Some(image::ImageFormat::Jpeg) {
+        let working = jpeg_working_bytes(bytes)?;
+        if working > decode_bytes { return Err(ThumbnailError::Fallback); }
+        Some(working)
+    } else { None };
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(decode_bytes / 2);
     reader.limits(limits);
     let mut decoder = reader.into_decoder().map_err(decode_error)?;
     let (width, height) = decoder.dimensions();
-    let working = u64::from(width).checked_mul(u64::from(height)).and_then(|pixels| pixels.checked_mul(12))
-        .and_then(|pixels| pixels.checked_add(bytes.len() as u64)).ok_or_else(unavailable)?;
+    // Reserve the decoded surface and a decoder-owned surface (including
+    // high-bit-depth output). Sampling and orientation only allocate at the
+    // preview dimensions; they never create a full-size float resize buffer.
+    let preview_pixels = u64::from(width.min(DIMENSION)) * u64::from(height.min(DIMENSION));
+    let working = jpeg_working.unwrap_or(decoder.total_bytes().checked_mul(2)
+        .and_then(|pixels| pixels.checked_add(preview_pixels * 24))
+        .and_then(|pixels| pixels.checked_add((bytes.len() as u64) * 2)).ok_or_else(unavailable)?);
     if width == 0 || height == 0 { return Err(ThumbnailError::Unavailable); }
     if working > decode_bytes { return Err(ThumbnailError::Fallback); }
     let profile = decoder.icc_profile().map_err(|_| unavailable())?;
@@ -355,13 +390,49 @@ fn encode_with_budget(bytes: &[u8], decode_bytes: u64) -> Result<Vec<u8>, Thumbn
     // ImageDecoder reads the first image, so animation frame counts do not
     // multiply the gallery's decode budget or produce animated derivatives.
     let mut decoded = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
-    decoded.apply_orientation(orientation);
     if decoded.width().max(decoded.height()) > DIMENSION {
-        decoded = decoded.resize(DIMENSION, DIMENSION, FilterType::Triangle);
+        decoded = decoded.thumbnail(DIMENSION, DIMENSION);
     }
+    decoded.apply_orientation(orientation);
     let rgba = decoded.into_rgba8();
     let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height()).encode(75.0).to_vec();
     Ok(attach_profile(encoded, profile.as_deref(), rgba.width(), rgba.height())?)
+}
+
+fn jpeg_working_bytes(bytes: &[u8]) -> Result<u64, ThumbnailError> {
+    let mut source = Cursor::new(bytes);
+    let mut decoder = zune_jpeg::JpegDecoder::new(&mut source);
+    decoder.set_options(decoder.options().set_strict_mode(false).set_max_width(usize::MAX).set_max_height(usize::MAX));
+    decoder.decode_headers().map_err(|error| match error {
+        zune_jpeg::errors::DecodeErrors::Unsupported(_) => ThumbnailError::Fallback,
+        _ => ThumbnailError::Unavailable,
+    })?;
+    let info = decoder.info().ok_or(ThumbnailError::Unavailable)?;
+    let width = u64::from(info.width);
+    let height = u64::from(info.height);
+    let components = decoder.input_colorspace().ok_or(ThumbnailError::Unavailable)?.num_components() as u64;
+    drop(decoder);
+    // Header decoding stops immediately after SOS. Only a uniquely matching
+    // all-component scan can avoid the baseline decoder's full coefficient planes.
+    let header_end = source.position() as usize;
+    let mut scan_components = (1_u8..=4).filter(|count| {
+        let length = 6 + 2 * usize::from(*count);
+        header_end.checked_sub(length + 2).and_then(|start| bytes.get(start..start + 5))
+            .is_some_and(|header| header == [0xff, 0xda, 0, length as u8, *count])
+    });
+    let all_components_in_first_scan = scan_components.next() == Some(info.components) && scan_components.next().is_none();
+    let decoded = width * height * if components == 1 { 1 } else { 3 };
+    let padded_width = width.div_ceil(32) * 32;
+    let padded_height = height.div_ceil(32) * 32;
+    // Progressive and baseline multi-scan JPEG keep full i16 coefficient planes.
+    // MCU padding and four-component input also apply to CMYK/YCCK sources.
+    let coefficients = if info.sof.is_progressive() || !all_components_in_first_scan {
+        padded_width * padded_height * u64::from(info.components).max(components) * 2
+    } else { 0 };
+    let surfaces = (decoded * 2).max(decoded + coefficients);
+    // Cover raw MCU rows, previous rows and generic 4x4 upsampling scratch,
+    // plus compressed input/metadata copies retained by the image adapter.
+    Ok(surfaces + padded_width * 4096 + width.min(u64::from(DIMENSION)) * height.min(u64::from(DIMENSION)) * 24 + bytes.len() as u64 * 4)
 }
 
 fn attach_profile(encoded: Vec<u8>, profile: Option<&[u8]>, width: u32, height: u32) -> io::Result<Vec<u8>> {

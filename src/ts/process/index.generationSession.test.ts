@@ -1416,6 +1416,12 @@ describe('sendChat generation session integration', () => {
 
         await expect(sending).resolves.toBe(false)
         expect(currentCharacter.chats[0].message[0].data).toBe('replacement')
+        expect(mocks.diagnosticEvents).toContainEqual(expect.objectContaining({
+            phase: 'completion-processing', edge: 'exit', outcome: 'stale',
+        }))
+        expect(mocks.diagnosticEvents).toContainEqual(expect.objectContaining({
+            phase: 'settled', edge: 'exit', outcome: 'stale',
+        }))
     })
 
     it('preserves complete successful non-empty multiline response behavior', async () => {

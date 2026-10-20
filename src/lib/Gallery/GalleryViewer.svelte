@@ -29,16 +29,17 @@
     onMount(() => {
         showInfo = window.innerWidth >= 640
         const unsubscribe = subscribeNativeMediaEndpointChanges(() => { endpoint++ })
-        const key = (event:KeyboardEvent) => {
-            if (isCompositionKey(event) || !['none','toast','wait','progress'].includes(get(alertStore).type)) return
-            const target=event.target as HTMLElement
-            if (target?.closest('input,textarea,select,[contenteditable="true"]')) return
-            if(event.key==='ArrowLeft') { event.preventDefault(); navigate(-1) }
-            if(event.key==='ArrowRight') { event.preventDefault(); navigate(1) }
-        }
-        window.addEventListener('keydown',key)
-        return () => { unsubscribe(); window.removeEventListener('keydown',key) }
+        return unsubscribe
     })
+    function key(event:KeyboardEvent) {
+        const alert = get(alertStore)
+        if (event.defaultPrevented || isCompositionKey(event) || alert.dialogPending || !['none','toast'].includes(alert.type)) return
+        const target = event.target as HTMLElement
+        if (target?.closest('input,textarea,select,video,audio,[contenteditable]:not([contenteditable="false"])')) return
+        if (target?.closest('[role="dialog"]') !== event.currentTarget) return
+        if(event.key==='ArrowLeft') { event.preventDefault(); navigate(-1) }
+        if(event.key==='ArrowRight') { event.preventDefault(); navigate(1) }
+    }
     $effect(() => {
         endpoint
         const neighbours = [previous,next].filter((value):value is GalleryItem => !!value && value.type==='image')
@@ -73,7 +74,7 @@
         } else if(!actualSize && current.touch && Math.abs(dx)>50 && Math.abs(dx)>Math.abs(dy)*1.5) navigate(dx<0?1:-1)
     }
 </script>
-<div class="viewer" role="dialog" aria-modal="true" aria-label={item.name || item.key} tabindex="-1" use:modalNavigation={{close:onclose}}>
+<div class="viewer" role="dialog" aria-modal="true" aria-label={item.name || item.key} tabindex="-1" onkeydown={key} use:modalNavigation={{close:onclose}}>
     <div class="main">
         <div class="top">
             <button type="button" class="vbutton icon" onclick={onclose} aria-label={text.close}><XIcon size={20} /></button>
@@ -112,12 +113,12 @@
     {/if}
 </div>
 <style>
-    .viewer { position:fixed; inset:0; z-index:150; display:flex; background:#0f1016; color:var(--risu-theme-textcolor); padding-top:env(safe-area-inset-top,0px); padding-left:env(safe-area-inset-left,0px); padding-right:env(safe-area-inset-right,0px); }
-    .main { color:#f1f2f6; position:relative; flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; }
+    .viewer { position:fixed; inset:0; z-index:150; display:flex; background:var(--risu-theme-bgcolor); color:var(--risu-theme-textcolor); padding-top:env(safe-area-inset-top,0px); padding-left:env(safe-area-inset-left,0px); padding-right:env(safe-area-inset-right,0px); }
+    .main { position:relative; flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; }
     .top { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; padding:.625rem .75rem; }
     .title { display:grid; min-width:3rem; flex:1; line-height:1.3; }
     .name { font-size:14px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .count { font-size:12px; color:#a6adbb; font-variant-numeric:tabular-nums; }
+    .count { font-size:12px; color:var(--risu-theme-textcolor2); font-variant-numeric:tabular-nums; }
     .vbutton { display:inline-flex; align-items:center; justify-content:center; gap:.375rem; height:2.25rem; padding:0 .625rem; border-radius:.375rem; border:1px solid color-mix(in srgb,currentColor 14%,transparent); background:color-mix(in srgb,currentColor 6%,transparent); color:inherit; font-size:13px; white-space:nowrap; cursor:pointer; }
     .vbutton.icon { width:2.25rem; padding:0; }
     .vbutton.active,.vbutton:hover { background:color-mix(in srgb,currentColor 16%,transparent); }
@@ -126,24 +127,21 @@
     .stage { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:.5rem 4rem 1.5rem; overflow:hidden; touch-action:pan-y; }
     .stage.actual { display:block; overflow:auto; padding:0; touch-action:none; cursor:grab; }
     .stage.actual:active { cursor:grabbing; }
-    .navigation { position:absolute; z-index:1; top:50%; transform:translateY(-50%); display:flex; width:2.75rem; height:2.75rem; align-items:center; justify-content:center; border-radius:999px; border:1px solid color-mix(in srgb,currentColor 14%,transparent); background:#21222ccc; color:#f1f2f6; cursor:pointer; }
+    .navigation { position:absolute; z-index:1; top:50%; transform:translateY(-50%); display:flex; width:2.75rem; height:2.75rem; align-items:center; justify-content:center; border-radius:999px; border:1px solid var(--risu-theme-darkborderc); background:color-mix(in srgb,var(--risu-theme-darkbg) 90%,transparent); color:var(--risu-theme-textcolor); cursor:pointer; }
     .navigation:disabled { visibility:hidden; }
     .previous { left:.75rem; }.next { right:.75rem; }
     .information { flex:none; width:20rem; border-left:1px solid var(--risu-theme-darkborderc); background:var(--risu-theme-darkbg); overflow-y:auto; padding:1rem; }
     dl { display:grid; grid-template-columns:auto minmax(0,1fr); gap:.375rem 1rem; font-size:13px; margin:0; }
     dt { color:var(--risu-theme-textcolor2); }dd { margin:0; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
     .desktop-actions { display:flex; flex-wrap:wrap; gap:.5rem; }
-    .desktop-actions :global(.g-button) { height:2.25rem; padding:0 .625rem; border-color:#ffffff24; background:#ffffff0f; color:inherit; font-size:13px; }
-    .desktop-actions :global(.g-button.danger) { color:#fca5a5; border-color:#f8717166; }
-    .desktop-actions :global(.g-button:hover) { background:#ffffff29; }
+    .desktop-actions :global(.g-button) { height:2.25rem; padding:0 .625rem; font-size:13px; }
     .mobile-actions,.handle { display:none; }
     @media(max-width:639px) {
         .viewer { flex-direction:column; }
         .stage { padding:.25rem .5rem .75rem; }
         .information { width:100%; max-height:58%; border-left:0; border-top:1px solid var(--risu-theme-darkborderc); border-radius:1rem 1rem 0 0; padding:.5rem 1rem max(1.5rem,env(safe-area-inset-bottom)); }
         .handle { display:block; width:2.5rem; height:.25rem; border-radius:999px; background:var(--risu-theme-darkborderc); margin:0 auto .75rem; }
-        .navigation,.desktop-actions { display:none; }
-        .navigation.actual-nav { display:flex; }
+        .desktop-actions { display:none; }
         .mobile-actions { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:1.25rem; }
     }
 </style>

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 
 mod usage;
+pub(super) use usage::pending_fence;
 #[cfg(test)]
 mod tests;
 
@@ -47,7 +48,7 @@ pub(crate) struct GalleryItem { #[serde(flatten)] pub(crate) alias: AssetAlias, 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GalleryPage {
-    pub(crate) revision: i64, pub(crate) total: usize, pub(crate) total_bytes: i64,
+    pub(crate) scan_id: Option<String>, pub(crate) revision: i64, pub(crate) total: usize, pub(crate) total_bytes: i64,
     pub(crate) counts: TypeCounts, pub(crate) items: Vec<GalleryItem>,
 }
 #[derive(Serialize)]
@@ -102,6 +103,7 @@ struct ScanSession { status: Option<ScanStatus>, result: Option<UsageResult>, ca
 struct UsageResult {
     id: String, revision: i64, status: ScanStatus, keys: HashSet<String>, locations: HashMap<String, Vec<GalleryLocation>>,
     unchecked_archives: usize, unchecked_records: usize,
+    pending_fence: [u8; 32],
     device_fence: Option<super::device_store::plugin_gc::PluginGcFence>,
 }
 impl UsageResult {
@@ -189,7 +191,7 @@ impl PersistentStore {
                 items.push(GalleryItem { alias: alias.value, sort_time: times.query_row(params![reader.target.generation, key], |row| row.get(0))? });
             }
         }
-        Ok(GalleryPage { revision: reader.target.revision, total: order.keys.len(), total_bytes: order.total_bytes, counts: order.counts.clone(), items })
+        Ok(GalleryPage { scan_id: order.scan_id.clone(), revision: reader.target.revision, total: order.keys.len(), total_bytes: order.total_bytes, counts: order.counts.clone(), items })
     }
     pub(crate) fn gallery_keys(&mut self, query: &GalleryQuery) -> StoreResult<GalleryKeys> {
         let reader = self.gallery_reader()?;
@@ -199,13 +201,17 @@ impl PersistentStore {
     /// With `scan_id`, deletes only while that scan still describes the library,
     /// including device-local plugin values, which do not move the revision.
     pub(crate) fn gallery_delete(&mut self, keys: &[String], expected_revision: i64, scan_id: Option<&str>) -> StoreResult<RevisionResult> {
+        let mut gallery_pending_fence = None;
         if let Some(scan_id) = scan_id {
             let current = {
                 let scan = self.gallery.scan.lock().unwrap_or_else(|e| e.into_inner());
                 match &scan.result {
-                    Some(result) if result.id == scan_id && result.revision == expected_revision => match &result.device_fence {
-                        Some(fence) => self.device_store()?.plugin_gc_fence_is_current(fence)?,
-                        None => true,
+                    Some(result) if result.id == scan_id && result.revision == expected_revision => {
+                        gallery_pending_fence = Some(result.pending_fence);
+                        match &result.device_fence {
+                            Some(fence) => self.device_store()?.plugin_gc_fence_is_current(fence)?,
+                            None => true,
+                        }
                     },
                     _ => false,
                 }
@@ -214,7 +220,7 @@ impl PersistentStore {
         }
         let mut seen = HashSet::new();
         let mutations = keys.iter().filter(|key| seen.insert(key.as_str())).map(|key| Ok(super::lww::UnitMutation::Delete { key: super::lww::unit_key(&["inlay", key])? })).collect::<StoreResult<Vec<_>>>()?;
-        self.lww_commit(&WorkingSetCommit { expected_revision, unit_mutations: Some(mutations), ..Default::default() }, &[], &mut None)
+        self.commit_with_asset_aliases(&WorkingSetCommit { expected_revision, gallery_pending_fence, unit_mutations: Some(mutations), ..Default::default() }, &[])
     }
     pub(crate) fn gallery_scan_status(&mut self) -> StoreResult<Option<ScanStatus>> {
         self.gallery_generation(&super::active_generation(&self.connection)?);

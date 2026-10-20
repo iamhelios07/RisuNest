@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
+import { get } from 'svelte/store'
 import type { GalleryItem } from 'src/ts/gallery/types'
 import { resolveGalleryMedia, type GalleryMediaSource } from 'src/ts/gallery/galleryMedia'
 
@@ -40,6 +41,9 @@ import { createNativeImmutablePayloadCas, createNativeAssetObjectUrlResolver,
     createNativeNewInlayImageEncoder, createNativeDurableAssetWriteSessionFactory } from 'src/ts/storage/nativeAssetRepository'
 import { createInRealmStorageLockManager, createStorageMutationGate } from 'src/ts/storage/storageMutationGate'
 import Harness from './GalleryMediaHarness.test.svelte'
+import GalleryViewer from './GalleryViewer.svelte'
+import GalleryGrid from './GalleryGrid.svelte'
+import { alertStore } from 'src/ts/stores.svelte'
 
 // Flush startup effects after Vitest's asynchronous module graph has initialized.
 vi.runAllTicks()
@@ -76,6 +80,52 @@ afterEach(async () => {
     component = undefined
     await settled()
     document.body.replaceChildren(); vi.unstubAllGlobals()
+    alertStore.set({type:'none',msg:''})
+})
+
+describe('gallery navigation and focus', () => {
+    it('navigates only from its own dialog and leaves media, pending alerts and overlays alone', async () => {
+        target = document.createElement('div'); document.body.appendChild(target)
+        const navigated:number[] = []
+        alertStore.set({type:'none',msg:''})
+        component = mount(GalleryViewer, { target, props: { item:{...initial,type:'other'}, index:1, total:3,
+            onclose:()=>{}, onnavigate:index=>navigated.push(index) } })
+        await settled()
+        const viewer = target.querySelector<HTMLElement>('[role="dialog"]')!
+        const key = (node:HTMLElement) => node.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}))
+        key(viewer.querySelector('button')!)
+        expect(navigated).toEqual([2])
+        for (const tag of ['video','audio','input']) {
+            const content = document.createElement(tag); viewer.appendChild(content); key(content); content.remove()
+        }
+        const overlay = document.createElement('div'); overlay.setAttribute('role','dialog'); document.body.appendChild(overlay)
+        const button = document.createElement('button'); overlay.appendChild(button); key(button)
+        alertStore.set({type:'normal',msg:'first'}); alertStore.set({type:'normal',msg:'second'})
+        key(viewer)
+        alertStore.set({type:'none',msg:''})
+        expect(get(alertStore).dialogPending).toBe(true)
+        key(viewer)
+        await vi.waitFor(() => expect(get(alertStore).type).toBe('normal'))
+        alertStore.set({type:'none',msg:''})
+        alertStore.set({type:'progress',msg:''}); key(viewer)
+        expect(navigated).toEqual([2])
+    })
+    it('scrolls a focused grid row below the sticky toolbar', async () => {
+        target = document.createElement('div')
+        target.style.overflowY = 'auto'
+        document.body.appendChild(target)
+        const toolbar = document.createElement('div'); toolbar.dataset.galleryToolbar = ''; toolbar.style.position = 'sticky'; toolbar.style.top = '0px'
+        toolbar.getBoundingClientRect = () => ({top:0,bottom:60,height:60} as DOMRect)
+        target.appendChild(toolbar)
+        const content = document.createElement('div'); target.appendChild(content)
+        const app = mount(GalleryGrid, {target:content,props:{total:100,items:new Map<number, GalleryItem>(),selected:new Set<string>(),onwindow:()=>{},onopen:()=>{},ontoggle:()=>{}}})
+        component = app
+        await settled()
+        const root = content.querySelector<HTMLElement>('[data-gallery-grid]')!
+        root.getBoundingClientRect = () => ({top:60-target.scrollTop,bottom:2000,width:600,height:2000} as DOMRect)
+        await app.scrollToIndex(0)
+        expect(target.scrollTop).toBe(12)
+    })
 })
 
 describe('gallery media content lifetime', () => {

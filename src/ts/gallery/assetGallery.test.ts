@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
     addGalleryAssets, assetGalleryItems, assetGalleryPage, assetSectionCount, assertAssetSnapshots, deleteGalleryAssets,
-    renameGalleryAsset, replaceGalleryAsset, setGalleryCharacterIcon, setGalleryPromptExcluded,
+    renameGalleryAsset, replaceGalleryAsset, setGalleryCharacterIcon, setGalleryPromptExcluded, selectionAfterAssetDelete,
     AssetNameError, StaleAssetSelectionError, type AssetOwnerData, type AssetOwner,
 } from './assetGallery'
 
@@ -9,6 +9,16 @@ const owner: AssetOwner = { kind: 'character', id: 'synthetic-character' }
 const entries = (data: AssetOwnerData, section: 'icons' | 'emotions' | 'assets' = 'assets') => [...assetGalleryItems(owner, data, section)]
 
 describe('asset gallery registration operations', () => {
+    it('keeps other selected registrations after viewer deletion shifts their positions', () => {
+        const data: AssetOwnerData = { additionalAssets: [['first', 'shared', 'png'], ['second', 'shared', 'png'], ['third', 'three', 'png']] }
+        const [first, second, third] = entries(data)
+        deleteGalleryAssets(owner, data, [first])
+        const selected = selectionAfterAssetDelete(owner, data, [second, third], [first])
+        expect([...selected.values()].map(entry => [entry.name, entry.position])).toEqual([['second', 0], ['third', 1]])
+        assertAssetSnapshots(owner, data, [...selected.values()])
+        deleteGalleryAssets(owner, data, [...selected.values()])
+        expect(data.additionalAssets).toEqual([])
+    })
     it('manages shared content independently by registration and keeps exclusion until its last use', () => {
         const data: AssetOwnerData = { additionalAssets: [['smile', 'assets/shared.png', 'png'], ['happy', 'assets/shared.png', 'png']], prebuiltAssetExclude: ['assets/shared.png'] }
         const [first, second] = entries(data)

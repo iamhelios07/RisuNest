@@ -39,8 +39,21 @@ export function galleryDownloadName(name: string, key: string, ext: string): str
     const stem = original.includes('.') && suffix.toLowerCase() === ext.replace(/^\.+/, '').toLowerCase()
         ? original.slice(0, -(suffix.length + 1))
         : original.replace(/\.(jpg|jpeg|png|gif|webp|avif|wav|mp3|ogg|flac|webm|mp4|mkv)$/i, '')
-    const clean = (value: string, fallback: string) => [...value.replace(/[\\/:*?"<>|\u0000-\u001f\u007f-\u009f]/g, '_').replace(/[. ]+$/, '')].slice(0, 120).join('').replace(/[. ]+$/, '') || fallback
-    return `${clean(stem, 'file')}.${clean(ext.replace(/^\.+/, ''), 'bin')}`
+    const encoder = new TextEncoder()
+    const clean = (value: string, fallback: string, maxBytes: number) => {
+        let cleaned = [...value.replace(/[\\/:*?"<>|\u0000-\u001f\u007f-\u009f]/g, '_').replace(/[. ]+$/, '')].slice(0, 120).join('').replace(/[. ]+$/, '') || fallback
+        if (/^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])$/i.test(cleaned.split('.')[0].replace(/ +$/, ''))) cleaned = `_${cleaned}`
+        let bytes = 0
+        let result = ''
+        for (const character of cleaned) {
+            bytes += encoder.encode(character).length
+            if (bytes > maxBytes) break
+            result += character
+        }
+        return result.replace(/[. ]+$/, '')
+    }
+    const extension = clean(ext.replace(/^\.+/, ''), 'bin', 120)
+    return `${clean(stem, 'file', 255 - encoder.encode(extension).length - 1)}.${extension}`
 }
 /** The calendar date on this device, for default archive names. */
 export function galleryArchiveDate(date: Date): string {

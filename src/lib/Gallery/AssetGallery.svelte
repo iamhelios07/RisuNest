@@ -20,7 +20,7 @@
     import { downloadGallery } from 'src/ts/gallery/galleryDownloads'
     import {
         prepareGalleryModuleMutation, readPinnedAssetOwner, assetGalleryItems, assetGalleryPage, assetSectionCount, assetExtension, assertAssetSnapshots, addGalleryAssets,
-        deleteGalleryAssets, renameGalleryAsset, replaceGalleryAsset, setGalleryCharacterIcon,
+        deleteGalleryAssets, selectionAfterAssetDelete, renameGalleryAsset, replaceGalleryAsset, setGalleryCharacterIcon,
         setGalleryPromptExcluded, validateAssetName, AssetNameError, StaleAssetSelectionError,
         type AssetOwner, type AssetOwnerData, type AssetSection, type AssetGalleryItem,
     } from 'src/ts/gallery/assetGallery'
@@ -85,6 +85,11 @@
     const total = $derived(typeCounts[filter])
     const items = $derived(assetGalleryPage(owner, data, section, normalizedSearch, filter, offset, limit))
     const listing = $derived({ counts, typeCounts, total, items })
+    $effect(() => {
+        normalizedSearch
+        filter
+        untrack(() => { clear(); offset = 0; void grid?.scrollToIndex(0).catch(report) })
+    })
     function at(index: number): AssetGalleryItem | undefined {
         if (index < 0 || index >= total) return
         return assetGalleryPage(owner, data, section, normalizedSearch, filter, index, 1).get(index)
@@ -111,7 +116,7 @@
         untrack(() => {
             const kept = new Map<string, AssetGalleryItem>()
             for (const [id, snapshot] of selections) {
-                try { assertAssetSnapshots(owner, data, [snapshot]); kept.set(id, snapshot) } catch {}
+                try { assertAssetSnapshots(owner, data, [snapshot]); if (matches(snapshot)) kept.set(id, snapshot) } catch {}
             }
             if (kept.size !== selections.size) selections = kept
             if (viewer) {
@@ -148,7 +153,7 @@
         return () => { active = false }
     })
     onDestroy(() => downloadAbort?.abort())
-    function changeSection(value: AssetSection) { section = value; filter = 'all'; search = ''; clear(); offset = 0; void grid?.scrollToIndex(0) }
+    function changeSection(value: AssetSection) { section = value; filter = 'all'; search = ''; clear(); offset = 0; void grid?.scrollToIndex(0).catch(report) }
     function clear() { selections = new Map(); selecting = false; lastSelectedIndex = -1 }
     function toggle(item: GalleryItem, index: number, range: boolean) {
         const next = new Map(selections)
@@ -220,8 +225,10 @@
         if (!removable.length) return
         await action(async () => {
             if (!await alertActionConfirm({ title: text.deleteAssetsTitle, description: galleryFormat(text.deleteAssets, removable.length), cancelLabel: text.cancel, actionLabel: text.remove })) return
+            const previousSelection = [...selections.values()]
             await mutate('delete-assets', value => deleteGalleryAssets(owner, value, removable))
-            clear()
+            selections = selectionAfterAssetDelete(owner, data, previousSelection, removable)
+            lastSelectedIndex = -1
         })
     }
     async function replace(target: AssetGalleryItem) {
@@ -292,9 +299,9 @@
                     <button class="g-button small danger" disabled={busy || ![...selections.values()].some(entry => !entry.portrait)} onclick={() => remove([...selections.values()])}>{text.remove}</button>
                 </GalleryToolbar>
             {:else}
-                <div class="g-toolbar">
+                <div class="g-toolbar" data-gallery-toolbar>
                     <label class="g-search"><SearchIcon size={16}/><input aria-label={text.search} placeholder={text.search} bind:value={search}/></label>
-                    {#if section === 'assets'}<div class="g-row">{#each filters as value}<button class="g-chip" class:active={filter === value} onclick={() => { filter = value; offset = 0; void grid?.scrollToIndex(0) }}>{text[value]} <span>{listing.typeCounts[value]}</span></button>{/each}</div>{/if}
+                    {#if section === 'assets'}<div class="g-row">{#each filters as value}<button class="g-chip" class:active={filter === value} onclick={() => { filter = value }}>{text[value]} <span>{listing.typeCounts[value]}</span></button>{/each}</div>{/if}
                     <span class="g-grow"></span><div class="g-row">
                         <div class="g-segment"><button class:active={size === 'normal'} onclick={() => setSize('normal')}>{text.normal}</button><button class:active={size === 'large'} onclick={() => setSize('large')}>{text.large}</button></div>
                         <button class="g-button small" class:active={selecting} onclick={() => selecting = !selecting}>{selecting ? text.cancel : text.select}</button>

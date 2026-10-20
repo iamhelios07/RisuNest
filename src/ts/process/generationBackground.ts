@@ -1,6 +1,6 @@
 import { isTauriAndroid, isTauriIOS } from '../platform'
 import { getDeviceSettings } from '../storage/deviceSettings'
-import { beginDeferredMobileBackgroundTask, beginMobileBackgroundTask, type MobileBackgroundTask } from '../mobileBackgroundTask'
+import { beginDeferredMobileBackgroundTask, beginMobileBackgroundTask, retainMobileBackgroundActivity, type MobileBackgroundTask } from '../mobileBackgroundTask'
 import { beginIOSGeneration, isBackgroundExpiryReason } from '../iosNative'
 import { isGenerationReserved, joinGenerationSignal, type GenerationBackground } from './generationState'
 
@@ -19,7 +19,13 @@ export function beginGenerationBackground(): GenerationBackground {
     }
     const android: Promise<MobileBackgroundTask> | null = isTauriAndroid && androidKeepAlive()
         ? Promise.resolve(beginMobileBackgroundTask('generation')).then(forwardExpiry) : null
-    const ios = isTauriIOS ? beginIOSGeneration().then(forwardExpiry) : null
+    const releaseIOSActivity = isTauriIOS ? retainMobileBackgroundActivity() : undefined
+    const ios = isTauriIOS ? beginIOSGeneration().then(task => {
+        forwardExpiry(task)
+        if (!task.admitted() || task.signal?.aborted) releaseIOSActivity?.()
+        else task.signal?.addEventListener('abort', () => releaseIOSActivity?.(), { once: true })
+        return task
+    }, error => { releaseIOSActivity?.(); throw error }) : null
     let succeeded = false
     let expiryTaken = false
     let ended = false
@@ -38,7 +44,7 @@ export function beginGenerationBackground(): GenerationBackground {
             await Promise.all([
                 android?.then(task => task.dispose(succeeded)),
                 ios?.then(task => task.dispose(succeeded && !controller.signal.aborted)),
-            ]).catch(error => console.error('Generation background cleanup failed', error))
+            ]).catch(error => console.error('Generation background cleanup failed', error)).finally(releaseIOSActivity)
         },
     }
 }

@@ -130,6 +130,7 @@ export async function selectCharImg(charIndex:number, check?: (character: Charac
             return typeof selected === 'string' ? selected : null
         },
         readDesktopPath: readFile,
+        onImageError: message => { void alertError(message) },
         readDesktopHeader: async path => {
             const file = await openFile(path, { read: true })
             try {
