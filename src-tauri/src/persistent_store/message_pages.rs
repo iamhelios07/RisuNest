@@ -1066,6 +1066,12 @@ pub(super) fn accept_copied_database(tx: &Transaction<'_>) -> StoreResult<()> {
     let orphan: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM message_page_indexes i LEFT JOIN message_page_manifests m
         ON m.generation=i.generation AND m.character_id=i.character_id AND m.conversation_id=i.conversation_id WHERE m.body IS NULL)",[],|r|r.get(0))?;
     if orphan { return Err(codec_error("copied page index has no manifest")); }
+    // Older stores kept these derived rows after deleting their conversations.
+    for table in ["message_page_indexes", "message_page_manifests"] {
+        tx.execute(&format!("DELETE FROM {table} WHERE NOT EXISTS(
+            SELECT 1 FROM conversations c WHERE c.generation={table}.generation
+            AND c.character_id={table}.character_id AND c.conversation_id={table}.conversation_id)"), [])?;
+    }
     let mut manifests = tx.prepare("SELECT generation,character_id,conversation_id,body FROM message_page_manifests")?;
     let entries = manifests.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Vec<u8>>(3)?)))?
         .collect::<Result<Vec<_>,_>>()?;

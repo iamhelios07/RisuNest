@@ -503,7 +503,8 @@ fn manifest_mismatches(store: &mut PersistentStore) -> Vec<String> {
     let generation = active_generation(&store.connection).unwrap();
     let conversations = store
         .connection
-        .prepare("SELECT character_id,conversation_id FROM conversations WHERE generation=?1 ORDER BY 1,2")
+        .prepare("SELECT character_id,conversation_id FROM conversations WHERE generation=?1
+            UNION SELECT character_id,conversation_id FROM message_page_manifests WHERE generation=?1 ORDER BY 1,2")
         .unwrap()
         .query_map([&generation], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
         .unwrap()
@@ -558,6 +559,15 @@ fn active_manifests_equal_a_full_capture_after_every_mutation_kind() {
         })
         .unwrap();
     results.push(("conversation edits", manifest_mismatches(&mut store)));
+
+    let revision = store.revision().unwrap();
+    store.commit(&WorkingSetCommit {
+        conversations: Some(vec![ConversationMutation::Delete {
+            character_id: "char-a".into(), conversation_id: "conv-long".into(),
+        }]),
+        ..empty_working_set_commit(revision)
+    }).unwrap();
+    results.push(("delete_conversation", manifest_mismatches(&mut store)));
 
     let revision = store.revision().unwrap();
     store
