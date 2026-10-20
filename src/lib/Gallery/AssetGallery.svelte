@@ -358,7 +358,7 @@
     .asset-empty { text-align:center; padding:3rem 1rem; color:var(--risu-theme-textcolor2); }
     .asset-info { display:grid; grid-template-columns:auto minmax(0,1fr); gap:.375rem 1rem; font-size:13px; margin:0; }
     .asset-info dt { color:var(--risu-theme-textcolor2); }
-    .asset-info dd { margin:0; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+    .asset-info dd { margin:0; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; display:flex; align-items:center; gap:.5rem .625rem; flex-wrap:wrap; }
     .asset-info dd .g-button.quiet { margin-left:-.625rem; }
     .asset-exclude { display:flex; align-items:center; gap:.5rem; margin-top:1rem; font-size:.85rem; }
     .rename-overlay { position:fixed; inset:0; z-index:170; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; padding:1rem; color:var(--risu-theme-textcolor); }
