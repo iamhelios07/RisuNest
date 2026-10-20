@@ -1423,10 +1423,9 @@ export async function runScripted(code:string, arg:{
                     ScriptingEngineState.stopSending = true
                 }
             } catch (error) {
-                // Wasmoon wraps synchronous hook timeouts in a plain Error; the prefix depends on proxy mode.
+                // Wasmoon wraps synchronous hook timeouts in a plain Error with this first line.
                 if ((luaTimeoutErrorConstructor && error instanceof luaTimeoutErrorConstructor) ||
-                    (error instanceof Error && ['thread timeout exceeded', 'Error: thread timeout exceeded']
-                        .includes(error.message.split('\n', 1)[0]))) {
+                    (error instanceof Error && error.message.split('\n', 1)[0] === 'thread timeout exceeded')) {
                     const diagnosticMode = ['input', 'output', 'start', 'onButtonClick', 'editRequest',
                         'editDisplay', 'editInput', 'editOutput', 'manual'].includes(mode) ? mode : 'custom'
                     console.error({ code: 'lua-listener-timeout', mode: diagnosticMode,
