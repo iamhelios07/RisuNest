@@ -1821,7 +1821,7 @@ export const languageKorean = {
             "zipSaved": "압축 파일을 저장했습니다.",
             "zipSkipped": "압축 파일을 저장했으며, {0}개는 읽을 수 없어 제외했습니다.",
             "fileSaved": "파일을 저장했습니다.",
-            "unavailable": "첨부 파일을 불러올 수 없습니다"
+            "unavailable": "파일을 불러올 수 없습니다"
         },
         pluginStartup: {
             delayLabel: '동기화 후 플러그인 불러오기',
