@@ -482,4 +482,23 @@ describe('common backup file production route', () => {
         expect(await exportPortableBackupFromSystemPicker()).toEqual(result)
         expect(m.manager.mock.calls[0][3]).toMatchObject({ protectAfterPicker: true })
     })
+    it('ends quietly when the Android save picker is backed out of and rejects every other cancellation', async () => {
+        m.os = 'android'
+        const cancelled = () => new DOMException('Android SAF export was cancelled', 'AbortError')
+        m.export.mockRejectedValueOnce(cancelled())
+        await expect(exportPortableBackupFromSystemPicker()).resolves.toBeNull()
+        expect(m.protect).not.toHaveBeenCalled()
+        m.export.mockRejectedValueOnce(new Error('synthetic reservation failure'))
+        await expect(exportPortableBackupFromSystemPicker()).rejects.toThrow('synthetic reservation failure')
+        m.export.mockImplementationOnce(async (_runtime, _destination, _selection, options) => {
+            options.onDestinationChosen()
+            throw cancelled()
+        })
+        await expect(exportPortableBackupFromSystemPicker()).rejects.toMatchObject({ name: 'AbortError' })
+        m.export.mockImplementationOnce(async () => {
+            m.controller.abort()
+            throw cancelled()
+        })
+        await expect(exportPortableBackupFromSystemPicker()).rejects.toMatchObject({ name: 'AbortError' })
+    })
 })

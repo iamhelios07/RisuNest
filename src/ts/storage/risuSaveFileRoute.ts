@@ -140,8 +140,14 @@ async function exportThroughAndroidSaf(
     name: string,
     options: RisuSaveFileRouteOptions,
     dependencies: RisuSaveFileRouteDependencies,
-): Promise<RisuSaveFileRouteResult> {
+): Promise<RisuSaveFileRouteResult | null> {
     const reservation = await dependencies.reserveAndroidDestination(name, 'risuSave', options.signal)
+        .catch((error: unknown) => {
+            // Backing out of the save picker ends like a dismissed desktop dialog; a cancelled export still rejects.
+            if (!options.signal?.aborted && error instanceof DOMException && error.name === 'AbortError') return null
+            throw error
+        })
+    if (!reservation) return null
     options.onDestinationChosen?.()
     return withAndroidSafDestination(reservation, () =>
         exportToReservedAndroidSaf(runtime, name, options, dependencies, reservation))

@@ -104,6 +104,7 @@ export async function exportPortableBackupFromSystemPicker(
                           })
                 if (!isTauriAndroid && !isTauriIOS && !path) return null
                 checkSignal(joined.signal)
+                let destinationChosen = false
                 return await runNativeArchiveExport(
                     getPersistentDataRuntime(),
                     isTauriIOS
@@ -121,11 +122,23 @@ export async function exportPortableBackupFromSystemPicker(
                             options.onStatus?.(status)
                         },
                         onDestinationChosen() {
+                            destinationChosen = true
                             protect()
                             options.onDestinationChosen?.()
                         },
                     },
-                )
+                ).catch((error: unknown) => {
+                    // Backing out of the Android save picker ends like a dismissed
+                    // desktop dialog; a cancelled export still rejects.
+                    if (
+                        !destinationChosen &&
+                        !joined.signal.aborted &&
+                        error instanceof DOMException &&
+                        error.name === 'AbortError'
+                    )
+                        return null
+                    throw error
+                })
             } finally {
                 joined.dispose()
             }
