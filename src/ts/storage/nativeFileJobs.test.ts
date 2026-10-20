@@ -5317,6 +5317,7 @@ it('neither reopens nor releases an Android destination its caller reserved', as
         invoke: async () => { throw new Error('expected data revision 42, but current revision is 43') },
         wait: async () => {},
         reserveAndroidDestination: picker.reserve,
+        copyToAndroidSaf: async () => { throw new Error('A failed export publishes nothing') },
     }
     // A gallery retry after a revision conflict publishes to the destination the user already picked.
     for (let attempt = 0; attempt < 2; attempt++) {
