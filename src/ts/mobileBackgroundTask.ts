@@ -20,7 +20,7 @@ export interface MobileBackgroundTask {
 }
 /** Native replies `active`, `deferred`, or the reason it refused; a refused hold stays registered until it ends. */
 export interface AndroidBackgroundTaskBridge {
-    begin(id: string, kind: MobileTaskKind, deferred: boolean): Promise<string>
+    begin(id: string, kind: MobileTaskKind, deferred: boolean, userInitiated: boolean): Promise<string>
     progress(id: string, percent: number): Promise<unknown>
     end(id: string): Promise<unknown>
 }
@@ -130,7 +130,7 @@ function beginTask(
                 window.addEventListener('risunest-background-expired', expired)
                 let status: string
                 try {
-                    status = await bridge.begin(id, kind, deferred)
+                    status = await bridge.begin(id, kind, deferred, userInitiated)
                 } catch (error) {
                     // Native may still admit a request that timed out, so the hold always ends with the work.
                     status = error instanceof Error && error.message === 'android-control-timeout' ? 'timeout' : 'failed'

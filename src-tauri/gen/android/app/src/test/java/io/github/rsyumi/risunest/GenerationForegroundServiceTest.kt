@@ -27,8 +27,8 @@ class GenerationForegroundServiceTest {
       if (lifecycle.begin { if (refuse == null) { starts++; true } else false }) null else refuse
     }
     val stop: () -> Boolean = { lifecycle.end { stops++; true } }
-    fun begin(id: String, kind: String, deferred: Boolean = false, refresh: () -> Unit = {}) =
-      registry.begin(id, kind, deferred, start, { expired.add(it) }, refresh)
+    fun begin(id: String, kind: String, deferred: Boolean = false, userInitiated: Boolean = false, refresh: () -> Unit = {}) =
+      registry.begin(id, kind, deferred, userInitiated, start, { expired.add(it) }, refresh)
     fun end(id: String) = registry.end(id, stop)
   }
 
@@ -119,12 +119,12 @@ class GenerationForegroundServiceTest {
   @Test
   fun `returning to the screen keeps immediate holds in the service`() {
     val host = Hosted()
-    host.begin(taskId(1), "export")
+    host.begin(taskId(1), "export", userInitiated = true)
     host.begin(taskId(2), "sync", deferred = true)
     host.registry.promote(host.start)
     host.registry.demote(host.stop)
     assertEquals(0, host.stops)
-    assertEquals(listOf(BackgroundTaskStatus("export")), host.registry.snapshot())
+    assertEquals(listOf(BackgroundTaskStatus("export", userInitiated = true)), host.registry.snapshot())
     assertTrue(host.end(taskId(1)))
     assertEquals(1, host.stops)
   }
@@ -203,9 +203,9 @@ class GenerationForegroundServiceTest {
   }
 
   @Test
-  fun `notification groups kinds beside generation with a mean percent and a kind icon`() {
+  fun `notification groups kinds beside generation with a mean percent and a kind icon and shows user-started work at once`() {
     assertEquals(
-      BackgroundNotificationContent(true, emptyList(), -1, BackgroundNotificationIcon.CHAT),
+      BackgroundNotificationContent(true, emptyList(), -1, BackgroundNotificationIcon.CHAT, immediate = false),
       backgroundNotificationContent(listOf(BackgroundTaskStatus("generation"))),
     )
     assertEquals(
@@ -214,11 +214,12 @@ class GenerationForegroundServiceTest {
         lines = listOf(BackgroundNotificationLine("backup", 30), BackgroundNotificationLine("export", 90)),
         percent = 50,
         icon = BackgroundNotificationIcon.UPLOAD,
+        immediate = true,
       ),
       backgroundNotificationContent(listOf(
         BackgroundTaskStatus("backup", 20),
         BackgroundTaskStatus("generation"),
-        BackgroundTaskStatus("export", 90),
+        BackgroundTaskStatus("export", 90, userInitiated = true),
         BackgroundTaskStatus("backup", 40),
       )),
     )
@@ -228,6 +229,7 @@ class GenerationForegroundServiceTest {
         lines = listOf(BackgroundNotificationLine("restore", 10), BackgroundNotificationLine("sync", -1)),
         percent = -1,
         icon = BackgroundNotificationIcon.SYNC,
+        immediate = false,
       ),
       backgroundNotificationContent(listOf(BackgroundTaskStatus("restore", 10), BackgroundTaskStatus("sync"))),
     )

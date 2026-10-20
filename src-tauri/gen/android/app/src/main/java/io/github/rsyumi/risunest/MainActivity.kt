@@ -1038,7 +1038,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       "lifecycle.requestExit" -> lifecycleCommands.requestExit()
       "lifecycle.requestRestart" -> lifecycleCommands.requestRestart()
       "background.begin", "background.defer" -> GenerationForegroundService.beginTask(
-        this, args[0], args[1], deferred = method == "background.defer",
+        this, args[0], args[1], deferred = method == "background.defer", userInitiated = args.getOrNull(2) == "true",
       ) { id ->
         lifecycleWebView?.evaluateJavascript(
           "window.dispatchEvent(new CustomEvent('risunest-background-expired',{detail:'$id'}));", null,
