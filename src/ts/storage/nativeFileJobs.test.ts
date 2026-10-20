@@ -181,6 +181,7 @@ import {
     runNativeCharacterCardExport,
     runNativeRisuModuleExport,
     runNativeDatasetExport,
+    runNativeGalleryExport,
     runNativeOfficialPublicationAttempt,
     resumeNativeOfficialPublication,
     type NativeFileJobStatus,
@@ -5249,4 +5250,44 @@ describe('native snapshot restore', () => {
         await retryCommittedWorkingSetRefreshWithContinuation(runtime)
         expect(events).toEqual(['status-read', 'bodies:stage:12:1', 'forgotten'])
     })
+})
+
+it.each([
+    ['androidSaf', false], ['androidSaf', true], ['iosFiles', false], ['iosFiles', true],
+] as const)('publishes gallery downloads through %s (archive=%s) and cleans their handoff', async (platform, archive) => {
+    const kind = archive ? 'export-gallery-zip' : 'export-gallery-file'
+    const handoffPath = '/synthetic/native-file-jobs/handoffs/risu-download-123e4567-e89b-42d3-a456-426614174004.bin'
+    let published = false
+    let cleaned = false
+    const selection = {kind: 'inlay' as const, keys: ['selected-inlay']}
+    const publish = async (request: {sourcePath: string; suggestedName: string}) => {
+        expect(request.sourcePath).toBe(handoffPath)
+        expect(request.suggestedName).toBe(archive ? 'images.zip' : 'photo.png')
+        published = true
+        return {bytes: 10, warningCodes: []}
+    }
+    const result = await runNativeGalleryExport({destination: {type: platform, suggestedName: archive ? 'images.zip' : 'photo.png'},
+        expectedRevision: 42, archive, selection}, {}, {
+        isTauri: () => true,
+        invoke: async (command, args) => {
+            if (command === 'native_file_job_start') {
+                expect(args?.request).toEqual({kind, expectedRevision: 42, selection})
+                return {jobId: 'gallery'}
+            }
+            if (command === 'native_file_job_status') return {jobId: 'gallery', kind, state: 'succeeded', phase: 'complete',
+                progress: {completedBytes: 10, completedItems: 1}, result: {revision: 42, sourceBytes: 10,
+                    sourceFingerprintKind: 'whole-file-sha256', sourceSha256: 'a'.repeat(64), characterCount: 0,
+                    presetCount: 0, warningCodes: [], handoffPath}}
+            if (command === 'native_download_handoff_cleanup') { expect(published).toBe(true); cleaned = true; return true }
+            if (command === 'native_file_job_forget') { expect(cleaned).toBe(true); return true }
+            throw new Error(command)
+        },
+        wait: async () => {},
+        reserveAndroidDestination: androidSafReservationFixture().reserve,
+        copyToAndroidSaf: publish,
+        copyToIOSFiles: publish,
+    })
+    expect(published).toBe(true)
+    expect(cleaned).toBe(true)
+    expect(result.handoffPath).toBeUndefined()
 })

@@ -445,6 +445,8 @@ export interface NativeFileJobStatus {
         | 'export-character-card'
         | 'export-risu-module'
         | 'export-dataset'
+        | 'export-gallery-file'
+        | 'export-gallery-zip'
         | 'restore-legacy-local-backup'
         | 'export-compatible-local-backup'
         | 'export-portable-backup'
@@ -3532,4 +3534,32 @@ export async function resumeNativeOfficialPublication(
         },
     )
     return outcome?.kind === 'completed' ? outcome.receipt : null
+}
+
+export interface NativeGalleryExportInput {
+    destination: NativeCharacterCharxExportDestination
+    expectedRevision: number
+    archive: boolean
+    selection: {kind: 'asset'; entries: {key: string; name: string; section: string}[]}
+        | {kind: 'inlay'; keys: string[]}
+}
+
+export function runNativeGalleryExport(
+    input: NativeGalleryExportInput,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativeManagedExport({
+        operation: 'Native gallery export',
+        safLengthMismatchLabel: 'gallery download',
+        handoffCleanupCommand: 'native_download_handoff_cleanup',
+        androidSourceKind: 'download',
+        destination: input.destination,
+        prepareRequest: () => ({
+            kind: input.archive ? 'export-gallery-zip' : 'export-gallery-file',
+            ...(input.destination.type === 'desktopPath' ? {destination: input.destination.path} : {}),
+            expectedRevision: input.expectedRevision,
+            selection: input.selection,
+        }),
+    }, options, dependencies)
 }

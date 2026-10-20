@@ -1,4 +1,8 @@
 <script lang="ts">
+    import AssetGallery from "src/lib/Gallery/AssetGallery.svelte";
+    import { galleryText } from "src/ts/gallery/strings";
+    import type { AssetSection } from "src/ts/gallery/assetGallery";
+    let galleryOwner = $state<{ id: string; section: AssetSection } | null>(null)
     import { language } from "../../lang";
     import { tokenizeAccurate } from "../../ts/tokenizer";
     import { getCurrentCharacter, saveImage as saveAsset, type character } from "../../ts/storage/database.svelte";
@@ -308,6 +312,8 @@
             <span>{language.additionalAssets}</span>
         </button>
     </div>
+
+    <div class="flex justify-end mb-2"><Button styled="outlined" size="sm" onclick={() => { galleryOwner = { id: DBState.db.characters[$selectedCharID].chaId, section: viewSubMenu === 0 ? 'icons' : viewSubMenu === 1 ? 'emotions' : 'assets' } }}>{galleryText().gallery}</Button></div>
 
     {#if viewSubMenu === 0}
         <div class="p-2 border-darkborderc border rounded-md flex flex-wrap gap-2">
@@ -1211,3 +1217,7 @@
     }
 
 </style>
+
+{#if galleryOwner}
+    <AssetGallery owner={{ kind: 'character', id: galleryOwner.id }} initialSection={galleryOwner.section} onclose={() => galleryOwner = null}/>
+{/if}

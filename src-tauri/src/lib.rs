@@ -691,6 +691,7 @@ fn builder_with_main_window(
                 server_sync::residency::arm_anchor(&app_data_dir);
                 app.manage(native_media::streaming::MediaServerState::initialize(
                     app_data_dir.clone(),
+                    app.state::<app_paths::AppPaths>().cache.clone(),
                 ));
                 app.manage(
                     native_file_jobs::screenshot_output::ScreenshotOutputState::initialize(
@@ -967,6 +968,17 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_read_asset_alias,
         persistent_store::commands::pds_read_asset_aliases_by_keys,
         persistent_store::commands::pds_list_asset_aliases,
+        persistent_store::commands::gallery::pds_gallery_page,
+        persistent_store::commands::gallery::pds_gallery_keys,
+        persistent_store::commands::gallery::pds_gallery_index,
+        persistent_store::commands::gallery::pds_gallery_missing_keys,
+        persistent_store::commands::gallery::pds_gallery_delete,
+        persistent_store::commands::gallery::pds_gallery_scan_start,
+        persistent_store::commands::gallery::pds_gallery_scan_status,
+        persistent_store::commands::gallery::pds_gallery_scan_result,
+        persistent_store::commands::gallery::pds_gallery_scan_cancel,
+        persistent_store::commands::gallery::pds_gallery_locations,
+        persistent_store::commands::gallery::pds_gallery_usage_count,
         persistent_store::commands::pds_read_asset_owner_head,
         persistent_store::commands::pds_commit_asset_alias,
         persistent_store::commands::pds_delete_asset_alias,
