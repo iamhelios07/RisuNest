@@ -1297,6 +1297,7 @@ impl PersistentStore {
         &mut self,
         input: &WorkingSetCommit,
         aliases: &[super::AssetAlias],
+        committed_revision: &mut Option<i64>,
     ) -> StoreResult<RevisionResult> {
         self.lww_recover_intents()?;
         let header = Header {
@@ -1321,6 +1322,7 @@ impl PersistentStore {
             &stamp,
             &digest,
         );
+        *committed_revision = result.as_ref().ok().map(|value| value.revision);
         if result.is_ok()
             || matches!(
                 result,

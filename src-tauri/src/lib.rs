@@ -42,6 +42,7 @@ mod macos_lifecycle;
 pub mod native_file_jobs;
 pub(crate) mod native_log;
 mod diagnostics;
+mod generation_diagnostics;
 mod network_log;
 mod native_media;
 mod native_tokenizer;
@@ -393,12 +394,15 @@ fn builder_with_main_window(
         builder = builder.on_web_content_process_terminate(|webview| {
             if webview.label() == "main" {
                 crate::nlog!("error", "WebKit web content process ended");
+                generation_diagnostics::renderer_exit(generation_diagnostics::RendererExit::Apple { reason: "unknown" });
+                generation_diagnostics::reload_result("requested");
                 renderer_recovery::renderer_exited(webview.app_handle());
                 // A quit that arrives before the reloaded document is ready no longer waits for it.
                 #[cfg(target_os = "macos")]
                 macos_lifecycle::document_started(webview.app_handle());
             }
             if let Err(error) = webview.reload() {
+                if webview.label() == "main" { generation_diagnostics::reload_result("failed"); }
                 crate::nlog!("error", "Could not reload after the web content process ended: {error}");
             }
         });
@@ -411,6 +415,7 @@ fn builder_with_main_window(
                 if webview.label() == "main"
                     && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
                 {
+                    generation_diagnostics::document_started();
                     if let Some(state) =
                         webview.try_state::<persistent_store::PersistentStoreState>()
                     {
@@ -464,6 +469,7 @@ fn builder_with_main_window(
             if webview.label() == "main"
                 && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
             {
+                generation_diagnostics::document_started();
                 renderer_recovery::document_started(webview.app_handle());
                 if let Some(state) = webview.try_state::<persistent_store::PersistentStoreState>() {
                     if let Err(error) = state.reset_renderer_session() {
@@ -513,6 +519,7 @@ fn builder_with_main_window(
             if webview.label() == "main"
                 && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
             {
+                generation_diagnostics::document_started();
                 #[cfg(target_os = "ios")]
                 ios_lifecycle::main_document_started(webview.app_handle());
                 #[cfg(target_os = "macos")]
@@ -874,6 +881,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_log::native_log_tail,
         diagnostics::diagnostic_device_info,
         native_log::native_log_error,
+        generation_diagnostics::native_generation_diagnostic,
         native_log::native_log_file_path,
         native_log::native_log_set_file_enabled,
         native_tokenizer::tokenize_batch,

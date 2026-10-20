@@ -214,7 +214,7 @@ impl PersistentStore {
         }
         let mut seen = HashSet::new();
         let mutations = keys.iter().filter(|key| seen.insert(key.as_str())).map(|key| Ok(super::lww::UnitMutation::Delete { key: super::lww::unit_key(&["inlay", key])? })).collect::<StoreResult<Vec<_>>>()?;
-        self.lww_commit(&WorkingSetCommit { expected_revision, unit_mutations: Some(mutations), ..Default::default() }, &[])
+        self.lww_commit(&WorkingSetCommit { expected_revision, unit_mutations: Some(mutations), ..Default::default() }, &[], &mut None)
     }
     pub(crate) fn gallery_scan_status(&mut self) -> StoreResult<Option<ScanStatus>> {
         self.gallery_generation(&super::active_generation(&self.connection)?);

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { generationDiagnostics } from "./generationDiagnostics";
 import { isTauriIOS } from "./platform";
 
 export class BackgroundExecutionExpiredError extends DOMException {
@@ -218,6 +219,11 @@ export function installIOSPersistenceLifecycle(
   const native = (event: Event) => {
     const detail = (event as CustomEvent<{ event: string; id?: string }>)
       .detail;
+    if (detail?.event === "background" || detail?.event === "memory-warning") {
+      generationDiagnostics.lifecycle(detail.event);
+    } else if (detail?.event === "expired") {
+      generationDiagnostics.lifecycle("expiry");
+    }
     if (detail?.event === "active") {
       returnedThrough = entries;
       stopWaiting();
