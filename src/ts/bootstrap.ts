@@ -84,6 +84,7 @@ import { resolveBlobStore } from "./storage/platformBlobStore";
 import {
     OfficialAccountSnapshotAdapter,
     createOfficialAssociationMarkers,
+    type OfficialRestoreOmissions,
 } from "./storage/sync/officialAccountSnapshot";
 import { createNativeOfficialAccountAssets } from "./storage/sync/nativeOfficialAccountAssets";
 import { getSyncConflictBackupStore } from "./storage/sync/syncConflictBackup";
@@ -422,6 +423,14 @@ export async function loadData() {
                 },
             })
             : undefined
+        const pluginOmissionWarnings = (omissions?: OfficialRestoreOmissions) => [
+            ...(omissions?.pluginStorage
+                ? [language.portableBackup.omittedRestoreData.pluginStorage(omissions.pluginStorage)]
+                : []),
+            ...(omissions?.oversizedPluginStorage
+                ? [language.portableBackup.omittedRestoreData.oversizedPluginStorage(omissions.oversizedPluginStorage)]
+                : []),
+        ]
         const officialAdapter = new OfficialAccountSnapshotAdapter({
             store: runtime.store,
             resolveBlobs: resolveBlobStore,
@@ -432,19 +441,14 @@ export async function loadData() {
                 ? undefined
                 : (omissions) => alertActionConfirm({
                     title: language.loadDataFromAccount,
-                    description: language.portableBackup.omittedRestoreData.pluginStorage(omissions.pluginStorage),
+                    description: pluginOmissionWarnings(omissions).join('\n\n'),
                     actionLabel: language.confirm,
                     cancelLabel: language.cancel,
                 }),
             restoreCandidate: isTauri
                 ? (candidate, expectedRevision, signal, omissions) => restoreNativeOfficialAccountCandidate(
                     runtime, candidate, expectedRevision, signal,
-                    [
-                        language.risuNest.backup.officialRestoreInlayWarning,
-                        ...(omissions?.pluginStorage
-                            ? [language.portableBackup.omittedRestoreData.pluginStorage(omissions.pluginStorage)]
-                            : []),
-                    ],
+                    [language.risuNest.backup.officialRestoreInlayWarning, ...pluginOmissionWarnings(omissions)],
                 )
                 : undefined,
             markPublished: () => undefined,

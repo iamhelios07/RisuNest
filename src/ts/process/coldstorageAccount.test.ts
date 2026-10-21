@@ -83,6 +83,34 @@ describe('official account cold storage read', () => {
         await expect(transport.getAccountColdStorageItem('cold-broken')).resolves.toEqual({ kind: 'unreadable' })
     })
 
+    it('reads a payload whose decoded JSON fills the limit and reports one byte more as too large', async () => {
+        const value = 'x'.repeat(4096)
+        const decodedBytes = JSON.stringify(value).length
+        serveCold({ 'cold-large': () => new Response(coldBody(value), { status: 200 }) })
+
+        await expect(transport.getAccountColdStorageItem('cold-large', undefined, decodedBytes)).resolves.toEqual({ kind: 'present', value })
+        await expect(transport.getAccountColdStorageItem('cold-large', undefined, decodedBytes - 1)).resolves.toEqual({ kind: 'too-large' })
+    })
+
+    it('stops reading a response body over the limit and reports it as too large', async () => {
+        const cancel = vi.fn()
+        const pulled = vi.fn()
+        serveCold({
+            'cold-oversized': () => new Response(new ReadableStream({
+                pull(controller) {
+                    pulled()
+                    if (pulled.mock.calls.length > 64) controller.close()
+                    else controller.enqueue(new Uint8Array(1024))
+                },
+                cancel,
+            }), { status: 200 }),
+        })
+
+        await expect(transport.getAccountColdStorageItem('cold-oversized', undefined, 4096)).resolves.toEqual({ kind: 'too-large' })
+        expect(cancel).toHaveBeenCalledOnce()
+        expect(pulled.mock.calls.length).toBeLessThan(10)
+    })
+
     it('preserves read AbortError identity', async () => {
         const readAbort = new DOMException('read cancelled', 'AbortError')
         vi.stubGlobal('fetch', vi.fn(async () => { throw readAbort }))
@@ -96,7 +124,7 @@ describe('official account cold storage read', () => {
         serveCold({ [storedNull]: () => new Response(coldBody(null), { status: 200 }) })
         const database = { pluginCustomStorage: { _coldplugin: { kept: storedNull, lost: absent } } as Record<string, unknown> }
 
-        await expect(importColdPluginStorage(database, (key) => transport.getAccountColdStorageItem(key))).resolves.toEqual({ omitted: 1 })
+        await expect(importColdPluginStorage(database, (key) => transport.getAccountColdStorageItem(key))).resolves.toEqual({ omitted: 1, tooLarge: 0 })
         expect(database.pluginCustomStorage).toEqual({ kept: null })
         expect(Object.hasOwn(database.pluginCustomStorage, 'lost')).toBe(false)
     })

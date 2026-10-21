@@ -10,6 +10,7 @@ export type ColdItemRead =
     | { kind: 'present', value: unknown }
     | { kind: 'missing' }
     | { kind: 'unreadable' }
+    | { kind: 'too-large' }
 
 export type ColdItemReader = (key: string) => Promise<ColdItemRead>
 
@@ -149,23 +150,29 @@ function isPluginStorageIndex(value: unknown): value is { entries: unknown[], tr
 /**
  * Resolves upstream cold plugin storage (the index and the legacy per-key map)
  * into plain plugin values and removes both reference keys. Precedence is inline,
- * then index, then legacy. A value that cannot be resolved is counted, never stored.
+ * then index, then legacy. A value that cannot be resolved is counted, never stored;
+ * one that is too large is counted separately.
  */
 export async function importColdPluginStorage(
     db: { pluginCustomStorage?: Database['pluginCustomStorage'] },
     read: ColdItemReader,
-): Promise<{ omitted: number }> {
+): Promise<{ omitted: number, tooLarge: number }> {
     const storage = db?.pluginCustomStorage
-    if (!storage || typeof storage !== 'object' || Array.isArray(storage)) return { omitted: 0 }
+    if (!storage || typeof storage !== 'object' || Array.isArray(storage)) return { omitted: 0, tooLarge: 0 }
     const hasIndex = Object.hasOwn(storage, PLUGIN_STORAGE_INDEX_KEY)
     const hasLegacy = Object.hasOwn(storage, PLUGIN_STORAGE_LEGACY_MAP_KEY)
-    if (!hasIndex && !hasLegacy) return { omitted: 0 }
+    if (!hasIndex && !hasLegacy) return { omitted: 0, tooLarge: 0 }
     const pointer: unknown = storage[PLUGIN_STORAGE_INDEX_KEY]
     const legacy: unknown = storage[PLUGIN_STORAGE_LEGACY_MAP_KEY]
     delete storage[PLUGIN_STORAGE_INDEX_KEY]
     delete storage[PLUGIN_STORAGE_LEGACY_MAP_KEY]
 
     let omitted = 0
+    let tooLarge = 0
+    const skip = (item: ColdItemRead) => {
+        if (item.kind === 'too-large') tooLarge++
+        else omitted++
+    }
     const readItem = async (key: string): Promise<ColdItemRead> => {
         try {
             return await read(key)
@@ -192,7 +199,7 @@ export async function importColdPluginStorage(
                 indexed.set(entry.k, entry)
             }
         } else {
-            omitted++
+            skip(index)
         }
     } else if (pointer !== null && pointer !== undefined) {
         omitted++
@@ -203,7 +210,7 @@ export async function importColdPluginStorage(
         if (typeof entry.l === 'string') {
             const item = await readItem(entry.l)
             if (item.kind !== 'present') {
-                omitted++
+                skip(item)
                 continue
             }
             defineOwnEnumerableProperty(storage, key, item.value)
@@ -228,7 +235,7 @@ export async function importColdPluginStorage(
                 }
                 const item = await readItem(id)
                 if (item.kind !== 'present') {
-                    omitted++
+                    skip(item)
                     continue
                 }
                 defineOwnEnumerableProperty(storage, key, item.value)
@@ -236,5 +243,5 @@ export async function importColdPluginStorage(
         }
     }
 
-    return { omitted }
+    return { omitted, tooLarge }
 }

@@ -147,9 +147,10 @@ export async function loadRisuAccountBackup() {
             return
         }
         const plugins = await importColdPluginStorage(candidate, getAccountColdStorageItem)
-        const warnings = plugins.omitted > 0
-            ? [language.portableBackup.omittedRestoreData.pluginStorage(plugins.omitted)]
-            : []
+        const warnings = [
+            ...(plugins.omitted > 0 ? [language.portableBackup.omittedRestoreData.pluginStorage(plugins.omitted)] : []),
+            ...(plugins.tooLarge > 0 ? [language.portableBackup.omittedRestoreData.oversizedPluginStorage(plugins.tooLarge)] : []),
+        ]
         if (!isTauri && warnings.length > 0 && !(await alertActionConfirm({
             title: language.backupLoadConfirm,
             description: warnings.join('\n\n'),

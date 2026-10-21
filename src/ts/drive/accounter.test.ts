@@ -139,24 +139,28 @@ function servePluginBackup() {
     serveBackup({
         characters: [],
         botPresets: [],
-        pluginCustomStorage: { inline: 'kept', _coldpluginIndex: 'dangling-index', _coldplugin: { zero: 'legacy-zero' } },
+        pluginCustomStorage: { inline: 'kept', _coldpluginIndex: 'dangling-index', _coldplugin: { zero: 'legacy-zero', huge: 'legacy-huge' } },
     })
-    f.readCold.mockImplementation(async (key: string) => key === 'legacy-zero' ? present(0) : { kind: 'missing' })
+    f.readCold.mockImplementation(async (key: string) => key === 'legacy-zero' ? present(0)
+        : key === 'legacy-huge' ? { kind: 'too-large' } : { kind: 'missing' })
 }
 
-it.each([false, true])('imports account backup plugin values and reports a dangling index (native %s)', async (native) => {
+it.each([false, true])('imports account backup plugin values and reports a dangling index and an oversized value (native %s)', async (native) => {
     f.native = native
     servePluginBackup()
 
     await loadRisuAccountBackup()
 
     expect(f.installed?.pluginCustomStorage).toStrictEqual({ inline: 'kept', zero: 0 })
-    const warning = language.portableBackup.omittedRestoreData.pluginStorage(1)
+    const warnings = [
+        language.portableBackup.omittedRestoreData.pluginStorage(1),
+        language.portableBackup.omittedRestoreData.oversizedPluginStorage(1),
+    ]
     if (native) {
-        expect(f.options?.upstreamImportWarnings).toEqual([warning])
+        expect(f.options?.upstreamImportWarnings).toEqual(warnings)
         expect(f.action).not.toHaveBeenCalled()
     } else {
-        expect(f.action).toHaveBeenCalledWith(expect.objectContaining({ description: warning }))
+        expect(f.action).toHaveBeenCalledWith(expect.objectContaining({ description: warnings.join('\n\n') }))
     }
 })
 

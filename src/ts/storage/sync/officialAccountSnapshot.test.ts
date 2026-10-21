@@ -1198,7 +1198,7 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         ])
         expect((await harness.store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'zero'))?.value).toBe(0)
         expect((await harness.store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'large'))?.value).toBeNull()
-        expect(restore ? restoreCandidate.mock.calls[0][3] : confirmOmissions.mock.calls[0][0]).toEqual({ pluginStorage: 1 })
+        expect(restore ? restoreCandidate.mock.calls[0][3] : confirmOmissions.mock.calls[0][0]).toEqual({ pluginStorage: 1, oversizedPluginStorage: 0 })
     })
 
     it('leaves the library unchanged when a web restore that leaves plugin values out is declined', async () => {

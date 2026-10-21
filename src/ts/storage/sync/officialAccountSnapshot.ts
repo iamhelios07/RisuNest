@@ -66,6 +66,7 @@ export interface OfficialColdStorageTransport {
 /** Counts of data the restore leaves out, for the replacement confirmation. */
 export interface OfficialRestoreOmissions {
     pluginStorage: number
+    oversizedPluginStorage: number
 }
 
 export interface OfficialAssociationRecord {
@@ -707,12 +708,12 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         }
         // Plugin values that cannot be resolved are left out instead of blocking activation.
         const plugins = await importColdPluginStorage(candidate, readCold)
-        const omissions: OfficialRestoreOmissions = { pluginStorage: plugins.omitted }
-        if (omissions.pluginStorage > 0 && !this.dependencies.restoreCandidate) {
+        const omissions: OfficialRestoreOmissions = { pluginStorage: plugins.omitted, oversizedPluginStorage: plugins.tooLarge }
+        if (plugins.omitted + plugins.tooLarge > 0 && !this.dependencies.restoreCandidate) {
             if (this.dependencies.confirmOmissions) {
                 if (!await this.dependencies.confirmOmissions(omissions)) return { kind: 'declined' }
             } else {
-                console.warn(`Official snapshot restore left out ${omissions.pluginStorage} plugin storage values`)
+                console.warn(`Official snapshot restore left out ${plugins.omitted + plugins.tooLarge} plugin storage values`)
             }
         }
 

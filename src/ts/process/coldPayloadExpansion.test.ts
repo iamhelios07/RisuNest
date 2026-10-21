@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { coldItemFromMap, expandColdPayloads, importColdPluginStorage } from './coldPayloadExpansion'
+import { coldItemFromMap, expandColdPayloads, importColdPluginStorage, type ColdItemRead } from './coldPayloadExpansion'
 import { coldStorageHeader } from './coldstorageData'
 
 const present = (value: unknown) => ({ kind: 'present' as const, value })
@@ -236,11 +236,29 @@ describe('importColdPluginStorage', () => {
         expect(corruptMap.omitted).toBe(2)
     })
 
+    it('counts too large index, large and legacy items apart from other omissions', async () => {
+        const db = {
+            pluginCustomStorage: {
+                _coldpluginIndex: 'idx',
+                _coldplugin: { legacy: 'legacy-huge', gone: 'legacy-gone' },
+            } as Record<string, unknown>,
+        }
+        const read = async (key: string): Promise<ColdItemRead> => key === 'idx'
+            ? { kind: 'present', value: pluginIndex([{ k: 'large', l: 'large-huge' }, { k: 'kept', s: '1' }]) }
+            : key.endsWith('-huge') ? { kind: 'too-large' } : { kind: 'missing' }
+
+        await expect(importColdPluginStorage(db, read)).resolves.toEqual({ omitted: 1, tooLarge: 2 })
+        expect(db.pluginCustomStorage).toEqual({ kept: 1 })
+
+        const oversizedIndex = { pluginCustomStorage: { _coldpluginIndex: 'idx' } as Record<string, unknown> }
+        await expect(importColdPluginStorage(oversizedIndex, async () => ({ kind: 'too-large' }))).resolves.toEqual({ omitted: 0, tooLarge: 1 })
+    })
+
     it('reports an unreadable item as an omission and rethrows an abort', async () => {
         const db = { pluginCustomStorage: { _coldplugin: { a: 'id-a' } } as Record<string, unknown> }
         await expect(importColdPluginStorage(db, async () => {
             throw new Error('synthetic read failure')
-        })).resolves.toEqual({ omitted: 1 })
+        })).resolves.toEqual({ omitted: 1, tooLarge: 0 })
         expect(db.pluginCustomStorage).toEqual({})
 
         const aborted = { pluginCustomStorage: { _coldplugin: { a: 'id-a' } } }
