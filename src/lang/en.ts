@@ -306,8 +306,8 @@ export const languageEnglish = {
             "After it is all setup, you can able it in the setting of a character.",
         replaceGlobalNote: "If it's not blank, it replaces current global note to this.",
         onboarding:
-            "Onboarding lets users pick options before a chat starts, like a short form. Each answer is saved to a chat variable, usable with `{{getvar::name}}` or triggers.\n\n" +
-            "Until the user finishes or skips it, the chat shows a banner that opens the onboarding. It can be reopened from the chat menu.\n\n" +
+            "Chat setup lets users pick options before a chat starts, like a short form. Each answer is saved to a chat variable, usable with `{{getvar::name}}` or triggers.\n\n" +
+            "Until the user applies or skips it, the chat shows a banner that opens the chat setup. It can be reopened from the chat menu.\n\n" +
             "**Form** mode builds choices and text questions. Multiple-choice answers are saved as a JSON array.\n\n" +
             "**HTML** mode lets you write your own layout. It is sanitized like chat messages, and `<style>` is supported. Add `risu-change-var-name=\"varname\"` and `risu-change-var-value=\"value\"` to any element to set the variable when it is clicked; the clicked element gets the `selected` class. On `<input>`, `<select>` and `<textarea>`, the variable follows the input's value.",
         backgroundHTML:
@@ -1417,13 +1417,13 @@ export const languageEnglish = {
     nickname: "Nickname",
     useRegexLorebook: "Use Regex",
     customPromptTemplateToggle: "Custom Toggles",
-    onboarding: "Onboarding",
-    onboardingEnable: "Enable Onboarding",
+    onboarding: "Chat Setup",
+    onboardingEnable: "Enable Chat Setup",
     onboardingFloatingButton: "Show Floating Button",
-    onboardingAvailable: "This character has an onboarding",
+    onboardingAvailable: "This character has a chat setup",
     onboardingAvailableDesc: "Choose a few options to set up this chat.",
     onboardingSkip: "Skip",
-    onboardingDone: "Done",
+    onboardingDone: "Apply",
     onboardingModeForm: "Form",
     onboardingModeHTML: "HTML",
     onboardingTitle: "Title",

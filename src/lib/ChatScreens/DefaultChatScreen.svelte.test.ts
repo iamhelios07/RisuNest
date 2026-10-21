@@ -3,7 +3,8 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { get, writable } from 'svelte/store'
 import { language } from 'src/lang'
-import { DBState } from 'src/ts/stores.svelte'
+import { DBState, onboardingModalStore } from 'src/ts/stores.svelte'
+import { createConversationSummaryStubFromChat } from 'src/ts/storage/conversationResidency'
 import DefaultChatScreen from './DefaultChatScreen.svelte'
 import { chatScreenState } from '../../ts/ui/chatScreenState.svelte'
 import { doingChat } from 'src/ts/process/index.svelte'
@@ -20,7 +21,8 @@ const mocks = vi.hoisted(() => ({ trigger: vi.fn(), generate: vi.fn(), process: 
 }))
 vi.mock('src/ts/stores.svelte', () => {
     const DBState = $state({ db: {} })
-    return { DBState, selectedCharID: writable(0), PlaygroundStore: writable(0), hypaV3ModalOpen: writable(false),
+    const onboardingModalStore = $state({ open: false })
+    return { DBState, onboardingModalStore, selectedCharID: writable(0), PlaygroundStore: writable(0), hypaV3ModalOpen: writable(false),
         ScrollToMessageStore: writable(null), additionalChatMenu: writable([]), additionalFloatingActionButtons: writable([]),
         easyPanelStore: writable(false), chatPanelStore: writable(false), HideIconStore: writable(false) }
 })
@@ -85,6 +87,7 @@ function send() {
 }
 beforeEach(async () => {
     vi.clearAllMocks()
+    onboardingModalStore.open = false
     updateDeviceSettings({ messageSendKey: 'enter' })
     chatScreenState.clear()
     mocks.translate.mockResolvedValue('')
@@ -796,4 +799,63 @@ it('refuses send and regenerate while plugins wait, retaining the draft and conv
         pluginStartupState.set({ phase: 'released', since: 0 })
         configurePluginStartup(() => false, async () => {})
     }
+})
+
+function setChatSetup(overrides: Record<string, unknown> = {}) {
+    DBState.db.characters[0].onboarding = {
+        enabled: true, mode: 'form', questions: [{ id: 'q', title: 'Route', type: 'single', varName: 'route', options: [{ label: 'A', value: 'a' }] }],
+        ...overrides,
+    } as any
+}
+const chatSetupBanner = () => [...document.querySelectorAll('button')].find(button => button.textContent?.includes(language.onboardingAvailable))
+
+it('shows the chat setup banner on a chat with messages until it is applied or skipped', async () => {
+    DBState.db.characters[0].chats[0].message = [
+        { role: 'char', data: 'First', chatId: 'm1' }, { role: 'user', data: 'Second', chatId: 'm2' }, { role: 'char', data: 'Third', chatId: 'm3' },
+    ] as any
+    setChatSetup()
+    await tick()
+    chatSetupBanner()!.click()
+    expect(onboardingModalStore.open).toBe(true)
+    DBState.db.characters[0].chats[0].onboardingDone = true
+    await tick()
+    expect(chatSetupBanner()).toBeUndefined()
+    DBState.db.characters[0].chats.push({ id: 'new', message: [] } as any)
+    DBState.db.characters[0].chatPage = 1
+    await tick()
+    expect(chatSetupBanner()).toBeDefined()
+    setChatSetup({ enabled: false })
+    await tick()
+    expect(chatSetupBanner()).toBeUndefined()
+})
+
+it('does not offer the chat setup for a chat that is only a summary', async () => {
+    setChatSetup()
+    const chat = DBState.db.characters[0].chats[0]
+    DBState.db.characters[0].chats[0] = createConversationSummaryStubFromChat('character', chat, 0)
+    await tick()
+    expect(chatSetupBanner()).toBeUndefined()
+})
+
+it('opens the chat setup from the side menu and from its optional floating button', async () => {
+    const floatingButton = () => document.querySelector<HTMLButtonElement>(`button[aria-label="${language.onboarding}"]`)
+    const menuItem = () => [...document.querySelectorAll('span')].find(span => span.textContent === language.onboarding)
+    const openMenu = async () => {
+        document.querySelector<HTMLButtonElement>('.button-icon-send')!.nextElementSibling!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+        await tick()
+    }
+    await openMenu()
+    expect(menuItem()).toBeUndefined()
+    setChatSetup()
+    await tick()
+    expect(floatingButton()).toBeNull()
+    menuItem()!.parentElement!.click()
+    await tick()
+    expect(onboardingModalStore.open).toBe(true)
+    expect(menuItem()).toBeUndefined()
+    onboardingModalStore.open = false
+    setChatSetup({ floatingButton: true })
+    await tick()
+    floatingButton()!.click()
+    expect(onboardingModalStore.open).toBe(true)
 })

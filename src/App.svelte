@@ -1,7 +1,7 @@
 <script lang="ts">
     import LazyScreenError from "./lib/UI/LazyScreenError.svelte";
     import ChatBindingLifecycle from './lib/SideBars/ChatBindingLifecycle.svelte'
-    import { DynamicGUI, settingsOpen, sideBarStore, sideBarClosing, ShowRealmFrameStore, openPresetList, openPersonaList, MobileGUI, CustomGUISettingMenuStore, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore, bootFailure, recoveryStart } from './ts/stores.svelte';
+    import { DynamicGUI, settingsOpen, sideBarStore, sideBarClosing, ShowRealmFrameStore, openPresetList, openPersonaList, MobileGUI, CustomGUISettingMenuStore, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, easyPanelStore, popUpEditorStore, loadoutModalStore, onboardingModalStore, irisStore, customSideBarConfigDialogStore, bootFailure, recoveryStart } from './ts/stores.svelte';
     import Sidebar from './lib/SideBars/Sidebar.svelte';
     import { DBState } from './ts/stores.svelte';
     import ChatScreen from './lib/ChatScreens/ChatScreen.svelte';
@@ -32,6 +32,7 @@
     import TextEditorPopup from './lib/Others/TextEditorPopup.svelte';
     import { textEditorPopup } from './ts/gui/textEditorPopup.svelte';
     import LoadoutModal from './lib/Others/LoadoutModal.svelte';
+    import OnboardingModal from './lib/Others/OnboardingModal.svelte';
     import IrisModal from './lib/Others/IrisModal.svelte';
     import Legal from './lib/Others/Legal.svelte';
     import CustomSidebarConfig from './lib/Others/CustomSidebarConfig.svelte';
@@ -426,6 +427,10 @@
         {#key textEditorPopup.request}
             <TextEditorPopup request={textEditorPopup.request} />
         {/key}
+    {/if}
+    <!-- Also before the alerts, so a blocked or failed save shows above it. -->
+    {#if onboardingModalStore.open}
+        <OnboardingModal />
     {/if}
     {#if $alertStore.type !== 'none'}
         <AlertComp />

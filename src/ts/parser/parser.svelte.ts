@@ -848,6 +848,32 @@ export interface TrimMarkdownRenderContext {
     chatID?: number
     projectedChatID?: number
     cbsConditions?: CbsConditions
+    /** Attributes kept in addition to the message ones, such as onboarding variable bindings. */
+    variableBindingAttributes?: readonly string[]
+}
+
+// Onboarding HTML can bind clicks and inputs to chat variables. Messages never keep these.
+const onboardingVariableBindingAttributes = ['risu-change-var-name', 'risu-change-var-value'] as const
+
+/**
+ * Renders a character's onboarding HTML: assets, CBS and inlays are resolved, then it goes
+ * through the same sanitization and <style> scoping as chat messages. Scoped styles are
+ * prefixed with `.chattext`, so the caller renders the result inside a `.chattext` element
+ * and mounts `deferredInlays` on it.
+ */
+export async function parseOnboardingHTML(
+    data:string,
+    char:character,
+    deferredInlays:DeferredInlayMarkerRegistry,
+){
+    data = await parseAdditionalAssets(data ?? '', char, 'normal', { ch: -1 }, { deferredInlays })
+    data = risuChatParser(data, { chara: char })
+    data = await parseInlayAssets(data, deferredInlays)
+    data = encodeStyle(data)
+    return trimMarkdown(data, {
+        deferredInlays,
+        variableBindingAttributes: onboardingVariableBindingAttributes,
+    })
 }
 
 export function trimMarkdown(
@@ -861,6 +887,9 @@ export function trimMarkdown(
     const renderContext = typeof options === 'boolean'
         ? { hideAllImages: options }
         : options
+    const purifyConfig = renderContext.variableBindingAttributes?.length
+        ? { ...trimPurifyConfig, ADD_ATTR: [...trimPurifyConfig.ADD_ATTR, ...renderContext.variableBindingAttributes] }
+        : trimPurifyConfig
     const previousHideAllImages = activeSanitizeHideAllImages
     activeSanitizeHideAllImages = renderContext.hideAllImages
     try {
@@ -869,7 +898,7 @@ export function trimMarkdown(
         // risu-style is in ADD_TAGS, so cards, model output and user scripts can
         // author one directly. Only its position in the parsed tree is relied on.
         if(!data.includes('<risu-style') && !renderContext.deferredInlays?.hasAssetImages){
-            return DOMPurify.sanitize(data, trimPurifyConfig)
+            return DOMPurify.sanitize(data, purifyConfig)
         }
 
         // Decoded CSS must never be handed back to the HTML sanitizer as <style>
@@ -880,7 +909,7 @@ export function trimMarkdown(
         // RETURN_DOM hands back the sanitized <body>, typed as Node. It is null only
         // for empty input, which the guard above already excludes.
         const root = DOMPurify.sanitize(data, {
-            ...trimPurifyConfig,
+            ...purifyConfig,
             RETURN_DOM: true,
         }) as HTMLElement | null
         if(!root){
