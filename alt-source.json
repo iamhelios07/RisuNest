@@ -22,6 +22,16 @@
       },
       "versions": [
         {
+          "version": "1.1.0",
+          "buildVersion": "1.1.0",
+          "date": "2026-10-21T23:52:47Z",
+          "localizedDescription": "- Applied RisuAI v2026.10.211 changes.\n- Added asset and inlay (chat attachment) galleries.\n- Expanded image format support for personas, character icons, and more.\n- Improved tasks such as responses and sync to keep running after leaving the app on mobile.\n- Added progress and resuming to RisuAI account restores and improved their performance.\n- Fixed external storage sync showing as complete before it had finished.\n- Optimized memory usage when sending messages in long chats.\n- Fixed compatibility issues in some Lua modules (such as Lightboard).\n- Fixed a bug where the built-in translator could send translation requests repeatedly.\n- Fixed clock and server connection issues in external storage and Sync synchronization.\n- Fixed PocketRisu exports not working with some settings.\n- Fixed asset bot downloads from Realm and CharX imports not working properly.\n- Replaced the Gemini/Gemma tokenizer with the Gemma 4 tokenizer.\n- Added a setting for the scroll navigation buttons.\n- Changed update checks to run at every app start.\n- Improved overall performance of storage, backups, restores, sync, rendering, and startup.\n- Improved error messages and logging.",
+          "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.1.0/RisuNest-1.1.0-ios-aarch64-unsigned.ipa",
+          "size": 77609969,
+          "sha256": "e5d44fdeb4cf1df75c9dbe5cf4252e06969ba523dce4266ed68426824fb9056e",
+          "minOSVersion": "16.4"
+        },
+        {
           "version": "1.0.6",
           "buildVersion": "1.0.6",
           "date": "2026-10-18T18:52:39Z",
@@ -52,11 +62,11 @@
           "minOSVersion": "16.4"
         }
       ],
-      "version": "1.0.6",
-      "versionDate": "2026-10-18T18:52:39Z",
-      "versionDescription": "- Fixed RisuAI account backup and restore not working.\n- Fixed restore problems with some backup files and improved restore failure notices.\n- Fixed backup and sync issues with external storage such as Google Drive, OneDrive, and GitHub.\n- Added a UI and popups that show sync status and errors.\n- Added a feature that delays loading plugins until sync has fully finished (prevents plugin data corruption).\n- Fixed and improved Sync server synchronization.\n- Added CBS parsing for plugins (parseRisuChat).\n- Improved plugin storage compatibility (fixed storing Date objects).\n- Improved conversation loading performance with long chats or many assets.\n- Fixed bugs in automatic input translation, toggle presets, and lorebooks.\n- Fixed a bug that could navigate the RisuNest app to an external page.\n- Fixed and improved file downloads on all platforms, including plugin file downloads.\n- Improved the Windows installer.\n- Improved error messages and logging.",
-      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.6/RisuNest-1.0.6-ios-aarch64-unsigned.ipa",
-      "size": 78806152
+      "version": "1.1.0",
+      "versionDate": "2026-10-21T23:52:47Z",
+      "versionDescription": "- Applied RisuAI v2026.10.211 changes.\n- Added asset and inlay (chat attachment) galleries.\n- Expanded image format support for personas, character icons, and more.\n- Improved tasks such as responses and sync to keep running after leaving the app on mobile.\n- Added progress and resuming to RisuAI account restores and improved their performance.\n- Fixed external storage sync showing as complete before it had finished.\n- Optimized memory usage when sending messages in long chats.\n- Fixed compatibility issues in some Lua modules (such as Lightboard).\n- Fixed a bug where the built-in translator could send translation requests repeatedly.\n- Fixed clock and server connection issues in external storage and Sync synchronization.\n- Fixed PocketRisu exports not working with some settings.\n- Fixed asset bot downloads from Realm and CharX imports not working properly.\n- Replaced the Gemini/Gemma tokenizer with the Gemma 4 tokenizer.\n- Added a setting for the scroll navigation buttons.\n- Changed update checks to run at every app start.\n- Improved overall performance of storage, backups, restores, sync, rendering, and startup.\n- Improved error messages and logging.",
+      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.1.0/RisuNest-1.1.0-ios-aarch64-unsigned.ipa",
+      "size": 77609969
     }
   ],
   "news": []
