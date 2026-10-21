@@ -80,6 +80,15 @@ export type AccountNativeOfficialWriteAttempt<T> = (
     context: AccountNativeOfficialWriteAttemptContext,
 ) => Promise<AccountNativeOfficialWriteAttemptResult<T> | null>
 
+export interface AccountNativeAssetReadContext {
+    credential: { kind: 'risu-auth'; token: string }
+    reauthenticated: boolean
+}
+
+export type AccountNativeAssetReadAttempt = (
+    context: AccountNativeAssetReadContext,
+) => Promise<'done' | 'reauthentication-needed'>
+
 export interface AccountRecoveredOfficialWrite {
     session: string | null
     warning?: string | null
@@ -331,6 +340,29 @@ export class AccountStorage{
                 receipt: result.receipt,
                 completeReload: () => applyAccountReload(result.reloadSession ?? false),
             }
+        }
+    }
+
+    /** A rejected credential gets one reauthentication and one more attempt. */
+    async readAssetsFromNative(
+        attempt: AccountNativeAssetReadAttempt,
+        options: { signal?: AbortSignal } = {},
+    ): Promise<'done' | 'unauthenticated'> {
+        let reauthenticated = false
+        while (true) {
+            this.checkAuth()
+            if (getDeviceMarkers().getItem('ignoreRisuAuth') === 'true' || !this.auth) return 'unauthenticated'
+            const expectedAccountId = this.getAccountId()
+            const expectedToken = this.auth
+            const result = await attempt({ credential: { kind: 'risu-auth', token: this.auth }, reauthenticated })
+            if (result === 'done') return 'done'
+            if (reauthenticated) return 'unauthenticated'
+            try { await this.reauthenticate(options.signal, expectedAccountId, expectedToken) }
+            catch (error) {
+                if (options.signal?.aborted) throw error
+                return 'unauthenticated'
+            }
+            reauthenticated = true
         }
     }
 
