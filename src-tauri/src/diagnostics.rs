@@ -4,18 +4,42 @@ use serde::Serialize;
 pub(crate) struct DeviceInfo {
     model: Option<String>,
     arch: &'static str,
+    os: Option<WindowsInfo>,
+}
+
+#[derive(Serialize)]
+struct WindowsInfo {
+    name: String,
+    version: Option<String>,
 }
 
 #[tauri::command]
 pub(crate) async fn diagnostic_device_info() -> DeviceInfo {
-    let model = tauri::async_runtime::spawn_blocking(device_model)
+    let (model, os) = tauri::async_runtime::spawn_blocking(|| (device_model(), windows_info()))
         .await
-        .ok()
-        .flatten();
+        .unwrap_or_default();
     DeviceInfo {
         model,
         arch: std::env::consts::ARCH,
+        os,
     }
+}
+
+#[cfg(windows)]
+fn windows_info() -> Option<WindowsInfo> {
+    let info = os_info::get();
+    Some(WindowsInfo {
+        name: info.edition().unwrap_or("Windows").to_owned(),
+        version: match info.version() {
+            os_info::Version::Unknown => None,
+            version => Some(version.to_string()),
+        },
+    })
+}
+
+#[cfg(not(windows))]
+fn windows_info() -> Option<WindowsInfo> {
+    None
 }
 
 fn model_label(manufacturer: Option<String>, model: Option<String>) -> Option<String> {
@@ -156,6 +180,18 @@ fn device_model() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reports_the_native_windows_product_and_kernel_version() {
+        let response = serde_json::to_value(diagnostic_device_info().await).unwrap();
+        let name = response["os"]["name"].as_str().unwrap();
+        assert!(name.starts_with("Windows "), "missing Windows product name: {name}");
+        let version = response["os"]["version"].as_str().unwrap();
+        let parts: Vec<_> = version.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|part| part.parse::<u64>().is_ok()));
+    }
 
     #[test]
     fn reports_only_available_models_without_repeating_manufacturers() {
