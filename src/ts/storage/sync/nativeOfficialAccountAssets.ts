@@ -98,7 +98,8 @@ export function createNativeOfficialAccountAssets(dependencies: {
                     signal: options.signal,
                     guard: () => continuation.guard(receipt),
                     settled(asset, result) {
-                        if (result === 'installed') ledger.record(asset, asset)
+                        // The ledger follows the signed-in account, so a result that settles after an account change is not recorded.
+                        if (result === 'installed' && dependencies.getAccountId() === accountId) ledger.record(asset, asset)
                         counts[result]++
                         counts.notAttempted--
                         if (result === 'failed') stillFailed.add(asset)

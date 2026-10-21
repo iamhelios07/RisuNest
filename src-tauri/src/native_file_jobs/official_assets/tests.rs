@@ -1,3 +1,4 @@
+use super::download::Spooled;
 use super::*;
 use crate::asset_repository::PayloadCas;
 use crate::native_file_jobs::{JobKind, JobRegistry};
@@ -217,6 +218,12 @@ fn ok(body: &[u8]) -> Reply {
     Reply::Send(response("200 OK", &[], body))
 }
 
+fn gzip(body: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
 #[test]
 fn bodies_install_with_the_verified_write_metadata_and_other_answers_settle_by_class() {
     let server = Server::start(|key, _| match key {
@@ -231,7 +238,7 @@ fn bodies_install_with_the_verified_write_metadata_and_other_answers_settle_by_c
         "assets/cached.png" => Reply::Send(response("303 See Other", &[], br#"{"match":false}"#)),
         "assets/matched.png" => Reply::Send(response("303 See Other", &[], br#"{"match":true}"#)),
         "assets/gone.png" => Reply::Send(response("404 Not Found", &[], b"")),
-        "assets/encoded.png" => Reply::Send(response("200 OK", &[("Content-Encoding", "gzip")], b"compressed")),
+        "assets/encoded.png" => Reply::Send(response("200 OK", &[("Content-Encoding", "gzip")], &gzip(b"compressed"))),
         _ => panic!("unexpected read of {key}"),
     });
     let fixture = Fixture::new();
@@ -276,6 +283,7 @@ fn bodies_install_with_the_verified_write_metadata_and_other_answers_settle_by_c
     assert_eq!(fixture.object(&fixture.alias("assets/café.png").unwrap()), b"latin one");
     assert_eq!(server.requests("assets/café.png"), vec![b"assets/caf\xe9.png".to_vec()]);
     assert!(server.requests("assets/한.png").is_empty());
+    assert_eq!(server.requests("assets/encoded.png").len(), 1);
     for key in &keys[3..] {
         assert_eq!(fixture.alias(key), None);
     }
@@ -365,6 +373,39 @@ fn cancellation_during_a_body_leaves_no_alias_or_spooled_file_and_stops_taking_k
     assert_eq!(fixture.spooled_files(), 0);
     assert_eq!(shared.enqueue(vec!["assets/after.png".to_owned()]).unwrap(), false);
     assert_eq!(shared.page(0, 512).unwrap().total, 0);
+}
+
+#[test]
+fn the_spool_holds_one_batch_including_the_batch_being_installed() {
+    let directory = tempfile::tempdir().unwrap();
+    let body = |index: usize, size: u64| Body {
+        index,
+        key: format!("assets/{index}.png"),
+        spooled: Spooled { path: directory.path().join(format!("asset-{index}.payload")), sha256: String::new(), size },
+    };
+    let mut backlog = Backlog::default();
+    for index in 0..BACKLOG_BODIES {
+        assert!(backlog.open());
+        backlog.push(body(index, 1));
+    }
+    assert!(!backlog.open());
+    assert_eq!(backlog.take().unwrap().len(), BACKLOG_BODIES);
+    assert!(!backlog.open());
+    // A read already in flight still lands, and waits for the installing batch.
+    backlog.push(body(BACKLOG_BODIES, 1));
+    assert!(backlog.take().is_none());
+    backlog.installed();
+    assert!(backlog.open());
+    assert_eq!(backlog.take().unwrap().len(), 1);
+    backlog.installed();
+
+    backlog.push(body(0, BACKLOG_BYTES / 2));
+    assert_eq!(backlog.take().unwrap().len(), 1);
+    assert!(backlog.open());
+    backlog.push(body(1, BACKLOG_BYTES / 2));
+    assert!(!backlog.open());
+    backlog.installed();
+    assert!(backlog.open());
 }
 
 #[test]

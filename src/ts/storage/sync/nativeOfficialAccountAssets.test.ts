@@ -9,6 +9,7 @@ import type { AccountStorage } from '../accountStorage'
 import type { NativeFileJobDependencies, NativeFileJobStatus, NativeOfficialAssetRestoreProgress, NativeOfficialAssetSettled } from '../nativeFileJobs'
 import { BackgroundExecutionExpiredError } from '../../iosNative'
 import { AssetAliasSizeMismatchError } from '../assetRepository'
+import { createAccountScopedOfficialAssetLedger, createOfficialAssetLedger, type LedgerStorage } from './officialAssetLedger'
 
 vi.mock('../database.svelte', () => ({
     getDatabase: () => { throw new Error('Asset recovery must use the pinned store') },
@@ -145,10 +146,14 @@ function harness(extra = 0, concurrency: 1 | 2 = 1) {
             return await attempt({ credential: { kind: 'risu-auth', token }, reauthenticated: true }) === 'done' ? 'done' : 'unauthenticated'
         },
     }
-    const ledger = { record: vi.fn(), publishedAs: vi.fn(), reset: vi.fn(), clear: vi.fn() }
+    const ledgerValues = new Map<string, string>()
+    const ledgerStorage: LedgerStorage = { getItem: key => ledgerValues.get(key) ?? null, setItem: (key, value) => { ledgerValues.set(key, value) }, removeItem: key => { ledgerValues.delete(key) } }
+    const accountLedger = createAccountScopedOfficialAssetLedger(ledgerStorage, () => accountId)
+    const ledger = { record: vi.fn(accountLedger.record), publishedAs: vi.fn(), reset: vi.fn(), clear: vi.fn() }
     const baseUrl = `https://synthetic-${harnessSequence++}.invalid`
     const dependencies = { settings, store, getAccountId: () => accountId, account, ledger, resolveBlobs: async () => blobs, flushMetadata: vi.fn(async () => {}), baseUrl, concurrency, jobs: jobs.dependencies }
     return { values, settings, lease, blobs, jobs, ledger, dependencies, baseUrl, assets: createNativeOfficialAccountAssets(dependencies),
+        publishedAs: (account: string, key: string) => createOfficialAssetLedger(ledgerStorage, account).publishedAs(key),
         replaceLibrary: () => { library = 'library-2' }, changeAccount: () => { accountId = 'other' }, refuseLogin: () => { renews = false } }
 }
 
@@ -385,6 +390,12 @@ describe('native restored account assets', () => {
         expect(await outcome).toMatchObject({ state: 'failed', reason: 'account-changed' })
         expect(running.jobs.runs[0].state).toBe('cancelled')
         expect(running.jobs.jobs.size).toBe(0)
+        const late = harness()
+        await late.assets.prepare('account'); await late.assets.bind('account')
+        late.jobs.reply(key => { if (key === 'assets/background') late.changeAccount(); return 'installed' })
+        expect(await late.assets.complete('account')).toMatchObject({ state: 'failed', reason: 'account-changed' })
+        expect(late.publishedAs('account', 'assets/avatar')).toBe('assets/avatar')
+        expect(late.publishedAs('other', 'assets/background')).toBeNull()
     })
 
     it('reports a failed settlement write instead of claiming a durable stopped outcome', async () => {

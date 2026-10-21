@@ -54,7 +54,13 @@ impl AccountReader {
         directory: &Path,
     ) -> Result<Self, NativeJobError> {
         validate_base_url(base_url)?;
+        // Other crates enable reqwest's decoders, which would strip a
+        // Content-Encoding this client has to see and refuse.
         let client = crate::platform_tls::client_builder()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(30))
             .build()

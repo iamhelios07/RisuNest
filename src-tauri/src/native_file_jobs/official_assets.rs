@@ -235,9 +235,7 @@ pub(crate) fn run(request: Request, owned_directory: &Path, job: &JobControl) ->
         fingerprint: Sha256::new(),
         in_flight: HashMap::new(),
         sequence: 0,
-        queue: VecDeque::new(),
-        queue_bytes: 0,
-        installing: false,
+        backlog: Backlog::default(),
         progress: RestoreProgress::default(),
         published: None,
         revision,
@@ -289,6 +287,65 @@ enum Event {
     Wake,
 }
 
+/// Spooled bodies waiting for installation and the batch the install thread holds.
+#[derive(Default)]
+struct Backlog {
+    queue: VecDeque<Body>,
+    queued_bytes: u64,
+    /// Bodies and bytes of the batch being installed.
+    installing: Option<(usize, u64)>,
+}
+
+impl Backlog {
+    /// Admission waits while the spool holds a batch, counting the batch being installed.
+    fn open(&self) -> bool {
+        let (bodies, bytes) = self.installing.unwrap_or_default();
+        self.queue.len() + bodies < BACKLOG_BODIES && self.queued_bytes + bytes < BACKLOG_BYTES
+    }
+
+    fn push(&mut self, body: Body) {
+        self.queued_bytes += body.spooled.size;
+        self.queue.push_back(body);
+    }
+
+    /// The next batch, once the previous one is installed.
+    fn take(&mut self) -> Option<Vec<Body>> {
+        if self.installing.is_some() || self.queue.is_empty() {
+            return None;
+        }
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        while let Some(body) = self.queue.front() {
+            if !batch.is_empty() && (batch.len() >= BACKLOG_BODIES || bytes + body.spooled.size > BACKLOG_BYTES) {
+                break;
+            }
+            bytes += body.spooled.size;
+            batch.extend(self.queue.pop_front());
+        }
+        self.queued_bytes -= bytes;
+        self.installing = Some((batch.len(), bytes));
+        Some(batch)
+    }
+
+    fn installed(&mut self) {
+        self.installing = None;
+    }
+
+    /// Drops the bodies not yet handed to the install thread.
+    fn discard(&mut self) {
+        self.queue.clear();
+        self.queued_bytes = 0;
+    }
+
+    fn is_installing(&self) -> bool {
+        self.installing.is_some()
+    }
+
+    fn is_idle(&self) -> bool {
+        self.installing.is_none() && self.queue.is_empty()
+    }
+}
+
 struct Run<'a> {
     job: &'a JobControl,
     shared: &'a Shared,
@@ -300,9 +357,7 @@ struct Run<'a> {
     fingerprint: Sha256,
     in_flight: HashMap<u64, Attempt>,
     sequence: u64,
-    queue: VecDeque<Body>,
-    queue_bytes: u64,
-    installing: bool,
+    backlog: Backlog,
     progress: RestoreProgress,
     published: Option<Instant>,
     revision: i64,
@@ -329,35 +384,32 @@ impl Run<'_> {
                 }
             }
             if cancelled || matches!(self.scheduler.reason(), Some(StopReason::Local | StopReason::LibraryChanged)) {
-                self.queue.clear();
-                self.queue_bytes = 0;
+                self.backlog.discard();
             }
-            if cancelled && !self.installing {
+            if cancelled && !self.backlog.is_installing() {
                 return Err(NativeJobError::new("cancelled", "Official asset restore was cancelled"));
             }
             if !cancelled {
                 let now = now_ms();
-                while let Some(attempt) = self.scheduler.next(now, self.backlog_open()) {
+                while let Some(attempt) = self.scheduler.next(now, self.backlog.open()) {
                     self.sequence += 1;
                     let (sequence, key) = (self.sequence, self.keys[attempt.index].clone());
                     self.in_flight.insert(sequence, attempt);
                     reads.push(async move { (sequence, reader.read(&key, sequence, job, received).await) });
                 }
             }
-            if !self.installing && !self.queue.is_empty() {
-                let batch = self.take_batch();
+            if let Some(batch) = self.backlog.take() {
                 batches.send(batch).map_err(|_| installer_stopped())?;
-                self.installing = true;
             }
             self.publish(false);
-            if self.scheduler.done() && !self.installing && self.queue.is_empty() {
+            if self.scheduler.done() && self.backlog.is_idle() {
                 return Ok(());
             }
             let wait = self
                 .scheduler
-                .wake_at(self.backlog_open())
+                .wake_at(self.backlog.open())
                 .map_or(TICK, |at| TICK.min(Duration::from_millis(at.saturating_sub(now_ms()))));
-            let installing = self.installing;
+            let installing = self.backlog.is_installing();
             let event = tokio::select! {
                 Some((sequence, read)) = reads.next(), if !reads.is_empty() => Event::Read(sequence, read),
                 result = installed.recv(), if installing => Event::Installed(result),
@@ -383,24 +435,6 @@ impl Run<'_> {
         self.keys.extend(keys);
     }
 
-    fn backlog_open(&self) -> bool {
-        self.queue.len() < BACKLOG_BODIES && self.queue_bytes < BACKLOG_BYTES
-    }
-
-    fn take_batch(&mut self) -> Vec<Body> {
-        let mut batch = Vec::new();
-        let mut bytes = 0;
-        while let Some(body) = self.queue.front() {
-            if !batch.is_empty() && (batch.len() >= BACKLOG_BODIES || bytes + body.spooled.size > BACKLOG_BYTES) {
-                break;
-            }
-            bytes += body.spooled.size;
-            batch.extend(self.queue.pop_front());
-        }
-        self.queue_bytes -= bytes;
-        batch
-    }
-
     fn read_finished(&mut self, sequence: u64, read: Read) {
         let Some(attempt) = self.in_flight.remove(&sequence) else { return };
         let index = attempt.index;
@@ -414,8 +448,7 @@ impl Run<'_> {
         };
         match (self.scheduler.finish(attempt, exchange, now_ms()), spooled) {
             (Outcome::Install, Some(spooled)) => {
-                self.queue_bytes += spooled.size;
-                self.queue.push_back(Body { index, key: self.keys[index].clone(), spooled });
+                self.backlog.push(Body { index, key: self.keys[index].clone(), spooled });
             }
             (Outcome::Settled(result), _) => self.settle(index, result),
             _ => {}
@@ -423,7 +456,7 @@ impl Run<'_> {
     }
 
     fn batch_finished(&mut self, batch: Vec<Body>, result: Result<Installed, BatchError>) {
-        self.installing = false;
+        self.backlog.installed();
         let (settled, stop) = match result {
             Ok(installed) => {
                 self.revision = installed.revision;
