@@ -661,7 +661,7 @@ async function performAccountUnmigration(): Promise<void> {
         isColdStorageBackupData,
         listColdDataKeys,
     } = await import("../process/coldstorage.svelte")
-    const { expandColdPayloads } = await import("../process/coldPayloadExpansion")
+    const { coldItemFromMap, expandColdPayloads } = await import("../process/coldPayloadExpansion")
     const blobStore = await resolveBlobStore()
     const accountStorage = new AccountStorage()
     const coldKeys = await listColdDataKeys(db)
@@ -710,14 +710,15 @@ async function performAccountUnmigration(): Promise<void> {
                     })
                 },
                 readRemoteCold: async (key) => {
-                    const value = await getAccountColdStorageItem(key)
-                    if (value !== null && !isColdStorageBackupData(value)) {
+                    const item = await getAccountColdStorageItem(key)
+                    if (item.kind !== 'present') return null
+                    if (!isColdStorageBackupData(item.value)) {
                         throw new Error(`Invalid account cold payload: ${key}`)
                     }
-                    return value
+                    return item.value
                 },
             })
-            await expandColdPayloads(candidate, async (key) => selectedCold.get(key) ?? null)
+            await expandColdPayloads(candidate, async (key) => coldItemFromMap(selectedCold, key))
         },
         replaceDatabase: (database, reason, options) => {
             alertStore.set({ type: 'wait', msg: language.accountUnmigration.finishing })

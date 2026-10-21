@@ -5,12 +5,14 @@ import {
     listCharacterResources,
     listDatabaseRootResources,
 } from '../../process/coldstorageData'
+import type { ColdItemRead } from '../../process/coldPayloadExpansion'
 import type { AccountReadResult, AccountWriteOptions, AccountWriteResult } from '../accountStorage'
 import type { BlobMetadata, BlobStore } from '../blobStore'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import type { Database } from '../database.svelte'
 import { RevisionConflictError, type PersistentDataStore } from '../persistentDataStore'
 import { decodeRisuSave, encodeRisuSaveLegacy } from '../risuSave'
+import { UNOWNED_PLUGIN_OWNER } from '../../plugins/pluginOwner'
 import { streamRisuSaveFromStore } from '../risuSaveStoreAdapter'
 import { risuSaveFixtureDatabase } from '../tests/risuSaveFixtures'
 import {
@@ -191,7 +193,9 @@ async function makeHarness(options: HarnessOptions = {}) {
         return { kind: 'written', replacementKey: `remote/${key}` }
     })
     const cold = {
-        readRemote: vi.fn(async (key: string) => structuredClone(remoteCold.get(key) ?? null)),
+        readRemote: vi.fn(async (key: string): Promise<ColdItemRead> => remoteCold.has(key)
+            ? { kind: 'present', value: structuredClone(remoteCold.get(key)) }
+            : { kind: 'missing' }),
     }
     const markPublished = vi.fn()
     const prepareCandidate = options.prepareCandidate ?? vi.fn(async (value: Database) => structuredClone(value))
@@ -1145,12 +1149,13 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         }
     })
 
-    it.each(['missing', '403', '503'])('rejects unresolved cold payloads (%s) before activation', async failure => {
+    it.each(['missing', 'unreadable', 'throws'])('rejects unresolved cold payloads (%s) before activation', async failure => {
         const remote = makeDatabase() as any
         remote.characters[0].coldstorage = 'cold-character'
         const bytes = encodeRisuSaveLegacy(remote, 'compression')
         const harness = await makeHarness({ databaseRead: { kind: 'value', bytes }, remoteCold: new Map() })
-        if (failure !== 'missing') harness.cold.readRemote.mockRejectedValue(new Error(failure))
+        if (failure === 'unreadable') harness.cold.readRemote.mockResolvedValue({ kind: 'unreadable' })
+        if (failure === 'throws') harness.cold.readRemote.mockRejectedValue(new Error(failure))
         const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
         await expect(harness.adapter.pull()).rejects.toMatchObject({ name: 'ColdPayloadUnavailableError' })
         expect(replace).not.toHaveBeenCalled()
@@ -1158,6 +1163,37 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         expect(harness.writeItem).not.toHaveBeenCalled()
         expect(remote.characters[0].coldstorage).toBe('cold-character')
         expect(remote.characters[0].chats.at(-1).message[0].data).toBe(`${coldStorageHeader}cold-message`)
+    })
+
+    it.each([false, true])('imports plugin values from an index-only snapshot instead of storing references (restore=%s)', async (restore) => {
+        const remote = makeDatabase()
+        remote.characters[0].coldStoragedChats = []
+        remote.characters[0].chats = remote.characters[0].chats.slice(0, -1)
+        remote.pluginCustomStorage = { inline: 'kept', _coldpluginIndex: 'plugin-index' }
+        const restoreCandidate = vi.fn<NonNullable<OfficialAccountSnapshotDependencies['restoreCandidate']>>(
+            (candidate, expectedRevision) => harness.store.replaceFromDatabase(candidate, expectedRevision),
+        )
+        const harness = await makeHarness({
+            databaseRead: { kind: 'value', bytes: encodeRisuSaveLegacy(remote, 'compression') },
+            remoteCold: new Map<string, unknown>([
+                ['plugin-index', {
+                    type: 'risu-plugin-storage-index', version: 1, trash: [],
+                    entries: [{ k: 'zero', s: '0' }, { k: 'large', l: 'plugin-large' }, { k: 'lost', l: 'plugin-missing' }],
+                }],
+                ['plugin-large', null],
+            ]),
+            restoreCandidate: restore ? restoreCandidate : undefined,
+        })
+
+        await expect(harness.adapter.pull()).resolves.toMatchObject({ kind: 'activated' })
+
+        const stored = await harness.store.listPluginStorage()
+        expect(stored.map((item) => [item.owner, item.key]).sort()).toEqual([
+            [UNOWNED_PLUGIN_OWNER, 'inline'], [UNOWNED_PLUGIN_OWNER, 'large'], [UNOWNED_PLUGIN_OWNER, 'zero'],
+        ])
+        expect((await harness.store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'zero'))?.value).toBe(0)
+        expect((await harness.store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'large'))?.value).toBeNull()
+        if (restore) expect(restoreCandidate.mock.calls[0][3]).toEqual({ pluginStorage: 1 })
     })
 
     it('stops pinning on cancellation and releases the revision without remote probes', async () => {
@@ -1216,7 +1252,7 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
                     : { kind: 'value', bytes: Uint8Array.of(1) }),
                 writeItem: vi.fn(),
             },
-            cold: { readRemote: vi.fn(async () => ({ message: [] })) },
+            cold: { readRemote: vi.fn(async (): Promise<ColdItemRead> => ({ kind: 'present', value: { message: [] } })) },
             prepareCandidate: async (value) => {
                 if (!raced) {
                     raced = true
