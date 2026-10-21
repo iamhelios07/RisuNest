@@ -9,7 +9,7 @@ export type DiagnosticInfo = { os: string; device: string; userAgent: string }
 type NativeDeviceInfo = {
     model: string | null
     arch: string
-    os?: { name: string; version: string | null } | null
+    os?: { platform?: 'windows' | 'linux'; name: string; version: string | null } | null
 }
 
 function fallbackInfo(): DiagnosticInfo {
@@ -34,7 +34,8 @@ export function loadDiagnosticInfo(): Promise<DiagnosticInfo> {
         if (device) {
             info.device = device.model ? `${device.model} (${device.arch})` : device.arch
             if (device.os) {
-                info.os = device.os.version ? `${device.os.name} (NT ${device.os.version})` : device.os.name
+                const { platform, name, version } = device.os
+                info.os = !version ? name : platform === 'linux' ? `${name} ${version}` : `${name} (NT ${version})`
             }
         }
         return info

@@ -29,7 +29,7 @@ describe('diagnostic reports', () => {
     ])('reports the native Windows product name and available kernel version: %s', async (name, version, expected) => {
         native.os = 'windows'
         native.version = '10.0.26100'
-        native.invoke.mockResolvedValue({ model: null, arch: 'x86_64', os: { name, version } })
+        native.invoke.mockResolvedValue({ model: null, arch: 'x86_64', os: { platform: 'windows', name, version } })
         const { loadDiagnosticInfo, formatErrorDetails, formatDiagnosticLog } = await import('./diagnostics')
         const info = await loadDiagnosticInfo()
         expect(info.os).toBe(expected)
@@ -45,6 +45,31 @@ describe('diagnostic reports', () => {
         else native.invoke.mockResolvedValue({ model: null, arch: 'x86_64' })
         const { loadDiagnosticInfo } = await import('./diagnostics')
         expect((await loadDiagnosticInfo()).os).toBe('Windows (NT 10.0.26100)')
+    })
+
+    it.each([
+        ['Ubuntu', '24.4.0', 'Ubuntu 24.4.0'],
+        ['Debian', '13.0.0', 'Debian 13.0.0'],
+        ['Arch Linux', 'Rolling Release', 'Arch Linux Rolling Release'],
+        ['Linux', null, 'Linux'],
+    ])('reports the Linux distribution and available release: %s', async (name, version, expected) => {
+        native.os = 'linux'
+        native.version = '24.4.0'
+        native.invoke.mockResolvedValue({ model: null, arch: 'x86_64', os: { platform: 'linux', name, version } })
+        const { loadDiagnosticInfo, formatErrorDetails, formatDiagnosticLog } = await import('./diagnostics')
+        const info = await loadDiagnosticInfo()
+        expect(info.os).toBe(expected)
+        expect(formatErrorDetails(info, 'synthetic failure')).toContain(`\nOS: ${expected}\n`)
+        expect(formatDiagnosticLog(info, '[error] synthetic')).toContain(` | OS: ${expected} | `)
+    })
+
+    it.each(['unavailable command', 'older response'])('keeps the Linux fallback when native distribution details are missing: %s', async mode => {
+        native.os = 'linux'
+        native.version = '24.4.0'
+        if (mode === 'unavailable command') native.invoke.mockRejectedValue(new Error('bridge unavailable'))
+        else native.invoke.mockResolvedValue({ model: null, arch: 'x86_64' })
+        const { loadDiagnosticInfo } = await import('./diagnostics')
+        expect((await loadDiagnosticInfo()).os).toBe('Linux 24.4.0')
     })
 
     it.each([

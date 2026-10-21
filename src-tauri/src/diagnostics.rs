@@ -4,18 +4,19 @@ use serde::Serialize;
 pub(crate) struct DeviceInfo {
     model: Option<String>,
     arch: &'static str,
-    os: Option<WindowsInfo>,
+    os: Option<NativeOsInfo>,
 }
 
 #[derive(Serialize)]
-struct WindowsInfo {
+struct NativeOsInfo {
+    platform: &'static str,
     name: String,
     version: Option<String>,
 }
 
 #[tauri::command]
 pub(crate) async fn diagnostic_device_info() -> DeviceInfo {
-    let (model, os) = tauri::async_runtime::spawn_blocking(|| (device_model(), windows_info()))
+    let (model, os) = tauri::async_runtime::spawn_blocking(|| (device_model(), native_os_info()))
         .await
         .unwrap_or_default();
     DeviceInfo {
@@ -25,11 +26,16 @@ pub(crate) async fn diagnostic_device_info() -> DeviceInfo {
     }
 }
 
-#[cfg(windows)]
-fn windows_info() -> Option<WindowsInfo> {
+#[cfg(any(windows, target_os = "linux"))]
+fn native_os_info() -> Option<NativeOsInfo> {
     let info = os_info::get();
-    Some(WindowsInfo {
-        name: info.edition().unwrap_or("Windows").to_owned(),
+    #[cfg(windows)]
+    let name = info.edition().unwrap_or("Windows").to_owned();
+    #[cfg(target_os = "linux")]
+    let name = info.os_type().to_string();
+    Some(NativeOsInfo {
+        platform: std::env::consts::OS,
+        name,
         version: match info.version() {
             os_info::Version::Unknown => None,
             version => Some(version.to_string()),
@@ -37,8 +43,8 @@ fn windows_info() -> Option<WindowsInfo> {
     })
 }
 
-#[cfg(not(windows))]
-fn windows_info() -> Option<WindowsInfo> {
+#[cfg(not(any(windows, target_os = "linux")))]
+fn native_os_info() -> Option<NativeOsInfo> {
     None
 }
 
@@ -185,12 +191,27 @@ mod tests {
     #[tokio::test]
     async fn reports_the_native_windows_product_and_kernel_version() {
         let response = serde_json::to_value(diagnostic_device_info().await).unwrap();
+        assert_eq!(response["os"]["platform"], "windows");
         let name = response["os"]["name"].as_str().unwrap();
         assert!(name.starts_with("Windows "), "missing Windows product name: {name}");
         let version = response["os"]["version"].as_str().unwrap();
         let parts: Vec<_> = version.split('.').collect();
         assert_eq!(parts.len(), 3);
         assert!(parts.iter().all(|part| part.parse::<u64>().is_ok()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reports_the_native_linux_distribution_and_release() {
+        let native = os_info::get();
+        let response = serde_json::to_value(diagnostic_device_info().await).unwrap();
+        assert_eq!(response["os"]["platform"], "linux");
+        assert_eq!(response["os"]["name"], native.os_type().to_string());
+        let version = match native.version() {
+            os_info::Version::Unknown => serde_json::Value::Null,
+            version => serde_json::Value::String(version.to_string()),
+        };
+        assert_eq!(response["os"]["version"], version);
     }
 
     #[test]

@@ -109,8 +109,10 @@ reqwest = { version = "0.12.28", features = ["blocking", "json"] }
 [target.'cfg(any(windows, target_os = "android", target_os = "linux", target_os = "ios", target_os = "macos"))'.dependencies]
 regex = "1.13.1"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 os_info = "3.15.0"
+
+[target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "=0.8.1"
 webview2-com = "0.39.1"
 windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_Graphics_Dwm", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging"] }
