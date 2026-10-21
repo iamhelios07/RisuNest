@@ -42,7 +42,6 @@
     import { selectSingleFile } from "src/ts/util";
     import { withObjectUrl } from "src/ts/objectUrl";
     import { getModelInfo, LLMFlags, LLMFormat, LLMProvider } from "src/ts/model/modellist";
-    import { resolveClaudeThinkingType } from "src/ts/model/types";
     import RegexList from "src/lib/SideBars/Scripts/RegexList.svelte";
     import SettingRenderer from "../SettingRenderer.svelte";
     import { allBasicParameterItems } from "src/ts/setting/botSettingsParamsData";
@@ -128,13 +127,6 @@
             DBState.db.nanogptRequestModel = '';
             DBState.db.nanogptRequestModelName = '';
             prevNanogptInputMode = nanogptInputMode;
-        }
-    });
-
-    $effect(() => {
-        const resolved = resolveClaudeThinkingType(modelInfo.flags, DBState.db.thinkingType)
-        if (resolved !== DBState.db.thinkingType) {
-            DBState.db.thinkingType = resolved
         }
     });
 

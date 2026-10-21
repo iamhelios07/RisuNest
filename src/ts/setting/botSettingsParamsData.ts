@@ -128,6 +128,8 @@ export const modelSpecificParameterItems: SettingItem[] = [
         type: 'segmented',
         labelKey: 'thinkingType',
         bindKey: 'thinkingType',
+        // Shows the mode the request uses without rewriting the stored value.
+        getValue: (db, ctx) => ctx ? resolveClaudeThinkingType(ctx.modelInfo.flags, db.thinkingType) : db.thinkingType,
         condition: (ctx) =>
             ctx.modelInfo.flags.includes(LLMFlags.claudeThinking) ||
             ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking),
