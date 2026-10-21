@@ -144,6 +144,7 @@ interface HarnessOptions {
     getAccountId?: () => string | null
     flushPublicationMetadata?: () => Promise<void>
     restoreCandidate?: OfficialAccountSnapshotDependencies['restoreCandidate']
+    confirmOmissions?: OfficialAccountSnapshotDependencies['confirmOmissions']
     events?: string[]
 }
 
@@ -216,6 +217,7 @@ async function makeHarness(options: HarnessOptions = {}) {
         getAccountId: options.getAccountId,
         flushPublicationMetadata: options.flushPublicationMetadata,
         restoreCandidate: options.restoreCandidate,
+        confirmOmissions: options.confirmOmissions,
     }
     const adapter = new OfficialAccountSnapshotAdapter(dependencies)
     return {
@@ -1165,7 +1167,8 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         expect(remote.characters[0].chats.at(-1).message[0].data).toBe(`${coldStorageHeader}cold-message`)
     })
 
-    it.each([false, true])('imports plugin values from an index-only snapshot instead of storing references (restore=%s)', async (restore) => {
+    it.each(['web', 'native'] as const)('imports plugin values from an index-only snapshot instead of storing references (%s)', async (route) => {
+        const restore = route === 'native'
         const remote = makeDatabase()
         remote.characters[0].coldStoragedChats = []
         remote.characters[0].chats = remote.characters[0].chats.slice(0, -1)
@@ -1173,6 +1176,7 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         const restoreCandidate = vi.fn<NonNullable<OfficialAccountSnapshotDependencies['restoreCandidate']>>(
             (candidate, expectedRevision) => harness.store.replaceFromDatabase(candidate, expectedRevision),
         )
+        const confirmOmissions = vi.fn<NonNullable<OfficialAccountSnapshotDependencies['confirmOmissions']>>(async () => true)
         const harness = await makeHarness({
             databaseRead: { kind: 'value', bytes: encodeRisuSaveLegacy(remote, 'compression') },
             remoteCold: new Map<string, unknown>([
@@ -1183,6 +1187,7 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
                 ['plugin-large', null],
             ]),
             restoreCandidate: restore ? restoreCandidate : undefined,
+            confirmOmissions: restore ? undefined : confirmOmissions,
         })
 
         await expect(harness.adapter.pull()).resolves.toMatchObject({ kind: 'activated' })
@@ -1193,7 +1198,30 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         ])
         expect((await harness.store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'zero'))?.value).toBe(0)
         expect((await harness.store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'large'))?.value).toBeNull()
-        if (restore) expect(restoreCandidate.mock.calls[0][3]).toEqual({ pluginStorage: 1 })
+        expect(restore ? restoreCandidate.mock.calls[0][3] : confirmOmissions.mock.calls[0][0]).toEqual({ pluginStorage: 1 })
+    })
+
+    it('leaves the library unchanged when a web restore that leaves plugin values out is declined', async () => {
+        const remote = makeDatabase()
+        remote.characters[0].coldStoragedChats = []
+        remote.characters[0].chats = remote.characters[0].chats.slice(0, -1)
+        remote.username = 'Remote user'
+        remote.pluginCustomStorage = { _coldpluginIndex: 'plugin-index' }
+        const harness = await makeHarness({
+            databaseRead: { kind: 'value', bytes: encodeRisuSaveLegacy(remote, 'compression') },
+            remoteCold: new Map<string, unknown>([
+                ['plugin-index', { type: 'risu-plugin-storage-index', version: 1, trash: [], entries: [{ k: 'lost', l: 'plugin-missing' }] }],
+            ]),
+            confirmOmissions: vi.fn(async () => false),
+        })
+        const before = await harness.store.readRoot()
+        const pluginsBefore = await harness.store.listPluginStorage()
+
+        await expect(harness.adapter.pull()).resolves.toEqual({ kind: 'declined' })
+
+        expect(await harness.store.readRoot()).toEqual(before)
+        expect(await harness.store.listPluginStorage()).toEqual(pluginsBefore)
+        expect(harness.writeItem).not.toHaveBeenCalled()
     })
 
     it('stops pinning on cancellation and releases the revision without remote probes', async () => {

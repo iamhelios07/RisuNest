@@ -128,6 +128,8 @@ export async function initializeOfficialAccountBootstrap(
                 const pulled = await dependencies.adapter.pull()
                 if (pulled.kind === 'activated') revision = pulled.revision
                 if (pulled.kind === 'missing') action = 'push'
+                // Declining a restore that leaves data out keeps local data, like cancelling account sync.
+                if (pulled.kind === 'declined') action = 'cancel'
                 if (pulled.kind === 'kept-local') {
                     dependencies.onPullSkipped?.({ conflict: pulled.conflict })
                 }

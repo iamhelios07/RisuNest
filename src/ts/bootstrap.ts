@@ -20,7 +20,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure } from "./stores.svelte";
 import { afterPluginsStarted, keepPluginsOffForThisStart, loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
 import { setPluginStartupSyncExcluded } from './plugins/pluginStartupGate';
-import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertToast, alertTOS, waitAlert } from "./alert";
+import { alertActionConfirm, alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertToast, alertTOS, waitAlert } from "./alert";
 import { backgroundErrorMessage } from "./storage/backgroundErrorMessage";
 import { applyHubSelection, characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
 import { initializeNativeLocalUrls } from "./nativeLocalUrls";
@@ -428,6 +428,14 @@ export async function loadData() {
             account: accountStorage,
             cold: { readRemote: getAccountColdStorageItem },
             prepareCandidate: prepareDatabaseForPersistence,
+            confirmOmissions: isTauri
+                ? undefined
+                : (omissions) => alertActionConfirm({
+                    title: language.loadDataFromAccount,
+                    description: language.portableBackup.omittedRestoreData.pluginStorage(omissions.pluginStorage),
+                    actionLabel: language.confirm,
+                    cancelLabel: language.cancel,
+                }),
             restoreCandidate: isTauri
                 ? (candidate, expectedRevision, signal, omissions) => restoreNativeOfficialAccountCandidate(
                     runtime, candidate, expectedRevision, signal,

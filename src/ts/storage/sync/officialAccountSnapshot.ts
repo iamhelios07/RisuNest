@@ -107,6 +107,8 @@ export interface OfficialAccountSnapshotDependencies {
     account: Pick<AccountStorage, 'readItem' | 'writeItem'>
     cold: OfficialColdStorageTransport
     prepareCandidate(database: Database): Promise<Database>
+    /** Asks before a web restore leaves data out; a decline leaves the library unchanged. */
+    confirmOmissions?(omissions: OfficialRestoreOmissions): Promise<boolean>
     /** Explicit native restores use the runtime's confirmed and fenced replacement path. */
     restoreCandidate?(
         database: Database,
@@ -152,6 +154,8 @@ export type OfficialPullResult =
     | { kind: 'unchanged' }
     | { kind: 'kept-local'; conflict: boolean }
     | { kind: 'activated'; revision: DataRevision }
+    /** The user declined a restore that leaves data out. Nothing changed. */
+    | { kind: 'declined' }
 
 interface PinnedAsset {
     key: string
@@ -705,7 +709,11 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         const plugins = await importColdPluginStorage(candidate, readCold)
         const omissions: OfficialRestoreOmissions = { pluginStorage: plugins.omitted }
         if (omissions.pluginStorage > 0 && !this.dependencies.restoreCandidate) {
-            console.warn(`Official snapshot restore left out ${omissions.pluginStorage} plugin storage values`)
+            if (this.dependencies.confirmOmissions) {
+                if (!await this.dependencies.confirmOmissions(omissions)) return { kind: 'declined' }
+            } else {
+                console.warn(`Official snapshot restore left out ${omissions.pluginStorage} plugin storage values`)
+            }
         }
 
         // Referenced assets load lazily on use, matching the upstream client;

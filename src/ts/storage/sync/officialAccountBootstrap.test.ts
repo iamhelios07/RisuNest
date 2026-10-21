@@ -225,6 +225,26 @@ describe('official account production bootstrap', () => {
         ])
     })
 
+    it('keeps local data and turns sync off without publishing when the user declines a lossy pull', async () => {
+        const harness = makeHarness({
+            accountEnabled: true,
+            pull: async () => ({ kind: 'declined' }),
+        })
+        harness.local.account = { token: 'synthetic-token', useSync: true } as Database['account']
+        harness.dependencies.onPullSkipped = vi.fn()
+
+        const result = await initializeOfficialAccountBootstrap(harness.dependencies)
+
+        expect(result).toMatchObject({ database: harness.local, revision: 1, officialEnabled: false })
+        expect(result.database.account?.useSync).toBe(false)
+        expect(harness.adapter.pin).not.toHaveBeenCalled()
+        expect(harness.dependencies.confirmInitialPush).not.toHaveBeenCalled()
+        expect(harness.dependencies.onPullSkipped).not.toHaveBeenCalled()
+        expect(harness.dependencies.resolveWorkingSet).not.toHaveBeenCalled()
+        expect(harness.markers.get('dosync')).toBe('avoid')
+        expect(harness.dependencies.accountMode.isAccount).toBe(false)
+    })
+
     it('publishes the local revision explicitly when a new account has no remote database', async () => {
         const harness = makeHarness({ syncRequested: true })
 
