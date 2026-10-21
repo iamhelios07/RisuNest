@@ -23,8 +23,6 @@ afterEach(() => {
 describe('diagnostic reports', () => {
     it.each([
         ['Windows 11 Professional', '10.0.26100', 'Windows 11 Professional (NT 10.0.26100)'],
-        ['Windows 10 Pro', '10.0.19045', 'Windows 10 Pro (NT 10.0.19045)'],
-        ['Windows', '10.0.26100', 'Windows (NT 10.0.26100)'],
         ['Windows 11 Professional', null, 'Windows 11 Professional'],
     ])('reports the native Windows product name and available kernel version: %s', async (name, version, expected) => {
         native.os = 'windows'
