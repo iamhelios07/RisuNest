@@ -2986,8 +2986,10 @@
   var MAX_STRING = 64 * 1024 * 1024;
   var MAX_BLOCK = 1024 * 1024 * 1024;
   var MAX_REFERENCE = 64 * 1024;
-  var MAX_HELD_PLUGIN_STORAGE = 64 * 1024;
-  var EMPTY_PLUGIN_STORAGE = Uint8Array.of(11, 0, 13, ...encoder.encode("pluginStorage"), 2, 0, 0, 0, ...encoder.encode("{}"));
+  var MAX_HELD_PLUGIN_STORAGE = MAX_STRING;
+  var PLUGIN_STORAGE_MARKERS = ["_coldpluginIndex", "_coldplugin"];
+  var pluginStorageHeader = (length) => Uint8Array.of(11, 0, 13, ...encoder.encode("pluginStorage"), ...u32(length));
+  var EMPTY_PLUGIN_STORAGE = Uint8Array.of(...pluginStorageHeader(2), ...encoder.encode("{}"));
   var JsonScan = class {
     constructor(visit, { maxString = MAX_STRING, blank = false, cold = false } = {}) {
       this.visit = visit;
@@ -3247,11 +3249,11 @@
         } finally {
           await limited.close();
         }
-        return;
+        return { pluginStorage: null };
       }
       await write?.(first);
       const names = /* @__PURE__ */ new Set(), directory = /* @__PURE__ */ new Set();
-      let directoryFound = false;
+      let directoryFound = false, pluginStorage = null;
       const expected = /* @__PURE__ */ new Map([[0, "config"], [1, "root"], [4, "preset"], [5, "modules"], [9, "plugins"], [10, "loadouts"], [11, "pluginStorage"]]);
       while (await reader.available()) {
         const head = await reader.take(3);
@@ -3261,7 +3263,8 @@
         const size = await reader.take(4);
         const length = new DataView(size.buffer, size.byteOffset, 4).getUint32(0, true);
         if (!name || names.has(name) || compression > 1) fail("invalidData");
-        if (![0, 1, 2, 4, 5, 7, 9, 10, 11].includes(type)) fail("unsupported");
+        if (![0, 1, 2, 4, 5, 7, 9, 10, 11, 12].includes(type)) fail("unsupported");
+        if (type === 12 && !name.startsWith("kv:")) fail("unsupported");
         if (expected.has(type) && expected.get(type) !== name) fail("invalidData");
         names.add(name);
         const header = new Uint8Array(7 + nameLength);
@@ -3270,11 +3273,11 @@
         header.set(size, 3 + nameLength);
         const held = write && type === 11 && length <= MAX_HELD_PLUGIN_STORAGE ? [] : null;
         if (write && !held) await write(header);
-        let characterId = null, rootType = null;
+        let characterId = null, rootType = null, coldPlugin = false;
         const parts = reader.parts(length);
         let block = streamOf(held ? hold(parts, held) : write ? tap(parts, write) : parts);
         if (compression) block = block.pipeThrough(new DecompressionStream("gzip"));
-        await scanJson(block, (path, value) => {
+        const decoded = await scanJson(block, (path, value) => {
           if (!path.length) rootType = Array.isArray(value) ? "array" : value && typeof value === "object" ? "object" : "scalar";
           if (path.length === 1 && path[0] === "chaId") characterId = value;
           if (type === 1 && path[0] === "__directory") {
@@ -3286,15 +3289,18 @@
               directory.add(value);
             } else fail("invalidData");
           }
-          if (type === 11) refs.visitPluginStorage?.(path, value);
-          else if (![0, 9, 10].includes(type)) refs.visit(path, value);
+          if (type === 11) {
+            if (path.length === 1 && PLUGIN_STORAGE_MARKERS.includes(path[0])) coldPlugin = true;
+            refs.visitPluginStorage?.(path, value);
+          } else if (![0, 9, 10, 12].includes(type)) refs.visit(path, value);
         }, signal3, maxDecodedBlockBytes, { maxString: type === 2 || type === 7 ? MAX_STRING : maxDecodedBlockBytes, blank: type === 11 });
         if (type === 11 && rootType === null) {
           if (write && !held) fail("invalidData");
           if (held) await write(EMPTY_PLUGIN_STORAGE);
         } else {
           if ([4, 5, 9, 10].includes(type) ? rootType !== "array" : rootType !== "object") fail("invalidData");
-          if (held) {
+          if (held && coldPlugin && decoded <= MAX_HELD_PLUGIN_STORAGE) pluginStorage = { compression, parts: held };
+          else if (held) {
             await write(header);
             for (const part of held) await write(part);
           }
@@ -3307,6 +3313,7 @@
       if (!directoryFound) fail("invalidData");
       for (const name of directory) if (!names.has(name)) fail("invalidData");
       for (const name of names) if (name !== "root" && !directory.has(name)) fail("invalidData");
+      return { pluginStorage };
     } catch (error) {
       if (error instanceof OutputError) throw error.error;
       if (error instanceof ExportError || signal3?.aborted) throw error;
@@ -3724,6 +3731,8 @@
 
   // src/export.mjs
   var MAX_COLD = 1024 * 1024 * 1024;
+  var PLUGIN_STORAGE_INDEX = "risu-plugin-storage-index";
+  var BOM = [239, 187, 191];
   var BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
   var RETRIES = 3;
   var UNREADABLE = /* @__PURE__ */ new Set(["invalidData", "truncated", "recordTooLarge", "invalidCold"]);
@@ -3849,29 +3858,122 @@
       await writer.end();
       return found;
     };
+    const readCold = async (key) => {
+      if (!UUID.test(key)) fail("invalidCold");
+      for (let retry2 = 0; ; retry2++) {
+        try {
+          const parser = new JsonScan(() => {
+          }, { maxString: MAX_COLD });
+          const parts = [];
+          let size = 0;
+          for await (let bytes of gunzip(await source.cold(key), signal3)) {
+            if (!size && BOM.every((byte, i) => bytes[i] === byte)) bytes = bytes.subarray(3);
+            size += bytes.length;
+            if (size > MAX_COLD) fail("recordTooLarge");
+            parser.write(bytes);
+            parts.push(bytes.slice());
+            await breathe();
+          }
+          parser.end();
+          return parts;
+        } catch (error) {
+          check(signal3);
+          if (error?.code !== "interrupted") throw error;
+          if (retry2 === RETRIES) fail("network");
+          await wait(500 * 2 ** retry2, signal3);
+        }
+      }
+    };
+    const inlinePluginStorage = async ({ compression, parts }) => {
+      let stream = new Blob(parts).stream();
+      if (compression) stream = stream.pipeThrough(new DecompressionStream("gzip"));
+      const stored = JSON.parse(await new Response(stream).text());
+      const reads = /* @__PURE__ */ new Map();
+      const cold = async (key) => {
+        if (!reads.has(key)) reads.set(key, readCold(key).then((value2) => ({ value: value2 }), (error2) => ({ error: error2 })));
+        const { value, error } = await reads.get(key);
+        if (!error) return value;
+        check(signal3);
+        if (error.code === "missing" || unreadable(error)) return null;
+        throw error;
+      };
+      const values = /* @__PURE__ */ new Map();
+      let left = 0;
+      const pointer = stored._coldpluginIndex;
+      if (typeof pointer === "string") {
+        let index = null;
+        const bytes = await cold(pointer);
+        try {
+          if (bytes) index = JSON.parse(await new Blob(bytes).text());
+        } catch {
+        }
+        if (index?.type === PLUGIN_STORAGE_INDEX && Array.isArray(index.entries) && Array.isArray(index.trash)) {
+          for (const entry of index.entries) {
+            if (typeof entry?.k !== "string") continue;
+            if (typeof entry.l === "string") values.set(entry.k, { cold: entry.l });
+            else if (typeof entry.s === "string") values.set(entry.k, { json: entry.s });
+          }
+        } else left++;
+      }
+      const inline = new Set(Object.keys(stored).filter((key) => !PLUGIN_STORAGE_MARKERS.includes(key)));
+      const legacy = stored._coldplugin;
+      if (legacy && typeof legacy === "object") {
+        for (const [key, id] of Object.entries(legacy)) {
+          if (typeof id === "string" && !inline.has(key) && !values.has(key)) values.set(key, { cold: id });
+        }
+      }
+      for (const key of inline) values.set(key, { value: stored[key] });
+      const members = [];
+      let length = 2;
+      for (const [key, entry] of values) {
+        check(signal3);
+        let bytes = null;
+        if ("value" in entry) bytes = [encoder.encode(JSON.stringify(entry.value))];
+        else if ("json" in entry) {
+          try {
+            bytes = [encoder.encode(JSON.stringify(JSON.parse(entry.json)))];
+          } catch {
+          }
+        } else bytes = await cold(entry.cold);
+        const name = encoder.encode((members.length ? "," : "") + JSON.stringify(key) + ":");
+        const size = bytes && bytes.reduce((total, part) => total + part.length, name.length);
+        if (!bytes || length + size > MAX_BLOCK) {
+          left++;
+          continue;
+        }
+        members.push(name, ...bytes);
+        length += size;
+      }
+      await writer.append(pluginStorageHeader(length));
+      await writer.append(encoder.encode("{"));
+      for (const part of members) await writer.append(part);
+      await writer.append(encoder.encode("}"));
+      return left;
+    };
     let pending = null;
     try {
       report({}, true);
       const inventory = await source.inventory();
       report({ stage: "database" }, true);
-      let refs, initialHash;
+      let refs, initialHash, pluginLeft = null;
       await retrying(await source.database(), () => source.database(), async (database) => {
         refs = references();
         const hash = sha256.create();
-        let read = 0;
+        let read = 0, pluginStorage;
         await writer.begin("database.risudat");
         try {
-          await scanDatabase(database.stream(), refs, signal3, async (bytes) => {
+          ({ pluginStorage } = await scanDatabase(database.stream(), refs, signal3, async (bytes) => {
             hash.update(bytes);
             read += bytes.length;
             state.readBytes += bytes.length;
             await breathe();
-          }, void 0, (bytes) => writer.append(bytes));
+          }, void 0, (bytes) => writer.append(bytes)));
         } catch (error) {
           state.readBytes -= read;
           throw error;
         }
         if (database.size != null && read !== database.size) fail("changed");
+        pluginLeft = pluginStorage ? await inlinePluginStorage(pluginStorage) : null;
         await writer.end();
         initialHash = hex(hash.digest());
       });
@@ -3897,7 +3999,8 @@
         state.items++;
         report();
       }
-      for (const key of refs.pluginCold) if (!coldKeys.has(key)) skipped.pluginCold++;
+      if (pluginLeft !== null) skipped.pluginCold += pluginLeft;
+      else for (const key of refs.pluginCold) if (!coldKeys.has(key)) skipped.pluginCold++;
       const assets = [.../* @__PURE__ */ new Set([...inventory.assets, ...refs.assets])].sort();
       report({ stage: "assets", total: state.items + assets.length + inventory.inlays.length }, true);
       const prepare = (key) => source.asset(key).then((value) => ({ value }), (error) => ({ error }));

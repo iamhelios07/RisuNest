@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { ArchiveWriter, ByteReader, ExportError, U32_MAX, encoder, keyHex, sourceOf, streamOf } from '../src/bytes.mjs';
 import { COLD_HEADER, JsonScan, references, scanDatabase } from '../src/scan.mjs';
 import { exportBackup, inlaySource } from '../src/export.mjs';
-import { MemorySink, archive, block, coldId, database, fixtureSource, msgpack, rawBlock } from './fixtures.mjs';
+import { MemorySink, archive, block, coldId, database, fixtureSource, msgpack, rawBlock, readBlocks } from './fixtures.mjs';
 
 function fragmented(bytes, width = 1) {
     return streamOf((async function* () {
@@ -46,28 +46,39 @@ test('current release block layout discovers assets and cold references across c
     }
 });
 test('raw and compressed legacy message-pack databases preserve reference discovery', async () => {
-    const packed = msgpack({ pluginCustomStorage: { _coldpluginIndex: coldId }, characters: [{ image: 'assets/old.png', chats: [{ message: [{ data: COLD_HEADER + coldId }] }] }], characterOrder: [{ img: 'assets/folder.png' }], botPresets: [{ image: 'assets/preset.png' }] });
+    const index = '20000000-0000-4000-8000-000000000006';
+    const packed = msgpack({ pluginCustomStorage: { _coldpluginIndex: index }, characters: [{ image: 'assets/old.png', chats: [{ message: [{ data: COLD_HEADER + coldId }] }] }], characterOrder: [{ img: 'assets/folder.png' }], botPresets: [{ image: 'assets/preset.png' }] });
     for (const format of [7, 8, 9]) {
         const bytes = Buffer.concat([Buffer.from('\0RISUSAVE\0'), Buffer.from([format]), format === 7 ? packed : gzipSync(packed)]);
         const refs = references();
         await scanDatabase(fragmented(bytes, 2), refs);
         assert.deepEqual([...refs.assets].sort(), ['assets/folder.png', 'assets/old.png', 'assets/preset.png']);
         assert.deepEqual([...refs.cold], [coldId]);
-        assert.deepEqual([...refs.pluginCold], [coldId]);
+        assert.deepEqual([...refs.pluginCold], [index]);
         await assert.rejects(scanDatabase(fragmented(bytes, 2), references(), undefined, undefined, 32), error => error.code === 'recordTooLarge');
     }
+    // Message-pack plugin storage is copied unchanged, so its cold-stored values are reported as skipped.
+    const db = Buffer.concat([Buffer.from('\0RISUSAVE\0'), Buffer.from([7]), packed]);
+    const sink = new MemorySink();
+    const result = await exportBackup({ source: fixtureSource({ db, cold: new Map([[coldId, gzipSync('[]')], [index, gzipSync('{}')]]) }), sink });
+    assert.deepEqual(archive(sink.bytes).get('database.risudat'), db);
+    assert.equal(result.skipped.pluginCold, 1);
 });
 test('rejects directory mismatches, unsupported blocks and truncation', async () => {
     const invalid = [
         database({ root: { __directory: [] } }),
         database({ root: { __directory: ['missing'] } }),
         Buffer.concat([database(), block(6, 'remote', {})]),
+        database({ blocks: [[12, 'cache', { version: 1, entries: [] }]] }),
         database().subarray(0, -1)
     ];
     for (const bytes of invalid) await assert.rejects(scanDatabase(fragmented(bytes, 7), references()), ExportError);
 });
 test('backup contains original database bytes, every asset type, orphaned inlays and decoded cold JSON', async () => {
-    const db = database({ character: { image: 'assets/icon.jpg', coldstorage: coldId }, root: { characterOrder: [{ img: 'assets/folder.png', imgFile: 'assets/folder-file.png' }] }, presets: [{ image: 'assets/preset.png' }] });
+    const db = database({
+        character: { image: 'assets/icon.jpg', coldstorage: coldId }, root: { characterOrder: [{ img: 'assets/folder.png', imgFile: 'assets/folder-file.png' }] }, presets: [{ image: 'assets/preset.png' }],
+        blocks: [[12, 'kv:synthetic', { version: 1, entries: [{ k: 'key', v: { value: true } }] }]]
+    });
     const cold = Buffer.from(JSON.stringify({ character: { chaId: 'character-1', image: 'assets/archived.webp' } }));
     const media = Buffer.from([0, 1, 2, 253, 254, 255]);
     const inlays = new Map([
@@ -238,33 +249,78 @@ test('record limits count UTF-8 and bound each field and message independently',
     ]) assert.throws(() => checkRecord(text), error => error.code === 'recordTooLarge');
 });
 test('cold storage exports only restorable archived chats and reports what it skips', async () => {
-    const [plugin, settings, corrupt, nested, scalar, index] = [1, 2, 3, 4, 5, 6].map(n => '2000000' + n + '-0000-4000-8000-00000000000' + n);
+    const [settings, corrupt, nested, scalar] = [2, 3, 4, 5].map(n => '2000000' + n + '-0000-4000-8000-00000000000' + n);
     const db = database({
-        pluginStorage: { _coldplugin: { synthetic: plugin, duplicate: plugin }, _coldpluginIndex: index },
         character: { coldstorage: coldId, coldStoragedChats: [settings, corrupt, scalar], chats: [{ message: [{ data: COLD_HEADER + nested }] }] }
     });
     // The rejected payload is larger than the output buffer, so its rollback rewinds flushed bytes.
     const big = { image: 'assets/dropped.png', value: 'x'.repeat(2 * 1024 * 1024) };
     const cold = new Map([
         [coldId, gzipSync(JSON.stringify({ character: { chaId: 'character-1', image: 'assets/archived.png' } }))],
-        [plugin, gzipSync('{"plugin":true}')],
         [settings, gzipSync(JSON.stringify(big))],
         [corrupt, Buffer.from('not gzip')],
         [nested, gzipSync(JSON.stringify([{ role: 'char', data: 'archived message' }]))],
         [scalar, gzipSync('"text"')]
     ]);
     const source = fixtureSource({ db, cold, assets: new Map([['assets/archived.png', Buffer.from([1])]]) });
-    const read = source.cold, requested = [];
-    source.cold = async key => { requested.push(key); return read(key); };
     const sink = new MemorySink();
     const result = await exportBackup({ source, sink });
     const entries = archive(sink.bytes);
     assert.deepEqual([...entries.keys()].sort(), ['archived.png', 'coldstorage_' + coldId + '.json', 'coldstorage_' + nested + '.json', 'database.risudat']);
     assert.deepEqual(JSON.parse(entries.get('coldstorage_' + nested + '.json')), [{ role: 'char', data: 'archived message' }]);
     assert.equal(result.bytes, sink.bytes.length);
-    assert.deepEqual(result.skipped, { missingAssets: 0, missingCold: 0, unreadableCold: 3, pluginCold: 2, unsupportedInlays: 0 });
-    assert(!requested.includes(plugin));
-    assert(!requested.includes(index));
+    assert.deepEqual(result.skipped, { missingAssets: 0, missingCold: 0, unreadableCold: 3, pluginCold: 0, unsupportedInlays: 0 });
+});
+test('cold-stored plugin storage is inlined with upstream precedence and unreadable values are skipped', async () => {
+    const [index, large, missing, corrupt, invalid, legacy, stale] = [1, 2, 3, 4, 5, 6, 7].map(n => '4000000' + n + '-0000-4000-8000-00000000000' + n);
+    const largeValue = { text: '큰 값'.repeat(1000) };
+    const stored = { _coldpluginIndex: index, _coldplugin: { legacy, indexed: stale, inline: stale }, inline: 'block value' };
+    const cold = new Map([
+        [index, gzipSync(JSON.stringify({ type: 'risu-plugin-storage-index', version: 1, trash: [{ id: stale, at: 0 }], entries: [
+            { k: 'null', s: 'null' }, { k: 'false', s: 'false' }, { k: 'zero', s: '0' }, { k: 'empty', s: '""' },
+            { k: 'object', s: '{"nested":[1,"둘"]}' }, { k: 'large', l: large }, { k: 'shared', l: large },
+            { k: 'missing', l: missing }, { k: 'corrupt', l: corrupt }, { k: 'invalid', l: invalid }, { k: 'malformed', s: '{' },
+            { k: 'inline', s: '"index copy"' }, { k: 'indexed', s: '"index value"' }
+        ] }))],
+        // Upstream decodes a BOM and surrounding whitespace as valid JSON text.
+        [large, gzipSync(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(' ' + JSON.stringify(largeValue) + '\n')]))],
+        [corrupt, Buffer.from('not gzip')], [invalid, gzipSync('{"unterminated"')],
+        [legacy, gzipSync('"legacy value"')], [stale, gzipSync('"stale"')]
+    ]);
+    for (const compressed of [false, true]) {
+        // encodeRisuSave also copies plugin storage into root; the separate block is the one restored.
+        const db = database({ compressed, root: { pluginCustomStorage: stored }, pluginStorage: stored, blocks: [[12, 'kv:synthetic', { version: 1, entries: [] }]] });
+        const source = fixtureSource({ db, cold });
+        const read = source.cold, open = source.database;
+        let opened = 0, stalled = false;
+        source.database = async () => { opened++; return open(); };
+        // A stalled plugin value download restarts that value, not the database entry.
+        source.cold = async key => {
+            if (key !== index || stalled) return read(key);
+            stalled = true;
+            return { size: null, stream: () => streamOf((async function* () { throw new ExportError('interrupted'); })()) };
+        };
+        const sink = new MemorySink();
+        const result = await exportBackup({ source, sink });
+        const entries = archive(sink.bytes);
+        const written = entries.get('database.risudat');
+        await scanDatabase(sourceOf(written).stream(), references());
+        const blocks = readBlocks(written), plugin = blocks.at(-1);
+        assert.deepEqual(blocks.slice(0, -1).map(b => b.bytes), readBlocks(db).filter(b => b.name !== 'pluginStorage').map(b => b.bytes));
+        assert.deepEqual([plugin.type, plugin.name, plugin.compressed], [11, 'pluginStorage', false]);
+        assert.deepEqual(JSON.parse(plugin.body), {
+            null: null, false: false, zero: 0, empty: '', object: { nested: [1, '둘'] }, large: largeValue, shared: largeValue,
+            inline: 'block value', indexed: 'index value', legacy: 'legacy value'
+        });
+        assert.deepEqual([...entries.keys()], ['database.risudat']);
+        assert.equal(result.skipped.pluginCold, 4);
+        assert.equal(opened, 2);
+    }
+    // A missing index is counted once; values in the block and the per-key map are still inlined.
+    const sink = new MemorySink();
+    const result = await exportBackup({ source: fixtureSource({ db: database({ pluginStorage: stored }), cold: new Map([[legacy, gzipSync('1')]]) }), sink });
+    assert.deepEqual(JSON.parse(readBlocks(archive(sink.bytes).get('database.risudat')).at(-1).body), { inline: 'block value', legacy: 1 });
+    assert.equal(result.skipped.pluginCold, 2);
 });
 test('an output failure while writing an archived chat stops the export instead of skipping it', async () => {
     const db = database({ character: { coldstorage: coldId } });

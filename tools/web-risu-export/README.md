@@ -2,7 +2,7 @@
 
 Export saved web RisuAI data, ordinary assets, archived chats, and **all inlays stored in the current browser**, including unreferenced inlays, into a RisuNest-compatible `.bin` backup.
 
-Supports local IndexedDB/OPFS storage and RisuAI account storage. The storage adapter targets RisuAI **v2026.8.250**. The panel supports Korean and English, with a language selector.
+Supports local IndexedDB/OPFS storage and RisuAI account storage. The storage adapter targets RisuAI **v2026.10.211**. The panel supports Korean and English, with a language selector.
 
 ## Use
 
@@ -26,8 +26,10 @@ For a self-hosted web RisuAI origin that keeps data in the browser, use the cons
 - Account mode downloads missing referenced assets and archived chats using the current login. It also includes all local inlays. Unreferenced remote assets and data held only in another origin/profile are not discoverable from this browser. A download that stalls for 60 seconds or ends early restarts that item, up to three times with increasing delays.
 - The exporter reads persisted data. It cannot include unsaved edits or obtain an atomic snapshot across browser stores and account servers. It checks database hashes and key inventories before completing; keep the application idle.
 - An interrupted or failed export is not a complete backup. A database the exporter cannot read stops the export. Referenced assets or archived chats that cannot be found, archived chats that cannot be read, and inlays in an unsupported format are skipped and counted, and the rest of the backup is completed.
-- Only archived chats referenced by the database are exported. Cold storage files nothing refers to are unused by RisuAI and are left out. RisuAI v3 plugin storage keeps its values in cold storage; RisuNest cannot restore those yet, so they are skipped and counted.
+- Only archived chats referenced by the database are exported. Cold storage files nothing refers to are unused by RisuAI and are left out.
 - Inlays saved before RisuAI recorded an inlay type are exported as images. An unset plugin storage block, which RisuAI writes as an empty block, is written as an empty object so RisuNest 1.0.4 and earlier can restore it.
+- RisuAI keeps plugin storage values in cold storage. The exporter writes them back into the database's plugin storage as plain values, which RisuNest restores. Values that cannot be found or read, or that would push plugin storage past the 1 GiB block limit, are skipped and counted. A plugin storage block over 64 MiB, or one in the older MessagePack database format, is copied unchanged, and its cold-stored values are skipped and counted.
+- SaveKV blocks (`kv:` names) are copied unchanged. RisuNest skips them on restore.
 - Individual character fields and messages are limited to 64 MiB of serialized UTF-8 JSON. Database blocks have a 1 GiB decoded limit.
 - Backups include saved settings and may contain credentials. Keep the file private. The exporter does not upload backup data or print record contents.
 - Source data is not migrated, rewritten, or deleted. Account authentication may refresh its login token. Firefox cleanup removes only this tool's temporary files and their folder.
