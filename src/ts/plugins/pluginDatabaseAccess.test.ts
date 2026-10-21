@@ -2189,6 +2189,23 @@ describe('plugin database access', () => {
         expect(harness.materializeDatabaseSnapshot).not.toHaveBeenCalled()
     })
 
+    it('ignores a plugin list sent through setDatabaseLite and still rejects a malformed one', async () => {
+        const harness = createHarness()
+        const installed = { name: 'installed', script: 'installed', version: '3.0', enabled: true }
+        harness.compatibilityDatabase.plugins = [installed] as any
+        const proposed = { name: 'new', script: 'proposed', version: '3.0', enabled: true }
+        harness.prepareAuthoritativeDatabaseUpdate.mockImplementation(async update => ({ ...update, plugins: [proposed] }))
+
+        await harness.access.setDatabaseLite({ username: 'Lite', plugins: [installed, proposed] }, ['plugins', 'username'])
+
+        expect(harness.commitPersistentUnitIntent.mock.calls.at(-1)?.[1]).toEqual([
+            { key: '["root","username"]', type: 'set', value: 'Lite' },
+        ])
+        expect(harness.compatibilityDatabase.plugins).toEqual([installed])
+        expect(() => harness.access.setDatabaseLite({ plugins: [{ name: 'broken' }] }, ['plugins']))
+            .toThrow(/plugins must be an array of plugin records/i)
+    })
+
     it(
         'persists a root-only update without replacing a concurrently edited character',
         async () => {

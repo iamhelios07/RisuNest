@@ -505,14 +505,22 @@ export async function loadData() {
             },
             assetReader: createStructuredAccountAssetReader(accountStorage),
             configureAssetReader: configureOfficialAccountAssetReader,
-            chooseExistingRemote: async () => await alertSelect([
-                language.loadDataFromAccount,
-                language.saveCurrentDataToAccount,
-            ]) === '0' ? 'pull' : 'push',
+            chooseExistingRemote: async () => {
+                const choice = await alertSelect([
+                    language.loadDataFromAccount,
+                    language.saveCurrentDataToAccount,
+                    language.cancelAccountSync,
+                ])
+                return choice === '0' ? 'pull' : choice === '2' ? 'cancel' : 'push'
+            },
             confirmInitialPush: async () =>
                 await alertInput('to overwrite your data, type "RISUNEST"') === 'RISUNEST',
             installDatabase: installPersistentWorkingSet,
             initializeWorkingSet: (database) => initializeActiveWorkingSet(database),
+            disableAccountSync: () => {
+                const account = getDatabase().account
+                if (account) account.useSync = false
+            },
             onRemoteError: (error) => {
                 console.error(error)
                 alertError(backgroundErrorMessage(error))
