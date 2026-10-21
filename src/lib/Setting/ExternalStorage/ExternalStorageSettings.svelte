@@ -926,7 +926,7 @@
                     </dl>
                 {/if}
                 {#if job && externalJobIsPaused(job) && job.error?.retryAtMs}<p class="note">{strings.retryAt.replace('{0}', when(job.error.retryAtMs))}</p>{/if}
-                <ExternalTransferProgress connectionId={connection.id} {strings} {job} remaining={remaining[connection.id]}>
+                <ExternalTransferProgress connectionId={connection.id} {strings} {job} remaining={remaining[connection.id]} catchingUp={syncCatchingUp.has(connection.id)}>
                     {#snippet exportActions()}
                         {#if exportRun?.connectionId === connection.id}
                             <SettingButton variant="secondary" size="sm" onclick={() => exportRun && bridge.cancelExport(exportRun.id)}>{strings.cancel}</SettingButton>
