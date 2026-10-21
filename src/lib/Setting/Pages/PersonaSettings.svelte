@@ -136,12 +136,10 @@
             saveUserPersona()
         }}/>
         <span class="text-sm text-textcolor2">{language.note}</span>
-        {#if DBState.db.personaNote}
-            <TextInput marginBottom size="lg" bind:value={() => DBState.db.userNote, (value) => {
-                DBState.db.userNote = value
-                saveUserPersona()
-            }} placeholder={`Put a unique identifier for this persona here.\nExample: [Alternate Hunters persona]`} />
-        {/if}
+        <TextInput marginBottom size="lg" bind:value={() => DBState.db.userNote, (value) => {
+            DBState.db.userNote = value
+            saveUserPersona()
+        }} placeholder={language.personaNotePlaceholder} />
         <span class="text-sm text-textcolor2">{language.description}</span>
         <TextAreaInput autocomplete="off" bind:value={() => DBState.db.personaPrompt, (value) => {
             DBState.db.personaPrompt = value

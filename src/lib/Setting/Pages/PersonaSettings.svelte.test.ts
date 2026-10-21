@@ -61,7 +61,7 @@ it('updates the persona used by bound chats while editing its current name, note
     DBState.db = {
         personas: [{ id: 'persona', name: 'Before', icon: '', personaPrompt: 'Before prompt', note: 'Before note' }],
         selectedPersona: 0, username: 'Before', userIcon: '', personaPrompt: 'Before prompt', userNote: 'Before note',
-        personaNote: true, hotkeys: [], characters: [], botPresets: [],
+        personaNote: false, hotkeys: [], characters: [], botPresets: [],
     } as any
     deriveEffectivePersonaMirrors(DBState.db)
     const indexedDB = new IDBFactory()
@@ -78,6 +78,7 @@ it('updates the persona used by bound chats while editing its current name, note
     await tick()
     const inputs = document.querySelectorAll<HTMLInputElement>('input[type="text"]')
     const prompt = document.querySelector('textarea')!
+    expect(inputs[1].placeholder).toBe(languageEnglish.personaNotePlaceholder)
     inputs[0].focus()
     inputs[0].value = 'Edited name'
     inputs[0].dispatchEvent(new Event('input', { bubbles: true }))
