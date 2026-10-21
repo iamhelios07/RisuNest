@@ -13,7 +13,7 @@
 </script>
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
-<div class="fixed left-0 top-0 z-60 flex h-full w-full items-center justify-center bg-black/50 text-textcolor" role="button" tabindex="0" onclick={onClose}>
+<div class="fixed left-0 top-0 z-modal flex h-full w-full items-center justify-center bg-black/50 text-textcolor" role="button" tabindex="0" onclick={onClose}>
     <div class="flex max-h-full w-xl max-w-full flex-col gap-4 overflow-y-auto rounded-md bg-darkbg p-6" role="presentation" onclick={(e) => e.stopPropagation()}>
         <div class="flex items-center justify-between gap-4">
             <h1 class="text-2xl font-bold">{language.blockedRealmCreators}</h1>
