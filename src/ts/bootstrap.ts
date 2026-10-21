@@ -553,7 +553,7 @@ export async function loadData() {
             configureOfficialAccountAssetReader(null)
             const restoredAssets = createNativeOfficialAccountAssets({
                 settings: nativeDeviceSettings!, store: runtime.store, resolveBlobs: resolveBlobStore,
-                account: accountStorage, ledger: officialAssetLedger, flushMetadata: flushNativeOfficialMetadata, origin: new URL(hubURL).origin,
+                account: accountStorage, ledger: officialAssetLedger, flushMetadata: flushNativeOfficialMetadata, baseUrl: hubURL,
                 getAccountId: getNativeAccountId,
             })
             const completeRestoreAssets = restoredAssets.complete

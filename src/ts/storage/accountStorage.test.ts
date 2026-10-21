@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { language } from 'src/lang'
-import type { AccountNativeOfficialWriteAttemptContext } from './accountStorage'
+import type { AccountNativeAssetReadAttempt, AccountNativeOfficialWriteAttemptContext } from './accountStorage'
 import {
     createNativeOfficialAccountFlowService,
     type NativeOfficialAccountFlow,
@@ -566,6 +566,61 @@ describe('AccountStorage structured wire contract', () => {
         expect(attempt).toHaveBeenCalledTimes(3)
         expect(mocks.alertLogin).toHaveBeenCalledTimes(2)
         expect(credentialRouting.reauthenticate).toHaveBeenCalledTimes(2)
+    })
+
+    it('reauthenticates rejected native asset reads once and retries them with the fresh token', async () => {
+        let token = 'old-token'
+        const credentialRouting = {
+            getAccountId: () => 'account-a',
+            getToken: vi.fn(() => token),
+            reauthenticate: vi.fn(async () => { token = 'new-token' }),
+        }
+        const attempt = vi.fn<AccountNativeAssetReadAttempt>()
+            .mockResolvedValueOnce('reauthentication-needed')
+            .mockResolvedValueOnce('done')
+        const { AccountStorage } = await loadStorage()
+
+        await expect(new AccountStorage({ credentialRouting }).readAssetsFromNative(attempt)).resolves.toBe('done')
+
+        expect(mocks.alertLogin).toHaveBeenCalledOnce()
+        expect(attempt.mock.calls).toEqual([
+            [{ credential: { kind: 'risu-auth', token: 'old-token' }, reauthenticated: false }],
+            [{ credential: { kind: 'risu-auth', token: 'new-token' }, reauthenticated: true }],
+        ])
+    })
+
+    it.each(['missing', 'rejected again', 'not renewed'] as const)('ends native asset reads unauthenticated when the credential is %s', async ending => {
+        const credentialRouting = {
+            getAccountId: () => 'account-a',
+            getToken: vi.fn(() => ending === 'missing' ? '' : 'native-token'),
+            reauthenticate: vi.fn(async () => { if (ending === 'not renewed') throw new Error('Synthetic login failure') }),
+        }
+        const attempt = vi.fn<AccountNativeAssetReadAttempt>(async () => 'reauthentication-needed')
+        const { AccountStorage } = await loadStorage()
+
+        await expect(new AccountStorage({ credentialRouting }).readAssetsFromNative(attempt)).resolves.toBe('unauthenticated')
+
+        expect(attempt).toHaveBeenCalledTimes({ missing: 0, 'rejected again': 2, 'not renewed': 1 }[ending])
+        expect(mocks.alertLogin).toHaveBeenCalledTimes(ending === 'missing' ? 0 : 1)
+    })
+
+    it('aborts native asset reads while waiting for reauthentication', async () => {
+        mocks.alertLogin.mockReturnValueOnce(new Promise<string>(() => {}))
+        const credentialRouting = {
+            getAccountId: () => 'account-a',
+            getToken: vi.fn(() => 'native-token'),
+            reauthenticate: vi.fn(async () => undefined),
+        }
+        const attempt = vi.fn<AccountNativeAssetReadAttempt>(async () => 'reauthentication-needed')
+        const { AccountStorage } = await loadStorage()
+        const controller = new AbortController()
+
+        const reading = new AccountStorage({ credentialRouting }).readAssetsFromNative(attempt, { signal: controller.signal })
+        await vi.waitFor(() => expect(mocks.alertLogin).toHaveBeenCalledOnce())
+        controller.abort(new DOMException('Restore cancelled', 'AbortError'))
+
+        await expect(reading).rejects.toMatchObject({ name: 'AbortError' })
+        expect(attempt).toHaveBeenCalledOnce()
     })
 
     it('aborts while waiting for native reauthentication without retrying after login resolves', async () => {

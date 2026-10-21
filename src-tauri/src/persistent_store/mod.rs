@@ -1721,6 +1721,10 @@ impl PersistentStore {
         current_revision(&self.connection)
     }
 
+    pub(crate) fn library_identity(&self) -> StoreResult<String> {
+        active_generation(&self.connection)
+    }
+
     pub(crate) fn read_root(&self, lease: Option<&str>) -> StoreResult<Versioned<Value>> {
         let (connection, target) = self.read_view(lease)?;
         query::read_root(connection, &target)
