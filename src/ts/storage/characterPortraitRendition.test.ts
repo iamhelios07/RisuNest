@@ -20,6 +20,7 @@ let source: Uint8Array
 let png: Uint8Array
 let sourceHash: string
 let missing: boolean
+let unreadable: '' | 'alias' | 'object'
 let failure: string
 let controller: AbortController
 
@@ -28,6 +29,7 @@ beforeEach(() => {
     png = imageFixture('png')
     sourceHash = createHash('sha256').update(source).digest('hex')
     missing = false
+    unreadable = ''
     failure = ''
     controller = new AbortController()
     staging.clear()
@@ -47,7 +49,7 @@ beforeEach(() => {
                 return { lease: 'portrait-lease' }
             case 'pds_read_asset_alias':
                 if (!leases.has(args.lease) || args.key !== character.image || args.kind !== 'asset') throw new Error('Invalid pinned read')
-                return { revision: 7, value: { objectHash: sourceHash, size: source.length } }
+                return unreadable === 'alias' ? null : { revision: 7, value: { objectHash: sourceHash, size: source.length } }
             case 'pds_release_revision':
                 leases.delete(args.lease)
                 return
@@ -56,6 +58,7 @@ beforeEach(() => {
                 if (args.contentHash !== sourceHash || args.expectedSize !== source.length) throw new Error('Invalid CAS read')
                 return source.slice(args.start, args.endExclusive)
             case 'asset_remote_hydrate_object':
+                if (unreadable === 'object') return null
                 missing = false
                 return source.length
             case 'native_download_handoff_create':
@@ -102,6 +105,14 @@ describe('portrait rendition preparation through native IPC', () => {
 
     it.each(['png', 'jpg', 'gif', 'webp'] as const)('leaves native %s portraits without a rendition', async ext => {
         source = imageFixture(ext)
+        expect(await prepareCharacterPortraitRendition(character, 7, 'png-card')).toBeUndefined()
+        expect(leases.size).toBe(0)
+        expect(staging.size).toBe(0)
+    })
+
+    it.each(['alias', 'object'] as const)('leaves a portrait with a missing %s to the native fallback', async mode => {
+        unreadable = mode
+        missing = true
         expect(await prepareCharacterPortraitRendition(character, 7, 'png-card')).toBeUndefined()
         expect(leases.size).toBe(0)
         expect(staging.size).toBe(0)
