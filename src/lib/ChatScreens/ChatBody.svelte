@@ -475,7 +475,11 @@
             //retry
             if(tries > 2){
                 if(captureContext) throw error
-                alertError(`Error while parsing chat message: ${translated}, ${error.message}, ${error.stack}`)
+                const wrapped = new Error(`Error while parsing chat message: ${error?.message ?? error}`)
+                if(error instanceof Error){
+                    wrapped.stack = error.stack
+                }
+                alertError(wrapped)
                 return data
             }
             if(job.disposed) return data

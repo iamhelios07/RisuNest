@@ -616,6 +616,7 @@ export function normalizeDatabaseDefaults(data:Database): Database {
     data.showDeprecatedTriggerV2 ??= false
     data.returnCSSError ??= true
     data.realmDirectOpen ??= false
+    data.blockedRealmCreators ??= []
     data.checkCorruption ??= false
     data.toggleConfirmRecommendedPreset ??= false
     data.useExperimentalGoogleTranslator ??= false
@@ -733,6 +734,12 @@ export function normalizeDatabaseDefaults(data:Database): Database {
     data.enableRisuaiProTools ??= data.plugins.length > 0
     data.keepSessionAlive ??= 'off'
     data.loadouts ??= []
+    data.loadoutApplyOptions ??= {
+        modules: true,
+        globalVariables: true,
+        preset: true,
+        persona: true
+    }
     data.longPressToPopupEditor ??= false
     data.customSidebarItems ??= []
     data.moveInsteadOfCopyOnCMPConvert ??= false
@@ -841,6 +848,11 @@ export interface RisuPersona {
     id?:string
     note?:string
     embeddedModule?:RisuModule
+}
+
+export type BlockedRealmCreator = {
+    id: string
+    name: string
 }
 
 export interface Database{
@@ -1004,6 +1016,7 @@ export interface Database{
     botSettingAtStart:false
     NAIsettings:NAISettings
     hideRealm:boolean
+    blockedRealmCreators:BlockedRealmCreator[]
     colorScheme:ColorScheme
     colorSchemeName:string
     customColorScheme:ColorScheme
@@ -1332,6 +1345,12 @@ export interface Database{
     keepSessionAlive: 'off' | 'pip' | 'sound'
     longPressToPopupEditor?: boolean
     loadouts: Loadout[]
+    loadoutApplyOptions: {
+        modules: boolean
+        globalVariables: boolean
+        preset: boolean
+        persona: boolean
+    }
     disableAprilFools?:boolean
     customSidebarItems: CustomSideBarItem[]
     lastLoadedLoadoutName: string
@@ -1543,6 +1562,7 @@ export interface character{
         ext: string
     }>
     defaultVariables?:string
+    onboarding?:CharacterOnboarding
     lowLevelAccess?:boolean
     hideChatIcon?:boolean
     lastInteraction?:number
@@ -1833,6 +1853,35 @@ export interface Chat{
     useLocallySetGlobalVariables?: boolean
     GLGlobalVariables?: { [key: string]: string }
     toolCalls?: { [callId: string]: import('../process/mcp/mcp').toolCallData }
+    onboardingDone?: boolean
+}
+
+export interface OnboardingOption{
+    label:string
+    value:string
+}
+
+export interface OnboardingQuestion{
+    id:string
+    title:string
+    description?:string
+    type:'single'|'multiple'|'text'
+    varName:string
+    required?:boolean
+    options:OnboardingOption[]
+    placeholder?:string
+}
+
+/** A creator-defined set of choices shown before a chat starts. Each answer is written to a chat variable. */
+export interface CharacterOnboarding{
+    enabled:boolean
+    mode:'form'|'html'
+    title?:string
+    description?:string
+    questions:OnboardingQuestion[]
+    html?:string
+    /** Also shows a floating button on the chat screen that opens the onboarding. */
+    floatingButton?:boolean
 }
 
 export interface IrisDialogueLine{

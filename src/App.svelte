@@ -27,7 +27,7 @@
     import HypaV3Progress from './lib/Others/HypaV3Progress.svelte';
     import PopupList from './lib/UI/PopupList.svelte';
     import EasyPanel from './lib/Others/ProTools/EasyPanel.svelte';
-    import sendSound from './etc/send.mp3'
+    import { createKeepAliveAudio } from './ts/keepAliveAudio';
     import PopupEditor from './lib/Others/PopupEditor.svelte';
     import TextEditorPopup from './lib/Others/TextEditorPopup.svelte';
     import { textEditorPopup } from './ts/gui/textEditorPopup.svelte';
@@ -157,6 +157,7 @@
     let aprilFools = $state(new Date().getMonth() === 3 && new Date().getDate() === 1)
     let aprilFoolsPage = $state(0)
     let keepingSessionAlive = $state(false)
+    let keepAliveAudio: HTMLAudioElement | null = null
 
     const getMainDropEffect = (e:DragEvent): DataTransfer['dropEffect'] => {
         const types = Array.from(e.dataTransfer?.types ?? [])
@@ -230,12 +231,23 @@
             break
         }
         case 'sound':{
-            console.log("Starting silent audio to keep session alive")
-            const silentAudio = new Audio(sendSound);
-            silentAudio.loop = true;
-            silentAudio.volume = 0.000001;
-            silentAudio.play();
-            keepingSessionAlive = true;
+            console.log("Starting inaudible audio to keep session alive")
+            if(!keepAliveAudio){
+                keepAliveAudio = createKeepAliveAudio()
+                // Paused by the OS or by another app taking audio focus; restart on the next click
+                keepAliveAudio.addEventListener('pause', () => {
+                    keepingSessionAlive = false
+                })
+            }
+            keepingSessionAlive = true
+            keepAliveAudio.play().catch(() => {
+                keepingSessionAlive = false
+            })
+            if('mediaSession' in navigator){
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title: 'RisuNest'
+                })
+            }
             break
         }
     }

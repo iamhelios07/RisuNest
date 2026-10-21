@@ -177,6 +177,10 @@ export const loadoutModalStore = $state({
     open: false
 })
 
+export const onboardingModalStore = $state({
+    open: false
+})
+
 export const irisStore = $state({
     open: false
 })

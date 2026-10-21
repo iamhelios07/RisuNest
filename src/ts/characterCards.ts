@@ -2282,6 +2282,7 @@ export async function getRisuHub(arg:{
 
 export async function downloadRisuHub(id:string, arg:{
     forceRedirect?: boolean
+    creator?: string
 } = {}) {
     let background: MobileBackgroundTask | undefined
     try {
