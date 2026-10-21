@@ -24,7 +24,8 @@ vi.mock('../model/modellist', () => ({
     LLMFormat: { OpenAICompatible: 'openai-compatible' },
     LLMTokenizer: {},
 }))
-import { normalizeDatabaseDefaults, deriveEffectivePresetMirrors, flushEffectivePresetEdits, type Database } from './database.svelte'
+import { normalizeDatabaseDefaults, deriveEffectivePresetMirrors, flushEffectivePresetEdits, getCharacterByIndex, getCurrentCharacter, type Database } from './database.svelte'
+import { DBState, selectedCharID } from '../stores.svelte'
 
 it('derives missing preset fields from current defaults instead of another preset mirror', () => {
     const database = normalizeDatabaseDefaults({ characters: [] } as Database)
@@ -46,6 +47,21 @@ it('creates IDs for new defaults without adding IDs to existing records during n
     const existing = normalizeDatabaseDefaults({ characters: [], botPresets: [{ name: 'Existing' }], personas: [{ name: 'Existing' }] } as Database)
     expect(existing.botPresets[0].id).toBeUndefined()
     expect(existing.personas[0].id).toBeUndefined()
+})
+
+it('snapshots only the requested character', () => {
+    const characters = [{ chaId: 'first', name: 'First' }, { chaId: 'second', name: 'Second', chats: [{ message: [] }] }]
+    const database = { characters } as unknown as Database
+    Object.defineProperty(database, 'unrelated', { enumerable: true, get: () => { throw new Error('read outside the character') } })
+    DBState.db = database
+    selectedCharID.set(1)
+    for (const snapshot of [getCharacterByIndex(1, { snapshot: true }), getCurrentCharacter({ snapshot: true })]) {
+        expect(snapshot).toEqual(characters[1])
+        expect(snapshot).not.toBe(characters[1])
+        snapshot.name = 'Edited'
+        expect(characters[1].name).toBe('Second')
+    }
+    expect(getCharacterByIndex(1)).toBe(characters[1])
 })
 
 describe('streaming display defaults', () => {
