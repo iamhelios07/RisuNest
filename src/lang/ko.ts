@@ -102,6 +102,8 @@ export const languageKorean = {
             missing: (count: number) => `백업에 없는 저장 데이터 ${count}개는 복원되지 않습니다.`,
             values: (count: number) => `지원하지 않는 저장 값 ${count}개는 복원되지 않습니다.`,
             pluginStorage: (count: number) => `지원하지 않는 플러그인 저장 데이터 ${count}개는 복원되지 않습니다.`,
+            damagedPluginStorage: (count: number) => `손상된 플러그인 저장 데이터 ${count}개는 복원되지 않습니다.`,
+            oversizedPluginStorage: (count: number) => `크기가 너무 큰 플러그인 저장 데이터 ${count}개는 복원되지 않습니다.`,
             inlays: (count: number) => `지원하지 않는 인레이 ${count}개는 복원되지 않습니다.`,
         },
         "recovery": {
