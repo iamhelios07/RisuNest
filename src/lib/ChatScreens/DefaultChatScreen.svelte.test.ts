@@ -151,6 +151,14 @@ it('shows the scroll buttons for a while after the chat scrolls and runs each mo
     expect(mocks.viewport.navigateMessage.mock.calls).toEqual([['previous', 0], ['next', 0]])
     expect(mocks.viewport.jumpToTop).toHaveBeenCalledOnce()
     expect(mocks.viewport.jumpToBottom).toHaveBeenCalledOnce()
+    DBState.db.risunestScrollNavigation = false
+    mocks.chatsProps.onScrollMove()
+    await tick()
+    expect(nav.classList.contains('invisible')).toBe(true)
+    DBState.db.risunestScrollNavigation = true
+    mocks.chatsProps.onScrollMove()
+    await tick()
+    expect(nav.classList.contains('invisible')).toBe(false)
 })
 
 it('keeps the scroll buttons hidden while the chat menu is open', async () => {

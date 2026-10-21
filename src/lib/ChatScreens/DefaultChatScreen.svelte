@@ -1470,8 +1470,8 @@
     {:else}
         <div
             class="absolute right-3 z-40 flex flex-col divide-y divide-darkborderc/60 overflow-hidden rounded-lg border border-darkborderc/60 bg-bgcolor/80 shadow-lg backdrop-blur-sm transition-[opacity,visibility] duration-300"
-            class:opacity-0={!scrollNavVisible || openMenu}
-            class:invisible={!scrollNavVisible || openMenu}
+            class:opacity-0={DBState.db.risunestScrollNavigation === false || !scrollNavVisible || openMenu}
+            class:invisible={DBState.db.risunestScrollNavigation === false || !scrollNavVisible || openMenu}
             style:bottom="{scrollNavBottom}px"
             data-chat-scroll-nav
             onpointerenter={() => {

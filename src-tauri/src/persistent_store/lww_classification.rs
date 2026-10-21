@@ -221,6 +221,7 @@ pub(super) const ROOT_FIELDS: &[&str] = &[
     "risunestInlaySkipReencode",
     "risunestInlayWebpQuality",
     "risunestIrisDialogue",
+    "risunestScrollNavigation",
     "risunestSyncStatusUi",
     "roundIcons",
     "saveSignatures",

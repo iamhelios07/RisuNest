@@ -2576,6 +2576,8 @@ export const languageEnglish = {
             messageSendKeyButton: 'Send button',
             chatEditPopup: 'Edit chat messages in a popup',
             chatEditPopupHelp: 'Pressing the chat edit button lets you edit the message in a popup.',
+            scrollNavigation: 'Scroll navigation',
+            scrollNavigationHelp: 'Shows buttons for moving between chat messages in the bottom-right corner when scrolling.',
             syncStatusUi: 'Show sync UI',
             syncStatusUiHelp: 'Shows the sync status icon, and a notice when sync stops or plugins are waiting for sync.',
         },

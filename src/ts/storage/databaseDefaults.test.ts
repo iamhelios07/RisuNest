@@ -101,9 +101,11 @@ describe('streaming display defaults', () => {
         ).toBe(false)
     })
 
-    it('shows the sync status UI by default and preserves turning it off', () => {
-        expect(normalizeDatabaseDefaults({ characters: [] } as Database).risunestSyncStatusUi).toBe(true)
-        expect(normalizeDatabaseDefaults({ characters: [], risunestSyncStatusUi: false } as Database).risunestSyncStatusUi).toBe(false)
+    it.each(['risunestSyncStatusUi', 'risunestScrollNavigation'] as const)('enables %s by default and preserves turning it off', (key) => {
+        expect(normalizeDatabaseDefaults({ characters: [] } as Database)[key]).toBe(true)
+        const database = { characters: [] } as Database
+        database[key] = false
+        expect(normalizeDatabaseDefaults(database)[key]).toBe(false)
     })
 })
 
