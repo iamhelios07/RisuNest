@@ -429,9 +429,14 @@ export async function loadData() {
             cold: { readRemote: getAccountColdStorageItem },
             prepareCandidate: prepareDatabaseForPersistence,
             restoreCandidate: isTauri
-                ? (candidate, expectedRevision, signal) => restoreNativeOfficialAccountCandidate(
+                ? (candidate, expectedRevision, signal, omissions) => restoreNativeOfficialAccountCandidate(
                     runtime, candidate, expectedRevision, signal,
-                    [language.risuNest.backup.officialRestoreInlayWarning],
+                    [
+                        language.risuNest.backup.officialRestoreInlayWarning,
+                        ...(omissions?.pluginStorage
+                            ? [language.portableBackup.omittedRestoreData.pluginStorage(omissions.pluginStorage)]
+                            : []),
+                    ],
                 )
                 : undefined,
             markPublished: () => undefined,
