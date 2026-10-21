@@ -2391,6 +2391,8 @@ export const languageKorean = {
             messageSendKeyButton: '전송 버튼',
             chatEditPopup: '채팅 수정 팝업창 사용',
             chatEditPopupHelp: '채팅 수정 버튼을 누르면 팝업창에서 내용을 수정할 수 있도록 합니다.',
+            scrollNavigation: '스크롤 네비게이션',
+            scrollNavigationHelp: '스크롤할 때 우측 하단에 채팅간 이동 버튼을 표시합니다.',
             syncStatusUi: '동기화 UI 표시',
             syncStatusUiHelp: '동기화 상태 아이콘을 표시하며, 동기화가 멈추거나 플러그인이 동기화를 기다리는 경우 알림을 표시합니다.',
         },
