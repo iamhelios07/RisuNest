@@ -13,14 +13,29 @@ export function rawBlock(type, name, body, compressed = false) {
     return Buffer.concat([header, body]);
 }
 // `pluginStorage` is the stored value, or a Buffer holding the whole encoded block.
-export function database({ compressed = false, root = {}, character = {}, modules = [], presets = [], pluginStorage = {} } = {}) {
+// `blocks` adds [type, name, value] entries listed in the root directory.
+export function database({ compressed = false, root = {}, character = {}, modules = [], presets = [], pluginStorage = {}, blocks = [] } = {}) {
     const entries = [
         [4, 'preset', presets], [5, 'modules', modules], [9, 'plugins', []],
         [10, 'loadouts', []], [11, 'pluginStorage', pluginStorage], [0, 'config', { version: 1 }],
-        [2, 'character-1', { chaId: 'character-1', type: 'character', name: 'Synthetic', chats: [], ...character }]
+        [2, 'character-1', { chaId: 'character-1', type: 'character', name: 'Synthetic', chats: [], ...character }], ...blocks
     ];
     entries.unshift([1, 'root', { formatversion: 7, __directory: entries.map(e => e[1]), ...root }]);
     return Buffer.concat([Buffer.from('RISUSAVE\0'), ...entries.map(e => Buffer.isBuffer(e[2]) ? e[2] : block(...e, compressed))]);
+}
+// Splits a block-format database into its encoded blocks, in file order.
+export function readBlocks(bytes) {
+    const buffer = Buffer.from(bytes), result = [];
+    let offset = 9;
+    while (offset < buffer.length) {
+        const start = offset, type = buffer[offset], compressed = buffer[offset + 1] === 1;
+        const name = buffer.toString('utf8', offset + 3, offset + 3 + buffer[offset + 2]);
+        offset += 3 + buffer[offset + 2];
+        const size = buffer.readUInt32LE(offset); offset += 4;
+        const body = buffer.subarray(offset, offset + size); offset += size;
+        result.push({ type, name, compressed, body, bytes: buffer.subarray(start, offset) });
+    }
+    return result;
 }
 export function archive(bytes) {
     const buffer = Buffer.from(bytes);

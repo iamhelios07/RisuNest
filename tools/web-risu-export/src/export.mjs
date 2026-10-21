@@ -1,8 +1,10 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { ArchiveWriter, ExportError, check, chunks, digest, encoder, fail, hex, keyHex, sourceOf, streamOf, u32, wait, yielding } from './bytes.mjs';
-import { JsonScan, references, scanDatabase } from './scan.mjs';
+import { JsonScan, MAX_BLOCK, PLUGIN_STORAGE_MARKERS, UUID, pluginStorageHeader, references, scanDatabase } from './scan.mjs';
 
 const MAX_COLD = 1024 * 1024 * 1024;
+const PLUGIN_STORAGE_INDEX = 'risu-plugin-storage-index';
+const BOM = [0xef, 0xbb, 0xbf];
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 // A download that stalls or ends early restarts its entry, paced like the request retries.
 const RETRIES = 3;
@@ -117,24 +119,110 @@ export async function exportBackup({ source, sink, signal, progress = () => {} }
         await writer.end();
         return found;
     };
+    // Reads one whole cold item while the database entry is open, so a stalled download restarts
+    // only that item. A leading BOM is dropped because the bytes are embedded into another block.
+    const readCold = async key => {
+        if (!UUID.test(key)) fail('invalidCold');
+        for (let retry = 0; ; retry++) {
+            try {
+                const parser = new JsonScan(() => {}, { maxString: MAX_COLD });
+                const parts = [];
+                let size = 0;
+                for await (let bytes of gunzip(await source.cold(key), signal)) {
+                    if (!size && BOM.every((byte, i) => bytes[i] === byte)) bytes = bytes.subarray(3);
+                    size += bytes.length;
+                    if (size > MAX_COLD) fail('recordTooLarge');
+                    parser.write(bytes); parts.push(bytes.slice()); await breathe();
+                }
+                parser.end();
+                return parts;
+            } catch (error) {
+                check(signal);
+                if (error?.code !== 'interrupted') throw error;
+                if (retry === RETRIES) fail('network');
+                await wait(500 * 2 ** retry, signal);
+            }
+        }
+    };
+    // Upstream keeps plugin storage values in a cold-stored index and, before that, a per-key cold map.
+    // RisuNest restores plain values, so they are inlined with upstream's precedence: values still in
+    // the block, then the index, then the per-key map. Returns the number of values left out.
+    const inlinePluginStorage = async ({ compression, parts }) => {
+        let stream = new Blob(parts).stream();
+        if (compression) stream = stream.pipeThrough(new DecompressionStream('gzip'));
+        const stored = JSON.parse(await new Response(stream).text());
+        const reads = new Map();
+        const cold = async key => {
+            if (!reads.has(key)) reads.set(key, readCold(key).then(value => ({ value }), error => ({ error })));
+            const { value, error } = await reads.get(key);
+            if (!error) return value;
+            check(signal);
+            if (error.code === 'missing' || unreadable(error)) return null;
+            throw error;
+        };
+        const values = new Map();
+        let left = 0;
+        const pointer = stored._coldpluginIndex;
+        if (typeof pointer === 'string') {
+            let index = null;
+            const bytes = await cold(pointer);
+            try { if (bytes) index = JSON.parse(await new Blob(bytes).text()); } catch {}
+            if (index?.type === PLUGIN_STORAGE_INDEX && Array.isArray(index.entries) && Array.isArray(index.trash)) {
+                for (const entry of index.entries) {
+                    if (typeof entry?.k !== 'string') continue;
+                    if (typeof entry.l === 'string') values.set(entry.k, { cold: entry.l });
+                    else if (typeof entry.s === 'string') values.set(entry.k, { json: entry.s });
+                }
+            } else left++;
+        }
+        const inline = new Set(Object.keys(stored).filter(key => !PLUGIN_STORAGE_MARKERS.includes(key)));
+        const legacy = stored._coldplugin;
+        if (legacy && typeof legacy === 'object') {
+            for (const [key, id] of Object.entries(legacy)) {
+                if (typeof id === 'string' && !inline.has(key) && !values.has(key)) values.set(key, { cold: id });
+            }
+        }
+        for (const key of inline) values.set(key, { value: stored[key] });
+        const members = [];
+        let length = 2;
+        for (const [key, entry] of values) {
+            check(signal);
+            let bytes = null;
+            if ('value' in entry) bytes = [encoder.encode(JSON.stringify(entry.value))];
+            else if ('json' in entry) { try { bytes = [encoder.encode(JSON.stringify(JSON.parse(entry.json)))]; } catch {} }
+            else bytes = await cold(entry.cold);
+            const name = encoder.encode((members.length ? ',' : '') + JSON.stringify(key) + ':');
+            const size = bytes && bytes.reduce((total, part) => total + part.length, name.length);
+            if (!bytes || length + size > MAX_BLOCK) { left++; continue; }
+            members.push(name, ...bytes);
+            length += size;
+        }
+        await writer.append(pluginStorageHeader(length));
+        await writer.append(encoder.encode('{'));
+        for (const part of members) await writer.append(part);
+        await writer.append(encoder.encode('}'));
+        return left;
+    };
     let pending = null;
     try {
         report({}, true);
         const inventory = await source.inventory();
         report({ stage: 'database' }, true);
-        let refs, initialHash;
+        let refs, initialHash, pluginLeft = null;
         await retrying(await source.database(), () => source.database(), async database => {
             refs = references();
             const hash = sha256.create();
-            let read = 0;
+            let read = 0, pluginStorage;
             await writer.begin('database.risudat');
             try {
-                await scanDatabase(database.stream(), refs, signal, async bytes => {
+                ({ pluginStorage } = await scanDatabase(database.stream(), refs, signal, async bytes => {
                     hash.update(bytes); read += bytes.length; state.readBytes += bytes.length;
                     await breathe();
-                }, undefined, bytes => writer.append(bytes));
+                }, undefined, bytes => writer.append(bytes)));
             } catch (error) { state.readBytes -= read; throw error; }
             if (database.size != null && read !== database.size) fail('changed');
+            // Block order is free, so the rewritten plugin storage goes last, after the source is read.
+            pluginLeft = pluginStorage ? await inlinePluginStorage(pluginStorage) : null;
             await writer.end();
             initialHash = hex(hash.digest());
         });
@@ -159,8 +247,9 @@ export async function exportBackup({ source, sink, signal, progress = () => {} }
             for (const next of found.cold) coldKeys.add(next);
             state.items++; report();
         }
-        // Upstream v3 plugin storage values live in cold storage; RisuNest cannot restore them yet.
-        for (const key of refs.pluginCold) if (!coldKeys.has(key)) skipped.pluginCold++;
+        // Cold plugin storage that could not be inlined is left out; RisuNest restores only plain values.
+        if (pluginLeft !== null) skipped.pluginCold += pluginLeft;
+        else for (const key of refs.pluginCold) if (!coldKeys.has(key)) skipped.pluginCold++;
         const assets = [...new Set([...inventory.assets, ...refs.assets])].sort();
         report({ stage: 'assets', total: state.items + assets.length + inventory.inlays.length }, true);
         // One next request overlaps output without materializing response bodies.

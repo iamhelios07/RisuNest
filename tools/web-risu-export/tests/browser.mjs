@@ -4,7 +4,7 @@ import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, firefox } from 'playwright';
-import { archive, coldId, database } from './fixtures.mjs';
+import { archive, coldId, database, readBlocks } from './fixtures.mjs';
 import { gzipSync } from 'node:zlib';
 
 const directory = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -16,6 +16,12 @@ const server = createServer((request, response) => {
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const origin = 'http://127.0.0.1:' + server.address().port;
 const scratch = path.join(directory, '.tmp/browser');
+// Cold-stored plugin storage, read from OPFS locally and from the account server in account mode.
+const [pluginIndex, pluginLarge] = ['50000000-0000-4000-8000-000000000001', '50000000-0000-4000-8000-000000000002'];
+const pluginCold = new Map([
+    [pluginIndex, gzipSync(JSON.stringify({ type: 'risu-plugin-storage-index', version: 1, trash: [], entries: [{ k: 'small', s: 'false' }, { k: 'large', l: pluginLarge }] }))],
+    [pluginLarge, gzipSync(JSON.stringify({ text: '큰 값'.repeat(4096) }))]
+]);
 await mkdir(scratch, { recursive: true });
 let browser;
 const results = [];
@@ -34,7 +40,8 @@ try {
                 image: 'assets/synthetic.webp', ...(mode === 'account' ? { coldstorage: coldId } : {}),
                 ...(mode === 'indexeddb' ? { emotionImages: [['sad', 'assets/missing.png']] } : {})
             },
-            ...(mode === 'account' ? { root: { characterOrder: [{ img: 'assets/folder.png' }] }, presets: [{ image: 'assets/preset.png' }] } : {})
+            ...(mode === 'account' ? { root: { characterOrder: [{ img: 'assets/folder.png' }] }, presets: [{ image: 'assets/preset.png' }] } : {}),
+            ...(mode !== 'indexeddb' ? { pluginStorage: { _coldpluginIndex: pluginIndex, inline: 1 } } : {})
         });
         if (mode === 'account') {
             await context.route('https://sv.risuai.xyz/**', async route => {
@@ -56,13 +63,15 @@ try {
                     else if (key === 'assets/preset.png') body = Buffer.from([10, 11]);
                     else throw new Error('Unexpected synthetic asset request');
                 } else if (path === '/hub/account/coldstorage') {
-                    assert.equal(request.headers()['x-risu-key'], coldId);
-                    body = gzipSync(Buffer.from(JSON.stringify({ character: { chaId: 'character-1', image: 'assets/cold.png' } })));
+                    const key = request.headers()['x-risu-key'];
+                    if (key === coldId) body = gzipSync(Buffer.from(JSON.stringify({ character: { chaId: 'character-1', image: 'assets/cold.png' } })));
+                    else body = pluginCold.get(key);
+                    assert(body, 'Unexpected synthetic cold storage request');
                 } else return route.abort();
                 return route.fulfill({ status: 200, headers, body });
             });
         }
-        await page.evaluate(async ({ db, stale, mode }) => {
+        await page.evaluate(async ({ db, stale, mode, pluginCold }) => {
             async function store(name, storeName, pairs) {
                 const database = await new Promise((resolve, reject) => {
                     const request = indexedDB.open(name);
@@ -78,6 +87,10 @@ try {
             }
             const root = await navigator.storage.getDirectory();
             const bytes = Uint8Array.from(db);
+            if (mode !== 'account') for (const [key, value] of pluginCold) {
+                const writable = await (await root.getFileHandle('coldstorage_' + key + '.json', { create: true })).createWritable();
+                await writable.write(Uint8Array.from(value)); await writable.close();
+            }
             const media = new Blob([new Uint8Array(8 * 1024 * 1024).fill(37)], { type: 'image/webp' });
             if (mode === 'opfs') {
                 localStorage.setItem('opfs_flag!', 'able');
@@ -114,7 +127,7 @@ try {
             });
             window.fixtureTicks = 0;
             setInterval(() => window.fixtureTicks++, 20);
-        }, { db: [...db], stale: [...database({ root: { previousSave: true } })], mode });
+        }, { db: [...db], stale: [...database({ root: { previousSave: true } })], mode, pluginCold: [...pluginCold].map(([key, value]) => [key, [...value]]) });
         await page.addScriptTag({ url: origin + '/bundle.js' });
         const panel = page.locator('#risunest-web-export');
         await panel.getByText('RisuNest 백업 내보내기', { exact: true }).waitFor();
@@ -165,7 +178,11 @@ try {
             await page.evaluate(() => URL.revokeObjectURL(window.fixtureDownload));
         }
         const entries = archive(output);
-        assert.deepEqual(entries.get('database.risudat'), db);
+        if (mode !== 'indexeddb') {
+            const blocks = readBlocks(entries.get('database.risudat'));
+            assert.deepEqual(blocks.slice(0, -1).map(b => b.bytes), readBlocks(db).filter(b => b.name !== 'pluginStorage').map(b => b.bytes));
+            assert.deepEqual(JSON.parse(blocks.at(-1).body), { small: false, large: { text: '큰 값'.repeat(4096) }, inline: 1 });
+        } else assert.deepEqual(entries.get('database.risudat'), db);
         assert.equal(entries.get('synthetic.webp').length, 8 * 1024 * 1024);
         assert(entries.get('synthetic.webp').every(byte => byte === 37));
         assert.equal(entries.size, mode === 'account' ? 9 : 4);

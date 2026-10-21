@@ -7,7 +7,7 @@ import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { exportBackup } from '../src/export.mjs';
 import { COLD_HEADER } from '../src/scan.mjs';
-import { MemorySink, coldId, database, fixtureSource, rawBlock } from './fixtures.mjs';
+import { MemorySink, coldId, database, fixtureSource, rawBlock, readBlocks } from './fixtures.mjs';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(root, '.tmp/native');
@@ -15,14 +15,22 @@ await mkdir(output, { recursive: true });
 // A chat-shaped cold payload is restored; a referenced settings payload is skipped and restored as unavailable.
 const skippedCold = '30000000-0000-4000-8000-000000000003';
 const character = { image: 'assets/missing.png', coldstorage: coldId, chats: [{ name: 'Synthetic chat', message: [{ data: COLD_HEADER + skippedCold }] }] };
-const db = database({ character, pluginStorage: rawBlock(11, 'pluginStorage', Buffer.alloc(0)) });
+// Cold-stored plugin values, including falsy primitives, are inlined; the SaveKV block is copied.
+const [pluginIndex, pluginLarge] = ['30000000-0000-4000-8000-000000000004', '30000000-0000-4000-8000-000000000005'];
+const large = { text: '큰 값'.repeat(1024) };
+const plugins = { null: null, false: false, zero: 0, empty: '', large, inline: 'block value' };
+const index = { type: 'risu-plugin-storage-index', version: 1, trash: [], entries: [
+    { k: 'null', s: 'null' }, { k: 'false', s: 'false' }, { k: 'zero', s: '0' }, { k: 'empty', s: '""' }, { k: 'large', l: pluginLarge }
+] };
+const db = database({ character, pluginStorage: { _coldpluginIndex: pluginIndex, inline: 'block value' }, blocks: [[12, 'kv:synthetic', { version: 1, entries: [{ k: 'key', v: 'value' }] }]] });
 const sink = new MemorySink();
 const result = await exportBackup({
     source: fixtureSource({
         db, assets: new Map([['assets/nested/image.webp', new Uint8Array([1, 2, 3])]]),
         cold: new Map([
             [coldId, gzipSync(Buffer.from(JSON.stringify({ character: { chaId: 'character-1', name: 'Synthetic', chats: character.chats } })))],
-            [skippedCold, gzipSync(Buffer.from('{"settings":true}'))]
+            [skippedCold, gzipSync(Buffer.from('{"settings":true}'))],
+            [pluginIndex, gzipSync(JSON.stringify(index))], [pluginLarge, gzipSync(JSON.stringify(large))]
         ]),
         inlays: new Map([
             ['orphan-한글', { type: 'image', name: 'synthetic', ext: 'png', width: 1, height: 1, data: new Blob([Uint8Array.of(4, 5)]) }],
@@ -42,8 +50,9 @@ const cargo = (args, env = {}) => {
     if (child.error) throw child.error;
     if (child.status !== 0) process.exit(child.status ?? 1);
 };
-// The written database has the empty pluginStorage block rewritten, so hash the archive entry.
-const written = database({ character, pluginStorage: rawBlock(11, 'pluginStorage', Buffer.from('{}')) });
+// The written database carries the rewritten pluginStorage block last.
+const written = Buffer.concat([Buffer.from('RISUSAVE\0'), ...readBlocks(db).filter(b => b.name !== 'pluginStorage').map(b => b.bytes),
+    rawBlock(11, 'pluginStorage', Buffer.from(JSON.stringify(plugins)))]);
 cargo(['run', '--locked', '--offline', '--manifest-path', path.join(root, 'tests/native/Cargo.toml'), '--', backup, path.join(output, crypto.randomUUID()), createHash('sha256').update(written).digest('hex')]);
 // Restores the archive through RisuNest's legacy backup path, including cold and Inlay preparation.
 const report = path.join(output, crypto.randomUUID() + '.json');
@@ -52,7 +61,7 @@ cargo(['test', '--lib', '--locked', '--offline', '--manifest-path', path.join(ro
     { RISUNEST_WEB_EXPORT_ARCHIVE: backup, RISUNEST_WEB_EXPORT_REPORT: report });
 const restored = JSON.parse(await readFile(report, 'utf8'));
 assert.equal(restored.characterCount, 1);
-assert.deepEqual(restored.root.pluginCustomStorage, {});
+assert.deepEqual(restored.root.pluginCustomStorage, plugins);
 assert.deepEqual(restored.payloads.coldPayloads, [coldId]);
 assert.deepEqual(restored.payloads.invalidInlays, []);
 for (const key of ['orphan-한글', 'legacy-untyped']) {
