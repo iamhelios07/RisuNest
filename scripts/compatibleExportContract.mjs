@@ -19,7 +19,7 @@ export const references = {
   risuai: {
     directory:
       process.env.RISUAI_REFERENCE ?? fileURLToPath(new URL("../.tmp/test-references/risuai/", import.meta.url)),
-    revision: "63d85f9bee2b697818bfa83ae87fe67bc8e52336",
+    revision: "02a83695d81eb4e083453c4524b8c7d463df95aa",
   },
   pocket: {
     directory:

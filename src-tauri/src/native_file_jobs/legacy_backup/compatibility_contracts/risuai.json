@@ -2,10 +2,10 @@
   "version": 1,
   "target": "risuai",
   "reference": {
-    "revision": "63d85f9bee2b697818bfa83ae87fe67bc8e52336",
+    "revision": "02a83695d81eb4e083453c4524b8c7d463df95aa",
     "files": {
       "src/lib/Others/HypaV3Modal/types.ts": "da5150348b4008ff3ce02d3f36616fb5d9fe15b790835509ccaafa9f2c61a825",
-      "src/ts/bootstrap.ts": "2800e43e3481e51631194ec4b96c82dbd421129bcd791ebbac86a7904bc74579",
+      "src/ts/bootstrap.ts": "42f08a8c8bef88809ea1d4e09a7dfdc362d12d3bd2107da748cfdce9f6849128",
       "src/ts/defaulthotkeys.ts": "2672d93859aa004ca56672581a8aa3193aee811485c9be3ed4bd17d77c89f431",
       "src/ts/drive/backuplocal.ts": "3b62ef49429d8e3c061abccf2423b5bc62b5a13fb15bdb12c2e4c13b2cfa69fd",
       "src/ts/gui/colorscheme.ts": "30228cb5cb2bd130624b19513fb176cf1d1c39504a4057496898cd7e90667cf3",
@@ -22,7 +22,7 @@
       "src/ts/process/prompt.ts": "40e939fe61f515f53aa0b060c6693578dd3a59e556e016344db5f0750a9bbe3c",
       "src/ts/process/transformers.ts": "c40d093fc79f51e305ba494fb2608d69deb7c6be14c0873b0ddb382b1f4a8592",
       "src/ts/process/triggers.ts": "973cc85b47b95ee61d4258b9e22dca2dd9b968f6d3f04fa0d04dcb254fc0c56e",
-      "src/ts/storage/database.svelte.ts": "077ae67af32c182b4020b41b95efd2aea7a2f3a8c81d7d3ca07f5ae1536a283e",
+      "src/ts/storage/database.svelte.ts": "b09eea924c44b868159b9b5c28a615b8e83a29323d162ceba1162d702bea9170",
       "src/ts/storage/risuSave.ts": "85d059f34bb59a9640191130ea678143995b6bbe0188c7e3980ccfc58a1951a4",
       "src/ts/translator/presets.ts": "a7a9c7a55f1f171f2451b5a0e2be05424b50b698b62e1e6f0a6c743cc0132c1d"
     }
