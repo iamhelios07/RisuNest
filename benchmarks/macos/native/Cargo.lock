@@ -4294,6 +4294,7 @@ dependencies = [
  "native-tls",
  "notify-rust",
  "oauth2",
+ "os_info",
  "percent-encoding",
  "png 0.18.1",
  "quick-xml",
