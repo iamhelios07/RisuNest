@@ -156,8 +156,10 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
         } catch (error) {
             if (captured === epoch && !signal.aborted) {
                 if (operation === 'publish') { firstDirty ??= now(); immediate = true }
-                else { receiveMore = false; receiveBehind = false; receivePending ||= !hidden }
+                else { receiveMore = false; receivePending ||= !hidden }
                 rememberFailure(error, operation)
+                // A retried receive still has changes to take; only a blocking failure ends the catch-up.
+                if (operation === 'receive' && blocked.has('receive')) receiveBehind = false
             }
             throw error
         }
