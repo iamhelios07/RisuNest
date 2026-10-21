@@ -108,7 +108,7 @@ describe('modal layering', () => {
         expect(checkboxDialog).toContain('aria-describedby="checkbox-confirm-description"')
     })
 
-    it('mounts the text editor popup and the chat setup before the alerts so alerts cover them', () => {
+    it('mounts the text editor popup and the onboarding before the alerts so alerts cover them', () => {
         const app = readFileSync('src/App.svelte', 'utf8')
         for (const mount of ['<TextEditorPopup ', '<OnboardingModal />']) {
             expect(app.indexOf(mount), mount).toBeGreaterThan(-1)

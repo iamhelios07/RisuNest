@@ -1011,7 +1011,7 @@ describe('character card additions', () => {
         expect(mocks.downloads).toHaveLength(2)
     })
 
-    it('carries the chat setup through a V3 card export and import', async () => {
+    it('carries the onboarding through a V3 card export and import', async () => {
         const onboarding = {
             enabled: true, mode: 'form', title: 'Start', description: 'Pick a start', html: '', floatingButton: true,
             questions: [{

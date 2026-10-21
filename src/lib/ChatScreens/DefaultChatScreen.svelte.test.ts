@@ -801,43 +801,43 @@ it('refuses send and regenerate while plugins wait, retaining the draft and conv
     }
 })
 
-function setChatSetup(overrides: Record<string, unknown> = {}) {
+function setOnboarding(overrides: Record<string, unknown> = {}) {
     DBState.db.characters[0].onboarding = {
         enabled: true, mode: 'form', questions: [{ id: 'q', title: 'Route', type: 'single', varName: 'route', options: [{ label: 'A', value: 'a' }] }],
         ...overrides,
     } as any
 }
-const chatSetupBanner = () => [...document.querySelectorAll('button')].find(button => button.textContent?.includes(language.onboardingAvailable))
+const onboardingBanner = () => [...document.querySelectorAll('button')].find(button => button.textContent?.includes(language.onboardingAvailable))
 
-it('shows the chat setup banner on a chat with messages until it is applied or skipped', async () => {
+it('shows the onboarding banner on a chat with messages until it is done or skipped', async () => {
     DBState.db.characters[0].chats[0].message = [
         { role: 'char', data: 'First', chatId: 'm1' }, { role: 'user', data: 'Second', chatId: 'm2' }, { role: 'char', data: 'Third', chatId: 'm3' },
     ] as any
-    setChatSetup()
+    setOnboarding()
     await tick()
-    chatSetupBanner()!.click()
+    onboardingBanner()!.click()
     expect(onboardingModalStore.open).toBe(true)
     DBState.db.characters[0].chats[0].onboardingDone = true
     await tick()
-    expect(chatSetupBanner()).toBeUndefined()
+    expect(onboardingBanner()).toBeUndefined()
     DBState.db.characters[0].chats.push({ id: 'new', message: [] } as any)
     DBState.db.characters[0].chatPage = 1
     await tick()
-    expect(chatSetupBanner()).toBeDefined()
-    setChatSetup({ enabled: false })
+    expect(onboardingBanner()).toBeDefined()
+    setOnboarding({ enabled: false })
     await tick()
-    expect(chatSetupBanner()).toBeUndefined()
+    expect(onboardingBanner()).toBeUndefined()
 })
 
-it('does not offer the chat setup for a chat that is only a summary', async () => {
-    setChatSetup()
+it('does not offer the onboarding for a chat that is only a summary', async () => {
+    setOnboarding()
     const chat = DBState.db.characters[0].chats[0]
     DBState.db.characters[0].chats[0] = createConversationSummaryStubFromChat('character', chat, 0)
     await tick()
-    expect(chatSetupBanner()).toBeUndefined()
+    expect(onboardingBanner()).toBeUndefined()
 })
 
-it('opens the chat setup from the side menu and from its optional floating button', async () => {
+it('opens the onboarding from the side menu and from its optional floating button', async () => {
     const floatingButton = () => document.querySelector<HTMLButtonElement>(`button[aria-label="${language.onboarding}"]`)
     const menuItem = () => [...document.querySelectorAll('span')].find(span => span.textContent === language.onboarding)
     const openMenu = async () => {
@@ -846,7 +846,7 @@ it('opens the chat setup from the side menu and from its optional floating butto
     }
     await openMenu()
     expect(menuItem()).toBeUndefined()
-    setChatSetup()
+    setOnboarding()
     await tick()
     expect(floatingButton()).toBeNull()
     menuItem()!.parentElement!.click()
@@ -854,7 +854,7 @@ it('opens the chat setup from the side menu and from its optional floating butto
     expect(onboardingModalStore.open).toBe(true)
     expect(menuItem()).toBeUndefined()
     onboardingModalStore.open = false
-    setChatSetup({ floatingButton: true })
+    setOnboarding({ floatingButton: true })
     await tick()
     floatingButton()!.click()
     expect(onboardingModalStore.open).toBe(true)
