@@ -5,6 +5,7 @@ import { alertConfirm } from "../alert"
 import { language } from "src/lang"
 import type { Database } from "../storage/database.svelte"
 import { getColdStorageAffectedCharacters, listColdDataKeysFromDb } from "./coldstorageData"
+import type { ColdItemRead } from "./coldPayloadExpansion"
 
 export {
     coldStorageHeader,
@@ -33,13 +34,14 @@ async function discardResponseBody(response:Response):Promise<void> {
 }
 
 /**
- * Reads an upstream account cold payload. Import paths expand it into a record
- * body; nothing publishes a cold payload back to the account.
+ * Reads an upstream account cold item. Import paths expand it into a record
+ * body or a plugin value; nothing publishes a cold item back to the account.
+ * 200 is present whatever JSON it holds, 404 is missing, and anything else is unreadable.
  */
 export async function getAccountColdStorageItem(
     key:string,
     signal?:AbortSignal,
-):Promise<unknown|null> {
+):Promise<ColdItemRead> {
     const d = await fetchProtectedResource('/hub/account/coldstorage', {
         method: 'GET',
         headers: {
@@ -50,11 +52,17 @@ export async function getAccountColdStorageItem(
 
     if(d.status !== 200){
         await discardResponseBody(d)
-        return null
+        return { kind: d.status === 404 ? 'missing' : 'unreadable' }
     }
-    const buf = await d.arrayBuffer()
-    const text = new TextDecoder().decode(await decompress(new Uint8Array(buf)))
-    return JSON.parse(text)
+    try {
+        const buf = await d.arrayBuffer()
+        const text = new TextDecoder().decode(await decompress(new Uint8Array(buf)))
+        return { kind: 'present', value: JSON.parse(text) }
+    } catch (error) {
+        if ((error as { name?: string })?.name === 'AbortError') throw error
+        console.error(`Failed to decode the account cold storage item ${key}:`, error)
+        return { kind: 'unreadable' }
+    }
 }
 
 export async function listColdDataKeys(db: Pick<Database, 'characters'> = DBState.db): Promise<string[]> {

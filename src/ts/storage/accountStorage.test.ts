@@ -168,7 +168,7 @@ beforeEach(() => {
     })
     mocks.getUncleanablesSync.mockReset().mockReturnValue([])
     mocks.getColdStorageItem.mockReset().mockResolvedValue(null)
-    mocks.getAccountColdStorageItem.mockReset().mockResolvedValue(null)
+    mocks.getAccountColdStorageItem.mockReset().mockResolvedValue({ kind: 'missing' })
     mocks.setLocalColdStorageItem.mockReset().mockResolvedValue(true)
     mocks.materializePersistentDatabaseSnapshotWithRevision.mockReset().mockResolvedValue({
         database: mocks.database,
@@ -222,7 +222,7 @@ describe('AccountStorage structured wire contract', () => {
         mocks.replacePersistentDatabase.mockImplementation((candidate, reason, options) =>
             coordinator.replacePersistentDatabase(candidate, reason, options),
         )
-        mocks.getAccountColdStorageItem.mockResolvedValue({ character: database.characters[0] })
+        mocks.getAccountColdStorageItem.mockResolvedValue({ kind: 'present', value: { character: database.characters[0] } })
         mocks.getUncleanablesSync.mockReturnValue(['assets/remote.png'])
         let finishDownload!: (value: Response) => void
         mocks.fetchProtectedResource.mockImplementation(
@@ -254,7 +254,7 @@ describe('AccountStorage structured wire contract', () => {
         const actual =
             await vi.importActual<typeof import('./databaseRestore')>('./databaseRestore')
         mocks.completeAccountUnmigration.mockImplementation(actual.completeAccountUnmigration)
-        mocks.getAccountColdStorageItem.mockResolvedValue({ character: {} })
+        mocks.getAccountColdStorageItem.mockResolvedValue({ kind: 'present', value: { character: {} } })
         mocks.getUncleanablesSync.mockReturnValue(['assets/retry.png'])
         mocks.fetchProtectedResource
             .mockRejectedValueOnce(new Error('offline'))
@@ -1888,7 +1888,7 @@ describe('AccountStorage structured wire contract', () => {
             revision: 11,
             mutationGeneration: 17,
         })
-        mocks.getAccountColdStorageItem.mockResolvedValue(officialCold)
+        mocks.getAccountColdStorageItem.mockResolvedValue({ kind: 'present', value: officialCold })
         mocks.getUncleanablesSync.mockImplementation((_database, _mode, options) => (
             options.chars.flatMap((character: any) => (
                 character.additionalAssets?.map((asset: string[]) => asset[1]) ?? []
