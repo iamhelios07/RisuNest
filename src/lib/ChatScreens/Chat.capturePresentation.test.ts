@@ -26,7 +26,7 @@ const runtime = vi.hoisted(() => ({
 }))
 const actionMocks = vi.hoisted(() => ({
     runTrigger: vi.fn(),
-    runLuaButtonTrigger: vi.fn(),
+    runLuaInteractionTrigger: vi.fn(),
 }))
 const parserCalls = vi.hoisted(() => [] as Array<{
     chara?: unknown
@@ -125,8 +125,8 @@ vi.mock('src/ts/model/modellist', () => ({
     getModelInfo: (model: string) => ({ shortName: model || 'model' }),
 }))
 vi.mock('src/ts/process/scriptings', () => ({
-    runLuaButtonTrigger: actionMocks.runLuaButtonTrigger,
-}))
+    runLuaInteractionTrigger: actionMocks.runLuaInteractionTrigger,
+}) satisfies Partial<typeof import('src/ts/process/scriptings')>)
 vi.mock('src/ts/process/triggers', () => ({ runTrigger: actionMocks.runTrigger }))
 vi.mock('src/ts/process/tts', () => ({ sayTTS: vi.fn() }))
 vi.mock('src/ts/util', () => ({
@@ -356,7 +356,7 @@ describe('Chat frozen capture presentation', () => {
         live.reactive = false
         parserCalls.length = 0
         actionMocks.runTrigger.mockReset()
-        actionMocks.runLuaButtonTrigger.mockReset()
+        actionMocks.runLuaInteractionTrigger.mockReset()
         live.db = {
             theme: 'cardboard',
             iconsize: 25,
@@ -2149,7 +2149,7 @@ describe('Chat frozen capture presentation', () => {
         })
     })
 
-    test('runs a manual windowed trigger only inside the complete conversation gateway', async () => {
+    async function mountWindowedTriggerRow() {
         const harness = makeWindowedEditHarness()
         live.db = {
             ...live.db,
@@ -2173,7 +2173,6 @@ describe('Chat frozen capture presentation', () => {
         harness.withCompleteSelectedConversation.mockImplementation(
             async (_reason, operation) => operation({ requireCurrent }),
         )
-        actionMocks.runTrigger.mockResolvedValue(null)
         mounted = mount(Chat, {
             target,
             props: {
@@ -2200,6 +2199,12 @@ describe('Chat frozen capture presentation', () => {
             expect(element).not.toBeNull()
             return element!
         })
+        return { harness, requireCurrent, body }
+    }
+
+    test('runs a manual windowed trigger only inside the complete conversation gateway', async () => {
+        actionMocks.runTrigger.mockResolvedValue(null)
+        const { harness, requireCurrent, body } = await mountWindowedTriggerRow()
         const trigger = document.createElement('button')
         trigger.setAttribute('risu-trigger', 'manual-test')
         body.append(trigger)
@@ -2217,5 +2222,46 @@ describe('Chat frozen capture presentation', () => {
             )
             expect(requireCurrent).toHaveBeenCalledTimes(2)
         })
+    })
+
+    test('submits form values captured at submit time through the complete conversation gateway', async () => {
+        actionMocks.runLuaInteractionTrigger.mockResolvedValue(null)
+        const { harness, requireCurrent, body } = await mountWindowedTriggerRow()
+        // The gateway runs the trigger later, after the row may have changed the form.
+        harness.withCompleteSelectedConversation.mockImplementation(async (_reason, operation) => {
+            await Promise.resolve()
+            return operation({ requireCurrent })
+        })
+        body.innerHTML = `<form risu-form="survey">
+            <input name="choice" value="a"><input name="choice" value="b"><input name="__proto__" value="kept">
+            <button name="go" value="yes">Go</button><button name="go" value="no">Stop</button>
+        </form>`
+        const form = body.querySelector('form')!
+        const submitter = form.querySelector<HTMLButtonElement>('button[value="yes"]')!
+
+        const submit = new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter })
+        form.dispatchEvent(submit)
+        form.querySelector('input')!.value = 'changed'
+        form.remove()
+
+        expect(submit.defaultPrevented).toBe(true)
+        await vi.waitFor(() => expect(actionMocks.runLuaInteractionTrigger).toHaveBeenCalledOnce())
+        const [type, character, formName, meta] = actionMocks.runLuaInteractionTrigger.mock.calls[0]
+        expect([type, character, formName]).toEqual(['form', harness.completeCharacter, 'survey'])
+        expect(Object.entries(meta.data)).toEqual([['choice', ['a', 'b']], ['__proto__', 'kept'], ['go', 'yes']])
+        expect(harness.withCompleteSelectedConversation).toHaveBeenCalledWith('manual-chat-trigger', expect.any(Function))
+    })
+
+    test('prevents the submit of a message form without risu-form and runs no trigger', async () => {
+        const { harness, body } = await mountWindowedTriggerRow()
+        body.innerHTML = '<form action="/elsewhere"><input name="field" value="value"></form>'
+
+        const submit = new SubmitEvent('submit', { bubbles: true, cancelable: true })
+        body.querySelector('form')!.dispatchEvent(submit)
+        await Promise.resolve()
+
+        expect(submit.defaultPrevented).toBe(true)
+        expect(actionMocks.runLuaInteractionTrigger).not.toHaveBeenCalled()
+        expect(harness.withCompleteSelectedConversation).not.toHaveBeenCalled()
     })
 })
