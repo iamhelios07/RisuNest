@@ -227,6 +227,17 @@ it('writes onboarding answers through a complete-conversation lease and marks th
     expect(state.bindings).toEqual([])
 })
 
+it('writes onboarding answers onto a chat that has no persistent selection', async () => {
+    await expect(finishOnboarding(captureOnboardingTarget()!, new Map([['route', 'a']]))).resolves.toBe('applied')
+    expect(selectedChat().scriptstate).toEqual({ $route: 'a' })
+    expect(selectedChat().onboardingDone).toBe(true)
+    expect(state.bindings).toEqual([
+        { characterId: 'character', conversationId: 'chat', patch: { onboardingDone: true } },
+    ])
+    expect(state.promotions).toBe(0)
+    expect(state.flushes).toEqual(['chat-binding'])
+})
+
 it('skips onboarding by marking only the chat done without a lease or variables', async () => {
     state.selection = windowedSelection
     await expect(finishOnboarding(captureOnboardingTarget()!, null)).resolves.toBe('applied')
