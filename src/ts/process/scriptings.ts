@@ -14,7 +14,7 @@ import { get } from "svelte/store";
 import { DBState, ReloadChatPointer, ReloadGUIPointer, selectedCharID } from "../stores.svelte";
 import { alertSelect, alertError, alertInput, alertNormal, alertConfirm } from "../alert";
 import { HypaProcesser } from "./memory/hypamemory";
-import { generateAIImage } from "./stableDiff";
+import { generateAIImage, type ImageGenerationOptions } from "./stableDiff";
 import { writeInlayImage, getInlayAsset } from "./files/inlays";
 import type { OpenAIChat, MultiModal } from "./index.svelte";
 import { requestChatData, type StreamResponseChunk } from "./request/request";
@@ -684,15 +684,21 @@ export async function runScripted(code:string, arg:{
                 }
             })
 
-            declareAPI('generateImage', async (id:string, value:string, negValue:string = '') => {
+            declareAPI('generateImage', async (id:string, value:string, negValue:string = '', options?:ImageGenerationOptions) => {
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
+                const orientation = options?.orientation
+                if(orientation !== undefined && orientation !== 'landscape' && orientation !== 'portrait'){
+                    return 'Error: Image orientation must be landscape or portrait, received ' + orientation
+                }
+
                 const gen = await generateAIImage(
                     value,
                     ScriptingEngineState.operationCharacter as character,
                     negValue,
                     'inlay',
+                    options,
                 )
                 if(!gen){
                     return 'Error: Image generation failed'
@@ -1224,14 +1230,22 @@ export async function runScripted(code:string, arg:{
                     }
                 }
 
-                const options = parseLuaOptions(optionsStr) as { streaming?: boolean }
+                const options = parseLuaOptions(optionsStr) as { mode?: string, streaming?: boolean }
+                const modes = new Set(['emotion', 'memory', 'otherAx', 'submodel', 'translate'])
+                const mode = options.mode ?? 'otherAx'
+                if (!modes.has(mode)) {
+                    return JSON.stringify({
+                        result: 'Error: Invalid axLLM mode: ' + mode,
+                        success: false
+                    })
+                }
                 const result = await requestChatData({
                     formated: promptbody,
                     bias: {},
                     useStreaming: options.streaming === true,
                     forceStreaming: options.streaming === true,
                     noMultiGen: true,
-                }, 'otherAx')
+                }, mode as 'emotion' | 'memory' | 'otherAx' | 'submodel' | 'translate')
 
                 if(result.type === 'fail'){
                     return JSON.stringify({
@@ -1400,14 +1414,26 @@ export async function runScripted(code:string, arg:{
                         }
                         break
                     }
+                    case 'onFormSubmit':{
+                        const func = luaEngine.global.get('onFormSubmit')
+                        if(func){
+                            res = await func(accessKey, data, JSON.stringify(meta))
+                        }
+                        break
+                    }
                     case 'editRequest':
                     case 'editDisplay':
                     case 'editInput':
                     case 'editOutput':{
                         const func = luaEngine.global.get('callListenMain')
                         if(func){
-                            res = await func(mode, accessKey, JSON.stringify(data), JSON.stringify(meta))
-                            res = JSON.parse(res)
+                            // editDisplay takes a raw string, and must output a raw string
+                            const directString = mode === 'editDisplay'
+                            const value = directString ? data : JSON.stringify(data)
+                            res = await func(mode, accessKey, value, JSON.stringify(meta))
+                            if (!directString) {
+                                res = JSON.parse(res)
+                            }
                         }
                         break
                     }
@@ -1427,7 +1453,7 @@ export async function runScripted(code:string, arg:{
                 const firstLine = (typeof error === 'string' ? error : error instanceof Error ? error.message : '').split('\n', 1)[0]
                 // Lua wrap/error can prepend one or more source locations to the timeout string.
                 if (/(?:^|:\d+: )thread timeout exceeded$/.test(firstLine)) {
-                    const diagnosticMode = ['input', 'output', 'start', 'onButtonClick', 'editRequest',
+                    const diagnosticMode = ['input', 'output', 'start', 'onButtonClick', 'onFormSubmit', 'editRequest',
                         'editDisplay', 'editInput', 'editOutput', 'manual'].includes(mode) ? mode : 'custom'
                     console.error({ code: 'lua-listener-timeout', mode: diagnosticMode,
                         elapsedMs: performance.now() - listenerStartedAt })
@@ -1780,22 +1806,27 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
     }
 }
 
-export async function runLuaButtonTrigger(
+export async function runLuaInteractionTrigger(
+    type: 'button' | 'form',
     char: character | simpleCharacterArgument,
-    data: string,
+    triggerKey: string,
+    meta?: object,
     conversationOperation?: ConversationOperationContext,
 ): Promise<any> {
+    const mode = type === 'button' ? 'onButtonClick' : 'onFormSubmit'
     if (conversationOperation) {
-        return runLuaButtonTriggerBatch(char, data, conversationOperation)
+        return runLuaInteractionTriggerBatch(mode, char, triggerKey, meta, conversationOperation)
     }
     return runSerializedUserTrigger(char.chaId, getCurrentChat(), () =>
-        runLuaButtonTriggerBatch(char, data),
+        runLuaInteractionTriggerBatch(mode, char, triggerKey, meta),
     )
 }
 
-async function runLuaButtonTriggerBatch(
+async function runLuaInteractionTriggerBatch(
+    mode: 'onButtonClick' | 'onFormSubmit',
     char: character|simpleCharacterArgument,
-    data: string,
+    triggerKey: string,
+    meta?: object,
     conversationOperation?: ConversationOperationContext,
 ): Promise<any>{
     let runResult
@@ -1819,8 +1850,9 @@ async function runLuaButtonTriggerBatch(
                 runResult = await runScripted(trigger.effect[0].code, {
                     char: char,
                     lowLevelAccess: trigger.lowLevelAccess,
-                    mode: 'onButtonClick',
-                    data: data,
+                    mode,
+                    data: triggerKey,
+                    meta,
                     operationContext: conversationOperation,
                     access: access ?? undefined,
                     userStarted: true,

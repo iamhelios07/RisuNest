@@ -125,29 +125,39 @@ function async(callback)
     end
 end
 
-callListenMain = async(function(type, id, value, meta)
-    local realValue = json.decode(value)
+callListenMain = async(function(eventType, id, value, meta)
+    local realValue = value
     local realMeta = json.decode(meta)
 
-    if type == 'editRequest' then
+    if eventType == 'editDisplay' then
+        local realValue = value
+        for _, func in ipairs(editDisplayFuncs) do
+            local output = func(id, realValue, realMeta)
+            local outputType = type(output)
+            if outputType == 'string' then
+                realValue = output
+            else
+                print('Error: Lua editDisplay must return a string, received ' .. outputType)
+            end
+        end
+        return realValue
+    end
+
+    realValue = json.decode(value)
+
+    if eventType == 'editRequest' then
         for _, func in ipairs(editRequestFuncs) do
             realValue = func(id, realValue, realMeta)
         end
     end
 
-    if type == 'editDisplay' then
-        for _, func in ipairs(editDisplayFuncs) do
-            realValue = func(id, realValue, realMeta)
-        end
-    end
-
-    if type == 'editInput' then
+    if eventType == 'editInput' then
         for _, func in ipairs(editInputFuncs) do
             realValue = func(id, realValue, realMeta)
         end
     end
 
-    if type == 'editOutput' then
+    if eventType == 'editOutput' then
         for _, func in ipairs(editOutputFuncs) do
             realValue = func(id, realValue, realMeta)
         end
