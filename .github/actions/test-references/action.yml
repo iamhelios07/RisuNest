@@ -6,7 +6,7 @@ runs:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         repository: kwaroran/Risuai
-        ref: c454df882aaf32e02a22da26d3718c8cadc97814
+        ref: 63d85f9bee2b697818bfa83ae87fe67bc8e52336
         path: .tmp/test-references/risuai
         persist-credentials: false
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
