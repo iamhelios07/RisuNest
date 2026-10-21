@@ -105,6 +105,8 @@ export const languageEnglish = {
             missing: (count: number) => `Missing saved data (${count}) will not be restored.`,
             values: (count: number) => `Unsupported saved values (${count}) will not be restored.`,
             pluginStorage: (count: number) => `Unsupported plugin storage (${count}) will not be restored.`,
+            damagedPluginStorage: (count: number) => `Damaged plugin storage (${count}) will not be restored.`,
+            oversizedPluginStorage: (count: number) => `Oversized plugin storage (${count}) will not be restored.`,
             inlays: (count: number) => `Unsupported inlay entries (${count}) will not be restored.`,
         },
         "recovery": {

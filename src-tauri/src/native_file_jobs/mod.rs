@@ -4098,6 +4098,8 @@ pub(crate) struct RestoreOmissions {
     pub(crate) missing: u64,
     pub(crate) values: u64,
     pub(crate) plugin_storage: u64,
+    pub(crate) damaged_plugin_storage: u64,
+    pub(crate) oversized_plugin_storage: u64,
     pub(crate) inlays: u64,
     pub(crate) excluded_characters: u64,
 }
@@ -4115,6 +4117,8 @@ impl IncompleteRestorePreview {
             ("missing-backup-data", self.omissions.missing),
             ("skipped-backup-values", self.omissions.values),
             ("skipped-plugin-storage", self.omissions.plugin_storage),
+            ("damaged-plugin-storage", self.omissions.damaged_plugin_storage),
+            ("oversized-plugin-storage", self.omissions.oversized_plugin_storage),
             ("skipped-backup-inlays", self.omissions.inlays),
             ("excluded-backup-characters", self.omissions.excluded_characters),
         ] {
@@ -4494,6 +4498,8 @@ impl JobControl {
             "missing" => &mut omissions.missing,
             "values" => &mut omissions.values,
             "pluginStorage" => &mut omissions.plugin_storage,
+            "damagedPluginStorage" => &mut omissions.damaged_plugin_storage,
+            "oversizedPluginStorage" => &mut omissions.oversized_plugin_storage,
             "inlays" => &mut omissions.inlays,
             "excludedCharacters" => &mut omissions.excluded_characters,
             _ => return Err("unknown restore omission category".to_owned()),
