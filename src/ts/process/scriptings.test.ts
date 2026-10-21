@@ -1601,7 +1601,7 @@ test('passes host errors to Lua without JS constructors', async () => {
 })
 
 test.each([
-  ['listener', 2_000],
+  ['listener', 5_000],
   ['button', 60_000],
   ['manual trigger', 60_000],
 ] as const)('creates production Lua engines with the %s deadline', async (entry, functionTimeout) => {
@@ -1634,18 +1634,17 @@ test.each([
 })
 
 test.each(['timeout', 'ordinary'] as const)('distinguishes the actual Wasmoon instruction-hook timeout from ordinary errors (%s)', async (kind) => {
-  let now = Date.now()
+  let now = 0
   const failure = new Error('synthetic ordinary listener failure')
   diagnosticEngineSetup.next = (engine) => {
     engine.global.set('diagnosticFailure', () => {
       if (kind === 'ordinary') throw failure
-      now += 2_001
+      now += 5_001
     })
   }
   const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
   vi.mocked(alertToast).mockClear()
-  const elapsedClock = vi.spyOn(performance, 'now').mockReturnValueOnce(100).mockReturnValueOnce(125)
-  const deadlineClock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+  const deadlineClock = vi.spyOn(performance, 'now').mockImplementation(() => now)
   try {
     await runScripted(`function onOutput()
       diagnosticFailure()
@@ -1659,7 +1658,7 @@ test.each(['timeout', 'ordinary'] as const)('distinguishes the actual Wasmoon in
     })
     if (kind === 'timeout') {
       expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.scriptTimeout)
-      expect(errors.mock.calls).toEqual([[{ code: 'lua-listener-timeout', mode: 'output', elapsedMs: 25 }]])
+      expect(errors.mock.calls).toEqual([[{ code: 'lua-listener-timeout', mode: 'output', elapsedMs: 5_001 }]])
       expect(Number.isFinite(errors.mock.calls[0][0].elapsedMs)).toBe(true)
       expect(errors.mock.calls[0][0].elapsedMs).toBeGreaterThanOrEqual(0)
     } else {
@@ -1670,10 +1669,9 @@ test.each(['timeout', 'ordinary'] as const)('distinguishes the actual Wasmoon in
       expect(errors.mock.calls[0][0].message.split('\n', 1)[0]).toBe(failure.message)
       expect(errors.mock.calls[0][0]).not.toHaveProperty('code')
     }
-    expect(createdLuaEngineOptions.at(-1)).toEqual({ injectObjects: true, enableProxy: false, functionTimeout: 2_000 })
+    expect(createdLuaEngineOptions.at(-1)).toEqual({ injectObjects: true, enableProxy: false, functionTimeout: 5_000 })
   } finally {
     diagnosticEngineSetup.next = null
-    elapsedClock.mockRestore()
     deadlineClock.mockRestore()
     errors.mockRestore()
   }
@@ -1682,10 +1680,10 @@ test.each(['timeout', 'ordinary'] as const)('distinguishes the actual Wasmoon in
 test('shows one Lua timeout notice for queued display pipelines and another for a later refresh', async () => {
   const fixture = operationCharacterFixture('display-timeout-notice')
   fixture.char.customscript = []
-  let now = Date.now()
+  let now = 0
   diagnosticEngineSetup.next = (engine) => {
     engine.global.set('slowDisplay', () => {
-      now += 2_001
+      now += 5_001
     })
   }
   fixture.char.triggerscript = luaTriggerScript(`
@@ -1704,7 +1702,7 @@ test('shows one Lua timeout notice for queued display pipelines and another for 
   vi.stubGlobal('localStorage', { getItem: () => null })
   vi.mocked(risuChatParser).mockImplementation(value => value)
   const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
-  const deadlineClock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+  const deadlineClock = vi.spyOn(performance, 'now').mockImplementation(() => now)
   vi.mocked(alertToast).mockClear()
   try {
     const { processScriptFull } = await import('./scripts')
@@ -1728,13 +1726,13 @@ test('shows one Lua timeout notice for queued display pipelines and another for 
 })
 
 test('resumes a Lua listener after an LLM wait longer than its CPU deadline', async () => {
-  let now = Date.now()
-  const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+  let now = 0
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
   const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
   vi.mocked(requestChatData).mockReset()
   vi.mocked(requestChatData).mockImplementationOnce(async () => {
     await Promise.resolve()
-    now += 5_000
+    now += 61_000
     return { type: 'success', result: 'synthetic delayed response' } as never
   })
 
@@ -2658,3 +2656,55 @@ test.each(['current', 'version-changed', 'session-switched'] as const)(
     } finally { continuationRuntime.session = null }
   },
 )
+
+test('preserves an async result while a display engine is created', async () => {
+  vi.mocked(requestChatData).mockReset()
+  let resolveRequest!: (value: Awaited<ReturnType<typeof requestChatData>>) => void
+  let startedRequest!: () => void
+  const requestStarted = new Promise<void>((resolve) => { startedRequest = resolve })
+  vi.mocked(requestChatData).mockImplementationOnce(() => {
+    startedRequest()
+    return new Promise((resolve) => { resolveRequest = resolve })
+  })
+  const fixture = operationCharacterFixture('interleaved-lua-engines')
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  try {
+    const pending = runScripted(`onOutput = async(function(id)
+      local response = LLM(id, {{role = 'user', content = 'synthetic'}})
+      local sum = 0
+      for i = 1,5000 do sum = sum + i end
+      return response.result .. ':' .. sum
+    end)`, { char: fixture.char, chat: fixture.chat, lowLevelAccess: true, mode: 'output' })
+    await requestStarted
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const display = await runScripted(`listenEdit('editDisplay', function(id, value) return value end)`, {
+      char: fixture.char, chat: fixture.chat, mode: 'editDisplay', data: 'synthetic display',
+    })
+    expect(display.res).toBe('synthetic display')
+    resolveRequest({ type: 'success', result: 'synthetic response' })
+    expect((await pending).res).toBe('synthetic response:12502500')
+    expect(errors).not.toHaveBeenCalled()
+  } finally {
+    errors.mockRestore()
+  }
+})
+
+test('preserves synchronous writes and reads around an async LLM boundary', async () => {
+  vi.mocked(requestChatData).mockReset()
+  vi.mocked(requestChatData).mockResolvedValueOnce({ type: 'success', result: 'synthetic response' } as never)
+  const fixture = operationCharacterFixture('lua-write-read-await')
+  const variables = new Map<string, string>()
+  const result = await runScripted(`onOutput = async(function(id)
+    setChatVar(id, 'counter', '1')
+    local first = getChatVar(id, 'counter')
+    LLM(id, {{role = 'user', content = 'synthetic'}})
+    setChatVar(id, 'counter', tostring(tonumber(getChatVar(id, 'counter')) + 1))
+    return first .. ':' .. getChatVar(id, 'counter')
+  end)`, {
+    char: fixture.char, chat: fixture.chat, mode: 'output', lowLevelAccess: true,
+    setVar: (key, value) => { variables.set(key, value) },
+    getVar: key => variables.get(key) ?? 'null',
+  })
+  expect(result.res).toBe('1:2')
+  expect(variables.get('counter')).toBe('2')
+})

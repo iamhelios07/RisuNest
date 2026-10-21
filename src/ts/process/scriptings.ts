@@ -54,7 +54,7 @@ import { beginDisplayScriptRun, noticeScriptTimeout } from './scriptTimeoutNotic
 import { findCharacterById, findCharacterIndexById } from './scriptCharacterLookup';
 
 /** Deadline for each synchronous Lua segment of a listener. */
-const LUA_LISTENER_TIMEOUT_MS = 2_000
+const LUA_LISTENER_TIMEOUT_MS = 5_000
 /** Deadline for each synchronous Lua segment of a handler the user started. */
 const LUA_USER_HANDLER_TIMEOUT_MS = 60_000
 let luaFactory:LuaFactory
@@ -1423,9 +1423,9 @@ export async function runScripted(code:string, arg:{
                     ScriptingEngineState.stopSending = true
                 }
             } catch (error) {
-                // Wasmoon wraps synchronous hook timeouts in a plain Error with this first line.
+                // Async coroutine rejection preserves the Lua string; synchronous calls wrap it in Error.
                 if ((luaTimeoutErrorConstructor && error instanceof luaTimeoutErrorConstructor) ||
-                    (error instanceof Error && error.message.split('\n', 1)[0] === 'thread timeout exceeded')) {
+                    ((typeof error === 'string' ? error : error instanceof Error ? error.message : '').split('\n', 1)[0] === 'thread timeout exceeded')) {
                     const diagnosticMode = ['input', 'output', 'start', 'onButtonClick', 'editRequest',
                         'editDisplay', 'editInput', 'editOutput', 'manual'].includes(mode) ? mode : 'custom'
                     console.error({ code: 'lua-listener-timeout', mode: diagnosticMode,
