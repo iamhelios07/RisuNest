@@ -1633,12 +1633,23 @@ test.each([
   expect(createdLuaEngineOptions.at(-1)).toEqual({ injectObjects: true, enableProxy: false, functionTimeout })
 })
 
-test.each(['timeout', 'ordinary'] as const)('distinguishes the actual Wasmoon instruction-hook timeout from ordinary errors (%s)', async (kind) => {
+test.each([
+  { kind: 'direct', invocation: 'return work()', asynchronous: false, ordinary: false },
+  { kind: 'wrapped', invocation: 'return coroutine.wrap(work)()', asynchronous: false, ordinary: false },
+  { kind: 'rethrown', invocation: 'local ok, failure = pcall(work); if not ok then error(failure) end', asynchronous: false, ordinary: false },
+  { kind: 'wrapped rethrow', invocation: 'return coroutine.wrap(function() local ok, failure = pcall(work); if not ok then error(failure) end end)()', asynchronous: false, ordinary: false },
+  { kind: 'async wrapped', invocation: 'return coroutine.wrap(work)()', asynchronous: true, ordinary: false },
+  { kind: 'async rethrown', invocation: 'local ok, failure = pcall(work); if not ok then error(failure) end', asynchronous: true, ordinary: false },
+  { kind: 'ordinary', invocation: 'return work()', asynchronous: false, ordinary: true },
+  { kind: 'ordinary timeout suffix', invocation: 'return work()', asynchronous: false, ordinary: true },
+])('distinguishes the actual Wasmoon instruction-hook timeout from ordinary errors ($kind)', async ({ kind, invocation, asynchronous, ordinary }) => {
   let now = 0
-  const failure = new Error('synthetic ordinary listener failure')
+  const failure = new Error(kind === 'ordinary timeout suffix'
+    ? 'ordinary failure mentioning thread timeout exceeded'
+    : 'synthetic ordinary listener failure')
   diagnosticEngineSetup.next = (engine) => {
     engine.global.set('diagnosticFailure', () => {
-      if (kind === 'ordinary') throw failure
+      if (ordinary) throw failure
       now += 5_001
     })
   }
@@ -1646,17 +1657,19 @@ test.each(['timeout', 'ordinary'] as const)('distinguishes the actual Wasmoon in
   vi.mocked(alertToast).mockClear()
   const deadlineClock = vi.spyOn(performance, 'now').mockImplementation(() => now)
   try {
-    await runScripted(`function onOutput()
+    const callback = asynchronous ? `onOutput = async(function() ${invocation} end)` : `function onOutput() ${invocation} end`
+    await runScripted(`local function work()
       diagnosticFailure()
       local total = 0
       for i = 1, 10000 do total = total + i end
       return total
-    end`, {
+    end
+    ${callback}`, {
       char: { chaId: `listener-diagnostic-${kind}` } as never,
       chat: { message: [] } as never,
       mode: 'output',
     })
-    if (kind === 'timeout') {
+    if (!ordinary) {
       expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.scriptTimeout)
       expect(errors.mock.calls).toEqual([[{ code: 'lua-listener-timeout', mode: 'output', elapsedMs: 5_001 }]])
       expect(Number.isFinite(errors.mock.calls[0][0].elapsedMs)).toBe(true)

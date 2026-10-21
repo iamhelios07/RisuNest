@@ -34,17 +34,13 @@ async function runIsolatedWasmoon(body: string) {
     }
     const runtimeSource = await readFile(resolve(process.cwd(), 'src/ts/process/luaRuntime.ts'), 'utf8')
     const runtimeUrl = toModuleUrl(runtimeSource.replaceAll("'./luaExecutionBudget'", JSON.stringify(toModuleUrl(budgetSource))))
-    const scriptingSource = await readFile(resolve(process.cwd(), 'src/ts/process/scriptings.ts'), 'utf8')
-    const ast = ts.createSourceFile('scriptings.ts', scriptingSource, ts.ScriptTarget.Latest, true)
-    const wrapper = ast.statements.find((node): node is ts.FunctionDeclaration =>
-        ts.isFunctionDeclaration(node) && node.name?.text === 'luaCodeWrapper')!
-    const wrapperJavaScript = ts.transpileModule(wrapper.getText(ast), {}).outputText
+    const wrapperSource = await readFile(resolve(process.cwd(), 'src/ts/process/luaCodeWrapper.ts'), 'utf8')
     const jsonSource = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
     const childSource = `
         import assert from 'node:assert/strict'
         import * as luaRuntime from ${JSON.stringify(runtimeUrl)}
         const { runLuaSource } = luaRuntime
-        ${wrapperJavaScript}
+        import { luaCodeWrapper } from ${JSON.stringify(toModuleUrl(wrapperSource))}
         const factory = await luaRuntime.createLuaFactory()
         await factory.mountFile('json.lua', ${JSON.stringify(jsonSource)})
         const engines = []
@@ -296,13 +292,32 @@ it.each([
     ['custom', "error(setmetatable({}, {__tostring=function() return 'custom message' end}))", 'custom message'],
     ['throwing formatter', "error(setmetatable({}, {__tostring=function() error('format failed') end}))", 'format failed'],
     ['looping formatter', "error(setmetatable({}, {__tostring=function() while true do end end}))", 'thread timeout exceeded'],
-])('reports a %s error without corrupting the runtime', async (_label, code, expected) => {
-    const child = await runIsolatedWasmoon(`
-        await runLuaSource(engine, ${JSON.stringify(`function run() ${code} end`)})
-        assert.throws(() => engine.global.get('run')(), new RegExp(${JSON.stringify(expected)}))
-    `)
-    expect(child, child.stderr).toMatchObject({ code: 0, timedOut: false })
-})
+].flatMap(([label, code, expected]) => ['handler', 'expired source'].map(entry => ({ label, code, expected, entry }))))(
+    'reports a $label error from $entry without corrupting the runtime', async ({ label, code, expected, entry }) => {
+        const child = await runIsolatedWasmoon(`
+            const expected = new RegExp(${JSON.stringify(expected)})
+            if (${JSON.stringify(entry)} === 'handler') {
+                await runLuaSource(engine, ${JSON.stringify(`function run() ${code} end`)})
+                assert.throws(() => engine.global.get('run')(), expected)
+            } else {
+                let now = 0
+                const originalNow = performance.now
+                performance.now = () => now
+                engine.global.set('advance', () => { now += 6000 })
+                try {
+                    const initialTop = engine.global.getTop()
+                    await assert.rejects(runLuaSource(engine, ${JSON.stringify(`local function fail() advance(); ${code} end; fail()`)}), error => {
+                        assert.match(error.message, expected)
+                        if (${JSON.stringify(label)} === 'plain') assert.match(error.message, /stack traceback:/)
+                        return true
+                    })
+                    assert.equal(engine.global.getTop(), initialTop)
+                } finally { performance.now = originalNow }
+            }
+        `)
+        expect(child, child.stderr).toMatchObject({ code: 0, timedOut: false })
+    },
+)
 
 it('handles Promise rejection and late callbacks after closing their engine', async () => {
     const child = await runIsolatedWasmoon(`

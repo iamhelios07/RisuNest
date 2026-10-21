@@ -28,6 +28,7 @@ import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
 import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
 import { createLuaFactory, runLuaSource } from './luaRuntime';
+import { luaCodeWrapper } from './luaCodeWrapper';
 import { withObjectUrl } from '../objectUrl';
 import {
     type ConversationOperationContext,
@@ -58,7 +59,6 @@ const LUA_LISTENER_TIMEOUT_MS = 5_000
 /** Deadline for each synchronous Lua segment of a handler the user started. */
 const LUA_USER_HANDLER_TIMEOUT_MS = 60_000
 let luaFactory:LuaFactory
-let luaTimeoutErrorConstructor: typeof import('wasmoon').LuaTimeoutError | undefined
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
 let ScriptingLowLevelIds = new Set<string>()
@@ -1424,8 +1424,9 @@ export async function runScripted(code:string, arg:{
                 }
             } catch (error) {
                 // Async coroutine rejection preserves the Lua string; synchronous calls wrap it in Error.
-                if ((luaTimeoutErrorConstructor && error instanceof luaTimeoutErrorConstructor) ||
-                    ((typeof error === 'string' ? error : error instanceof Error ? error.message : '').split('\n', 1)[0] === 'thread timeout exceeded')) {
+                const firstLine = (typeof error === 'string' ? error : error instanceof Error ? error.message : '').split('\n', 1)[0]
+                // Lua wrap/error can prepend one or more source locations to the timeout string.
+                if (/(?:^|:\d+: )thread timeout exceeded$/.test(firstLine)) {
                     const diagnosticMode = ['input', 'output', 'start', 'onButtonClick', 'editRequest',
                         'editDisplay', 'editInput', 'editOutput', 'manual'].includes(mode) ? mode : 'custom'
                     console.error({ code: 'lua-listener-timeout', mode: diagnosticMode,
@@ -1492,8 +1493,6 @@ export async function runScripted(code:string, arg:{
 }
 
 async function makeLuaFactory(){
-    const wasmoon = await import('wasmoon')
-    luaTimeoutErrorConstructor = wasmoon.LuaTimeoutError
     const _luaFactory = await createLuaFactory()
     async function mountFile(name:string){
         let code = ''
@@ -1600,168 +1599,6 @@ function removeScriptingEngineStateIfUnused(state: ScriptingEngineState) {
     if (state.activeUses === 0 && ScriptingEngines.get(state.cacheKey) === state) {
         ScriptingEngines.delete(state.cacheKey)
     }
-}
-
-function luaCodeWrapper(code:string){
-    return `
-json = require 'json'
-
-function getChat(id, index)
-    return json.decode(getChatMain(id, index))
-end
-
-function getFullChat(id)
-    return json.decode(getFullChatMain(id))
-end
-
-function getRecentChats(id, count)
-    return json.decode(getRecentChatsMain(id, count))
-end
-
-function setFullChat(id, value)
-    setFullChatMain(id, json.encode(value))
-end
-
-function log(value)
-    logMain(json.encode(value))
-end
-
-function getLoreBooks(id, search)
-    return json.decode(getLoreBooksMain(id, search))
-end
-
-
-function loadLoreBooks(id)
-    return json.decode(loadLoreBooksMain(id):await())
-end
-
-function LLM(id, prompt, useMultimodal, options)
-    useMultimodal = useMultimodal or false
-    options = options or {}
-    return json.decode(LLMMain(id, json.encode(prompt), useMultimodal, json.encode(options)):await())
-end
-
-function axLLM(id, prompt, useMultimodal, options)
-    useMultimodal = useMultimodal or false
-    options = options or {}
-    return json.decode(axLLMMain(id, json.encode(prompt), useMultimodal, json.encode(options)):await())
-end
-
-function getCharacterImage(id)
-    return getCharacterImageMain(id):await()
-end
-
-function getPersonaImage(id)
-    return getPersonaImageMain(id):await()
-end
-
-local editRequestFuncs = {}
-local editDisplayFuncs = {}
-local editInputFuncs = {}
-local editOutputFuncs = {}
-
-function listenEdit(type, func)
-    if type == 'editRequest' then
-        editRequestFuncs[#editRequestFuncs + 1] = func
-        return
-    end
-
-    if type == 'editDisplay' then
-        editDisplayFuncs[#editDisplayFuncs + 1] = func
-        return
-    end
-
-    if type == 'editInput' then
-        editInputFuncs[#editInputFuncs + 1] = func
-        return
-    end
-
-    if type == 'editOutput' then
-        editOutputFuncs[#editOutputFuncs + 1] = func
-        return
-    end
-
-    throw('Invalid type')
-end
-
-function getState(id, name)
-    local escapedName = "__"..name
-    return json.decode(getChatVar(id, escapedName))
-end
-
-function setState(id, name, value)
-    local escapedName = "__"..name
-    setChatVar(id, escapedName, json.encode(value))
-end
-
-function setStateChanged(id, name, value)
-    local escapedName = "__"..name
-    return setChatVarChanged(id, escapedName, json.encode(value))
-end
-
-function async(callback)
-    return function(...)
-        local co = coroutine.create(callback)
-        local safe, result = coroutine.resume(co, ...)
-
-        return Promise.create(function(resolve, reject)
-            local checkresult
-            local step = function()
-                if coroutine.status(co) == "dead" then
-                    local send = safe and resolve or reject
-                    return send(result)
-                end
-
-                safe, result = coroutine.resume(co)
-                checkresult()
-            end
-
-            checkresult = function()
-                if safe and result == Promise.resolve(result) then
-                    result:finally(step):catch(reject)
-                else
-                    step()
-                end
-            end
-
-            checkresult()
-        end)
-    end
-end
-
-callListenMain = async(function(type, id, value, meta)
-    local realValue = json.decode(value)
-    local realMeta = json.decode(meta)
-
-    if type == 'editRequest' then
-        for _, func in ipairs(editRequestFuncs) do
-            realValue = func(id, realValue, realMeta)
-        end
-    end
-
-    if type == 'editDisplay' then
-        for _, func in ipairs(editDisplayFuncs) do
-            realValue = func(id, realValue, realMeta)
-        end
-    end
-
-    if type == 'editInput' then
-        for _, func in ipairs(editInputFuncs) do
-            realValue = func(id, realValue, realMeta)
-        end
-    end
-
-    if type == 'editOutput' then
-        for _, func in ipairs(editOutputFuncs) do
-            realValue = func(id, realValue, realMeta)
-        end
-    end
-
-    return json.encode(realValue)
-end)
-
-${code}
-`
 }
 
 export async function runLuaEditTrigger<T extends string | OpenAIChat[]>(

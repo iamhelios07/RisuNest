@@ -45,7 +45,9 @@ class LuaExecutionBudget {
             const absoluteIndex = lua.lua_absindex(address, index)
             lua.lua_pushcclosure(address, owner.formatter, 0)
             lua.lua_pushvalue(address, absoluteIndex)
-            const status = lua.lua_pcallk(address, 1, 1, 0, 0, null)
+            // Preserve an existing error even when source execution has expired.
+            // Lua formatters still run under the inherited instruction deadline.
+            const status = this.enter(address, () => pcall(address, 1, 1, 0, 0, null), false)
             if (status !== LuaReturn.Ok) {
                 const failure = lua.lua_tolstring(address, -1, null)
                     ?? 'Lua error object could not be converted to text'
@@ -60,14 +62,14 @@ class LuaExecutionBudget {
         return this.owners.get(this.lua.lua_topointer(address, LUA_REGISTRYINDEX))
     }
 
-    private enter<T>(address: number, run: () => T): T {
+    private enter<T>(address: number, run: () => T, checkSourceDeadline = true): T {
         const owner = this.owner(address)
         if (!owner) return run()
 
         const now = performance.now()
         const sourceDeadline = this.sourceDeadlines.get(address)
         // Frequent yields may never reach the instruction hook between resumes.
-        if (sourceDeadline !== undefined && now > sourceDeadline) {
+        if (checkSourceDeadline && sourceDeadline !== undefined && now > sourceDeadline) {
             throw new Error('thread timeout exceeded')
         }
         const deadline = Math.min(
