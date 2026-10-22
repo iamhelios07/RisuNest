@@ -21,7 +21,8 @@
         restoreNativePersistentSnapshot,
     } from 'src/ts/storage/nativePersistentMaintenance'
     import { getSyncConflictBackupStore } from 'src/ts/storage/sync/syncConflictBackup'
-    import { flushPendingData } from 'src/ts/storage/persistentDataRuntime.svelte'
+    import { assetAliasCleanupTarget, flushPendingData } from 'src/ts/storage/persistentDataRuntime.svelte'
+    import { deleteUnusedAssetAliases } from 'src/ts/storage/deletedOwnerAssetCleanup'
     import { getAssetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency'
     import { describeBlockedReason } from 'src/ts/storage/sync/blockedReasonText'
     import { openDataHealthScreen } from 'src/ts/storage/dataHealthNavigation'
@@ -45,7 +46,7 @@
         cleanupTemp: cleanupServerSyncCache,
         // Pending edits are committed first so a file they started using counts as used.
         previewGc: () => flushPendingData('asset-gc-preview').then(previewNativePersistentAssetGc),
-        executeGc: () => flushPendingData('asset-gc-execute').then(executeNativePersistentAssetGc),
+        executeGc: () => deleteUnusedAssetAliases(assetAliasCleanupTarget(), 'asset-gc-execute').then(executeNativePersistentAssetGc),
         deleteSnapshot: deleteNativePersistentSnapshot,
         deleteConflictBackup: (id) => conflictStore.remove(id),
         createSnapshot: createNativePersistentSnapshot,

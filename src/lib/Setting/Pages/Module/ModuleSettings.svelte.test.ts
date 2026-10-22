@@ -29,8 +29,11 @@ vi.mock('src/ts/util', () => ({}))
 vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 const core = vi.hoisted(() => ({ invoke: vi.fn(async () => ({})) }))
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: core.invoke }))
-const runtime = vi.hoisted(() => ({ flushPendingData: vi.fn(async () => {}) }))
-vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => runtime)
+const runtime = vi.hoisted(() => ({ flushPendingData: vi.fn(async (_reason: string) => {}) }))
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', async () => {
+    const { createAssetAliasCleanupTarget } = await import('src/ts/storage/deletedOwnerAssetCleanup.testSupport')
+    return { ...runtime, assetAliasCleanupTarget: () => createAssetAliasCleanupTarget(runtime.flushPendingData) }
+})
 
 let instance: ReturnType<typeof mount>
 beforeEach(() => {
@@ -145,9 +148,10 @@ it('deletes the assets of a removed module once the removal is saved', async () 
     await tick()
     const row = [...document.querySelectorAll('span')].find(span => span.textContent === 'First')!.parentElement!
     row.querySelectorAll<HTMLButtonElement>('button')[3].click()
-    await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith('pds_asset_cleanup_deleted_owner', {
-        keys: ['assets/first-map.png'], startedAtMs: expect.any(Number),
+    await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith('pds_asset_delete_orphaned_aliases', {
+        expectedRevision: 1, owner: { keys: ['assets/first-map.png'], startedAtMs: expect.any(Number) },
     }))
+    expect(runtime.flushPendingData).toHaveBeenCalledWith('module-delete')
     expect(runtime.flushPendingData.mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
     expect(DBState.db.modules.map(module => module.id)).toEqual(['Second'])
 })

@@ -25,6 +25,7 @@ import { fillRootFieldDefaults, getDatabase, setDatabase, setEffectivePresetOver
 import { getEffectivePresetOverride } from './effectiveIdentityState'
 import { prepareDatabaseForPersistence, preparePersistentRootForWorkingSet } from './databasePreparation'
 import { getPersistentDataStore, getPersistentStorageAuthority } from './persistentDataStoreFactory'
+import { scheduleDeletedOwnerAssetCleanup, type AssetAliasCleanupTarget } from './deletedOwnerAssetCleanup'
 import type {
     CharacterDetail,
     DataRevision,
@@ -498,10 +499,20 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
             onDestructiveReplacementFenceChanged: (active) => destructiveReplacementActive.set(active),
             prepareDatabase: prepareDatabaseForPersistence,
             prepareRoot: (root) => preparePersistentRootForWorkingSet(root),
+            deletedCharacterAssets: {
+                cleanup: (keys, startedAtMs) =>
+                    scheduleDeletedOwnerAssetCleanup(keys, startedAtMs, 'deleted-owner-assets', assetAliasCleanupTarget),
+            },
         })
     }
     return productionRuntime
 }
+
+/** The production save queue and write gate, for an asset alias cleanup. */
+export const assetAliasCleanupTarget = (): AssetAliasCleanupTarget => ({
+    runtime: getPersistentDataRuntime(),
+    gate: getPersistentStorageAuthority().gate,
+})
 
 export const initializeActiveWorkingSet = (database: Database): Promise<void> =>
     getPersistentDataRuntime().initializeActiveWorkingSet(database)

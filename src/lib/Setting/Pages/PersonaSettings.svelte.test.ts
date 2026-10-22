@@ -33,8 +33,11 @@ const platform = vi.hoisted(() => ({ runtime: 'web' as 'web' | 'tauri' }))
 vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
 const core = vi.hoisted(() => ({ invoke: vi.fn(async () => ({})) }))
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: core.invoke }))
-const runtime = vi.hoisted(() => ({ flushPendingData: vi.fn(async () => {}) }))
-vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => runtime)
+const runtime = vi.hoisted(() => ({ flushPendingData: vi.fn(async (_reason: string) => {}) }))
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', async () => {
+    const { createAssetAliasCleanupTarget } = await import('src/ts/storage/deletedOwnerAssetCleanup.testSupport')
+    return { ...runtime, assetAliasCleanupTarget: () => createAssetAliasCleanupTarget(runtime.flushPendingData) }
+})
 
 let instance: ReturnType<typeof mount>
 afterEach(async () => {
@@ -64,9 +67,10 @@ it('removes the confirmed persona after the active selection changes and deletes
     await vi.waitFor(() => expect(DBState.db.personas).toHaveLength(2))
     expect(DBState.db.personas.map(persona => persona.id)).toEqual(['Second', 'Third'])
     expect(DBState.db.personas[DBState.db.selectedPersona].id).toBe('Second')
-    await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith('pds_asset_cleanup_deleted_owner', {
-        keys: ['assets/First.png'], startedAtMs: expect.any(Number),
+    await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith('pds_asset_delete_orphaned_aliases', {
+        expectedRevision: 1, owner: { keys: ['assets/First.png'], startedAtMs: expect.any(Number) },
     }))
+    expect(runtime.flushPendingData).toHaveBeenCalledWith('persona-delete')
     expect(runtime.flushPendingData.mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
 })
 

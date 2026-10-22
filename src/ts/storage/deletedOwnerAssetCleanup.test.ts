@@ -6,6 +6,7 @@ const core = vi.hoisted(() => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: core.invoke }))
 
 import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from './deletedOwnerAssetCleanup'
+import { createAssetAliasCleanupTarget } from './deletedOwnerAssetCleanup.testSupport'
 
 afterEach(() => {
     platform.runtime = 'tauri'
@@ -36,24 +37,26 @@ describe('collectOwnedAssetKeys', () => {
 
 describe('scheduleDeletedOwnerAssetCleanup', () => {
     it('commits pending edits, then deletes the assets with the time the delete started', async () => {
-        const flush = vi.fn(async () => {})
-        core.invoke.mockResolvedValue({})
+        const target = createAssetAliasCleanupTarget()
+        core.invoke.mockResolvedValue({ revision: 2 })
 
-        scheduleDeletedOwnerAssetCleanup(['assets/a.png'], 123, flush)
+        scheduleDeletedOwnerAssetCleanup(['assets/a.png'], 123, 'module-delete', () => target)
 
-        await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith(
-            'pds_asset_cleanup_deleted_owner', { keys: ['assets/a.png'], startedAtMs: 123 }))
-        expect(flush.mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
+        await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith('pds_asset_delete_orphaned_aliases', {
+            expectedRevision: 1, owner: { keys: ['assets/a.png'], startedAtMs: 123 },
+        }))
+        expect(target.runtime.flushPendingData).toHaveBeenCalledWith('module-delete')
+        expect(target.runtime.flushPendingData.mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
     })
 
     it('leaves the web build and an owner without assets alone', async () => {
-        const flush = vi.fn(async () => {})
-        scheduleDeletedOwnerAssetCleanup([], 1, flush)
+        const target = createAssetAliasCleanupTarget()
+        scheduleDeletedOwnerAssetCleanup([], 1, 'module-delete', () => target)
         platform.runtime = 'web'
-        scheduleDeletedOwnerAssetCleanup(['assets/a.png'], 1, flush)
+        scheduleDeletedOwnerAssetCleanup(['assets/a.png'], 1, 'module-delete', () => target)
         await Promise.resolve()
 
-        expect(flush).not.toHaveBeenCalled()
+        expect(target.runtime.flushPendingData).not.toHaveBeenCalled()
         expect(core.invoke).not.toHaveBeenCalled()
     })
 
@@ -61,7 +64,7 @@ describe('scheduleDeletedOwnerAssetCleanup', () => {
         const failure = new Error('synthetic flush failure')
         const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-        scheduleDeletedOwnerAssetCleanup(['assets/a.png'], 1, async () => { throw failure })
+        scheduleDeletedOwnerAssetCleanup(['assets/a.png'], 1, 'module-delete', () => createAssetAliasCleanupTarget(vi.fn(async () => { throw failure })))
 
         await vi.waitFor(() => expect(logged).toHaveBeenCalledWith('Deleted owner asset cleanup failed', failure))
         expect(core.invoke).not.toHaveBeenCalled()

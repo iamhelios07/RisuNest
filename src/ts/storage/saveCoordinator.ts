@@ -65,7 +65,7 @@ import {
 } from './pluginMutationPublication'
 import { PENDING_SAVE_BYTE_LIMIT as PENDING_BYTE_LIMIT } from './pendingDataSize'
 import { jsonByteLength } from './nativePersistenceValue'
-import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from './deletedOwnerAssetCleanup'
+import { collectOwnedAssetKeys } from './deletedOwnerAssetCleanup'
 import { captureMessagePages, cloneConversationByMessage, createsConversation, planConversationInsertPages, type ConversationInsertPlan } from './conversationInsertPages'
 
 export { canonicalJson }
@@ -152,6 +152,10 @@ export interface SaveCoordinatorDependencies {
     onWorkingSetRefreshRequired?(revision: DataRevision | null): void
     onDestructiveReplacementFenceChanged?(active: boolean): void
     isConversationOperationActive?(): boolean
+    deletedCharacterAssets?: {
+        /** Deletes, in the background, the assets only permanently deleted characters used. */
+        cleanup(keys: string[], startedAtMs: number): void
+    }
 }
 
 export interface PersistedConversationMutationEvent {
@@ -2045,7 +2049,7 @@ export class SaveCoordinator {
         }).then((count) => {
             if (count > 0) {
                 const keys = new Set([...deletedIds].flatMap((id) => ownedAssetKeys.get(id) ?? []))
-                scheduleDeletedOwnerAssetCleanup([...keys], startedAtMs, () => this.flushPendingData('deleted-owner-assets'))
+                this.dependencies.deletedCharacterAssets?.cleanup([...keys], startedAtMs)
             }
             return count
         })

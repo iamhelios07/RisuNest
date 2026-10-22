@@ -15,7 +15,7 @@
     import { commitDetachedCharacter } from "src/ts/characters";
     import { commitModuleCharacterConversion } from "./moduleCharacterConversion";
     import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from "src/ts/storage/deletedOwnerAssetCleanup";
-    import { flushPendingData } from "src/ts/storage/persistentDataRuntime.svelte";
+    import { assetAliasCleanupTarget } from "src/ts/storage/persistentDataRuntime.svelte";
     let mode = $state(0)
     let editModuleId = $state('')
     const currentModule = $derived(DBState.db.modules.find(module => module.id === editModuleId))
@@ -134,7 +134,7 @@
                                     }
                                     DBState.db.modules.splice(index, 1)
                                     DBState.db.modules = DBState.db.modules
-                                    scheduleDeletedOwnerAssetCleanup(assetKeys, startedAtMs, () => flushPendingData('module-delete'))
+                                    scheduleDeletedOwnerAssetCleanup(assetKeys, startedAtMs, 'module-delete', assetAliasCleanupTarget)
                                 }
                             }}>
                                 <TrashIcon size={18}/>
