@@ -2801,6 +2801,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         abortSignal,
         continueGeneration: arg.continue === true,
         sayingCharacterId: currentChar.chaId,
+        ownerCharacterId: requestSourceCharacterId,
         generationId,
         generationInfo,
         promptInfo,

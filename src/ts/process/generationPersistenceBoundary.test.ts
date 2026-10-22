@@ -56,7 +56,7 @@ it('streams through the real session and save coordinator and reopens the exact 
             },
         }, { highWaterMark: 0 }) },
         abortSignal: new AbortController().signal, continueGeneration: false,
-        sayingCharacterId: 'owner', generationId: 'generated', generationInfo: {} as any, promptInfo: {} as any,
+        sayingCharacterId: 'owner', ownerCharacterId: 'owner', generationId: 'generated', generationInfo: {} as any, promptInfo: {} as any,
         removeIncompleteResponse: () => false, streamingDisplayOptimizationMode: () => 'off', ttsAutoSpeech: () => false,
         operation: {
             getCurrentSession: () => runtime.getActiveConversationSession(), getTargetChat: chat,
@@ -90,6 +90,44 @@ it('streams through the real session and save coordinator and reopens the exact 
     expect((recovered?.value as Chat).isStreaming).not.toBe(true)
 })
 
+
+it('records a streamed chat that has no active conversation session under the chat owner', async () => {
+    const chat = { id: 'bounded-chat', message: [{ role: 'user', data: 'Prompt', chatId: 'user' }] } as unknown as Chat
+    const device = recoveryStore()
+    const clock = manualTimers()
+    await installDisplayRecovery(device.store, { timers: clock.timers })
+    onTestFinished(() => installDisplayRecovery(null))
+    const recordsAtRead: unknown[] = []
+    const applying = applyGenerationResponse({
+        response: { type: 'streaming', result: new ReadableStream({
+            pull(controller) {
+                recordsAtRead.push(device.record)
+                controller.enqueue({ 0: 'Streamed' })
+                controller.close()
+            },
+        }, { highWaterMark: 0 }) },
+        abortSignal: new AbortController().signal, continueGeneration: false,
+        sayingCharacterId: 'group-member', ownerCharacterId: 'group', generationId: 'generated', generationInfo: {} as any, promptInfo: {} as any,
+        removeIncompleteResponse: () => false, streamingDisplayOptimizationMode: () => 'off', ttsAutoSpeech: () => false,
+        operation: {
+            getCurrentSession: () => null, getTargetChat: () => chat,
+            isOwnerCurrent: () => true, publishTargetChat: () => {},
+            invalidateSession: () => {}, incrementReloadKeys: () => {},
+        },
+        callbacks: {
+            reformatContent: value => value, processOutput: async value => ({ data: value, emoChanged: false }),
+            runCurrentChatParser: value => value, runInlay: text => ({ text }), runOutputTrigger: async () => null,
+            runOutputListeners: async () => {}, speak: async () => {}, trimIncompleteResponse: value => value,
+            markResponseApplied: () => {}, onProviderFailure: message => { throw new Error(message) },
+        },
+    })
+    await vi.waitFor(() => expect(device.pendingWrites).toBe(1))
+    device.commitAll()
+    expect((await applying)?.readOutput()?.data).toBe('Streamed')
+    expect(recordsAtRead).toEqual([{ working: [{ characterId: 'group', conversationId: 'bounded-chat' }], marked: [] }])
+    clock.runAll()
+    expect(device.record).toBeNull()
+})
 
 it('keeps bounded preparation available through the production mutation gate and selected authority', async () => {
     const raw = new IndexedDbPersistentDataStore(`bounded-production-${crypto.randomUUID()}`, indexedDB, IDBKeyRange)

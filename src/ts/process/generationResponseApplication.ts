@@ -70,6 +70,8 @@ export interface ApplyGenerationResponseOptions {
     abortSignal: AbortSignal
     continueGeneration: boolean
     sayingCharacterId: string
+    /** The character whose chat receives the response. */
+    ownerCharacterId: string
     generationId: string
     generationInfo: MessageGenerationInfo
     promptInfo: MessagePresetInfo
@@ -220,9 +222,8 @@ export async function applyGenerationResponse(
                 }
             }
             // Streaming renders into the chat, which a recovery record covers.
-            const session = options.operation.getCurrentSession()
-            const displayWork = beginDisplayWork(session && targetChat.id
-                ? { characterId: session.characterId, conversationId: targetChat.id }
+            const displayWork = beginDisplayWork(targetChat.id
+                ? { characterId: options.ownerCharacterId, conversationId: targetChat.id }
                 : null)
             let streamCompleted = false
             try {
