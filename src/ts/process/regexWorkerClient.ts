@@ -1,6 +1,7 @@
 import type { RegexExecutionPlan, RegexExecutionResult } from './regexExecutionPlan'
+import type { RegexOperation, RegexOperationResults } from './regexOperations'
 
-export const DEFAULT_REGEX_WORKER_TIMEOUT_MS = 2_000
+export const DEFAULT_REGEX_WORKER_TIMEOUT_MS = 10_000
 export const REGEX_WORKER_READY_TIMEOUT_MS = 10_000
 
 export type RegexWorkerPlanEntry = [
@@ -8,6 +9,8 @@ export type RegexWorkerPlanEntry = [
     pattern: string,
     replacement: string,
     flags: string,
+    host?: boolean,
+    conditional?: boolean,
 ]
 
 export type RegexWorkerRequest = {
@@ -19,6 +22,14 @@ export type RegexWorkerRequest = {
     id: number
     revision: number
     input: string
+    continuation?: { start: number, end: number }
+    reuseInput?: boolean
+} | {
+    type: 'operation'
+    id: number
+    operation: RegexOperation
+} | {
+    type: 'release'
 }
 
 export type RegexWorkerResponse = { type: 'ready' } | {
@@ -26,6 +37,12 @@ export type RegexWorkerResponse = { type: 'ready' } | {
     id: number
     data: string
     errors: [sourceIndex: number, message: string][]
+    steps?: { index: number, matched: boolean }[]
+    nextIndex?: number
+} | {
+    type: 'operationResult'
+    id: number
+    value: RegexOperationResults[keyof RegexOperationResults]
 } | {
     type: 'error'
     id: number
@@ -42,16 +59,19 @@ export interface RegexWorkerLike {
 export interface RegexWorkerExecuteOptions {
     signal?: AbortSignal
     timeoutMs?: number
+    continuation?: { start: number, end: number }
 }
 
 interface PendingRequest {
-    plan: RegexExecutionPlan
+    plan?: RegexExecutionPlan
+    operation?: RegexOperation
+    continuation?: { start: number, end: number }
     input: string
     timeoutMs: number
     signal?: AbortSignal
     abortListener?: () => void
     timeout?: ReturnType<typeof setTimeout>
-    resolve: (result: RegexExecutionResult) => void
+    resolve: (result: any) => void
     reject: (error: unknown) => void
 }
 
@@ -94,6 +114,7 @@ export class RegexWorkerClient {
     private ready = false
     private bootTimeout?: ReturnType<typeof setTimeout>
     private registeredRevision: number | undefined
+    private continuation?: { revision: number, data: string }
     private readonly pending = new Map<number, PendingRequest>()
     private activeId: number | undefined
     private nextRequestId = 1
@@ -102,11 +123,27 @@ export class RegexWorkerClient {
     constructor(private readonly workerFactory: () => RegexWorkerLike = createModuleWorker) {}
 
     execute(plan: RegexExecutionPlan, input: string, options: RegexWorkerExecuteOptions = {}): Promise<RegexExecutionResult> {
+        return this.enqueue({ plan, input, continuation: options.continuation }, options)
+    }
+
+    operate<K extends keyof RegexOperationResults>(operation: RegexOperation<K>, options: RegexWorkerExecuteOptions = {}): Promise<RegexOperationResults[K]> {
+        return this.enqueue({ operation, input: operation.input }, options)
+    }
+
+    releaseContinuation(): void {
+        this.continuation = undefined
+        if (this.ready && this.activeId === undefined && this.pending.size === 0) {
+            try { this.worker?.postMessage({ type: 'release' }) }
+            catch (error) { this.replaceWorker(error) }
+        }
+    }
+
+    private enqueue<T>(work: Pick<PendingRequest, 'plan' | 'operation' | 'input' | 'continuation'>, options: RegexWorkerExecuteOptions): Promise<T> {
         if (options.signal?.aborted) return Promise.reject(createAbortError(options.signal))
         return new Promise((resolve, reject) => {
             const id = this.nextRequestId++
             const request: PendingRequest = {
-                plan, input, signal: options.signal,
+                ...work, signal: options.signal,
                 timeoutMs: options.timeoutMs ?? DEFAULT_REGEX_WORKER_TIMEOUT_MS,
                 resolve, reject,
             }
@@ -149,11 +186,21 @@ export class RegexWorkerClient {
             this.pending.delete(response.id)
             this.activeId = undefined
             this.cleanupPending(request)
-            if (response.type === 'error') request.reject(new Error(response.message))
-            else request.resolve({
-                data: response.data,
-                errors: response.errors.map(([sourceIndex, message]) => ({ sourceIndex, error: new Error(message) })),
-            })
+            if (response.type === 'error') {
+                const error = new Error(response.message)
+                error.name = 'RegexWorkerOperationError'
+                request.reject(error)
+            }
+            else if (response.type === 'operationResult') request.resolve(response.value)
+            else {
+                this.continuation = request.continuation && request.plan
+                    ? { revision: request.plan.revision, data: response.data } : undefined
+                request.resolve({
+                    data: response.data,
+                    errors: response.errors.map(([sourceIndex, message]) => ({ sourceIndex, error: new Error(message) })),
+                    ...(response.steps ? { steps: response.steps, nextIndex: response.nextIndex } : {}),
+                })
+            }
             this.dispatchNext()
         }
         const errorListener: EventListener = (event) => {
@@ -173,15 +220,27 @@ export class RegexWorkerClient {
         if (!next) return
         const [id, request] = next
         this.activeId = id
-        request.timeout = setTimeout(() => this.replaceWorker(new RegexExecutionTimeoutError(request.plan.revision), id), request.timeoutMs)
+        request.timeout = setTimeout(() => this.replaceWorker(new RegexExecutionTimeoutError(request.plan?.revision ?? 0), id), request.timeoutMs)
         try {
-            if (this.registeredRevision !== request.plan.revision) {
-                this.registeredRevision = request.plan.revision
-                this.worker.postMessage({ type: 'register', revision: request.plan.revision,
-                    entries: request.plan.entries.map((entry) => [entry.sourceIndex, entry.pattern, entry.replacement, entry.flags]),
+            if (request.operation) {
+                this.worker.postMessage({ type: 'operation', id, operation: request.operation })
+                return
+            }
+            const plan = request.plan!
+            if (this.registeredRevision !== plan.revision) {
+                this.continuation = undefined
+                this.registeredRevision = plan.revision
+                this.worker.postMessage({ type: 'register', revision: plan.revision,
+                    entries: plan.entries.map((entry) => [entry.sourceIndex, entry.pattern, entry.replacement, entry.flags,
+                        entry.requiresHostExecution || entry.dynamicPattern, entry.actions.length > 0]),
                 })
             }
-            this.worker.postMessage({ type: 'execute', id, revision: request.plan.revision, input: request.input })
+            const reuseInput = request.continuation !== undefined
+                && this.continuation?.revision === plan.revision && this.continuation.data === request.input
+            this.worker.postMessage({ type: 'execute', id, revision: plan.revision, input: reuseInput ? '' : request.input,
+                ...(reuseInput ? { reuseInput: true } : {}),
+                ...(request.continuation ? { continuation: request.continuation } : {}),
+            })
         } catch (error) {
             this.replaceWorker(error, id)
         }
@@ -192,6 +251,7 @@ export class RegexWorkerClient {
         this.worker = undefined
         this.workerListeners = undefined
         this.registeredRevision = undefined
+        this.continuation = undefined
         this.ready = false
         this.activeId = undefined
         clearTimeout(this.bootTimeout)

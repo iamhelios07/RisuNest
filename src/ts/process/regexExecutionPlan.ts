@@ -38,6 +38,8 @@ export interface RegexExecutionError {
 export interface RegexExecutionResult {
     data: string
     errors: RegexExecutionError[]
+    steps?: { index: number, matched: boolean }[]
+    nextIndex?: number
 }
 
 function createPlanCache() {

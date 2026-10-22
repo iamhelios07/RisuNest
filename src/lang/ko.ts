@@ -3086,7 +3086,7 @@ export const languageKorean = {
     "syncConflictBackupUnreadable": '이 백업을 읽을 수 없습니다. 다른 백업을 선택하세요.',
     "chatMessageActionFailed": "작업 중 메시지가 변경되었습니다. 다시 시도하세요.",
     "chatConversationActionFailed": "작업 중 대화가 변경되었습니다. 다시 시도하세요.",
-    "regexScriptTimeout": "정규식 스크립트 실행 시간이 초과되었습니다.",
+    "regexScriptTimeout": "정규식 스크립트 실행 시간이 초과되어 건너뛰었습니다.",
     "generationInterruptedInBackground": "백그라운드에서 응답 생성이 중단되었습니다.",
     "generationConversationChanged": "응답 생성 중 대화가 변경되어 응답을 반영하지 못했습니다. 다시 시도하세요.",
     "mcpDesktopOnly": "로컬 MCP는 데스크톱 앱에서 사용할 수 있습니다.",

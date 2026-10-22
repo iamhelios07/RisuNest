@@ -45,6 +45,7 @@ import { createProductionPluginChatOutputProjector } from '../plugins/pluginData
 import { activatePresetChainForRequest } from "./presetChain";
 import {
     joinGenerationSignal,
+    bindGenerationRegexOwner,
     reserveGeneration,
     type GenerationReservation,
 } from './generationState'
@@ -1800,7 +1801,8 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     if (historyWindow && !historyWindow.controller.reconcileMetadata()) {
         throw new PersistentMutationFencedError()
     }
-    const triggerResult = await runTrigger(currentChar, 'start', {chat: currentChat})
+    bindGenerationRegexOwner(reservation, nowChatroom.chaId, currentChat.id)
+    const triggerResult = await runTrigger(currentChar, 'start', {chat: currentChat, regexScope: reservation.regexScope, regexGeneration: abortSignal})
     if(triggerResult){
         if (historyWindow) {
             if (!writeHistoryWindowChat(historyWindow.controller, triggerResult.chat)) {
@@ -1907,6 +1909,8 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             chatRole: msg.role,
         }, {
             promptOperationScope: promptScriptOperationScope ?? undefined,
+            regexGeneration: abortSignal,
+            regexScope: reservation.regexScope,
         })).data
         let name = ''
         if(msg.role === 'char'){
@@ -2845,13 +2849,15 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                           'editoutput',
                           messageIndex,
                           {},
-                          processing,
+                          { ...processing, regexScope: reservation.regexScope, regexGeneration: abortSignal },
                       )
                     : processScriptFull(
                           nowChatroom,
                           reformatContent(data),
                           'editoutput',
                           messageIndex,
+                          {},
+                          { regexScope: reservation.regexScope, regexGeneration: abortSignal },
                       ),
             runCurrentChatParser: runCurrentChatFunction,
             runInlay: (data) => runInlayScreen(currentChar, data),
@@ -2859,6 +2865,8 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 runTrigger(currentChar, 'output', {
                     chat,
                     onConversationCommit,
+                    regexGeneration: abortSignal,
+                    regexScope: reservation.regexScope,
                 }),
             runOutputListeners: (chat, messageIndex) =>
                 runChatOutputListeners(
