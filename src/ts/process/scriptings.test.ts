@@ -31,6 +31,11 @@ import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { alertConfirm, alertNormal, alertToast } from '../alert'
 import { language } from '../../lang'
 import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
+import { pluginV2 } from '../plugins/plugins.svelte'
+import { forgetDisplayRecovery, installDisplayRecovery } from '../displayRecovery.svelte'
+import { captureSelectedConversationAuthority, getActiveConversationViewportSource } from '../storage/persistentDataRuntime.svelte'
+import { createMetadataOnlySelectedConversation } from '../storage/selectedConversationLifecycle'
+import { recoveryStore } from '../displayRecovery.testSupport'
 
 const continuationRuntime = vi.hoisted(() => ({
   session: null as ActiveConversationSession | null,
@@ -1802,7 +1807,8 @@ test('shows one Lua timeout notice for queued display pipelines and another for 
       processScriptFull(fixture.char, 'first', 'editdisplay', 0),
       processScriptFull(fixture.char, 'second', 'editdisplay', 1),
     ])).resolves.toMatchObject([{ data: 'first' }, { data: 'second' }])
-    expect(errors.mock.calls.filter(([error]) => error?.code === 'lua-listener-timeout')).toHaveLength(2)
+    // The second row was already waiting when the listener timed out, so it skips it.
+    expect(errors.mock.calls.filter(([error]) => error?.code === 'lua-listener-timeout')).toHaveLength(1)
     expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.scriptTimeout)
 
     await processScriptFull(fixture.char, 'later', 'editdisplay', 0)
@@ -1811,6 +1817,202 @@ test('shows one Lua timeout notice for queued display pipelines and another for 
     diagnosticEngineSetup.next = null
     deadlineClock.mockRestore()
     errors.mockRestore()
+    continuationRuntime.session = null
+    vi.mocked(risuChatParser).mockReset()
+    vi.stubGlobal('localStorage', previousLocalStorage)
+  }
+})
+
+test('runs a timed-out display listener again only for a new row, message, input, conversation or script', async () => {
+  const fixture = operationCharacterFixture('display-timeout-rows', undefined, [
+    { role: 'char', data: 'zero', chatId: 'message-zero' },
+    { role: 'char', data: 'one', chatId: 'message-one' },
+  ])
+  fixture.char.customscript = []
+  let now = 0
+  let listenerRuns = 0
+  const setupEngine = (engine: LuaEngine) => {
+    engine.global.set('noteRun', (value: string) => {
+      listenerRuns++
+      if (value.startsWith('slow')) now += 5_001
+    })
+  }
+  diagnosticEngineSetup.next = setupEngine
+  const listener = (marker: string) => luaTriggerScript(`
+    -- ${marker}
+    listenEdit('editDisplay', function(id, value)
+      noteRun(value)
+      local total = 0
+      for i = 1, 10000 do total = total + i end
+      return value .. '!'
+    end)
+  `)
+  fixture.char.triggerscript = listener('original')
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const previousLocalStorage = globalThis.localStorage
+  vi.stubGlobal('localStorage', { getItem: () => null })
+  vi.mocked(risuChatParser).mockImplementation(value => value)
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const deadlineClock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+  const { processScriptFull } = await import('./scripts')
+  const render = async (data: string, index: number) => (await processScriptFull(fixture.char, data, 'editdisplay', index)).data
+  const timeouts = () => errors.mock.calls.filter(([error]) => error?.code === 'lua-listener-timeout').length
+  try {
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([1, 1])
+
+    // The same row and input skip it; a fast row still runs it.
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect(await render('one', 1)).toBe('one!')
+    expect([listenerRuns, timeouts()]).toEqual([2, 1])
+
+    // Changed input runs it again.
+    expect(await render('slow zero again', 0)).toBe('slow zero again')
+    expect([listenerRuns, timeouts()]).toEqual([3, 2])
+
+    // A different message at the same row runs it again.
+    fixture.chat.message[0] = { role: 'char', data: 'zero', chatId: 'message-replacement' }
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([4, 3])
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect(listenerRuns).toBe(4)
+
+    // The same row of another conversation runs it again.
+    vi.mocked(getCurrentChat).mockReturnValue({ ...fixture.chat, id: 'display-timeout-other-chat' })
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([5, 4])
+
+    // A conversation that keeps part of its history loaded has no active session and names its rows through the viewport.
+    const windowed = createMetadataOnlySelectedConversation({ ...fixture.chat, id: 'display-timeout-windowed' }) as Chat
+    continuationRuntime.session = null
+    let windowedMessageId = 'windowed-message'
+    vi.mocked(captureSelectedConversationAuthority).mockReturnValue({ conversationId: windowed.id } as never)
+    vi.mocked(getActiveConversationViewportSource).mockReturnValue({
+      snapshot: () => ({ rowAt: (index: number) => index === 0 ? { message: { chatId: windowedMessageId } } : undefined }),
+    } as never)
+    vi.mocked(getCurrentChat).mockReturnValue(windowed)
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([6, 5])
+    windowedMessageId = 'windowed-replacement'
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([7, 6])
+    vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+    continuationRuntime.session = fixture.session
+
+    // An edited script is a new engine without the earlier failures.
+    fixture.char.triggerscript = listener('edited')
+    diagnosticEngineSetup.next = setupEngine
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([8, 7])
+  } finally {
+    vi.mocked(captureSelectedConversationAuthority).mockReturnValue(null)
+    vi.mocked(getActiveConversationViewportSource).mockReturnValue(null)
+    diagnosticEngineSetup.next = null
+    deadlineClock.mockRestore()
+    errors.mockRestore()
+    continuationRuntime.session = null
+    vi.mocked(risuChatParser).mockReset()
+    vi.stubGlobal('localStorage', previousLocalStorage)
+  }
+})
+
+test('spends one source budget on the display rows queued behind top-level code that timed out', async () => {
+  const fixture = operationCharacterFixture('display-timeout-source', undefined, [
+    { role: 'char', data: 'zero', chatId: 'message-zero' },
+    { role: 'char', data: 'one', chatId: 'message-one' },
+  ])
+  fixture.char.customscript = []
+  fixture.char.triggerscript = luaTriggerScript(`
+    noteSource()
+    local total = 0
+    for i = 1, 10000 do total = total + i end
+    listenEdit('editDisplay', function(id, value) return value .. '!' end)
+  `)
+  let now = 0
+  let sourceRuns = 0
+  const setupEngine = (engine: LuaEngine) => {
+    diagnosticEngineSetup.next = setupEngine
+    engine.global.set('noteSource', () => {
+      sourceRuns++
+      now += 5_001
+    })
+  }
+  diagnosticEngineSetup.next = setupEngine
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const previousLocalStorage = globalThis.localStorage
+  vi.stubGlobal('localStorage', { getItem: () => null })
+  vi.mocked(risuChatParser).mockImplementation(value => value)
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const deadlineClock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+  const { processScriptFull } = await import('./scripts')
+  const { nextDisplayListenerOrder } = await import('./luaDisplayTimeouts')
+  const render = async (data: string, index: number, displayRequestOrder?: number) =>
+    (await processScriptFull(fixture.char, data, 'editdisplay', index, {}, { displayRequestOrder })).data
+  try {
+    // Both rows asked for their display before the source ran.
+    const first = nextDisplayListenerOrder()
+    const second = nextDisplayListenerOrder()
+    expect(await render('zero', 0, first)).toBe('zero')
+    expect(await render('one', 1, second)).toBe('one')
+    // Rendering the same row again later skips it too.
+    expect(await render('zero', 0)).toBe('zero')
+    expect(sourceRuns).toBe(1)
+  } finally {
+    diagnosticEngineSetup.next = null
+    deadlineClock.mockRestore()
+    errors.mockRestore()
+    continuationRuntime.session = null
+    vi.mocked(risuChatParser).mockReset()
+    vi.stubGlobal('localStorage', previousLocalStorage)
+  }
+})
+
+test('opens a chat left in the display recovery record without its Modify Display steps but with its CBS', async () => {
+  const fixture = operationCharacterFixture('display-recovery')
+  fixture.char.customscript = [{ comment: '', type: 'editdisplay', in: 'raw', out: 'REGEX', flag: 'g', ableFlag: true }]
+  fixture.char.triggerscript = [
+    ...luaTriggerScript(`
+      listenEdit('editDisplay', function(id, value)
+        return value .. ' LUA'
+      end)
+    `),
+    { comment: '', type: 'display', conditions: [], effect: [
+      { type: 'v2Header', code: '', indent: 0 },
+      { type: 'v2GetDisplayState', outputVar: 'shown', indent: 0 },
+      { type: 'v2ConcatString', source1: 'shown', source1Type: 'var', source2: ' TRIGGER', source2Type: 'value', outputVar: 'shown', indent: 0 },
+      { type: 'v2SetDisplayState', value: 'shown', valueType: 'var', indent: 0 },
+    ] },
+  ] as never
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const previousLocalStorage = globalThis.localStorage
+  vi.stubGlobal('localStorage', { getItem: () => null })
+  vi.mocked(risuChatParser).mockImplementation(value => value.replaceAll('{{cbs}}', 'CBS'))
+  const pluginHook = async (value: string) => `${value} PLUGIN`
+  pluginV2.editdisplay.add(pluginHook)
+  await installDisplayRecovery(recoveryStore({
+    working: [{ characterId: fixture.char.chaId, conversationId: fixture.chat.id }],
+    marked: [],
+  }, { commitAtOnce: true }).store)
+  const { processScriptFull } = await import('./scripts')
+  const render = async () => (await processScriptFull(fixture.char, 'raw {{cbs}}', 'editdisplay', 0)).data
+  try {
+    expect(await render()).toBe('raw CBS')
+
+    await forgetDisplayRecovery(() => true)
+    expect(await render()).toBe('REGEX CBS LUA TRIGGER PLUGIN')
+  } finally {
+    await installDisplayRecovery(null)
+    pluginV2.editdisplay.delete(pluginHook)
     continuationRuntime.session = null
     vi.mocked(risuChatParser).mockReset()
     vi.stubGlobal('localStorage', previousLocalStorage)
@@ -2306,6 +2508,57 @@ test('stops a Lua handler at the next wait once its conversation is no longer cu
     expect(other.chat.scriptstate).toBeUndefined()
   } finally {
     vi.mocked(requestChatData).mockReset()
+    continuationRuntime.session = null
+  }
+})
+
+test('keeps Lua variables committed before a wait when the handler later swallows a timeout', async () => {
+  const fixture = operationCharacterFixture('wait-flush-timeout')
+  fixture.char.lowLevelAccess = true
+  let now = 0
+  diagnosticEngineSetup.next = (engine) => {
+    engine.global.set('expire', () => { now = 1e12 })
+  }
+  fixture.char.triggerscript = luaTriggerScript(`
+    onButtonClick = async(function(id, data)
+      setChat(id, 0, 'edited')
+      setChatVar(id, 'before', '1')
+      sleep(id, 4321):await()
+      setChatVar(id, 'after', '2')
+      local tries = 0
+      repeat
+        tries = tries + 1
+        setChatVar(id, 'tries', tostring(tries))
+      until pcall(function() expire(); while true do end end) or tries >= 1e6
+    end)
+  `)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const atWait: unknown[] = []
+  const realSetTimeout = globalThis.setTimeout
+  const timeout = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, delay?: number) => {
+    if (delay !== 4321) return realSetTimeout(handler, delay)
+    atWait.push({ messages: fixture.chat.message.map((entry) => entry.data), scriptstate: { ...fixture.chat.scriptstate } })
+    return realSetTimeout(handler, 0)
+  }) as typeof setTimeout)
+  const deadlineClock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  vi.mocked(alertToast).mockClear()
+  const { runLuaInteractionTrigger } = await import('./scriptings')
+  try {
+    await runLuaInteractionTrigger('button', fixture.char, 'click')
+
+    expect(atWait).toEqual([{ messages: ['message'], scriptstate: { $before: '1' } }])
+    expect(fixture.chat.scriptstate).toEqual({ $before: '1', $after: '2', $tries: '1' })
+    expect(fixture.chat.message.map((entry) => entry.data)).toEqual(['edited'])
+    expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.scriptTimeout)
+  } finally {
+    diagnosticEngineSetup.next = null
+    deadlineClock.mockRestore()
+    errors.mockRestore()
+    timeout.mockRestore()
     continuationRuntime.session = null
   }
 })

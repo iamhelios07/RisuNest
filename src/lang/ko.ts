@@ -1883,6 +1883,10 @@ export const languageKorean = {
 
         backgroundDataFailed: '일부 데이터 변경을 완료하지 못했습니다.',
         scriptTimeout: 'Lua 스크립트 실행 시간이 초과되어 중단되었습니다.',
+        displayRecovery: {
+            notice: '디스플레이 수정을 끄고 채팅을 열었습니다.',
+            turnBackOn: '다시 켜기',
+        },
         localSaveFailure: {
             failed: '변경 사항을 저장하지 못했습니다. 앱을 종료하기 전에 저장을 다시 시도해주세요.',
             invalid: '{0} 데이터를 저장하지 못했습니다. 해당 데이터를 확인한 후 저장을 다시 시도해주세요.',

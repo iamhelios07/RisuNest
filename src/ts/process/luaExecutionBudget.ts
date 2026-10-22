@@ -26,6 +26,7 @@ class LuaExecutionBudget {
     private readonly owners = new Map<number, EngineBudget>()
     private readonly sourceDeadlines = new Map<number, number>()
     private readonly deadlines: number[] = []
+    private readonly entered: number[] = []
     private readonly originalToString: LuaWasm['luaL_tolstring']
 
     constructor(private readonly lua: LuaWasm) {
@@ -78,10 +79,12 @@ class LuaExecutionBudget {
         )
         this.lua.lua_sethook(address, owner.hook, LuaEventMasks.Count, INSTRUCTION_HOOK_COUNT)
         this.deadlines.push(deadline)
+        this.entered.push(address)
         try {
             return run()
         } finally {
             this.deadlines.pop()
+            this.entered.pop()
         }
     }
 
@@ -90,9 +93,16 @@ class LuaExecutionBudget {
         const key = this.lua.lua_topointer(engine.global.address, LUA_REGISTRYINDEX)
         if (this.owners.has(key)) return
 
-        const hook = this.lua.module.addFunction((address: number) => {
+        const hook: number = this.lua.module.addFunction((address: number) => {
             const deadline = this.deadlines.at(-1)
             if (deadline !== undefined && performance.now() > deadline) {
+                // pcall, xpcall or coroutine.resume may catch the timeout. Checking every
+                // instruction of this thread and of the thread the host entered raises it again.
+                this.lua.lua_sethook(address, hook, LuaEventMasks.Count, 1)
+                const entered = this.entered.at(-1)
+                if (entered !== undefined && entered !== address) {
+                    this.lua.lua_sethook(entered, hook, LuaEventMasks.Count, 1)
+                }
                 this.lua.lua_pushstring(address, 'thread timeout exceeded')
                 this.lua.lua_error(address)
             }

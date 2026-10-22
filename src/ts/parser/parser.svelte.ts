@@ -8,6 +8,9 @@ import { isTauri } from "src/ts/platform"
 import { getChatVar, setChatVar, getGlobalChatVar } from './chatVar.svelte';
 import { noteChatVariableRead, noteUntrackedVariableRead, recordChatVariableReads, type DisplayReadRecord } from '../process/scriptVariableReads';
 import { processScriptFull, type ProcessScriptCaptureContext } from '../process/scripts';
+import { nextDisplayListenerOrder } from '../process/luaDisplayTimeouts';
+import { beginDisplayWork, displayRecoveryTarget } from '../displayRecovery.svelte';
+import { untrack } from 'svelte';
 import { get } from 'svelte/store';
 import css, { type CssAtRuleAST, type CssDeclarationAST } from '@adobe/css-tools'
 import { selectedCharID } from '../stores.svelte';
@@ -714,6 +717,8 @@ export interface ParseMarkdownRenderContext {
     projectedChatID?: number
     /** Collects the chat variables this render reads. */
     variableReads?: DisplayReadRecord
+    /** When the view asked for this render, from `nextDisplayListenerOrder`. */
+    displayRequestOrder?: number
 }
 
 function parseThoughtsAndTools(
@@ -772,19 +777,47 @@ export async function ParseMarkdown(
     renderContext:ParseMarkdownRenderContext = {},
 ) {
     renderContext.signal?.throwIfAborted()
-    renderContext = { ...renderContext, deferredInlays: renderContext.deferredInlays ?? new DeferredInlayMarkerRegistry() }
+    // Rendering the selected chat is display work, which a recovery record covers. A reactive
+    // caller does not depend on the record or the selection it names.
+    const characterId = typeof charArg === 'string' ? charArg : charArg?.chaId
+    const displayWork = untrack(() => beginDisplayWork(characterId
+        ? displayRecoveryTarget(() => getCurrentCharacter(), characterId)
+        : null))
+    try {
+        return await parseMarkdownForDisplay(data, charArg, mode, chatID, cbsConditions, renderContext, displayWork.ready)
+    } finally {
+        displayWork.release()
+    }
+}
+
+async function parseMarkdownForDisplay(
+    data:string,
+    charArg:(character|simpleCharacterArgument | string),
+    mode:'normal'|'back'|'pretranslate'|'notrim',
+    chatID:number,
+    cbsConditions:CbsConditions,
+    renderContext:ParseMarkdownRenderContext,
+    recordStored:Promise<void> | null,
+) {
+    renderContext = {
+        ...renderContext,
+        deferredInlays: renderContext.deferredInlays ?? new DeferredInlayMarkerRegistry(),
+        displayRequestOrder: renderContext.displayRequestOrder ?? nextDisplayListenerOrder(),
+    }
     const prepareStyleHistory = renderContext.scriptContext?.parserContext.prepareHistory
     let firstParsed = ''
     const additionalAssetMode = (mode === 'back') ? 'back' : 'normal'
     let char = (typeof(charArg) === 'string') ? (findCharacterbyId(charArg)) : (charArg)
 
     if(char){
-        data = await parseAdditionalAssets(data, char, additionalAssetMode, {
+        // Started before waiting for the record, so a reactive caller still tracks the assets it reads.
+        [data] = await Promise.all([parseAdditionalAssets(data, char, additionalAssetMode, {
             ch: chatID
-        }, renderContext)
+        }, renderContext), recordStored])
         renderContext.signal?.throwIfAborted()
         firstParsed = data
     }
+    else if (recordStored) await recordStored
 
     if(char){
         data = (await processScriptFull(char, data, 'editdisplay', chatID, cbsConditions, {
@@ -793,6 +826,7 @@ export async function ParseMarkdown(
             projectedChatID: renderContext.projectedChatID,
             signal: renderContext.signal,
             variableReads: renderContext.variableReads,
+            displayRequestOrder: renderContext.displayRequestOrder,
         })).data
     }
 

@@ -2067,6 +2067,10 @@ export const languageEnglish = {
 
         backgroundDataFailed: 'Some changes to the data could not be completed.',
         scriptTimeout: 'A Lua script took too long and was stopped.',
+        displayRecovery: {
+            notice: 'Opened this chat with Modify Display turned off.',
+            turnBackOn: 'Turn back on',
+        },
         localSaveFailure: {
             failed: 'Changes could not be saved. Retry saving before closing the app.',
             invalid: '{0} could not be saved. Check this data, then retry saving.',

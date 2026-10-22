@@ -132,6 +132,8 @@
         parserProjection?: BoundedLiveChatParserProjection
         parserAbortSignal?: AbortSignal
         onDisplaySettled?: () => void
+        /** When the view asked for this row, from `nextDisplayListenerOrder`. */
+        displayRequestOrder?: number
         restoredEditor?: ChatEditorDraft
         onEditorOpen?: () => void
         onEditorClose?: () => void
@@ -175,6 +177,7 @@
         parserProjection,
         parserAbortSignal,
         onDisplaySettled,
+        displayRequestOrder,
         restoredEditor,
         onEditorOpen,
         onEditorClose,
@@ -403,6 +406,7 @@
         parserProjection = state.parserProjection
         parserAbortSignal = state.parserAbortSignal
         onDisplaySettled = state.onDisplaySettled
+        if (state.displayRequestOrder !== undefined) displayRequestOrder = state.displayRequestOrder
         if (state.viewportBinding) {
             updateViewportBinding({
                 ...state.viewportBinding,
@@ -1232,6 +1236,7 @@
                     {captureParserIndex}
                     {parserAbortSignal}
                     {onDisplaySettled}
+                    {displayRequestOrder}
                     displayRow={displayRow ?? undefined}
                     {parserProjection} />
         </span>

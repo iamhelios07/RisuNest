@@ -12,7 +12,7 @@
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
     import { getFileSrc } from "src/ts/globalApi.svelte";
     import { DeferredInlayMarkerRegistry, mountDeferredInlaySources, resolveDeferredInlaySources } from "src/ts/process/files/inlayRenderSource";
-    import { onDestroy, tick } from 'svelte'
+    import { onDestroy, tick, untrack } from 'svelte'
     import type { FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
@@ -23,6 +23,7 @@
     import type { StreamingThoughtMode } from '../../ts/storage/database.svelte'
     import { mountBoundedThoughtExpansion, type BoundedThoughtExpansion } from './boundedThoughtExpansion'
     import { DisplayReadRecord, recordChatVariableReads, type DisplayRowReads } from 'src/ts/process/scriptVariableReads'
+    import { nextDisplayListenerOrder } from 'src/ts/process/luaDisplayTimeouts'
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -51,6 +52,8 @@
         parserAbortSignal?: AbortSignal
         onDisplaySettled?: () => void
         displayRow?: DisplayRowReads
+        /** When the view asked for this row, from `nextDisplayListenerOrder`. */
+        displayRequestOrder?: number
     }
 
     let {
@@ -80,6 +83,7 @@
         parserAbortSignal,
         onDisplaySettled,
         displayRow,
+        displayRequestOrder,
     }: Props =  $props()
 
     // svelte-ignore non_reactive_update
@@ -111,6 +115,7 @@
         reads?: DisplayReadRecord
         rebuildRevision: number
         translatedDuringGeneration: boolean
+        displayRequestOrder: number
     }
 
     let activeParseJob: ChatBodyParseJob|null = null
@@ -349,6 +354,7 @@
                     ? captureParserIndex
                     : parserProjection?.projectedChatID,
                 variableReads: job.reads,
+                displayRequestOrder: job.displayRequestOrder,
             })
         )
         // track 'translated' and 'retranslate' state
@@ -605,6 +611,15 @@
         }
     }
 
+    // The parse the view asked for keeps the view's request order. A later parse is a new request.
+    let consumedDisplayRequestOrder: number | undefined
+    function takeDisplayRequestOrder(): number {
+        const requested = untrack(() => displayRequestOrder)
+        if (requested === undefined || requested === consumedDisplayRequestOrder) return nextDisplayListenerOrder()
+        consumedDisplayRequestOrder = requested
+        return requested
+    }
+
     function startParsing(requestedRevision: number):ChatBodyParseJob {
         const controller = new AbortController()
         const externalSignal = parserAbortSignal
@@ -633,6 +648,7 @@
             reads,
             rebuildRevision: displayRow?.rebuildRevision ?? 0,
             translatedDuringGeneration: false,
+            displayRequestOrder: takeDisplayRequestOrder(),
         }
         job.promise = markParsing(msgDisplay, character, idx, job)
         return job

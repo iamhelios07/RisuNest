@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { get, writable } from 'svelte/store'
 import { language } from 'src/lang'
-import { DBState, onboardingModalStore } from 'src/ts/stores.svelte'
+import { DBState, onboardingModalStore, ScriptDisplayRebuildPointer } from 'src/ts/stores.svelte'
 import { createConversationSummaryStubFromChat } from 'src/ts/storage/conversationResidency'
 import DefaultChatScreen from './DefaultChatScreen.svelte'
 import { chatScreenState } from '../../ts/ui/chatScreenState.svelte'
@@ -11,6 +11,8 @@ import { doingChat } from 'src/ts/process/index.svelte'
 import { updateDeviceSettings } from 'src/ts/storage/deviceSettings'
 import { noteGenerationMessage, noteGenerationStarted, subscribeGenerationEnd, type GenerationEndRecord } from 'src/ts/process/generationEnd'
 import { ActiveConversationSession } from 'src/ts/storage/activeConversationSession'
+import { installDisplayRecovery } from 'src/ts/displayRecovery.svelte'
+import { recoveryStore } from 'src/ts/displayRecovery.testSupport'
 
 const mocks = vi.hoisted(() => ({ trigger: vi.fn(), generate: vi.fn(), process: vi.fn(), error: vi.fn(), postFile: vi.fn(),
     bounded: false, appended: [] as any[], acquireComplete: vi.fn(), flush: vi.fn(async () => {}),
@@ -24,7 +26,8 @@ vi.mock('src/ts/stores.svelte', () => {
     const onboardingModalStore = $state({ open: false })
     return { DBState, onboardingModalStore, selectedCharID: writable(0), PlaygroundStore: writable(0), hypaV3ModalOpen: writable(false),
         ScrollToMessageStore: writable(null), additionalChatMenu: writable([]), additionalFloatingActionButtons: writable([]),
-        easyPanelStore: writable(false), chatPanelStore: writable(false), HideIconStore: writable(false) }
+        easyPanelStore: writable(false), chatPanelStore: writable(false), HideIconStore: writable(false),
+        ScriptDisplayRebuildPointer: writable(0), ScriptDisplayRefreshPointer: writable(0), ReloadChatPointer: writable({}) }
 })
 vi.mock('src/ts/process/index.svelte', async () => ({ doingChat: (await import('src/ts/process/generationState')).doingChat, chatProcessStage: writable(0), sendChat: mocks.generate, getSelectedBoundedGenerationFallbackReason: () => mocks.bounded ? null : 'test-complete-conversation',
     getHistoryWindowMemoryMode: (historyLimit: boolean) => historyLimit && mocks.historyLimit ? 'none' : null, openSelectedHistoryWindow: mocks.openWindow, notifyGenerationCompletion: mocks.notify }))
@@ -866,4 +869,23 @@ it('opens the onboarding from the side menu and from its optional floating butto
     await tick()
     floatingButton()!.click()
     expect(onboardingModalStore.open).toBe(true)
+})
+
+it('tells that a chat left in the display recovery record opened without Modify Display and turns it back on', async () => {
+    const device = recoveryStore({ working: [{ characterId: 'character', conversationId: 'chat' }], marked: [] }, { commitAtOnce: true })
+    const notice = () => document.querySelector('[data-display-recovery]')
+    try {
+        await installDisplayRecovery(device.store)
+        await tick()
+        expect(notice()?.textContent).toContain(language.risuNest.displayRecovery.notice)
+        const rebuilds = get(ScriptDisplayRebuildPointer)
+
+        const button = [...notice()!.querySelectorAll('button')].find(button => button.textContent?.trim() === language.risuNest.displayRecovery.turnBackOn)
+        button!.click()
+        await vi.waitFor(() => expect(get(ScriptDisplayRebuildPointer)).toBe(rebuilds + 1))
+        expect(notice()).toBeNull()
+        expect(device.record).toBeNull()
+    } finally {
+        await installDisplayRecovery(null)
+    }
 })
