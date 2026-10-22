@@ -291,6 +291,7 @@ export async function runScripted(code:string, arg:{
                     : undefined
                 if (message) edit(message)
             }
+            // Commits buffered variables before a call that waits, so triggers and displays running meanwhile read them.
             const flushScriptingVariables = () => ScriptingEngineState.flushVariables?.()
             const getScriptingDatabase = () => ScriptingEngineState.readDatabase?.() ?? getDatabase()
             const getScriptingCharacterIndex = (db: Database) => {
@@ -521,6 +522,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
+                flushScriptingVariables()
                 return new Promise((resolve) => {
                     setTimeout(() => {
                         resolve(true)
@@ -610,6 +612,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
+                flushScriptingVariables()
                 const processer = new HypaProcesser()
                 await processer.addText(value)
                 return await processer.similaritySearch(source)
@@ -619,6 +622,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
+                flushScriptingVariables()
 
                 if(lastRequestResetTime + 60000 < Date.now()){
                     lastRequestsCount = 0
@@ -688,6 +692,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
+                flushScriptingVariables()
                 const orientation = options?.orientation
                 if(orientation !== undefined && orientation !== 'landscape' && orientation !== 'portrait'){
                     return 'Error: Image orientation must be landscape or portrait, received ' + orientation
@@ -823,6 +828,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
+                flushScriptingVariables()
                 let promptbody:OpenAIChat[] = prompt.map((dict) => {
                     let role:'system'|'user'|'assistant' = 'assistant'
                     switch(dict['role']){
@@ -930,6 +936,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
+                flushScriptingVariables()
                 const result = await requestChatData({
                     formated: [{
                         role: 'user',
@@ -1170,6 +1177,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
+                flushScriptingVariables()
                 let promptbody:OpenAIChat[] = prompt.map((dict) => {
                     let role:'system'|'user'|'assistant' = 'assistant'
                     switch(dict['role']){

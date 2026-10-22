@@ -30,8 +30,12 @@ vi.mock('./command', () => ({ processMultiCommand: vi.fn() }))
 vi.mock('./request/request', () => ({ requestChatData: vi.fn() }))
 vi.mock('./stableDiff', () => ({ generateAIImage: vi.fn() }))
 vi.mock('./files/inlays', () => ({ writeInlayImage: vi.fn() }))
+vi.mock('./memory/hypamemory', () => ({ HypaProcesser: vi.fn() }))
 
 const { runTrigger } = await import('./triggers')
+const { requestChatData } = await import('./request/request')
+const { generateAIImage } = await import('./stableDiff')
+const { HypaProcesser } = await import('./memory/hypamemory')
 
 function fixture() {
     const chat = {
@@ -417,6 +421,8 @@ test.each(['variables', 'message edit'] as const)(
                 (error: unknown) => error,
             )
             await vi.advanceTimersByTimeAsync(0)
+            // Variables set before the wait are committed while it waits.
+            expect(chat.scriptstate).toEqual({ $state: 'new' })
             session.edit(session.locate(0), { role: 'user', data: 'concurrent', chatId: 'message-0' })
             await vi.advanceTimersByTimeAsync(1)
 
@@ -434,6 +440,44 @@ test.each(['variables', 'message edit'] as const)(
         }
     },
 )
+
+test.each([
+    { type: 'runLLM', value: 'prompt', inputVar: 'out' },
+    { type: 'runImgGen', value: 'prompt', negValue: '', inputVar: 'out' },
+    { type: 'checkSimilarity', value: 'value', source: 'source', inputVar: 'out' },
+    { type: 'v2RunLLM', value: 'prompt', valueType: 'value', outputVar: 'out', model: 'model' },
+    { type: 'v2ImgGen', value: 'prompt', valueType: 'value', negValue: '', negValueType: 'value', outputVar: 'out' },
+    { type: 'v2CheckSimilarity', source: 'source', sourceType: 'value', value: 'value', valueType: 'value', outputVar: 'out' },
+])('commits trigger variables before $type waits', async (wait) => {
+    const { chat, char, session } = fixture()
+    char.lowLevelAccess = true
+    char.triggerscript[0].effect = [
+        { type: 'setvar', var: 'state', value: 'new', operator: '=' },
+        wait,
+    ] as never
+    runtime.session = session
+    DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+    const atWait: unknown[] = []
+    vi.mocked(requestChatData).mockReset().mockImplementation(async () => {
+        atWait.push({ ...chat.scriptstate })
+        return { type: 'success', result: 'done' } as never
+    })
+    vi.mocked(generateAIImage).mockReset().mockImplementation(async () => {
+        atWait.push({ ...chat.scriptstate })
+        return false
+    })
+    vi.mocked(HypaProcesser).mockReset().mockImplementation(function () {
+        return {
+            addText: async () => { atWait.push({ ...chat.scriptstate }) },
+            similaritySearch: async () => [],
+        } as never
+    })
+
+    await runTrigger(char, 'manual', { chat, manualName: 'ordered' })
+
+    expect(atWait).toEqual([{ $state: 'new' }])
+    expect(chat.scriptstate).toEqual({ $state: 'new', $out: expect.any(String) })
+})
 
 test('does not publish Trigger metadata to either conversation after navigation', async () => {
     const original = fixture()
@@ -478,7 +522,8 @@ test('does not publish Trigger metadata to either conversation after navigation'
             message: expect.stringMatching(/inactive/i),
         }))
         expect(original.chat.note).toBe('original note')
-        expect(original.chat.scriptstate).toEqual({})
+        // The variable was committed before the wait, while its conversation was current.
+        expect(original.chat.scriptstate).toEqual({ $state: 'operation value' })
         expect(replacement.chat.note).toBe('replacement note')
         expect(replacement.chat.scriptstate).toEqual({})
     } finally {
