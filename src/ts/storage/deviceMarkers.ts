@@ -20,6 +20,7 @@ export const DEVICE_MARKER_KEYS = [
     'risuNestDefaultPluginsAttempted',
     'risuNestUpdateSettings',
     'mcpStdioApprovals',
+    'risuNestDisplayRecovery',
 ] as const
 
 export type DeviceMarkerKey = (typeof DEVICE_MARKER_KEYS)[number]

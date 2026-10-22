@@ -1,7 +1,7 @@
 import { get } from "svelte/store"
 import { CbsHistoryAccessError } from '../cbsHistoryAccess'
 import { parseChatML } from "../parser/chatML";
-import { getDatabase, type character, type customscript, type Database } from "../storage/database.svelte"
+import { getCurrentCharacter, getDatabase, type character, type customscript, type Database } from "../storage/database.svelte"
 import {
     defaultTranslatorPrompt,
     getCurrentTranslatorPresetFromState,
@@ -17,6 +17,7 @@ import { selectedCharID } from "../stores.svelte"
 import { getModuleRegexScripts } from "../process/modules"
 import { getNodetextToSentence, sleep } from "../util"
 import { processScriptFull, type ProcessScriptCaptureContext } from "../process/scripts"
+import { displayRecoveryTarget, withDisplayWork } from "../displayRecovery.svelte"
 import localforage from "localforage"
 import sendSound from '../../etc/send.mp3'
 import { ByteBudgetLru } from "../util/byteBudgetLru"
@@ -497,18 +498,21 @@ export async function translateHTML(
                 return;
             }
             
-            const { data: processedTranslated } = await processScriptFull(
-                alwaysExistChar,
-                translated,
-                "editdisplay",
-                chatID,
-                captureContext?.cbsConditions,
-                {
-                    captureContext: captureContext?.scriptContext,
-                    projectedChatID: captureContext?.projectedChatID,
-                    cache: captureContext ? 'bypass' : 'normal',
-                    signal,
-                },
+            const { data: processedTranslated } = await withDisplayWork(
+                displayRecoveryTarget(() => getCurrentCharacter(), alwaysExistChar.chaId),
+                () => processScriptFull(
+                    alwaysExistChar,
+                    translated,
+                    "editdisplay",
+                    chatID,
+                    captureContext?.cbsConditions,
+                    {
+                        captureContext: captureContext?.scriptContext,
+                        projectedChatID: captureContext?.projectedChatID,
+                        cache: captureContext ? 'bypass' : 'normal',
+                        signal,
+                    },
+                ),
             );
             // If the translation is the same, don't replace the node
             if (translated == processedTranslated) {

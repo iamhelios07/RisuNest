@@ -114,6 +114,7 @@ import { initializeOfficialAccountBootstrap } from './storage/sync/officialAccou
 import { initializeNativeSyncBindings, installServerSyncProduction } from './storage/sync/serverSyncProduction'
 import { createSyncExitCoordinator } from './storage/syncExitCoordinator'
 import { getExternalStorageBridge } from './storage/sync/external/bridge'
+import { installDisplayRecovery, isDisplayRecoveryMarked } from './displayRecovery.svelte'
 
 beforeEach(() => {
     vi.clearAllMocks()
@@ -393,6 +394,35 @@ describe('renderer recovery notice', () => {
         answerTerms(true)
         await vi.waitFor(() => expect(startup.takeRendererRecovery).toHaveBeenCalled())
         expect(defaultPlugins.startDefaultPluginBootstrap).not.toHaveBeenCalled()
+    })
+})
+
+describe('display recovery at startup', () => {
+    beforeEach(() => {
+        startup.native = true
+        startup.exclusions = []
+        startup.reachUi = true
+        startup.reconcile.mockResolvedValue(undefined)
+    })
+
+    it('marks the chats the last run left in the display record and drops marks of characters gone after trash expiry', async () => {
+        const kept = { characterId: 'kept-character', conversationId: 'kept-chat' }
+        const gone = { characterId: 'gone-character', conversationId: 'gone-chat' }
+        startup.markers.getItem.mockImplementation((key) => key === 'risuNestDisplayRecovery'
+            ? JSON.stringify({ working: [kept, gone], marked: [] })
+            : null)
+        startup.database.characters = [{ chaId: kept.characterId }]
+        vi.mocked(alertTOS).mockReturnValueOnce(new Promise(() => {}))
+        try {
+            await loadData()
+            expect(startup.markers.setItem).toHaveBeenCalledWith('risuNestDisplayRecovery', JSON.stringify({ working: [], marked: [kept, gone] }))
+            expect(isDisplayRecoveryMarked(kept)).toBe(true)
+            await vi.waitFor(() => expect(isDisplayRecoveryMarked(gone)).toBe(false))
+            expect(isDisplayRecoveryMarked(kept)).toBe(true)
+        } finally {
+            startup.markers.getItem.mockImplementation(() => null)
+            await installDisplayRecovery(null)
+        }
     })
 })
 

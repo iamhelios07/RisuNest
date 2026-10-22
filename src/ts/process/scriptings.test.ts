@@ -31,6 +31,9 @@ import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { alertConfirm, alertNormal, alertToast } from '../alert'
 import { language } from '../../lang'
 import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
+import { pluginV2 } from '../plugins/plugins.svelte'
+import { forgetDisplayRecovery, installDisplayRecovery } from '../displayRecovery.svelte'
+import { recoveryStore } from '../displayRecovery.testSupport'
 
 const continuationRuntime = vi.hoisted(() => ({
   session: null as ActiveConversationSession | null,
@@ -1890,6 +1893,51 @@ test('runs a timed-out display listener again only for a new row, message, input
     diagnosticEngineSetup.next = null
     deadlineClock.mockRestore()
     errors.mockRestore()
+    continuationRuntime.session = null
+    vi.mocked(risuChatParser).mockReset()
+    vi.stubGlobal('localStorage', previousLocalStorage)
+  }
+})
+
+test('opens a chat left in the display recovery record without its Modify Display steps but with its CBS', async () => {
+  const fixture = operationCharacterFixture('display-recovery')
+  fixture.char.customscript = [{ comment: '', type: 'editdisplay', in: 'raw', out: 'REGEX', flag: 'g', ableFlag: true }]
+  fixture.char.triggerscript = [
+    ...luaTriggerScript(`
+      listenEdit('editDisplay', function(id, value)
+        return value .. ' LUA'
+      end)
+    `),
+    { comment: '', type: 'display', conditions: [], effect: [
+      { type: 'v2Header', code: '', indent: 0 },
+      { type: 'v2GetDisplayState', outputVar: 'shown', indent: 0 },
+      { type: 'v2ConcatString', source1: 'shown', source1Type: 'var', source2: ' TRIGGER', source2Type: 'value', outputVar: 'shown', indent: 0 },
+      { type: 'v2SetDisplayState', value: 'shown', valueType: 'var', indent: 0 },
+    ] },
+  ] as never
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const previousLocalStorage = globalThis.localStorage
+  vi.stubGlobal('localStorage', { getItem: () => null })
+  vi.mocked(risuChatParser).mockImplementation(value => value.replaceAll('{{cbs}}', 'CBS'))
+  const pluginHook = async (value: string) => `${value} PLUGIN`
+  pluginV2.editdisplay.add(pluginHook)
+  await installDisplayRecovery(recoveryStore({
+    working: [{ characterId: fixture.char.chaId, conversationId: fixture.chat.id }],
+    marked: [],
+  }, { commitAtOnce: true }).store)
+  const { processScriptFull } = await import('./scripts')
+  const render = async () => (await processScriptFull(fixture.char, 'raw {{cbs}}', 'editdisplay', 0)).data
+  try {
+    expect(await render()).toBe('raw CBS')
+
+    await forgetDisplayRecovery(() => true)
+    expect(await render()).toBe('REGEX CBS LUA TRIGGER PLUGIN')
+  } finally {
+    await installDisplayRecovery(null)
+    pluginV2.editdisplay.delete(pluginHook)
     continuationRuntime.session = null
     vi.mocked(risuChatParser).mockReset()
     vi.stubGlobal('localStorage', previousLocalStorage)

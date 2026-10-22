@@ -77,6 +77,7 @@ import {
 } from "./storage/persistentDataRuntime.svelte";
 import { registerLifecycleCommitListeners } from "./storage/lifecycleCommit";
 import { createLifecycleFlush } from "./storage/lifecycleFlush";
+import { forgetDisplayRecovery, installDisplayRecovery, listenForDisplayWorkResume, suspendDisplayWork } from "./displayRecovery.svelte";
 import { releaseIdleTransformerModels } from "./process/transformers";
 import { forgetInlayProviderImages } from "./process/files/inlayProviderImage";
 import { platform as nativePlatform } from '@tauri-apps/plugin-os'
@@ -167,6 +168,7 @@ import {
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 let disposeLifecycleCommitListeners: (() => void) | undefined
 let disposeMacosLifecycle: (() => void) | undefined
+let disposeDisplayWorkResume: (() => void) | undefined
 let disposeWindowCloseDrain: (() => void) | undefined
 let disposeAndroidScreenshotRecovery: (() => void) | undefined
 
@@ -239,6 +241,9 @@ export async function loadData() {
             await initializeDeviceMarkers()
         }
         const markers = getDeviceMarkers()
+        // Chats whose display work the last run left recorded open in recovery.
+        await installDisplayRecovery(markers)
+        disposeDisplayWorkResume ??= listenForDisplayWorkResume()
         applyHubSelection(markers)
         const deviceSettings = loadDeviceSettings(markers)
         const pluginsExcludedAtStart = excluded('plugins')
@@ -279,6 +284,7 @@ export async function loadData() {
             nativePlatform,
             forgetInlayProviderImages,
             releaseIdleTransformerModels,
+            suspendDisplayWork,
         })
         const resolvePersistentWorkingSet = () => bootstrapPersistentDatabase({
             store: runtime.store,
@@ -913,6 +919,8 @@ export async function loadData() {
         }
         setTimeout(() => {
             void runtime.expirePersistentTrash().catch((error) => console.error('Trash expiry failed', error))
+                .then(() => forgetDisplayRecovery((target) =>
+                    !getDatabase().characters.some((character) => character.chaId === target.characterId)))
         }, 0)
         void finishBoot()
         performance.mark('boot:interactive')

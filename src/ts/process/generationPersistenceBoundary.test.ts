@@ -1,5 +1,5 @@
 import 'fake-indexeddb/auto'
-import { expect, it, vi } from 'vitest'
+import { expect, it, onTestFinished, vi } from 'vitest'
 import type { Chat, Database } from '../storage/database.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
 import { createPersistentDataRuntime, capturePersistentRoot, capturePersistentPresets } from '../storage/persistentDataRuntime'
@@ -7,6 +7,8 @@ import { applyGenerationResponse } from './generationResponseApplication'
 import { createMutationGatedPersistentDataStore } from '../storage/mutationGatedPersistentDataStore'
 import { createStorageMutationGate } from '../storage/storageMutationGate'
 import { prepareSummaryAwareGeneration } from './summaryAwareGenerationPreparation'
+import { installDisplayRecovery } from '../displayRecovery.svelte'
+import { manualTimers, recoveryStore } from '../displayRecovery.testSupport'
 
 vi.mock('../storage/database.svelte', () => ({ presetTemplate: {} }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: {} }))
@@ -38,14 +40,21 @@ it('streams through the real session and save coordinator and reopens the exact 
     })
     await runtime.initializeActiveWorkingSet(database)
     const chat = () => current.characters[0].chats[0]
-    const response = await applyGenerationResponse({
+    const device = recoveryStore()
+    const clock = manualTimers()
+    await installDisplayRecovery(device.store, { timers: clock.timers })
+    onTestFinished(() => installDisplayRecovery(null))
+    const chunks = ['First', 'Final exact response']
+    const pendingRecordWritesAtRead: number[] = []
+    const applying = applyGenerationResponse({
         response: { type: 'streaming', result: new ReadableStream({
-            start(controller) {
-                controller.enqueue({ 0: 'First' })
-                controller.enqueue({ 0: 'Final exact response' })
-                controller.close()
+            pull(controller) {
+                pendingRecordWritesAtRead.push(device.pendingWrites)
+                const chunk = chunks.shift()
+                if (chunk === undefined) controller.close()
+                else controller.enqueue({ 0: chunk })
             },
-        }) },
+        }, { highWaterMark: 0 }) },
         abortSignal: new AbortController().signal, continueGeneration: false,
         sayingCharacterId: 'owner', generationId: 'generated', generationInfo: {} as any, promptInfo: {} as any,
         removeIncompleteResponse: () => false, streamingDisplayOptimizationMode: () => 'off', ttsAutoSpeech: () => false,
@@ -61,6 +70,13 @@ it('streams through the real session and save coordinator and reopens the exact 
             markResponseApplied: () => {}, onProviderFailure: message => { throw new Error(message) },
         },
     })
+    // The streamed chat is in the display recovery record, stored before the stream is read.
+    await vi.waitFor(() => expect(device.records).toEqual([{ working: [{ characterId: 'owner', conversationId: 'chat' }], marked: [] }]))
+    device.commitAll()
+    const response = await applying
+    expect(pendingRecordWritesAtRead).toEqual([0, 0, 0])
+    clock.runAll()
+    expect(device.record).toBeNull()
     expect(response).not.toBeNull()
     expect(response!.readOutput()?.data).toBe('Final exact response:processed')
     response!.release()

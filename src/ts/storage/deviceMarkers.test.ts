@@ -9,6 +9,7 @@ import {
     installDeviceMarkers,
 } from './deviceMarkers'
 import type { NativeDeviceSettings } from './nativeDeviceSettings'
+import { createDisplayRecovery } from '../displayRecovery.svelte'
 
 function settingsBackend() {
     const stored = new Map<string, unknown>()
@@ -104,6 +105,20 @@ describe('device markers', () => {
         stored.delete('risuNestDeviceSettings')
         await reopened.reload!()
         expect(reopened.getItem('risuNestDefaultPluginsAttempted')).toBe(attempted)
+    })
+
+    it('keeps the display recovery record of a run that ended during display work for the next launch', async () => {
+        const { stored, settings } = settingsBackend()
+        const target = { characterId: 'synthetic-character', conversationId: 'synthetic-chat' }
+        const work = createDisplayRecovery(await initializeDeviceMarkers(settings)).beginWork(target)
+        await work.ready
+        expect(settings.set).toHaveBeenCalledExactlyOnceWith('risuNestDisplayRecovery', expect.any(String))
+
+        installDeviceMarkers(null)
+        const relaunched = createDisplayRecovery(await initializeDeviceMarkers(settings))
+        await relaunched.settled
+        expect(relaunched.isMarked(target)).toBe(true)
+        expect(JSON.parse(stored.get('risuNestDisplayRecovery') as string)).toEqual({ working: [], marked: [target] })
     })
 
     it('falls back to local storage on the web build', () => {

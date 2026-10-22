@@ -40,6 +40,7 @@ import { recordAmbientChatVariableReads, recordChatVariableReads, DisplayReadRec
 import { findCharacterById } from "./scriptCharacterLookup";
 import { beginDisplayScriptRun } from "./scriptTimeoutNotice";
 import { nextDisplayListenerOrder } from "./luaDisplayTimeouts";
+import { displayRecoveryTarget, isDisplayRecoveryMarked } from "../displayRecovery.svelte";
 import { openHistoryWindowCopy, writeHistoryWindowMessage, type HistoryWindowCopy } from "./historyWindowWrite";
 
 export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
@@ -636,7 +637,10 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     const promptOperationScope = captureContext ? undefined : options.promptOperationScope
     let db = captureContext?.parserContext.database ?? invocation?.database ?? promptOperationScope?.database ?? getDatabase()
     let emoChanged = false
-    if (!captureContext) {
+    // A chat that froze the app while its display ran opens without the Modify Display step.
+    const displayRecovery = mode === 'editdisplay' &&
+        isDisplayRecoveryMarked(displayRecoveryTarget(() => getCurrentCharacter(), char.chaId))
+    if (!captureContext && !displayRecovery) {
         data = await runLuaEditTrigger(
             char,
             mode,
@@ -650,7 +654,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
         options.signal?.throwIfAborted()
     }
 
-    if(mode === 'editdisplay' && !captureContext){
+    if(mode === 'editdisplay' && !captureContext && !displayRecovery){
         const currentChar = getCurrentCharacter()
         try{
             const perf = performance.now()
@@ -672,7 +676,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     let conversationOwner = captureContext || invocation
         ? null
         : promptOperationScope?.getOwner() ?? captureScriptConversationOwner(char)
-    const usesPluginCompatibility = !captureContext &&
+    const usesPluginCompatibility = !captureContext && !displayRecovery &&
         (conversationOwner !== null || invocation !== undefined) && pluginV2[mode].size > 0
     const compatibilityPin = usesPluginCompatibility &&
         !promptOperationScope?.usesPluginCompatibility && conversationOwner?.session
@@ -713,6 +717,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                   ...char.customscript,
                   ...(captureContext?.moduleRegexScripts ?? invocation?.moduleRegexScripts ?? getModuleRegexScripts()),
               ]
+        if (displayRecovery) scripts = []
         plan = getRegexExecutionPlan(scripts, mode)
         conversationAccess = captureContext || invocation
             ? 'none'

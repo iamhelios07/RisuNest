@@ -15,6 +15,8 @@
     import { ChatComposerState, chatScreenState, type SubmittedChatComposer } from '../../ts/ui/chatScreenState.svelte';
     import { isCompositionKey } from 'src/ts/hotkeyModifier';
     import { getDeviceSettings } from 'src/ts/storage/deviceSettings';
+    import { forgetDisplayRecovery, isDisplayRecoveryMarked, type DisplayRecoveryTarget } from 'src/ts/displayRecovery.svelte';
+    import { requestScriptDisplayRefresh } from 'src/ts/process/scriptDisplayRefresh';
     import { shouldSendMessage } from 'src/ts/ui/messageSendKey';
     import { type Chat as ChatRecord, type Database, type character, type Message } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
@@ -160,6 +162,12 @@
             : null
     })
     const composer = $derived(composerOwner ? chatScreenState.getComposer(composerOwner) : emptyComposer)
+    const displayRecoveryChat = $derived(isDisplayRecoveryMarked(composerOwner) ? composerOwner : null)
+    function turnDisplayBackOn(target: DisplayRecoveryTarget) {
+        void forgetDisplayRecovery((chat) =>
+            chat.characterId === target.characterId && chat.conversationId === target.conversationId)
+        requestScriptDisplayRefresh({ all: true })
+    }
     function captureComposerInput(): SubmittedChatComposer {
         return composerOwner
             ? chatScreenState.captureComposer(composerOwner)
@@ -1468,6 +1476,19 @@
             {/await}
         {/if}
     {:else}
+        {#if displayRecoveryChat}
+            <div class="pointer-events-none absolute inset-x-0 top-2 z-40 flex justify-center px-4" data-display-recovery>
+                <div class="pointer-events-auto flex max-w-full items-center gap-3 rounded-lg border border-borderc bg-bgcolor px-3 py-2 text-sm shadow-lg" role="status">
+                    <span class="min-w-0">{language.risuNest.displayRecovery.notice}</span>
+                    <button
+                        class="shrink-0 rounded-lg border border-borderc px-3 py-1 hover:bg-darkbg"
+                        onclick={() => turnDisplayBackOn(displayRecoveryChat)}
+                    >
+                        {language.risuNest.displayRecovery.turnBackOn}
+                    </button>
+                </div>
+            </div>
+        {/if}
         <div
             class="absolute right-3 z-40 flex flex-col divide-y divide-darkborderc/60 overflow-hidden rounded-lg border border-darkborderc/60 bg-bgcolor/80 shadow-lg backdrop-blur-sm transition-[opacity,visibility] duration-300"
             class:opacity-0={DBState.db.risunestScrollNavigation === false || !scrollNavVisible || openMenu}
