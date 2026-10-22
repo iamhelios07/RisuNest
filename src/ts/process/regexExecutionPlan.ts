@@ -51,10 +51,30 @@ function createPlanCache() {
 }
 
 let planCache = createPlanCache()
+let lastPlan: { mode: string, sources: [number, string, string, string, boolean][], plan: RegexExecutionPlan } | undefined
 subscribeRuntimePerformanceProfile(() => {
     planCache = createPlanCache()
+    lastPlan = undefined
 })
 let nextPlanRevision = 1
+
+function rememberPlan(scripts: customscript[], mode: string, plan: RegexExecutionPlan): void {
+    lastPlan = { mode, plan, sources: scripts.flatMap((script, index) => script.type === mode
+        ? [[index, script.in, script.out, script.flag ?? '', !!script.ableFlag] as [number, string, string, string, boolean]] : []) }
+}
+
+function sameLastPlan(scripts: customscript[], mode: string): boolean {
+    if (!lastPlan || lastPlan.mode !== mode) return false
+    let count = 0
+    for (let index = 0; index < scripts.length; index++) {
+        const script = scripts[index]
+        if (script.type !== mode) continue
+        const source = lastPlan.sources[count++]
+        if (!source || source[0] !== index || source[1] !== script.in || source[2] !== script.out
+            || source[3] !== (script.flag ?? '') || source[4] !== !!script.ableFlag) return false
+    }
+    return count === lastPlan.sources.length
+}
 
 function makePlanKey(scripts: customscript[], mode: string): string {
     return JSON.stringify([
@@ -140,9 +160,11 @@ function parseEntry(script: customscript, sourceIndex: number): RegexExecutionPl
 }
 
 export function getRegexExecutionPlan(scripts: customscript[], mode: string): RegexExecutionPlan {
+    if (sameLastPlan(scripts, mode)) return lastPlan!.plan
     const key = makePlanKey(scripts, mode)
     const cached = planCache.get(key)
     if (cached !== undefined) {
+        rememberPlan(scripts, mode, cached)
         return cached
     }
 
@@ -171,6 +193,7 @@ export function getRegexExecutionPlan(scripts: customscript[], mode: string): Re
     }
 
     planCache.set(key, plan)
+    rememberPlan(scripts, mode, plan)
     return plan
 }
 

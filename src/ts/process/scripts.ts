@@ -911,6 +911,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     }
 
     const executor = new RegexExecutor({
+        skipPlainCbs: !prepareHistory,
         signal: options.signal, scope: options.regexScope, worker: options.regexWorker,
         onTimeout: noticeRegexTimeout,
     })

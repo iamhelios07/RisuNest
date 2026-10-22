@@ -3,6 +3,7 @@ import type {
     RegexWorkerResponse,
 } from './regexWorkerClient'
 import { executeRegexOperation } from './regexOperations'
+import { hasCbsSyntax } from '../parser/cbsSyntax'
 
 interface CompiledEntry {
     sourceIndex: number
@@ -77,6 +78,7 @@ export function createRegexWorkerMessageHandler(
             return
         }
         let data = request.reuseInput ? retainedInput! : request.input
+        let needsParse = !request.continuation?.skipPlainCbs || hasCbsSyntax(data)
         const errors: [sourceIndex: number, message: string][] = []
         const steps: { index: number, matched: boolean }[] = []
         let nextIndex = request.continuation?.start ?? 0
@@ -98,6 +100,13 @@ export function createRegexWorkerMessageHandler(
                 const matched = entry.regex.test(data)
                 entry.regex.lastIndex = 0
                 const replaced = matched ? data.replace(entry.regex, entry.replacement) : data
+                if (request.continuation?.skipPlainCbs) {
+                    if (replaced !== data) needsParse = hasCbsSyntax(replaced)
+                    if (!needsParse) {
+                        data = replaced
+                        continue
+                    }
+                }
                 steps.push({ index: nextIndex, matched })
                 if (request.continuation && replaced !== data) {
                     data = replaced

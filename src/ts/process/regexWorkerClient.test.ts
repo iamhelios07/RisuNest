@@ -75,6 +75,28 @@ function executePlan(executor: RegexExecutor, plan: RegexExecutionPlan, input: s
 }
 
 describe('bounded regex execution through the real Worker handler', () => {
+    it('keeps plain replacements resident, stops at generated CBS, and returns the final plain tail', async () => {
+        const worker = new InMemoryWorker()
+        const executor = new RegexExecutor({ skipPlainCbs: true, worker: true, client: new RegexWorkerClient(() => worker) })
+        const plan = continuationPlan([['a', '<b>b</b>'], ['b', 'c'], ['c', '{{value}}'], ['resolved', 'tail']])
+        const parsed: string[] = []
+        const result = await executePlan(executor, plan, 'a', value => {
+            parsed.push(value)
+            return value.replaceAll('{{value}}', 'resolved')
+        })
+        expect(result.data).toBe('<tail>tail</tail>\n')
+        expect(parsed).toEqual(['<{{value}}>{{value}}</{{value}}>\n'])
+    })
+
+    it('checks remembered timeouts after preceding plain replacements change the input', async () => {
+        const memory = new RegexTimeoutMemory()
+        const plan = continuationPlan([['a', 'b'], ['b', 'wrong'], ['b', 'done']])
+        const { regexRuleKey } = await import('./regexExecutor')
+        memory.remember(regexRuleKey(plan.entries[1]), 'b')
+        const result = await executePlan(new RegexExecutor({ skipPlainCbs: true, memory, worker: true,
+            client: new RegexWorkerClient(() => new InMemoryWorker()) }), plan, 'a')
+        expect(result.data).toBe('done')
+    })
     it('bounds remembered inputs by both byte size and entry count', () => {
         const memory = new RegexTimeoutMemory(100, 2)
         memory.remember('a', 'first')

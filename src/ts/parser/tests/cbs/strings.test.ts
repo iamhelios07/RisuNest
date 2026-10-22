@@ -64,6 +64,16 @@ vi.mock(import('../../../stores.svelte'), () => {
 
 const validCBSArgPropLong = validCBSArgProp.filter((s) => s.length > 1)
 
+test('plain text preserves call stack accounting and legacy substitutions still parse', () => {
+  const context = { callStack: 19, userName: 'Synthetic' }
+  expect(risuChatParser('<style>.x{color:red}</style>한글😀 #} }}', context)).toBe('<style>.x{color:red}</style>한글😀 #} }}')
+  expect(context.callStack).toBe(20)
+  expect(risuChatParser('plain', context)).toBe('ERROR: Call stack limit reached')
+  expect(risuChatParser('<UsEr>', { userName: 'Synthetic' })).toBe('Synthetic')
+  expect(risuChatParser('{{GET_VAR::key}}')).toBe('key')
+  expect(risuChatParser('{{get-var::key}}')).toBe('key')
+})
+
 const quickParse = (op: string, ...args: (string | number)[]) => risuChatParser(cbs(op, ...args.map(String)))
 
 test('parses very long plain text around a macro', () => {

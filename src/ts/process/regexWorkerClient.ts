@@ -22,7 +22,7 @@ export type RegexWorkerRequest = {
     id: number
     revision: number
     input: string
-    continuation?: { start: number, end: number }
+    continuation?: { start: number, end: number, skipPlainCbs?: boolean }
     reuseInput?: boolean
 } | {
     type: 'operation'
@@ -59,13 +59,13 @@ export interface RegexWorkerLike {
 export interface RegexWorkerExecuteOptions {
     signal?: AbortSignal
     timeoutMs?: number
-    continuation?: { start: number, end: number }
+    continuation?: { start: number, end: number, skipPlainCbs?: boolean }
 }
 
 interface PendingRequest {
     plan?: RegexExecutionPlan
     operation?: RegexOperation
-    continuation?: { start: number, end: number }
+    continuation?: { start: number, end: number, skipPlainCbs?: boolean }
     input: string
     timeoutMs: number
     signal?: AbortSignal

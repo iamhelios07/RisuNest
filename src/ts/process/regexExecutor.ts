@@ -1,4 +1,5 @@
 import { Mutex } from '../mutex'
+import { hasCbsSyntax } from '../parser/cbsSyntax'
 import { ByteBudgetLru } from '../util/byteBudgetLru'
 import type { RegexExecutionPlan, RegexExecutionPlanEntry, RegexExecutionResult } from './regexExecutionPlan'
 import { executeRegexOperation, unmatchedRegexOperation, type RegexOperation, type RegexOperationResults } from './regexOperations'
@@ -18,6 +19,7 @@ export class RegexTimeoutMemory {
     }
     has(key: string, input: string): boolean { return this.entries.get(key)?.includes(input) === true }
     hasRule(key: string): boolean { return this.entries.get(key) !== undefined }
+    get size(): number { return this.entries.size }
     remember(key: string, input: string): void {
         this.entries.set(key, [...(this.entries.get(key) ?? []).filter((text) => text !== input).slice(-3), input])
     }
@@ -44,6 +46,8 @@ async function runExclusive<T>(signal: AbortSignal | undefined, action: () => Pr
 }
 
 export interface RegexExecutorOptions {
+    // Only callers whose parse callback is identity on CBS-free text may opt in.
+    skipPlainCbs?: boolean
     signal?: AbortSignal
     scope?: RegexTimeoutScope
     worker?: boolean
@@ -150,15 +154,22 @@ export class RegexExecutor {
             let index = 0
             let isolateUntil = 0
             const errors: RegexExecutionResult['errors'] = []
-            const keys = plan.entries.map(regexRuleKey)
+            const keys: string[] = []
+            const keyAt = (index: number) => keys[index] ??= regexRuleKey(plan.entries[index])
+            // CBS-only replacements still require host parsing after each change.
+            const skipPlainCbs = this.options.skipPlainCbs
+                && plan.entries.some((entry) => !hasCbsSyntax(entry.replacement))
             const memory = this.options.memory ?? recentTimeouts
-            const skipCandidates = keys.flatMap((key, index) =>
-                this.scope.skipped.has(key) || memory.hasRule(key) ? [index] : [])
+            const skipCandidates = this.scope.skipped.size || memory.size
+                ? plan.entries.flatMap((_, index) => this.scope.skipped.has(keyAt(index)) || memory.hasRule(keyAt(index)) ? [index] : [])
+                : []
             try {
                 while (index < plan.entries.length) {
                     this.options.signal?.throwIfAborted()
                     const entry = plan.entries[index]
-                    if (entry.pattern === '' || this.skipped(keys[index], data)) { index++; continue }
+                    const needsSkipCheck = this.scope.skipped.size || memory.size
+                        || this.timedOutMs >= (this.options.invocationTimeoutMs ?? DEFAULT_REGEX_INVOCATION_TIMEOUT_MS)
+                    if (entry.pattern === '' || (needsSkipCheck && this.skipped(keyAt(index), data))) { index++; continue }
                     if (entry.requiresHostExecution || entry.dynamicPattern || !this.worker) {
                         data = await host(entry, data, this)
                         index++
@@ -166,17 +177,17 @@ export class RegexExecutor {
                     }
                     let end = index < isolateUntil ? index + 1 : plan.entries.length
                     for (const i of skipCandidates) {
-                        if (i > index && i < end && this.skipped(keys[i], data)) { end = i; break }
+                        if (i > index && i < end) { end = i; break }
                     }
                     let result: RegexExecutionResult
                     try {
                         result = await this.request<RegexExecutionResult>((timeoutMs) => this.client.execute(plan, data, {
-                            timeoutMs, signal: this.options.signal, continuation: { start: index, end },
+                            timeoutMs, signal: this.options.signal, continuation: { start: index, end, skipPlainCbs },
                         }), () => ({ data, errors: [], nextIndex: index, steps: [] }))
                     } catch (error) {
                         if (!(error instanceof RegexExecutionTimeoutError)) throw error
                         if (index < isolateUntil) {
-                            this.timeout(keys[index], data)
+                            this.timeout(keyAt(index), data)
                             index++
                         } else {
                             isolateUntil = end
@@ -202,7 +213,10 @@ export class RegexExecutor {
                     // Speculative failures after a parse changed the input are discarded too.
                     errors.push(...result.errors.filter((error) => !replayChanged
                         || plan.entries.findIndex((candidate) => candidate.sourceIndex === error.sourceIndex) < index))
-                    if (!replayChanged) index = next
+                    if (!replayChanged) {
+                        data = result.data
+                        index = next
+                    }
                 }
                 return { data, errors }
             } finally {

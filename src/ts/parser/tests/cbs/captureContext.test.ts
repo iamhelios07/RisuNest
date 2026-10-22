@@ -574,7 +574,7 @@ test('a missing prepared row is observable and does not replay preceding variabl
     expect(() => historyAccess.assertComplete()).toThrow(CbsHistoryAccessError)
 })
 
-test('Worker continuations preserve nested CBS, capture substitution, and ordered variable reads and writes', async () => {
+test.each([false, true])('Worker continuations preserve nested CBS, capture substitution, and ordered variable reads and writes (plain bypass %s)', async (skipPlainCbs) => {
     const character = makeCharacter('CBS worker')
     const variables: Record<string, string> = { score: '2', next: '{{getvar::score}}' }
     const reads: string[] = [], writes: string[] = []
@@ -592,7 +592,7 @@ test('Worker continuations preserve nested CBS, capture substitution, and ordere
         setChatVar: (key, value) => { writes.push(`${key}:${value}`); variables[key] = value },
     })
     const padding = '문장😀 '.repeat(1000)
-    const executor = new RegexExecutor({ worker: true, client: new RegexWorkerClient(() => new InMemoryWorker()) })
+    const executor = new RegexExecutor({ skipPlainCbs, worker: true, client: new RegexWorkerClient(() => new InMemoryWorker()) })
     const result = await executor.execute(plan, padding + '[board:item]', parse, async () => { throw new Error('Unexpected host rule') })
     expect(result.data).toBe(padding + `<section>${Array(24).fill('2').join(',')}:9/9</section>`)
     expect(writes).toEqual(['score:9'])
