@@ -39,6 +39,7 @@ import type { ActiveConversationSession } from '../storage/activeConversationSes
 import { runSerializedUserTrigger } from './conversationUserTrigger';
 import {
     findActiveHistoryWindow,
+    getHistoryMessage,
     getHistoryMessageAt,
     historyLength,
     sliceHistory,
@@ -52,7 +53,15 @@ import {
 } from './scriptConversationAccess';
 import { rebuildScriptDisplayRow, requestScriptDisplayRefresh } from './scriptDisplayRefresh';
 import { beginDisplayScriptRun, noticeScriptTimeout } from './scriptTimeoutNotice';
+import {
+    displayListenerEngine,
+    nextDisplayListenerOrder,
+    noteDisplayListenerTimeout,
+    skipsDisplayListener,
+    type DisplayListenerRequest,
+} from './luaDisplayTimeouts';
 import { findCharacterById, findCharacterIndexById } from './scriptCharacterLookup';
+import { isMetadataOnlySelectedConversation } from '../storage/selectedConversationLifecycle';
 
 /** Deadline for each synchronous Lua segment of a listener. */
 const LUA_LISTENER_TIMEOUT_MS = 5_000
@@ -93,6 +102,7 @@ interface BasicScriptingEngineState {
     readDatabase?: () => Database
     flushVariables?: () => void
     stopSending?: boolean
+    displayListenerEngine?: string
 }
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
@@ -149,6 +159,8 @@ export async function runScripted(code:string, arg:{
     /** A button or manual trigger the user started, which gets the longer deadline. */
     userStarted?: boolean
     createConversationChat?: () => Chat
+    /** An editDisplay request, which skips a listener that timed out for it. */
+    displayListener?: DisplayListenerRequest
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
     if (type === 'py' && isTauriMobile) {
@@ -208,9 +220,16 @@ export async function runScripted(code:string, arg:{
     const ScriptingEngineState = getOrCreateEngineState(mode, type, ownerChaId, code, functionTimeout);
     ScriptingEngineState.activeUses++
     let invocationFinished = false
+    const displayListener = mode === 'editDisplay' && type === 'lua' ? arg.displayListener : undefined
+    const displayEngine = displayListener
+        ? ScriptingEngineState.displayListenerEngine ??= displayListenerEngine(ownerChaId, code)
+        : undefined
     
     try {
     return await ScriptingEngineState.mutex.runExclusive(async () => {
+        if (displayEngine && skipsDisplayListener(displayEngine, displayListener!, data as string)) {
+            return { stopSending: false, chat, res: undefined }
+        }
         try {
         ScriptingEngineState.chat = chat
         ScriptingEngineState.setVar = setVar
@@ -1462,6 +1481,7 @@ export async function runScripted(code:string, arg:{
                         'editDisplay', 'editInput', 'editOutput', 'manual'].includes(mode) ? mode : 'custom'
                     console.error({ code: 'lua-listener-timeout', mode: diagnosticMode,
                         elapsedMs: performance.now() - listenerStartedAt })
+                    if (displayEngine) noteDisplayListenerTimeout(displayEngine, displayListener!, data as string)
                     noticeScriptTimeout(mode === 'editDisplay')
                 } else {
                     console.error(error)
@@ -1640,11 +1660,16 @@ export async function runLuaEditTrigger<T extends string | OpenAIChat[]>(
     conversationOperation?: ConversationOperationContext,
     onConversationCommit?: ConversationCommitObserver,
     signal?: AbortSignal,
+    /** When the view asked for this display, from `nextDisplayListenerOrder`. */
+    displayRequestOrder?: number,
 ): Promise<T> {
+    if (mode !== 'editdisplay' && mode !== 'editDisplay') {
+        return runLuaEditTriggerForMode(char, mode, content, meta, conversationOperation, onConversationCommit, signal)
+    }
+    const order = displayRequestOrder ?? nextDisplayListenerOrder()
     const run = () => runLuaEditTriggerForMode(
-        char, mode, content, meta, conversationOperation, onConversationCommit, signal,
+        char, mode, content, meta, conversationOperation, onConversationCommit, signal, order,
     )
-    if (mode !== 'editdisplay' && mode !== 'editDisplay') return run()
     const endDisplayRun = beginDisplayScriptRun()
     try {
         return await run()
@@ -1661,6 +1686,7 @@ async function runLuaEditTriggerForMode<T extends string | OpenAIChat[]>(
     conversationOperation?: ConversationOperationContext,
     onConversationCommit?: ConversationCommitObserver,
     signal?: AbortSignal,
+    displayRequestOrder?: number,
 ): Promise<T> {
     switch (mode) {
         case 'editinput':
@@ -1675,6 +1701,9 @@ async function runLuaEditTriggerForMode<T extends string | OpenAIChat[]>(
         case 'editprocess':
             return content
     }
+    const displayRequest = (chat: Chat | null | undefined) => mode === 'editDisplay' && displayRequestOrder !== undefined
+        ? createDisplayListenerRequest(displayRequestOrder, chat, meta)
+        : undefined
 
     if (mode === 'editDisplay' && !conversationOperation) {
         const hasLuaTrigger = (trigger: triggerscript) =>
@@ -1716,6 +1745,7 @@ async function runLuaEditTriggerForMode<T extends string | OpenAIChat[]>(
                     undefined,
                     onConversationCommit,
                     signal,
+                    displayRequest(sourceChat),
                 )
             })
         }
@@ -1728,7 +1758,17 @@ async function runLuaEditTriggerForMode<T extends string | OpenAIChat[]>(
         conversationOperation,
         onConversationCommit,
         signal,
+        displayRequest(conversationOperation ? null : getCurrentChat()),
     )
+}
+
+function createDisplayListenerRequest(order: number, chat: Chat | null | undefined, meta?: object): DisplayListenerRequest {
+    const index = (meta as { index?: unknown } | undefined)?.index
+    if (!chat?.id || typeof index !== 'number' || isMetadataOnlySelectedConversation(chat)) return { order }
+    return {
+        order,
+        row: { conversationId: chat.id, index, messageId: getHistoryMessage(chat, index)?.chatId ?? '' },
+    }
 }
 
 async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
@@ -1739,6 +1779,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
     conversationOperation?: ConversationOperationContext,
     onConversationCommit?: ConversationCommitObserver,
     signal?: AbortSignal,
+    displayRequest?: DisplayListenerRequest,
 ): Promise<T> {
     let operationContext = conversationOperation
     let historyWindowCopy: HistoryWindowCopy | null = null
@@ -1794,6 +1835,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
                     access: access ?? undefined,
                     chat: historyWindow?.chat,
                     createConversationChat: createWindowChat,
+                    displayListener: displayRequest,
                 })
                 data = runResult.res ?? data
             }

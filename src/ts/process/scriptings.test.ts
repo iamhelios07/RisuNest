@@ -1802,11 +1802,90 @@ test('shows one Lua timeout notice for queued display pipelines and another for 
       processScriptFull(fixture.char, 'first', 'editdisplay', 0),
       processScriptFull(fixture.char, 'second', 'editdisplay', 1),
     ])).resolves.toMatchObject([{ data: 'first' }, { data: 'second' }])
-    expect(errors.mock.calls.filter(([error]) => error?.code === 'lua-listener-timeout')).toHaveLength(2)
+    // The second row was already waiting when the listener timed out, so it skips it.
+    expect(errors.mock.calls.filter(([error]) => error?.code === 'lua-listener-timeout')).toHaveLength(1)
     expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.scriptTimeout)
 
     await processScriptFull(fixture.char, 'later', 'editdisplay', 0)
     expect(alertToast).toHaveBeenCalledTimes(2)
+  } finally {
+    diagnosticEngineSetup.next = null
+    deadlineClock.mockRestore()
+    errors.mockRestore()
+    continuationRuntime.session = null
+    vi.mocked(risuChatParser).mockReset()
+    vi.stubGlobal('localStorage', previousLocalStorage)
+  }
+})
+
+test('runs a timed-out display listener again only for a new row, message, input, conversation or script', async () => {
+  const fixture = operationCharacterFixture('display-timeout-rows', undefined, [
+    { role: 'char', data: 'zero', chatId: 'message-zero' },
+    { role: 'char', data: 'one', chatId: 'message-one' },
+  ])
+  fixture.char.customscript = []
+  let now = 0
+  let listenerRuns = 0
+  const setupEngine = (engine: LuaEngine) => {
+    engine.global.set('noteRun', (value: string) => {
+      listenerRuns++
+      if (value.startsWith('slow')) now += 5_001
+    })
+  }
+  diagnosticEngineSetup.next = setupEngine
+  const listener = (marker: string) => luaTriggerScript(`
+    -- ${marker}
+    listenEdit('editDisplay', function(id, value)
+      noteRun(value)
+      local total = 0
+      for i = 1, 10000 do total = total + i end
+      return value .. '!'
+    end)
+  `)
+  fixture.char.triggerscript = listener('original')
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const previousLocalStorage = globalThis.localStorage
+  vi.stubGlobal('localStorage', { getItem: () => null })
+  vi.mocked(risuChatParser).mockImplementation(value => value)
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const deadlineClock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+  const { processScriptFull } = await import('./scripts')
+  const render = async (data: string, index: number) => (await processScriptFull(fixture.char, data, 'editdisplay', index)).data
+  const timeouts = () => errors.mock.calls.filter(([error]) => error?.code === 'lua-listener-timeout').length
+  try {
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([1, 1])
+
+    // The same row and input skip it; a fast row still runs it.
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect(await render('one', 1)).toBe('one!')
+    expect([listenerRuns, timeouts()]).toEqual([2, 1])
+
+    // Changed input runs it again.
+    expect(await render('slow zero again', 0)).toBe('slow zero again')
+    expect([listenerRuns, timeouts()]).toEqual([3, 2])
+
+    // A different message at the same row runs it again.
+    fixture.chat.message[0] = { role: 'char', data: 'zero', chatId: 'message-replacement' }
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([4, 3])
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect(listenerRuns).toBe(4)
+
+    // The same row of another conversation runs it again.
+    vi.mocked(getCurrentChat).mockReturnValue({ ...fixture.chat, id: 'display-timeout-other-chat' })
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([5, 4])
+    vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+
+    // An edited script is a new engine without the earlier failures.
+    fixture.char.triggerscript = listener('edited')
+    diagnosticEngineSetup.next = setupEngine
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([6, 5])
   } finally {
     diagnosticEngineSetup.next = null
     deadlineClock.mockRestore()

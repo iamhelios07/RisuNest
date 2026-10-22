@@ -8,6 +8,7 @@ import { isTauri } from "src/ts/platform"
 import { getChatVar, setChatVar, getGlobalChatVar } from './chatVar.svelte';
 import { noteChatVariableRead, noteUntrackedVariableRead, recordChatVariableReads, type DisplayReadRecord } from '../process/scriptVariableReads';
 import { processScriptFull, type ProcessScriptCaptureContext } from '../process/scripts';
+import { nextDisplayListenerOrder } from '../process/luaDisplayTimeouts';
 import { get } from 'svelte/store';
 import css, { type CssAtRuleAST, type CssDeclarationAST } from '@adobe/css-tools'
 import { selectedCharID } from '../stores.svelte';
@@ -714,6 +715,8 @@ export interface ParseMarkdownRenderContext {
     projectedChatID?: number
     /** Collects the chat variables this render reads. */
     variableReads?: DisplayReadRecord
+    /** When the view asked for this render, from `nextDisplayListenerOrder`. */
+    displayRequestOrder?: number
 }
 
 function parseThoughtsAndTools(
@@ -772,7 +775,11 @@ export async function ParseMarkdown(
     renderContext:ParseMarkdownRenderContext = {},
 ) {
     renderContext.signal?.throwIfAborted()
-    renderContext = { ...renderContext, deferredInlays: renderContext.deferredInlays ?? new DeferredInlayMarkerRegistry() }
+    renderContext = {
+        ...renderContext,
+        deferredInlays: renderContext.deferredInlays ?? new DeferredInlayMarkerRegistry(),
+        displayRequestOrder: renderContext.displayRequestOrder ?? nextDisplayListenerOrder(),
+    }
     const prepareStyleHistory = renderContext.scriptContext?.parserContext.prepareHistory
     let firstParsed = ''
     const additionalAssetMode = (mode === 'back') ? 'back' : 'normal'
@@ -793,6 +800,7 @@ export async function ParseMarkdown(
             projectedChatID: renderContext.projectedChatID,
             signal: renderContext.signal,
             variableReads: renderContext.variableReads,
+            displayRequestOrder: renderContext.displayRequestOrder,
         })).data
     }
 

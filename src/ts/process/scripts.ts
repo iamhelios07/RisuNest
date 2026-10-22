@@ -39,6 +39,7 @@ import { findActiveHistoryWindow, resolveHistoryWindowChat, toWindowIndex } from
 import { recordAmbientChatVariableReads, recordChatVariableReads, DisplayReadRecord } from "./scriptVariableReads";
 import { findCharacterById } from "./scriptCharacterLookup";
 import { beginDisplayScriptRun } from "./scriptTimeoutNotice";
+import { nextDisplayListenerOrder } from "./luaDisplayTimeouts";
 import { openHistoryWindowCopy, writeHistoryWindowMessage, type HistoryWindowCopy } from "./historyWindowWrite";
 
 export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
@@ -55,6 +56,8 @@ export interface ProcessScriptOptions {
     promptOperationScope?: PromptScriptOperationScope
     /** Collects the chat variables a display row's pipeline reads. */
     variableReads?: DisplayReadRecord
+    /** When the view asked for this display, from `nextDisplayListenerOrder`. */
+    displayRequestOrder?: number
 }
 
 export interface ProcessScriptInvocationContext {
@@ -523,6 +526,9 @@ export async function processScriptFull(
     options: ProcessScriptOptions = {},
 ) {
     options.signal?.throwIfAborted()
+    if (mode === 'editdisplay' && options.displayRequestOrder === undefined) {
+        options = { ...options, displayRequestOrder: nextDisplayListenerOrder() }
+    }
     if (
         mode !== 'editdisplay' ||
         options.captureContext ||
@@ -639,6 +645,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             undefined,
             options.onConversationCommit,
             options.signal,
+            options.displayRequestOrder,
         )
         options.signal?.throwIfAborted()
     }
