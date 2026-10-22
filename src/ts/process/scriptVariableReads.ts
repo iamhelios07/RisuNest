@@ -117,12 +117,15 @@ export function displayRowsToRefresh({ keys }: { keys: readonly string[] }): num
     return [...indexes]
 }
 
-/** Raises the rebuild revision of the mounted rows at `index`, or of every mounted row, and returns their message indexes. */
-export function markDisplayRowsForRebuild(index?: number): number[] {
+/**
+ * Raises the rebuild revision of the mounted rows at `index`, or of every mounted row, and returns
+ * their message indexes. A string index reaches the rows its reload pointer key reaches.
+ */
+export function markDisplayRowsForRebuild(index?: number | string): number[] {
     const indexes = new Set<number>()
     for (const row of rows) {
         const rowIndex = row.index()
-        if (index !== undefined && rowIndex !== index) continue
+        if (index !== undefined && String(rowIndex) !== String(index)) continue
         row.rebuildRevision += 1
         indexes.add(rowIndex)
     }

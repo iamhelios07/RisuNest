@@ -2169,6 +2169,7 @@ test('shows Lua variables at reloadDisplay and commits message edits at the end'
 test.each([
   ['reloadDisplay(id)', [true, true]],
   ['reloadChat(id, 1)', [false, true]],
+  ["reloadChat(id, '1')", [false, true]],
 ])('rebuilds the mounted rows that %s reaches', async (call, rebuilt) => {
   const fixture = operationCharacterFixture('reload-rebuild')
   fixture.char.triggerscript = luaTriggerScript(`
@@ -2299,7 +2300,7 @@ test('stops a Lua handler at the next wait once its conversation is no longer cu
     continuationRuntime.session = other.session
     resolveFirst({ type: 'success', result: 'first' })
 
-    expect(await settled).toBeInstanceOf(Error)
+    expect(await settled).toEqual(expect.objectContaining({ message: expect.stringMatching(/inactive/i) }))
     expect(requestChatData).toHaveBeenCalledOnce()
     expect(fixture.chat.scriptstate).toEqual({ $before: '1' })
     expect(other.chat.scriptstate).toBeUndefined()

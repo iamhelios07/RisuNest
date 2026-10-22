@@ -2540,7 +2540,7 @@ async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTrigge
                 }
                 case 'v2UpdateChatAt':{
                     access?.flushVariables()
-                    rebuildScriptDisplayRow(Number(effect.index))
+                    rebuildScriptDisplayRow(effect.index)
                     break
                 }
                 case 'v2Wait':{

@@ -2205,6 +2205,7 @@ describe('Chat frozen capture presentation', () => {
 
     test('runs a manual windowed trigger only inside the complete conversation gateway', async () => {
         actionMocks.runTrigger.mockResolvedValue(null)
+        probedDisplayRows.length = 0
         const { harness, requireCurrent, body } = await mountWindowedTriggerRow()
         const trigger = document.createElement('button')
         trigger.setAttribute('risu-trigger', 'manual-test')

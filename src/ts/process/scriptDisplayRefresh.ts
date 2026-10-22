@@ -18,8 +18,11 @@ export function requestScriptDisplayRefresh(request: ScriptDisplayRefreshRequest
     else for (const key of request.keys) pending.keys.add(key)
 }
 
-/** Re-renders the mounted rows at a message index now and rebuilds their DOM, for a script reload of that message. */
-export function rebuildScriptDisplayRow(index: number): void {
+/**
+ * Re-renders the mounted rows at a message index now and rebuilds their DOM, for a script reload
+ * of that message. Scripts may pass the index as a string, which is used as the reload pointer key.
+ */
+export function rebuildScriptDisplayRow(index: number | string): void {
     markDisplayRowsForRebuild(index)
     bumpReloadPointers([index])
 }
@@ -35,7 +38,7 @@ function flushScriptDisplayRefresh(): void {
     bumpReloadPointers(indexes)
 }
 
-function bumpReloadPointers(indexes: number[]): void {
+function bumpReloadPointers(indexes: Array<number | string>): void {
     if (indexes.length === 0) return
     ReloadChatPointer.update((pointers) => {
         for (const index of indexes) pointers[index] = (pointers[index] ?? 0) + 1

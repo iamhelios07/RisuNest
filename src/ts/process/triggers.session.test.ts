@@ -30,7 +30,7 @@ vi.mock('./command', () => ({ processMultiCommand: vi.fn() }))
 vi.mock('./request/request', () => ({ requestChatData: vi.fn() }))
 vi.mock('./stableDiff', () => ({ generateAIImage: vi.fn() }))
 vi.mock('./files/inlays', () => ({ writeInlayImage: vi.fn() }))
-vi.mock('./memory/hypamemory', () => ({ HypaProcesser: vi.fn() }))
+vi.mock('./memory/hypamemory', async () => (await import('./tests/scriptingsTestHarness')).hypamemoryModule())
 
 const { runTrigger } = await import('./triggers')
 const { requestChatData } = await import('./request/request')
@@ -448,35 +448,85 @@ test.each([
     { type: 'v2RunLLM', value: 'prompt', valueType: 'value', outputVar: 'out', model: 'model' },
     { type: 'v2ImgGen', value: 'prompt', valueType: 'value', negValue: '', negValueType: 'value', outputVar: 'out' },
     { type: 'v2CheckSimilarity', source: 'source', sourceType: 'value', value: 'value', valueType: 'value', outputVar: 'out' },
-])('commits trigger variables before $type waits', async (wait) => {
+])('commits trigger variables before $type waits and message edits at the end', async (wait) => {
     const { chat, char, session } = fixture()
     char.lowLevelAccess = true
     char.triggerscript[0].effect = [
+        { type: 'modifychat', index: '0', value: 'edited' },
         { type: 'setvar', var: 'state', value: 'new', operator: '=' },
         wait,
     ] as never
     runtime.session = session
     DBState.db = { characters: [char], templateDefaultVariables: '' } as never
     const atWait: unknown[] = []
+    const record = () => atWait.push({
+        messages: chat.message.map((message) => message.data),
+        scriptstate: { ...chat.scriptstate },
+    })
     vi.mocked(requestChatData).mockReset().mockImplementation(async () => {
-        atWait.push({ ...chat.scriptstate })
+        record()
         return { type: 'success', result: 'done' } as never
     })
     vi.mocked(generateAIImage).mockReset().mockImplementation(async () => {
-        atWait.push({ ...chat.scriptstate })
+        record()
         return false
     })
     vi.mocked(HypaProcesser).mockReset().mockImplementation(function () {
         return {
-            addText: async () => { atWait.push({ ...chat.scriptstate }) },
+            addText: async () => { record() },
             similaritySearch: async () => [],
         } as never
     })
 
     await runTrigger(char, 'manual', { chat, manualName: 'ordered' })
 
-    expect(atWait).toEqual([{ $state: 'new' }])
+    expect(atWait).toEqual([{ messages: ['zero', 'one'], scriptstate: { $state: 'new' } }])
+    expect(chat.message.map((message) => message.data)).toEqual(['edited', 'one'])
     expect(chat.scriptstate).toEqual({ $state: 'new', $out: expect.any(String) })
+})
+
+test('stops a trigger at the next wait once its conversation is no longer current', async () => {
+    const original = fixture()
+    original.char.lowLevelAccess = true
+    original.char.triggerscript[0].effect = [
+        // The first result is buffered after the conversation changed, so only the flush stops the second request.
+        { type: 'v2RunLLM', value: 'first', valueType: 'value', outputVar: 'first', model: 'model' },
+        { type: 'v2RunLLM', value: 'second', valueType: 'value', outputVar: 'second', model: 'model' },
+    ] as never
+    const replacement = fixture()
+    replacement.char.chaId = 'character-2'
+    replacement.chat.id = 'conversation-2'
+    const replacementSession = new ActiveConversationSession({
+        characterId: replacement.char.chaId,
+        conversationId: replacement.chat.id!,
+        conversation: replacement.chat,
+        storeRevision: 20,
+    })
+    runtime.session = original.session
+    DBState.db = {
+        characters: [original.char, replacement.char],
+        templateDefaultVariables: '',
+    } as never
+    let resolveFirst!: (value: unknown) => void
+    vi.mocked(requestChatData).mockReset()
+        .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }) as never)
+        .mockResolvedValue({ type: 'success', result: 'second' } as never)
+
+    const settled = runTrigger(original.char, 'manual', {
+        chat: original.chat,
+        manualName: 'ordered',
+    }).then(() => null, (error: unknown) => error)
+    await vi.waitFor(() => expect(requestChatData).toHaveBeenCalledOnce())
+    selectedCharID.set(1)
+    runtime.session = replacementSession
+    resolveFirst({ type: 'success', result: 'first' })
+
+    expect(await settled).toEqual(expect.objectContaining({
+        message: expect.stringMatching(/inactive/i),
+    }))
+    expect(requestChatData).toHaveBeenCalledOnce()
+    expect(original.chat.scriptstate).toEqual({})
+    expect(replacement.chat.scriptstate).toEqual({})
 })
 
 test.each([
