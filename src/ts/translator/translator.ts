@@ -282,6 +282,8 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
     }
 
     if(!f.ok){
+        // An unread native body keeps its response open until the idle timeout.
+        await f.body?.cancel().catch(() => {})
         return `ERR::Google Translate Error ${f.status}`
     }
 

@@ -184,10 +184,12 @@ describe('Google Translate', () => {
         googleRequest('tauri', unreachable, () => { throw new TypeError('synthetic native transport failure') })
         await expect(translate('paragraph neither client can send', false)).rejects.toThrow('synthetic native transport failure')
     })
-    it('keeps the original text and reports the status when both clients are refused on Tauri', async () => {
-        googleRequest('tauri', unreachable, refused)
+    it('keeps the original text, reports the status and releases the native response when both clients are refused on Tauri', async () => {
+        const release = vi.fn()
+        googleRequest('tauri', unreachable, () => new Response(new ReadableStream({ cancel: release }), { status: 429 }))
         const text = 'paragraph Google refuses'
         await expect(translate(text, false)).resolves.toBe(text)
         expect(f.alert).toHaveBeenCalledExactlyOnceWith('ERR::Google Translate Error 429')
+        expect(release).toHaveBeenCalledOnce()
     })
 })
