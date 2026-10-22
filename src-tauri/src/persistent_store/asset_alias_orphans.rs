@@ -54,6 +54,8 @@ pub(crate) struct UnreferencedAlias {
 /// The aliases one search found unreferenced.
 pub(crate) struct OrphanAliasSearch {
     revision: i64,
+    /// The received rows waiting to apply that the references were read from.
+    pending_fence: [u8; 32],
     /// The device plugin values the references were read from, when any were read.
     device_fence: Option<PluginGcFence>,
     unreferenced: Vec<UnreferencedAlias>,
@@ -83,6 +85,7 @@ impl PersistentStore {
         scope: &OrphanAliasScope<'_>,
     ) -> StoreResult<Option<OrphanAliasSearch>> {
         let revision = self.revision()?;
+        let pending_fence = super::gallery::pending_fence(&self.connection)?;
         let generation = super::active_generation(&self.connection)?;
         let writes = owned_alias_writes(&self.connection, &generation, scope)?;
         let mut matcher = AssetKeyMatcher::new(writes.keys().cloned());
@@ -99,7 +102,7 @@ impl PersistentStore {
             .filter(|(key, _)| unreferenced_keys.contains(key))
             .map(|(key, (object_hash, written_at_ms))| UnreferencedAlias { key, object_hash, written_at_ms })
             .collect();
-        Ok(Some(OrphanAliasSearch { revision, device_fence, unreferenced }))
+        Ok(Some(OrphanAliasSearch { revision, pending_fence, device_fence, unreferenced }))
     }
 
     /// Every cleanup root, the device plugin values included, with the aliases `search` found
@@ -156,6 +159,9 @@ impl PersistentStore {
         self.commit_holding(
             &WorkingSetCommit {
                 expected_revision: search.revision,
+                // Rows can be received without moving the revision, so the commit also requires
+                // the ones the search read.
+                gallery_pending_fence: Some(search.pending_fence),
                 unit_mutations: Some(unit_mutations),
                 ..Default::default()
             },
@@ -351,10 +357,12 @@ fn observe_text_rows<P: rusqlite::Params>(
 
 /// Units outside the projected tables can still hold a reference: stored units of kinds this
 /// version does not project, received units waiting to apply and a snapshot's original units.
-/// Alias units only name themselves, and message and archive units have their own roots.
+/// Alias units only name themselves, archive units have their own roots and stored message units
+/// are projected, so only the pages of message units not applied yet are read.
 fn observe_units(connection: &Connection, matcher: &mut AssetKeyMatcher) -> StoreResult<bool> {
+    let mut unapplied_messages = 0;
     for table in ["lww_units", "lww_receive_rows", "snapshot_original_units"] {
-        let predicate = if table == "lww_receive_rows" { " WHERE status IN ('held','deferred')" } else { "" };
+        let predicate = if table == "lww_receive_rows" { " WHERE status IN ('staged','held','deferred')" } else { "" };
         let mut statement = connection.prepare(&format!("SELECT key,value FROM {table}{predicate}"))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
@@ -376,11 +384,53 @@ fn observe_units(connection: &Connection, matcher: &mut AssetKeyMatcher) -> Stor
                     let Ok(text) = std::str::from_utf8(&body) else { return Ok(false) };
                     matcher.observe(text, false);
                 }
+                UnitValue::Object { descriptor, .. }
+                    if table != "lww_units" && key.components().first().is_some_and(|kind| kind == "messages") =>
+                {
+                    unapplied_messages += 1;
+                    if unapplied_messages > UNAPPLIED_MESSAGE_UNITS_READ
+                        || !observe_message_pages(connection, &descriptor.object_hash, matcher)?
+                    {
+                        return Ok(false);
+                    }
+                }
                 UnitValue::Object { .. } | UnitValue::Deleted => {}
             }
         }
     }
     Ok(true)
+}
+
+/// Message units not applied yet that one search reads page by page. More, as while a whole
+/// library is being received, leave every alias in place until they are applied.
+const UNAPPLIED_MESSAGE_UNITS_READ: usize = 256;
+
+/// Feeds every string of the messages a manifest's pages hold to `matcher`, returning false when
+/// a body has not arrived or cannot be decoded.
+fn observe_message_pages(connection: &Connection, manifest_hash: &str, matcher: &mut AssetKeyMatcher) -> StoreResult<bool> {
+    use risunest_external_storage_format::{logical_records::decode_message_page, message_pages::MessageManifest};
+    let Some(body) = message_pages::object_body(connection, manifest_hash)? else { return Ok(false) };
+    let Ok(manifest) = MessageManifest::decode(&body) else { return Ok(false) };
+    for page in manifest.pages {
+        if matcher.is_complete() {
+            break;
+        }
+        let Some(body) = message_pages::object_body(connection, &page.hash)? else { return Ok(false) };
+        let Ok(messages) = decode_message_page(&body) else { return Ok(false) };
+        for message in &messages {
+            observe_json_strings(message, matcher);
+        }
+    }
+    Ok(true)
+}
+
+fn observe_json_strings(value: &serde_json::Value, matcher: &mut AssetKeyMatcher) {
+    match value {
+        serde_json::Value::String(text) => matcher.observe(text, false),
+        serde_json::Value::Array(values) => values.iter().for_each(|value| observe_json_strings(value, matcher)),
+        serde_json::Value::Object(values) => values.values().for_each(|value| observe_json_strings(value, matcher)),
+        _ => {}
+    }
 }
 
 fn inline_text(value: &UnitValue) -> Option<String> {

@@ -1809,6 +1809,52 @@ fn unused_alias_cleanup_keeps_device_plugin_writers_out_until_it_commits() {
 }
 
 #[test]
+fn unused_alias_cleanup_reads_received_message_pages_not_applied_yet() {
+    use crate::server_sync::lww_tests::put_asset;
+    use super::super::asset_alias_orphans::OrphanAliasScope;
+    use risunest_external_storage_format::{logical_records::encode_message_page, message_pages::{ManifestPage, MessageManifest, MANIFEST_SCHEMA}};
+    use risunest_sync_wire::{descriptor::RecordDescriptor, unit::{UnitKey, UnitValue}};
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    for key in ["assets/received.png", "assets/unused.png", "assets/late.png"] {
+        put_asset(&mut store, key, format!("synthetic body of {key}").as_bytes());
+        backdate_alias(&store, key, 1_000);
+    }
+    let page = encode_message_page(&[json!({"role": "char", "data": "<img src=\"assets/received.png\">"})]).unwrap();
+    let manifest = MessageManifest {
+        schema: MANIFEST_SCHEMA.into(),
+        message_count: 1.into(),
+        pages: vec![ManifestPage { hash: page.hash.clone(), message_count: 1, byte_length: page.size.into() }],
+    }.encode().unwrap();
+    super::super::message_pages::put_object(&store.connection, &manifest.hash, &manifest.bytes).unwrap();
+    let value = UnitValue::object(RecordDescriptor::content(manifest.hash.clone())).unwrap();
+    let key = UnitKey::new(&["messages", "receiving-owner", "chat"]).unwrap();
+    store.connection.execute("INSERT INTO lww_receive_rows VALUES('synthetic-receive',?1,'{}',?2,'staged')",
+        rusqlite::params![key.as_str(), serde_json::to_string(&value).unwrap()]).unwrap();
+    let now = super::super::device_store::now_ms().unwrap();
+    let cleanup = OrphanAliasScope::Cleanup { now_ms: now };
+
+    // Until its page arrives, the received chat may use any of them.
+    assert!(store.delete_orphaned_asset_aliases(&cleanup).unwrap().is_empty());
+
+    super::super::message_pages::put_object(&store.connection, &page.hash, &page.bytes).unwrap();
+    // A row received through another connection after the search may use the rest.
+    let library_path = store.database_path.clone();
+    super::super::lww::BEFORE_HELD_COMMIT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+        rusqlite::Connection::open(library_path).unwrap()
+            .execute("INSERT INTO lww_receive_rows VALUES('later-receive','[\"root\"]','{}','{}','held')", []).unwrap();
+    })));
+    assert!(matches!(store.delete_orphaned_asset_aliases(&cleanup), Err(StoreError::RevisionConflict { .. })));
+    assert!(alias_object(&store, "assets/unused.png").is_some());
+
+    store.connection.execute("DELETE FROM lww_receive_rows WHERE request_id = 'later-receive'", []).unwrap();
+    let deleted = store.delete_orphaned_asset_aliases(&cleanup).unwrap();
+    assert_eq!(deleted.iter().map(|alias| alias.key.as_str()).collect::<Vec<_>>(), ["assets/late.png", "assets/unused.png"]);
+    assert!(alias_object(&store, "assets/received.png").is_some());
+}
+
+#[test]
 fn a_commit_whose_hold_fails_is_not_applied_by_recovery() {
     use crate::server_sync::lww_tests::put_asset;
 
