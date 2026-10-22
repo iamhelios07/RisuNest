@@ -6,6 +6,7 @@ import { processMultiCommand } from './command'
 import { createConversationOperationContext } from './conversationOperationContext'
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
+import { StallingWorker } from '../../../tests/support/regexWorker'
 
 const runtime = vi.hoisted(() => ({
     unexpectedNativeRuntimeAccess: () => {
@@ -79,6 +80,46 @@ function fixture() {
 beforeEach(() => {
     runtime.session = null
     selectedCharID.set(0)
+})
+
+test('skips a stalled regex condition and replacement and continues the trigger', async () => {
+    vi.useFakeTimers()
+    const originalWorker = globalThis.Worker
+    vi.stubGlobal('Worker', StallingWorker)
+    try {
+        const { chat, char } = fixture()
+        char.triggerscript = [{
+            comment: 'condition', type: 'start',
+            conditions: [{ type: 'exists', type2: 'regex', value: 'SLOW-condition|zero', depth: 2 }],
+            effect: [{ type: 'modifychat', index: '0', value: 'must not run' }],
+        }, {
+            comment: 'replacement', type: 'start', conditions: [], effect: [{
+                type: 'v2ReplaceString', source: 'source', sourceType: 'var',
+                regex: 'pattern', regexType: 'var', flags: 'gs', flagsType: 'value',
+                result: '$0', resultType: 'value', replacement: 'bad', replacementType: 'value',
+                outputVar: 'replacement', indent: 0,
+            }, {
+                type: 'v2RegexTest', value: 'finished', valueType: 'value', regex: '^finished$', regexType: 'value',
+                flags: '', flagsType: 'value', outputVar: 'continued', indent: 0,
+            }],
+        }] as character['triggerscript']
+        DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+        chat.scriptstate = { $source: '<unchanged>', $pattern: 'SLOW-replacement|unchanged' }
+        const regexGeneration = {}
+        const result = runTrigger(char, 'start', { chat, regexGeneration })
+        await vi.advanceTimersByTimeAsync(20_000)
+        expect((await result)?.chat.scriptstate).toMatchObject({ $replacement: '<unchanged>', $continued: '1' })
+        expect((await result)?.chat.message[0].data).toBe('zero')
+        const nextChat = (await result)!.chat
+        nextChat.scriptstate.$source = '<updated>'
+        nextChat.scriptstate.$pattern = 'updated'
+        const repeated = await runTrigger(char, 'start', { chat: nextChat, regexGeneration })
+        expect(repeated?.chat.scriptstate.$replacement).toBe('<updated>')
+        nextChat.scriptstate.$source = '<next>'
+        nextChat.scriptstate.$pattern = 'next'
+        const nextGeneration = await runTrigger(char, 'start', { chat: nextChat, regexGeneration: {} })
+        expect(nextGeneration?.chat.scriptstate.$replacement).toBe('<bad>')
+    } finally { vi.stubGlobal('Worker', originalWorker); vi.useRealTimers() }
 })
 
 test('keeps stored trigger permissions and parser identity stable during display', async () => {

@@ -17,8 +17,12 @@ import { runLuaEditTrigger } from "./scriptings";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { runTrigger } from "./triggers";
 import { ByteBudgetLru } from "../util/byteBudgetLru";
-import { canExecuteRegexPlanInWorker, executeRegexPlanSync, getRegexExecutionPlan, type RegexExecutionPlanEntry, type RegexExecutionResult } from "./regexExecutionPlan";
-import { RegexExecutionTimeoutError, RegexWorkerResetError, getSharedRegexWorkerClient, isRegexWorkerAvailable } from "./regexWorkerClient";
+import { canExecuteRegexPlanInWorker, getRegexExecutionPlan, type RegexExecutionPlanEntry, type RegexExecutionResult } from "./regexExecutionPlan";
+import { isRegexWorkerAvailable } from "./regexWorkerClient";
+import { RegexExecutor, RegexRuleSkippedError, regexRuleKey } from './regexExecutor';
+import { generationRegexTimeoutScope, type RegexTimeoutScope } from './regexTimeoutScope';
+import { getGenerationRegexScope } from './generationState';
+import type { RegexOperationResults } from './regexOperations';
 import { tryExecuteNativeRegexBatch } from "./nativeRegexBatch";
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from "../runtimePerformanceProfile";
 import { createConversationOperationContext, type ConversationOperationContext, type ConversationCommitObserver } from "./conversationOperationContext";
@@ -38,7 +42,7 @@ import {
 import { findActiveHistoryWindow, resolveHistoryWindowChat, toWindowIndex } from "./historyWindowIndex";
 import { recordAmbientChatVariableReads, recordChatVariableReads, DisplayReadRecord } from "./scriptVariableReads";
 import { findCharacterById } from "./scriptCharacterLookup";
-import { beginDisplayScriptRun } from "./scriptTimeoutNotice";
+import { beginDisplayScriptRun, getDisplayRegexTimeoutScope, noticeRegexTimeout } from "./scriptTimeoutNotice";
 import { openHistoryWindowCopy, writeHistoryWindowMessage, type HistoryWindowCopy } from "./historyWindowWrite";
 
 export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
@@ -49,6 +53,8 @@ export interface ProcessScriptOptions {
     signal?: AbortSignal
     /** true forces the Worker path, false opts out, undefined offloads whenever a Worker is available. */
     regexWorker?: boolean
+    regexGeneration?: object
+    regexScope?: RegexTimeoutScope
     captureContext?: ProcessScriptCaptureContext
     invocationContext?: ProcessScriptInvocationContext
     projectedChatID?: number
@@ -522,6 +528,28 @@ export async function processScriptFull(
     cbsConditions: CbsConditions = {},
     options: ProcessScriptOptions = {},
 ) {
+    const endDisplayRun = mode === 'editdisplay' ? beginDisplayScriptRun() : undefined
+    try {
+        const displayGeneration = mode === 'editdisplay' && !options.captureContext
+            ? getGenerationRegexScope(char.chaId, getCurrentChat()?.id) : undefined
+        const scope = options.regexScope ?? (mode === 'editdisplay'
+            ? displayGeneration ?? getDisplayRegexTimeoutScope()
+            : (options.regexGeneration ?? options.signal)
+                ? generationRegexTimeoutScope((options.regexGeneration ?? options.signal)!) : undefined)
+        return await processScriptFullWithOwner(char, data, mode, chatID, cbsConditions, { ...options, regexScope: scope })
+    } finally {
+        endDisplayRun?.()
+    }
+}
+
+async function processScriptFullWithOwner(
+    char: character | simpleCharacterArgument,
+    data: string,
+    mode: ScriptMode,
+    chatID: number,
+    cbsConditions: CbsConditions,
+    options: ProcessScriptOptions,
+) {
     options.signal?.throwIfAborted()
     if (
         mode !== 'editdisplay' ||
@@ -565,8 +593,6 @@ export async function processScriptFull(
             invalidated = true
         }
     })
-    // Include queued pipelines so serialized Lua runs share the same timeout notice.
-    const endDisplayRun = beginDisplayScriptRun()
     try {
         // Protect the whole live script pipeline. A Lua-only lock still lets the
         // next row change variables while this row awaits plugins or regex work.
@@ -608,7 +634,6 @@ export async function processScriptFull(
         })
     } finally {
         unsubscribe()
-        endDisplayRun()
     }
 }
 
@@ -650,7 +675,8 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             const d = await runTrigger(currentChar, 'display', {
                 chat: getCurrentChat(),
                 displayMode: true,
-                displayData: data
+                displayData: data,
+                regexScope: options.regexScope,
             })
 
             data = d?.displayData ?? data
@@ -872,7 +898,12 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
         data = parse(value)
     }
 
-    function executeScript(entry:RegexExecutionPlanEntry){
+    const executor = new RegexExecutor({
+        signal: options.signal, scope: options.regexScope, worker: options.regexWorker,
+        onTimeout: noticeRegexTimeout,
+    })
+
+    async function executeScript(entry:RegexExecutionPlanEntry){
         const script = entry.script
         
         if(script.in === ''){
@@ -881,23 +912,13 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
 
         const outScript = entry.replacement
         const flag = entry.flags
-        let reg: RegExp
-        if(entry.dynamicPattern){
-            reg = new RegExp(parse(entry.pattern), flag)
-        }
-        else{
-            if(entry.compileError !== undefined){
-                throw entry.compileError
-            }
-            if(entry.compiledRegex === undefined){
-                throw new Error('Regex execution plan entry was not compiled')
-            }
-            reg = entry.compiledRegex
-        }
-        reg.lastIndex = 0
+        const pattern = entry.dynamicPattern ? parse(entry.pattern) : entry.pattern
+        const key = regexRuleKey(entry)
+        const regex = <K extends keyof RegexOperationResults>(kind: K, input = data, replacement?: string) =>
+            executor.scriptOperation({ kind, input, pattern, flags: flag, replacement }, key)
 
             if(outScript.startsWith('@@') || entry.actions.length > 0){
-                if(reg.test(data)){
+                if(await regex('test')){
                     if(outScript.startsWith('@@emo ')){
                         const emoName = script.out.substring(6).trim()
                         let charemotions = get(CharEmotion)
@@ -922,6 +943,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                         }
                     }
                     else if((outScript.startsWith('@@inject') || entry.actions.includes('inject')) && chatID !== -1){
+                        const replaced = await regex('replace', data, '')
                         if (invocation) {
                             invocation.inject(chatID, data)
                         } else if (!captureContext) {
@@ -942,18 +964,14 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                                 throw new ConversationSessionInactiveError()
                             }
                         }
-                        reg.lastIndex = 0
-                        data = data.replace(reg, "")
+                        data = replaced
                     }
                     else if(
                         outScript.startsWith('@@move_top') || outScript.startsWith('@@move_bottom') ||
                         entry.actions.includes('move_top') || entry.actions.includes('move_bottom')
                     ){
-                        const isGlobal = flag.includes('g')
-                        reg.lastIndex = 0
-                        const matchAll = isGlobal ? data.matchAll(reg) : [data.match(reg)]
-                        reg.lastIndex = 0
-                        data = data.replace(reg, "")
+                        const matchAll = await regex('matches')
+                        data = await regex('replace', data, '')
                         for(const matched of matchAll){
                             if(matched){
                                 const inData = matched[0]
@@ -983,8 +1001,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                         }
                     }
                     else{
-                        reg.lastIndex = 0
-                        return parseReplacement(data.replace(reg, outScript))
+                        return parseReplacement(await regex('replace', data, outScript))
                     }
                 }
                 else{
@@ -1008,8 +1025,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                             pointer--
                         }
 
-                        reg.lastIndex = 0
-                        const r = lastChat.match(reg)
+                        const r = await regex('match', lastChat)
                         if(!v){
                             data = data + r[0]
                         }
@@ -1034,65 +1050,44 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                 }
             }
             else{
-                return parseReplacement(data.replace(reg, outScript))
+                return parseReplacement(await regex('replace', data, outScript))
             }
     }
 
-    if(plan.requiresHostExecution || prepareHistory){
-        for (const entry of plan.entries){
-            try {
-                if (prepareHistory && entry.dynamicPattern) await prepareFor(entry.pattern)
-                const pending = executeScript(entry)
-                if (pending) await pending
-            } catch (error) {
-                if (error instanceof CbsHistoryAccessError || error === historyPreparationError) throw error
-                console.error(error)
-            }
-        }
-    }
-    else if((options.regexWorker ?? isRegexWorkerAvailable()) && mode === 'editoutput' && canExecuteRegexPlanInWorker(plan, data)){
-        let result: RegexExecutionResult | undefined
+    let result: RegexExecutionResult | undefined
+    if ((options.regexWorker ?? isRegexWorkerAvailable()) && mode === 'editoutput'
+        && !prepareHistory && canExecuteRegexPlanInWorker(plan, data)) {
         try {
             result = await tryExecuteNativeRegexBatch(plan, data, { signal: options.signal })
             options.signal?.throwIfAborted()
         } catch (error) {
-            if(options.signal?.aborted){
-                throw error
-            }
+            options.signal?.throwIfAborted()
             console.error(error)
         }
-        if(result === undefined){
-            let resetRetry = false
-            try {
-                try {
-                    result = await getSharedRegexWorkerClient().execute(plan, data, { signal: options.signal })
-                } catch (error) {
-                    if (!(error instanceof RegexWorkerResetError) || options.signal?.aborted) throw error
-                    resetRetry = true
-                    result = await getSharedRegexWorkerClient().execute(plan, data, { signal: options.signal })
-                }
-                options.signal?.throwIfAborted()
-            } catch (error) {
-                // A pathological ruleset must not be retried on the UI thread, and a cancelled
-                // generation must stay cancelled. Anything else means the Worker is unusable here.
-                if(error instanceof RegexExecutionTimeoutError) error.message = language.regexScriptTimeout
-                if(resetRetry || error instanceof RegexExecutionTimeoutError || error instanceof RegexWorkerResetError || options.signal?.aborted){
-                    throw error
-                }
-                console.error(error)
-                result = executeRegexPlanSync(plan, data, parse)
-            }
-        }
-        data = result.data
-        for(const error of result.errors){
-            console.error(error.error)
-        }
     }
-    else{
-        data = executeRegexPlanSync(plan, data, parse).data
-    }
-
-    
+    result ??= await executor.execute(plan, data, async (value) => {
+        try { await parseReplacement(value) }
+        catch (error) {
+            options.signal?.throwIfAborted()
+            if (error instanceof CbsHistoryAccessError || error === historyPreparationError) throw error
+            console.error(error)
+        }
+        return data
+    }, async (entry, input) => {
+        data = input
+        try {
+            if (prepareHistory && entry.dynamicPattern) await prepareFor(entry.pattern)
+            await executeScript(entry)
+        } catch (error) {
+            options.signal?.throwIfAborted()
+            if (error instanceof CbsHistoryAccessError || error === historyPreparationError) throw error
+            if (error instanceof RegexRuleSkippedError) data = input
+            else console.error(error)
+        }
+        return data
+    })
+    data = result.data
+    for (const error of result.errors) console.error(error.error)
 
     const dynamicAssets = captureContext?.dynamicAssets ?? db.dynamicAssets
     const dynamicAssetsEditDisplay = captureContext?.dynamicAssetsEditDisplay ?? db.dynamicAssetsEditDisplay

@@ -12,67 +12,14 @@ import {
     RegexWorkerUnavailableError,
     REGEX_WORKER_READY_TIMEOUT_MS,
     RegexWorkerClient,
-    type RegexWorkerLike,
     type RegexWorkerRequest,
-    type RegexWorkerResponse,
 } from './regexWorkerClient'
+import { FakeWorker, InMemoryWorker, StallingWorker } from '../../../tests/support/regexWorker'
 import { createRegexWorkerMessageHandler } from './regexWorker'
-
-class FakeWorker implements RegexWorkerLike {
-    constructor(private readonly autoReady = true) {}
-    readonly requests: RegexWorkerRequest[] = []
-    terminated = false
-    private readonly messageListeners = new Set<(event: MessageEvent<RegexWorkerResponse>) => void>()
-    private readonly errorListeners = new Set<(event: ErrorEvent) => void>()
-
-    postMessage(message: RegexWorkerRequest): void {
-        this.requests.push(message)
-    }
-
-    terminate(): void {
-        this.terminated = true
-    }
-
-    addEventListener(type: 'message' | 'error', listener: EventListener): void {
-        if (type === 'message') {
-            this.messageListeners.add(listener as (event: MessageEvent<RegexWorkerResponse>) => void)
-            if (this.autoReady) this.respond({ type: 'ready' })
-        }
-        else {
-            this.errorListeners.add(listener as (event: ErrorEvent) => void)
-        }
-    }
-
-    removeEventListener(type: 'message' | 'error', listener: EventListener): void {
-        if (type === 'message') {
-            this.messageListeners.delete(listener as (event: MessageEvent<RegexWorkerResponse>) => void)
-        }
-        else {
-            this.errorListeners.delete(listener as (event: ErrorEvent) => void)
-        }
-    }
-
-    respond(response: RegexWorkerResponse): void {
-        for (const listener of this.messageListeners) {
-            listener({ data: response } as MessageEvent<RegexWorkerResponse>)
-        }
-    }
-
-    get listenerCount(): number {
-        return this.messageListeners.size + this.errorListeners.size
-    }
-}
-
-class InMemoryWorker extends FakeWorker {
-    private readonly handleRequest = createRegexWorkerMessageHandler((response) => {
-        this.respond(response)
-    })
-
-    override postMessage(message: RegexWorkerRequest): void {
-        super.postMessage(message)
-        this.handleRequest(message)
-    }
-}
+import { RegexExecutor, RegexTimeoutMemory } from './regexExecutor'
+import { executeRegexOperation, replaceRegexMatches } from './regexOperations'
+import { createRegexTimeoutScope } from './regexTimeoutScope'
+import { executeRegexPlanSync } from './regexExecutionPlan'
 
 function plan(revision = 1): RegexExecutionPlan {
     return {
@@ -113,7 +60,200 @@ function plannedScript(output = 'b', flag = 'g'): customscript {
     }
 }
 
+function continuationPlan(patterns: [string, string, string?][], mode = 'editdisplay') {
+    return getRegexExecutionPlan(patterns.map(([pattern, replacement, flags]) => ({
+        ...plannedScript(replacement, flags ?? 'g'), in: pattern, type: mode,
+    })), mode)
+}
+
+function executePlan(executor: RegexExecutor, plan: RegexExecutionPlan, input: string, parse = (value: string) => value) {
+    return executor.execute(plan, input, parse, async (entry, value, runner) => {
+        const result = await runner.scriptOperation({ kind: 'replace', pattern: entry.dynamicPattern ? parse(entry.pattern) : entry.pattern,
+            input: value, flags: entry.flags, replacement: entry.replacement }, JSON.stringify(entry.script))
+        return parse(result)
+    })
+}
+
+describe('bounded regex execution through the real Worker handler', () => {
+    it('bounds remembered inputs by both byte size and entry count', () => {
+        const memory = new RegexTimeoutMemory(100, 2)
+        memory.remember('a', 'first')
+        memory.remember('b', 'next')
+        memory.remember('c', 'last')
+        expect(memory.has('a', 'first')).toBe(false)
+        expect(memory.has('c', 'last')).toBe(true)
+        memory.remember('large', 'x'.repeat(100))
+        expect(memory.has('large', 'x'.repeat(100))).toBe(false)
+        memory.remember('d', 'more')
+        expect(memory.has('b', 'next')).toBe(false)
+    })
+
+    it('cancels a queued request immediately without waiting for another row to time out', async () => {
+        vi.useFakeTimers()
+        try {
+            const client = new RegexWorkerClient(() => new StallingWorker())
+            const active = new RegexExecutor({ client, worker: true, requestTimeoutMs: 10 }).operation({ kind: 'test', pattern: 'SLOW-queued', flags: '', input: 'a' })
+            const controller = new AbortController()
+            const pending = new RegexExecutor({ client, worker: true, signal: controller.signal }).operation({ kind: 'test', pattern: 'a', flags: '', input: 'a' })
+            const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+            controller.abort()
+            await rejected
+            await vi.advanceTimersByTimeAsync(10)
+            expect(await active).toBe(false)
+        } finally { vi.useRealTimers() }
+    })
+
+    it.each(['editinput', 'editoutput', 'editprocess', 'editdisplay'])('replays parsing and replacement semantics in %s', async (mode) => {
+        const plan = continuationPlan([
+            ['missing', 'unused'],
+            ['x', '{{change}}'],
+            ['y', 'z', 'g<unknown>'],
+            ['z', '$&$`$\''],
+            ['(?<last>z)', '$<last>!'],
+        ], mode)
+        const inputs: string[] = []
+        const parse = (value: string) => { inputs.push(value); return value.replace('{{change}}', 'y') }
+        const expected = executeRegexPlanSync(plan, '<x>', parse)
+        const expectedInputs = inputs.splice(0)
+        const actual = await executePlan(new RegexExecutor({ worker: true, client: new RegexWorkerClient(() => new InMemoryWorker()) }), plan, '<x>', parse)
+        expect(actual.data).toBe(expected.data)
+        expect(inputs).toEqual(expectedInputs)
+    })
+
+    it('discards speculative replacement and errors when an earlier parse changes the input', async () => {
+        const plan = continuationPlan([['absent', 'unused'], ['x', 'wrong'], ['[', 'invalid'], ['y', 'correct']])
+        const parse = (value: string) => value === 'x' ? 'y' : value
+        const executor = new RegexExecutor({ worker: true, client: new RegexWorkerClient(() => new InMemoryWorker()) })
+        const result = await executePlan(executor, plan, 'x', parse)
+        expect(result.data).toBe('correct')
+        expect(result.errors.map((error) => error.sourceIndex)).toEqual([2])
+    })
+
+    it('parses every plain rule and only matching conditional rules, including unchanged replacements', async () => {
+        const plan = continuationPlan([['missing', 'x'], ['missing', 'x', 'g<unknown>'], ['a', '$&', 'g<unknown>'], ['a', 'b']])
+        let calls = 0
+        const executor = new RegexExecutor({ worker: true, client: new RegexWorkerClient(() => new InMemoryWorker()) })
+        const result = await executePlan(executor, plan, 'a', (value) => { calls++; return value })
+        expect(result.data).toBe('b')
+        expect(calls).toBe(3)
+    })
+
+    it('stops at host rules and resumes using their changed input', async () => {
+        const plan = continuationPlan([['none', 'unused'], ['dynamic', 'B', 'g<cbs>'], ['B', 'C'], ['C', '@@host'], ['D', 'E']])
+        const executor = new RegexExecutor({ worker: true, client: new RegexWorkerClient(() => new InMemoryWorker()) })
+        const result = await executor.execute(plan, 'A', (value) => value, async (entry, input, runner) => {
+            if (entry.dynamicPattern) return runner.scriptOperation({ kind: 'replace', input, pattern: 'A', flags: entry.flags, replacement: 'B' }, 'dynamic')
+            return (await runner.scriptOperation({ kind: 'test', input, pattern: 'C', flags: '' }, 'directive')) ? 'D' : input
+        })
+        expect(result.data).toBe('E')
+    })
+
+    it('isolates once for thirty queued rows, preserves following rules, and remembers the same text across batches', async () => {
+        vi.useFakeTimers()
+        try {
+            const client = new RegexWorkerClient(() => new StallingWorker())
+            const scope = createRegexTimeoutScope()
+            const notices = vi.fn()
+            const plan = continuationPlan([['missing', 'unused'], ['SLOW-display', 'bad'], ['row', 'rendered']])
+            const run = (input: string, batch = scope) => executePlan(new RegexExecutor({ client, worker: true, scope: batch,
+                requestTimeoutMs: 10, invocationTimeoutMs: 30, onTimeout: notices }), plan, input)
+            let timerFired = false
+            setTimeout(() => { timerFired = true }, 1)
+            const start = Date.now()
+            const rows = Promise.all(Array.from({ length: 30 }, (_, i) => run(`<row ${i} SLOW-display>`)))
+            await vi.advanceTimersByTimeAsync(1)
+            expect(timerFired).toBe(true)
+            await vi.advanceTimersByTimeAsync(19)
+            expect((await rows).map((row) => row.data)).toEqual(Array.from({ length: 30 }, (_, i) => `<rendered ${i} SLOW-display>`))
+            expect(Date.now() - start).toBe(20)
+            expect(notices).toHaveBeenCalledOnce()
+            // This exact input timed out; a new batch must not wait for it again.
+            expect((await run('<row 0 SLOW-display>', createRegexTimeoutScope())).data).toBe('<rendered 0 SLOW-display>')
+            expect(notices).toHaveBeenCalledOnce()
+        } finally { vi.useRealTimers() }
+    })
+
+    it('skips a timed-out rule on later stream updates and final output containing markup', async () => {
+        vi.useFakeTimers()
+        try {
+            const client = new RegexWorkerClient(() => new StallingWorker())
+            const scope = createRegexTimeoutScope()
+            const plan = continuationPlan([['SLOW-stream', 'bad'], ['tail', 'done']], 'editoutput')
+            const run = (input: string) => executePlan(new RegexExecutor({ client, worker: true, scope, requestTimeoutMs: 10 }), plan, input)
+            const first = run('<tail SLOW-stream>')
+            await vi.advanceTimersByTimeAsync(20)
+            expect((await first).data).toBe('<done SLOW-stream>')
+            expect((await run('<tail SLOW-stream> longer')).data).toBe('<done SLOW-stream> longer')
+            expect((await run('<tail SLOW-stream> final')).data).toBe('<done SLOW-stream> final')
+        } finally { vi.useRealTimers() }
+    })
+
+    it('caps timeout time including isolation and skips the remaining rules', async () => {
+        vi.useFakeTimers()
+        try {
+            const plan = continuationPlan([['SLOW-budget-1', 'bad'], ['SLOW-budget-2', 'bad'], ['tail', 'changed']])
+            const executor = new RegexExecutor({ client: new RegexWorkerClient(() => new StallingWorker()), worker: true,
+                requestTimeoutMs: 10, invocationTimeoutMs: 25 })
+            const result = executePlan(executor, plan, 'tail')
+            await vi.advanceTimersByTimeAsync(25)
+            expect((await result).data).toBe('tail')
+        } finally { vi.useRealTimers() }
+    })
+
+    it('returns no match for a stalled trigger operation and continues with subsequent operations', async () => {
+        vi.useFakeTimers()
+        try {
+            const executor = new RegexExecutor({ client: new RegexWorkerClient(() => new StallingWorker()), worker: true, requestTimeoutMs: 10 })
+            const test = executor.operation({ kind: 'test', pattern: 'SLOW-trigger|text', flags: 's', input: '<text>' })
+            await vi.advanceTimersByTimeAsync(10)
+            expect(await test).toBe(false)
+            const replacement = executor.operation({ kind: 'replacementMatches', pattern: 'SLOW-replace|text', flags: 'g', input: '<text>' })
+            await vi.advanceTimersByTimeAsync(10)
+            expect(replaceRegexMatches('<text>', await replacement, () => 'bad')).toBe('<text>')
+            expect(await executor.operation({ kind: 'replace', pattern: 'text', flags: '', input: '<text>', replacement: 'next' })).toBe('<next>')
+        } finally { vi.useRealTimers() }
+    })
+
+    it('preserves callback captures, optional named groups, zero-width matches, and split semantics', async () => {
+        const executor = new RegexExecutor({ client: new RegexWorkerClient(() => new InMemoryWorker()), worker: true })
+        const input = '😀ab a'
+        const pattern = '(?<first>a)(b)?|(?=$)'
+        const replace = (...args: any[]) => JSON.stringify(args)
+        const matches = await executor.operation({ kind: 'replacementMatches', input, pattern, flags: 'gu' })
+        expect(replaceRegexMatches(input, matches, replace)).toBe(input.replace(new RegExp(pattern, 'gu'), replace))
+        for (const kind of ['test', 'match', 'exec', 'matches', 'split'] as const) {
+            const operation = { kind, input, pattern, flags: 'gu' }
+            expect(await executor.operation(operation)).toEqual(executeRegexOperation(operation))
+        }
+    })
+
+    it('falls back only when the Worker cannot start, and preserves cancellation', async () => {
+        const executor = new RegexExecutor({ worker: true, client: new RegexWorkerClient(() => { throw new Error('boot failed') }) })
+        expect(await executor.operation({ kind: 'replace', pattern: 'a', flags: 'g', input: 'aa', replacement: 'b' })).toBe('bb')
+        const controller = new AbortController()
+        controller.abort()
+        const cancelled = new RegexExecutor({ worker: true, signal: controller.signal, client: new RegexWorkerClient(() => new InMemoryWorker()) })
+        await expect(cancelled.operation({ kind: 'test', pattern: 'a', flags: '', input: 'a' })).rejects.toMatchObject({ name: 'AbortError' })
+    })
+})
+
 describe('RegexWorkerClient', () => {
+    it('reuses unchanged continuation input and releases its retained message at the end', async () => {
+        const plan = continuationPlan([['a', 'b'], ['b', 'c']])
+        const worker = new InMemoryWorker()
+        const client = new RegexWorkerClient(() => worker)
+        const first = await client.execute(plan, 'a', { continuation: { start: 0, end: 2 } })
+        const second = await client.execute(plan, first.data, { continuation: { start: first.nextIndex!, end: 2 } })
+        expect(second.data).toBe('c')
+        const request = worker.requests.at(-1)
+        expect(request).toMatchObject({ type: 'execute', input: '', reuseInput: true })
+        client.releaseContinuation()
+        const responses: unknown[] = []
+        const handle = createRegexWorkerMessageHandler((response) => responses.push(response))
+        for (const message of worker.requests) handle(message)
+        handle({ type: 'execute', id: 100, revision: plan.revision, input: '', reuseInput: true, continuation: { start: 1, end: 2 } })
+        expect(responses.at(-1)).toMatchObject({ type: 'error', id: 100 })
+    })
     it('registers a plan once per compact revision', async () => {
         const worker = new FakeWorker()
         const client = new RegexWorkerClient(() => worker)
@@ -198,7 +338,7 @@ describe('RegexWorkerClient', () => {
             const worker = new FakeWorker(false)
             const client = new RegexWorkerClient(() => worker)
             const pending = client.execute(plan(), 'first').catch((error) => error)
-            await vi.advanceTimersByTimeAsync(DEFAULT_REGEX_WORKER_TIMEOUT_MS + 1)
+            await vi.advanceTimersByTimeAsync(REGEX_WORKER_READY_TIMEOUT_MS - 1)
             expect(worker.requests).toEqual([])
             expect(worker.terminated).toBe(false)
             await vi.advanceTimersByTimeAsync(REGEX_WORKER_READY_TIMEOUT_MS)
@@ -234,7 +374,7 @@ describe('RegexWorkerClient', () => {
         expect(worker.listenerCount).toBe(0)
     })
 
-    it('times out at 2,000 ms, terminates without retry, and rejects stale requests', async () => {
+    it('times out at 10,000 ms, terminates without retry, and rejects stale requests', async () => {
         vi.useFakeTimers()
         try {
             const workers: FakeWorker[] = []

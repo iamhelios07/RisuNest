@@ -3269,7 +3269,7 @@ export const languageEnglish = {
     "syncConflictBackupUnreadable": 'This backup could not be read. Select another backup.',
     "chatMessageActionFailed": "The message changed while the action was in progress. Please try again.",
     "chatConversationActionFailed": "The conversation changed while the action was in progress. Please try again.",
-    "regexScriptTimeout": "Regex script execution timed out.",
+    "regexScriptTimeout": "A regex script took too long and was skipped.",
     "generationInterruptedInBackground": "Response generation was interrupted in the background.",
     "generationConversationChanged": "The conversation changed during generation, so the response could not be applied. Please try again.",
     "screenshotPreparationFailed": "Screenshot preparation failed. Reduce the range and try again.",
