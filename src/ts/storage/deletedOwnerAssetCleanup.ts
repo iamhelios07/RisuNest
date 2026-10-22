@@ -4,14 +4,17 @@ import type { DataRevision } from './persistentDataStore'
 import type { StorageMutationGate } from './storageMutationGate'
 
 const OWNED_PREFIX = 'assets/'
-/** The longest key the native cleanup accepts. */
-const MAX_KEY_LENGTH = 4096
+/** The longest key, in UTF-8 bytes, the native cleanup accepts. */
+const MAX_KEY_BYTES = 4096
+const encoder = new TextEncoder()
 /** A key inside longer text, such as an `<img src>` or a `{{raw::}}` reference. */
 const EMBEDDED_KEY = /assets[\\/][^\s"'`<>()[\]{}|,;\\]+/g
 
 function ownedKey(text: string): string | null {
     const key = text.replaceAll('\\', '/')
-    return key.startsWith(OWNED_PREFIX) && key.length > OWNED_PREFIX.length && key.length <= MAX_KEY_LENGTH ? key : null
+    // A UTF-16 length never exceeds the UTF-8 one, so it bounds the text before encoding.
+    return key.startsWith(OWNED_PREFIX) && key.length > OWNED_PREFIX.length && key.length <= MAX_KEY_BYTES &&
+        encoder.encode(key).length <= MAX_KEY_BYTES ? key : null
 }
 
 /** The `assets/` keys a character, module or persona names anywhere in its data. */
@@ -34,6 +37,20 @@ export function collectOwnedAssetKeys(...values: unknown[]): string[] {
         }
     }
     return [...keys]
+}
+
+/**
+ * The `assets/` keys the conversations of characters about to be permanently deleted name, which
+ * a read of their details leaves out. Empty on the web build and when the store cannot read them.
+ */
+export async function collectCharacterConversationAssetKeys(characterIds: readonly string[]): Promise<string[]> {
+    if (!isTauri || characterIds.length === 0) return []
+    try {
+        return await invoke<string[]>('pds_character_asset_keys', { characterIds: [...characterIds] })
+    } catch (error) {
+        console.error('Deleted character conversation asset keys could not be read', error)
+        return []
+    }
 }
 
 /** The save queue and write gate an alias cleanup commits through. */

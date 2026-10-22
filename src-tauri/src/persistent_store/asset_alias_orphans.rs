@@ -666,6 +666,77 @@ fn ascii_escaped(text: &str, uppercase: bool) -> String {
     escaped
 }
 
+impl PersistentStore {
+    /// The owned keys the conversations of `character_ids` name in their details and messages, by
+    /// the rules the renderer applies to a deleted owner's own data, up to `limit` keys.
+    pub(crate) fn character_conversation_asset_keys(
+        &self,
+        character_ids: &[String],
+        limit: usize,
+    ) -> StoreResult<BTreeSet<String>> {
+        let generation = super::active_generation(&self.connection)?;
+        let mut keys = BTreeSet::new();
+        for (table, column) in [("conversations", "detail"), ("messages", "value")] {
+            let mut statement = self.connection.prepare(&format!(
+                "SELECT {column} FROM {table} WHERE generation = ?1 AND character_id = ?2"
+            ))?;
+            for character_id in character_ids {
+                let mut rows = statement.query(rusqlite::params![generation, character_id])?;
+                while let Some(row) = rows.next()? {
+                    let text = row.get::<_, String>(0)?;
+                    // Most rows name no key, so only those that might are parsed.
+                    if !text.contains(ANCHOR) {
+                        continue;
+                    }
+                    let mut pending = vec![serde_json::from_str::<serde_json::Value>(&text)?];
+                    while let Some(value) = pending.pop() {
+                        match value {
+                            serde_json::Value::String(text) => collect_owned_keys(&text, &mut keys),
+                            serde_json::Value::Array(values) => pending.extend(values),
+                            serde_json::Value::Object(values) => pending.extend(values.into_iter().map(|(_, value)| value)),
+                            _ => {}
+                        }
+                    }
+                    if keys.len() >= limit {
+                        return Ok(keys.into_iter().take(limit).collect());
+                    }
+                }
+            }
+        }
+        Ok(keys)
+    }
+}
+
+/// The longest key, in UTF-8 bytes, a deleted owner's cleanup accepts.
+const OWNED_KEY_MAX_BYTES: usize = 4096;
+
+fn owned_key(text: &str) -> Option<String> {
+    let key = text.replace('\\', "/");
+    (key.len() > OWNED_ASSET_KEY_PREFIX.len() && key.len() <= OWNED_KEY_MAX_BYTES && key.starts_with(OWNED_ASSET_KEY_PREFIX))
+        .then_some(key)
+}
+
+/// Adds `text` when it is an owned key itself, and each key inside it, such as an `<img src>` or
+/// a `{{raw::}}` reference.
+fn collect_owned_keys(text: &str, keys: &mut BTreeSet<String>) {
+    keys.extend(owned_key(text));
+    let mut rest = text;
+    while let Some(start) = rest.find(ANCHOR) {
+        let after = &rest[start + ANCHOR.len()..];
+        let Some(body) = after.strip_prefix(['/', '\\']) else {
+            rest = after;
+            continue;
+        };
+        let end = body
+            .find(|c: char| c.is_whitespace() || "\"'`<>()[]{}|,;\\".contains(c))
+            .unwrap_or(body.len());
+        if end > 0 {
+            keys.extend(owned_key(&format!("{OWNED_ASSET_KEY_PREFIX}{}", &body[..end])));
+        }
+        rest = &body[end..];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::AssetKeyMatcher;

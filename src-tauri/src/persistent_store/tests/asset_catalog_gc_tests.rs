@@ -1875,3 +1875,35 @@ fn a_commit_whose_hold_fails_is_not_applied_by_recovery() {
     store.lww_recover_intents().unwrap();
     assert!(alias_object(&store, "assets/kept.png").is_some());
 }
+
+/// A permanent delete reads its character's details without the conversations, so the keys only
+/// a chat names come from the store, by the rules the renderer applies to the details.
+#[test]
+fn deleted_character_conversations_give_the_owned_keys_they_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    for (character_id, data) in [
+        ("owner", "<img src=\"assets/chat.png\"> {{raw::assets\\raw.png}}"),
+        ("other", "assets/other.png"),
+    ] {
+        store.commit(&WorkingSetCommit {
+            add_character: Some(json!({
+                "chaId": character_id, "type": "character", "name": "Synthetic", "image": "", "desc": "",
+                "lastInteraction": 500,
+                "chats": [{"id": format!("{character_id}-chat"), "name": "Chat", "note": "see assets/note.png", "message": [
+                    {"role": "user", "data": data, "chatId": format!("{character_id}-first")},
+                    {"role": "char", "data": "sync-conflict-backups/a.risudat assets/", "chatId": format!("{character_id}-second")},
+                    {"role": "char", "data": format!("assets/{}.png", "가".repeat(1400)), "chatId": format!("{character_id}-long")},
+                ]}],
+            })),
+            ..empty_working_set_commit(store.revision().unwrap())
+        }).unwrap();
+    }
+
+    let owner = ["owner".to_owned()];
+    assert_eq!(
+        store.character_conversation_asset_keys(&owner, 100).unwrap(),
+        std::collections::BTreeSet::from(["assets/chat.png", "assets/note.png", "assets/raw.png"].map(str::to_owned)),
+    );
+    assert_eq!(store.character_conversation_asset_keys(&owner, 1).unwrap().len(), 1);
+}

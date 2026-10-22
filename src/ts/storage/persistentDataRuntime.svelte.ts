@@ -25,7 +25,7 @@ import { fillRootFieldDefaults, getDatabase, setDatabase, setEffectivePresetOver
 import { getEffectivePresetOverride } from './effectiveIdentityState'
 import { prepareDatabaseForPersistence, preparePersistentRootForWorkingSet } from './databasePreparation'
 import { getPersistentDataStore, getPersistentStorageAuthority } from './persistentDataStoreFactory'
-import { scheduleDeletedOwnerAssetCleanup, type AssetAliasCleanupTarget } from './deletedOwnerAssetCleanup'
+import { collectCharacterConversationAssetKeys, scheduleDeletedOwnerAssetCleanup, type AssetAliasCleanupTarget } from './deletedOwnerAssetCleanup'
 import type {
     CharacterDetail,
     DataRevision,
@@ -500,6 +500,7 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
             prepareDatabase: prepareDatabaseForPersistence,
             prepareRoot: (root) => preparePersistentRootForWorkingSet(root),
             deletedCharacterAssets: {
+                collectConversationKeys: collectCharacterConversationAssetKeys,
                 cleanup: (keys, startedAtMs) =>
                     scheduleDeletedOwnerAssetCleanup(keys, startedAtMs, 'deleted-owner-assets', assetAliasCleanupTarget),
             },

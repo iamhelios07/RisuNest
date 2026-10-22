@@ -34,7 +34,7 @@ function fixture(stamp: string | undefined, recheck=stamp) {
     const store=createStoreStub({queryCharacters:async()=>({revision:native.revision,items:[summary]}),acquireRevision:async(revision)=>lease(revision),commit})
     const coordinator:SaveCoordinator=new SaveCoordinator({store,captureRoot:()=>capturePersistentRoot(database),captureCharacter:()=>null,captureSelectedCharacter:()=>null,replaceDatabase:()=>{},
         publishCharacterMutation:(result)=>{Object.assign(database,result.root)},
-        deletedCharacterAssets:{cleanup:(keys,startedAtMs)=>scheduleDeletedOwnerAssetCleanup(keys,startedAtMs,'deleted-owner-assets',()=>({
+        deletedCharacterAssets:{collectConversationKeys:async()=>['assets/chat.png'],cleanup:(keys,startedAtMs)=>scheduleDeletedOwnerAssetCleanup(keys,startedAtMs,'deleted-owner-assets',()=>({
             runtime:{getStorageAuthorityEpoch:()=>coordinator.storageAuthorityEpoch,flushPendingData:(reason)=>coordinator.flushPendingData(reason),
                 runStorageOnlyMutation:(operation)=>coordinator.runStorageOnlyMutation(operation)},
             gate:{runWrite:(operation)=>operation()},
@@ -68,7 +68,7 @@ describe('native stamped trash expiry', () => {
         ]})
         // The cleanup reads the library after the delete, and an open lease would still hold its assets.
         await vi.waitFor(()=>expect(core.invoke).toHaveBeenCalledWith('pds_asset_delete_orphaned_aliases',{expectedRevision:2,owner:{
-            keys:expect.arrayContaining(['assets/expired.png','assets/extra.png']),startedAtMs:expect.any(Number)}}))
+            keys:expect.arrayContaining(['assets/expired.png','assets/extra.png','assets/chat.png']),startedAtMs:expect.any(Number)}}))
         expect(f.release.mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
         expect(f.commit.mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
     })

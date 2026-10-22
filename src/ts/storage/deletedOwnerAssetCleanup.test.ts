@@ -5,7 +5,7 @@ vi.mock('../platform', async () => (await import('../platform.testSupport')).pla
 const core = vi.hoisted(() => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: core.invoke }))
 
-import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from './deletedOwnerAssetCleanup'
+import { collectCharacterConversationAssetKeys, collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from './deletedOwnerAssetCleanup'
 import { createAssetAliasCleanupTarget } from './deletedOwnerAssetCleanup.testSupport'
 
 afterEach(() => {
@@ -24,6 +24,8 @@ describe('collectOwnedAssetKeys', () => {
             firstMessage: 'assets\\backslash.png',
             ccAssets: [{ type: 'icon', uri: 'ccdefault:', name: 'main', ext: 'png' }],
             note: 'sync-conflict-backups/backup.risudat assets/',
+            // Within 4096 UTF-16 units but over the 4096 bytes the native cleanup accepts.
+            longName: `assets/${'가'.repeat(1400)}.png`,
         }
         const module = { assets: [['map', 'assets/module.png', 'png']], lorebook: [{ content: 'see assets/lore.png' }] }
         const persona = { icon: 'assets/icon.png', embeddedModule: { assets: [['badge', 'assets/embedded.png', 'png']] } }
@@ -32,6 +34,21 @@ describe('collectOwnedAssetKeys', () => {
             'assets/portrait.png', 'assets/joy.png', 'assets/extra.webp', 'assets/inline.png', 'assets/raw.png',
             'assets/backslash.png', 'assets/module.png', 'assets/lore.png', 'assets/icon.png', 'assets/embedded.png',
         ]))
+    })
+})
+
+describe('collectCharacterConversationAssetKeys', () => {
+    it('reads the keys the store finds in the conversations, and none after a failed read or on the web build', async () => {
+        core.invoke.mockResolvedValueOnce(['assets/chat.png'])
+        await expect(collectCharacterConversationAssetKeys(['char-a'])).resolves.toEqual(['assets/chat.png'])
+        expect(core.invoke).toHaveBeenCalledWith('pds_character_asset_keys', { characterIds: ['char-a'] })
+
+        vi.spyOn(console, 'error').mockImplementation(() => {})
+        core.invoke.mockRejectedValueOnce(new Error('synthetic read failure'))
+        await expect(collectCharacterConversationAssetKeys(['char-a'])).resolves.toEqual([])
+        platform.runtime = 'web'
+        await expect(collectCharacterConversationAssetKeys(['char-a'])).resolves.toEqual([])
+        expect(core.invoke).toHaveBeenCalledTimes(2)
     })
 })
 

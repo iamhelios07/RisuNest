@@ -153,6 +153,8 @@ export interface SaveCoordinatorDependencies {
     onDestructiveReplacementFenceChanged?(active: boolean): void
     isConversationOperationActive?(): boolean
     deletedCharacterAssets?: {
+        /** The asset keys the conversations of characters about to be deleted name; never rejects. */
+        collectConversationKeys(characterIds: string[]): Promise<string[]>
         /** Deletes, in the background, the assets only permanently deleted characters used. */
         cleanup(keys: string[], startedAtMs: number): void
     }
@@ -1955,6 +1957,7 @@ export class SaveCoordinator {
         // The native store compares this against its own wall clock, so no injected time.
         const startedAtMs = Date.now()
         const ownedAssetKeys = new Map<string, string[]>()
+        let conversationAssetKeys: string[] = []
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
             const residentsBefore = new Map([...deletedIds].map((id) => [id, this.captureResidentCharacter(id)]))
@@ -1986,6 +1989,8 @@ export class SaveCoordinator {
             })
             if (!found) return 0
             if (!rootValue) return 0
+            // A detail read leaves out conversations, and the delete removes them.
+            conversationAssetKeys = await this.dependencies.deletedCharacterAssets?.collectConversationKeys([...deletedIds]) ?? []
             for (const id of deletedIds) this.assertResidentCharacterUnchanged(id, residentsBefore.get(id) ?? null)
             const mutatedRoot = canonicalClone(rootValue.value)
             for (const id of deletedIds) removeCharacterIdFromOrder(mutatedRoot, id)
@@ -2048,7 +2053,7 @@ export class SaveCoordinator {
             return deletedIds.size
         }).then((count) => {
             if (count > 0) {
-                const keys = new Set([...deletedIds].flatMap((id) => ownedAssetKeys.get(id) ?? []))
+                const keys = new Set([...deletedIds].flatMap((id) => ownedAssetKeys.get(id) ?? []).concat(conversationAssetKeys))
                 this.dependencies.deletedCharacterAssets?.cleanup([...keys], startedAtMs)
             }
             return count

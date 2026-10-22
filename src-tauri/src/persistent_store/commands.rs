@@ -1863,6 +1863,29 @@ fn delete_deleted_owner_files(
     Ok(())
 }
 
+/// Characters one permanent delete removes at most.
+const DELETED_CHARACTERS_MAX: usize = 128;
+
+/// The owned asset keys the conversations of characters about to be permanently deleted name,
+/// which a read of their details leaves out.
+#[tauri::command(async)]
+pub(crate) fn pds_character_asset_keys(
+    state: State<'_, PersistentStoreState>,
+    character_ids: Vec<String>,
+) -> Result<Vec<String>, StoreError> {
+    let operation_guard = state.admit_renderer_operation()?;
+    if character_ids.len() > DELETED_CHARACTERS_MAX {
+        return Err(StoreError::Validation { message: "too many characters for one asset key read".into() });
+    }
+    logged(
+        "pds_character_asset_keys",
+        with_store_mutex_admitted(&state, &operation_guard, |store| {
+            store.character_conversation_asset_keys(&character_ids, DELETED_OWNER_CLEANUP_MAX_KEYS)
+        })
+        .map(|keys| keys.into_iter().collect()),
+    )
+}
+
 /// Candidates one cleanup page deletes.
 const ASSET_GC_EXECUTE_PAGE: i64 = 1024;
 #[cfg(test)]
