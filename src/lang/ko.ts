@@ -2383,6 +2383,9 @@ export const languageKorean = {
             historyLimitMultiplier: '로딩 생략 기준',
             historyLimitMultiplierHelp:
                 '설정된 최대 컨텍스트 크기의 지정된 배수 만큼의 메시지를 로딩하게 됩니다. 하이파를 사용하는 경우 요약되지 않은 메시지는 생략되지 않으며, 사용하는 모듈이나 플러그인 등이 더 많은 과거 메시지를 요구하는 경우 이 값을 늘리면 됩니다.',
+            pluginOutputCurrentChatOnly: '플러그인에 현재 채팅 기록만 전달',
+            pluginOutputCurrentChatOnlyHelp:
+                '응답이 생성될 때 플러그인에 이 캐릭터의 다른 채팅 기록을 빼고 현재 채팅만 전달해 메모리 사용량을 줄이며, 다른 채팅 기록을 읽는 플러그인이 제대로 동작하지 않을 수 있습니다.',
         },
         ui: {
             title: 'UI',

@@ -146,7 +146,7 @@ const projectPluginChatOutput = createProductionPluginChatOutputProjector(
     <T>(value: T) => $state.snapshot(value) as T,
 )
 
-export async function runChatOutputListeners(char: any, chat: any, messageIndex: number, signal?: AbortSignal){
+export async function runChatOutputListeners(char: any, chat: any, messageIndex: number, signal?: AbortSignal, diagnostics?: GenerationDiagnosticTrace){
     if(pluginV2.chatOutput.size === 0){
         return
     }
@@ -156,8 +156,11 @@ export async function runChatOutputListeners(char: any, chat: any, messageIndex:
         chat,
         resolvePosition: resolvePinnedConversationPosition,
         messageIndex,
+        windowStart: getHistoryWindowStart(chat) ?? 0,
+        fullHistory: !getDeviceSettings().pluginOutputCurrentChatOnly,
         signal,
         projectScalable: projectPluginChatOutput,
+        onPayload: diagnostics ? (payload) => diagnostics.listenerPayload(payload) : undefined,
         onError: (error) => console.error(error),
     })
 }
@@ -2860,8 +2863,9 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 runChatOutputListeners(
                     currentChar,
                     chat,
-                    historyWindow ? toWindowIndex(chat, messageIndex) : messageIndex,
+                    messageIndex,
                     abortSignal,
+                    lifecycle.diagnostics,
                 ),
             speak: async (data) => {
                 try {

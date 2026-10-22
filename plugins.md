@@ -1224,7 +1224,9 @@ if (interceptor) {
 
 `addRisuChatListener('output', callback)` is the full-object compatibility listener. It runs after the model output and host-side output transformations. Listeners run sequentially, so a slow callback delays later chat flow. The callback receives the event snapshot supplied for that output event. To remove it, pass the same callback reference to `removeRisuChatListener`.
 
-Registration asks the user for the same consent as `addRisuReplacer` (the "replacer" permission). If the user declines, `addRisuChatListener` still resolves normally, but the listener is never registered and will not fire. Every output event with a registered listener materializes the full character (including all conversation histories) for the event snapshot, so registering a listener has a per-message cost proportional to the character's stored history.
+Registration asks the user for the same consent as `addRisuReplacer` (the "replacer" permission). If the user declines, `addRisuChatListener` still resolves normally, but the listener is never registered and will not fire.
+
+`chat` always holds the whole current conversation, and `messageIndex` indexes it. By default `char.chats` holds every conversation of the character with its messages, so a listener costs memory and time proportional to the character's stored history on every output. When the user turns on sending only the current chat to plugins in the RisuNest performance settings, or the listener is registered with `{ history: 'current' }`, every `char.chats` entry omits the `message` property and only `chat` carries messages. A `char` in that shape cannot be saved with `setCharacterToIndex` or `setDatabase`; save conversation changes with `setChatToIndex`. Register with `{ history: 'current' }` whenever the listener does not read other conversations. RisuAI ignores the third argument.
 
 ```javascript
 const onOutput = async ({ chat, messageIndex, characterIndex, chatIndex }) => {
@@ -1235,7 +1237,7 @@ const onOutput = async ({ chat, messageIndex, characterIndex, chatIndex }) => {
   await Risuai.setChatToIndex(characterIndex, chatIndex, chat);
 };
 
-await Risuai.addRisuChatListener('output', onOutput);
+await Risuai.addRisuChatListener('output', onOutput, { history: 'current' });
 
 // Use the same function object when the listener is no longer needed.
 await Risuai.removeRisuChatListener('output', onOutput);

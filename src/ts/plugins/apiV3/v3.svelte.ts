@@ -65,6 +65,7 @@ import {
     registerChatOutputListener,
     removeChatOutputListener,
     type ChatOutputListener,
+    type ChatOutputListenerOptions,
 } from '../pluginChatOutputListeners'
 import {
     createProductionPluginDatabaseAccess,
@@ -901,7 +902,7 @@ const makeRisuaiAPIV3 = (
             addPluginUnloadCallback(plugin.name, () => oldApis.removeRisuReplacer(name, func as any));
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
-        addRisuChatListener: async (mode:'output', func:Function) => {
+        addRisuChatListener: async (mode:'output', func:Function, options?: ChatOutputListenerOptions) => {
             if (mode !== 'output') throw (`chat listener mode ${mode} not found`)
             //permission check, lets use same as replacer
             const conf = await getPluginPermission(permissionContext, 'replacer', 'periodically');
@@ -910,7 +911,7 @@ const makeRisuaiAPIV3 = (
             }
             if (pluginLifetime.signal.aborted) return
             const listener = func as ChatOutputListener
-            registerChatOutputListener(pluginV2.chatOutput, listener)
+            registerChatOutputListener(pluginV2.chatOutput, listener, options)
             addPluginUnloadCallback(plugin.name, () => removeChatOutputListener(
                 pluginV2.chatOutput,
                 listener,

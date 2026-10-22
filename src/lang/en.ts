@@ -2568,6 +2568,9 @@ export const languageEnglish = {
             historyLimitMultiplier: 'Loading limit',
             historyLimitMultiplierHelp:
                 'Loads messages up to the given multiple of the set maximum context size. With HypaMemory, messages that are not summarized yet are always loaded. Increase this value if a module or plugin you use needs more older messages.',
+            pluginOutputCurrentChatOnly: 'Send only the current chat to plugins',
+            pluginOutputCurrentChatOnlyHelp:
+                "When a response is generated, plugins receive only the current chat without this character's other chats, which reduces memory use. Plugins that read other chats may not work correctly.",
         },
         ui: {
             title: 'UI',
