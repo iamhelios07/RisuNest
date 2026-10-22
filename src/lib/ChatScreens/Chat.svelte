@@ -14,6 +14,7 @@
     import { runLuaInteractionTrigger } from 'src/ts/process/scriptings'
     import { risuChatParser } from "src/ts/process/scripts"
     import { DisplayReadRecord, recordChatVariableReads, registerDisplayRow } from 'src/ts/process/scriptVariableReads'
+    import { rebuildScriptDisplayRow } from 'src/ts/process/scriptDisplayRefresh'
     import { runTrigger } from 'src/ts/process/triggers'
     import { sayTTS } from "src/ts/process/tts"
     import { DBState, ReloadChatPointer, CurrentTriggerIdStore, popupStore } from 'src/ts/stores.svelte'
@@ -1009,10 +1010,7 @@
                         )
                         context.requireCurrent()
                         if (triggerResult) setCurrentChat(triggerResult.chat)
-                        if (triggerResult) ReloadChatPointer.update((v) => {
-                            v[idx] = (v[idx] ?? 0) + 1
-                            return v
-                        })
+                        if (triggerResult) rebuildScriptDisplayRow(idx)
                     },
                 )
             } catch (error) {
@@ -1024,10 +1022,7 @@
             const triggerResult = await runManualTrigger(currentChar, getCurrentChat())
             if(triggerResult) {
                 setCurrentChat(triggerResult.chat)
-                ReloadChatPointer.update((v) => {
-                    v[idx] = (v[idx] ?? 0) + 1
-                    return v
-                })
+                rebuildScriptDisplayRow(idx)
             }
         }
     }

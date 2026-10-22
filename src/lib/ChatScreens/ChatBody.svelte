@@ -109,6 +109,7 @@
         releaseObjectUrls: () => void
         thoughtExpansion: BoundedThoughtExpansion | null
         reads?: DisplayReadRecord
+        rebuildRevision: number
         translatedDuringGeneration: boolean
     }
 
@@ -630,6 +631,7 @@
             releaseObjectUrls: () => {},
             thoughtExpansion: null,
             reads,
+            rebuildRevision: displayRow?.rebuildRevision ?? 0,
             translatedDuringGeneration: false,
         }
         job.promise = markParsing(msgDisplay, character, idx, job)
@@ -689,8 +691,10 @@
             ).map((element) => element.open)
             if (openThoughts.length) thoughtOpenStates = openThoughts
 
+            // Identical markup keeps its DOM unless a script reloaded the row.
             const retainMarkup =
-                html === displayedHtml && previousDisplay?.settledNotified
+                html === displayedHtml && previousDisplay?.settledNotified &&
+                job.rebuildRevision === previousDisplay.rebuildRevision
             if (retainMarkup) {
                 job.releaseObjectUrls = previousDisplay.releaseObjectUrls
                 previousDisplay.releaseObjectUrls = () => {}

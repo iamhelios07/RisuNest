@@ -78,6 +78,7 @@ export function storesModule(selectedIndex: () => number = () => 0) {
         ReloadChatPointer: storeStub({}),
         ReloadGUIPointer: storeStub(0),
         ScriptDisplayRefreshPointer: storeStub(0),
+        ScriptDisplayRebuildPointer: storeStub(0),
         CurrentTriggerIdStore: storeStub(null),
         selectedCharID: {
             subscribe: (run: (value: number) => void) => (run(selectedIndex()), () => undefined),

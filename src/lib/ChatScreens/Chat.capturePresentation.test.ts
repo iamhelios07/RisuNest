@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { fromStore, writable } from 'svelte/store'
+import { fromStore, get, writable } from 'svelte/store'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { ReloadChatPointer, ReloadGUIPointer } from 'src/ts/stores.svelte'
@@ -157,6 +157,7 @@ import Chats from './Chats.svelte'
 import { alertToast } from 'src/ts/alert'
 import ChatCaptureBatchHarness from './ChatCaptureBatchHarness.test.svelte'
 import ChatsHarness from './ChatsHarness.test.svelte'
+import { probedDisplayRows } from './ChatBodyCaptureProbe.test.svelte'
 import { chatViewEvents } from 'src/ts/plugins/chatViewHost.svelte'
 import { requestScriptDisplayRefresh } from 'src/ts/process/scriptDisplayRefresh'
 import type { ChatViewEvent } from 'src/ts/plugins/chatViewEvents'
@@ -2204,6 +2205,7 @@ describe('Chat frozen capture presentation', () => {
 
     test('runs a manual windowed trigger only inside the complete conversation gateway', async () => {
         actionMocks.runTrigger.mockResolvedValue(null)
+        probedDisplayRows.length = 0
         const { harness, requireCurrent, body } = await mountWindowedTriggerRow()
         const trigger = document.createElement('button')
         trigger.setAttribute('risu-trigger', 'manual-test')
@@ -2222,6 +2224,16 @@ describe('Chat frozen capture presentation', () => {
             )
             expect(requireCurrent).toHaveBeenCalledTimes(2)
         })
+        const row = probedDisplayRows.at(-1)!
+        const revision = row.rebuildRevision
+        const pointer = get(ReloadChatPointer)[1] ?? 0
+
+        // A trigger that returns a result rebuilds the clicked message.
+        actionMocks.runTrigger.mockResolvedValue({ chat: harness.completeConversation })
+        trigger.click()
+        await vi.waitFor(() => expect(requireCurrent).toHaveBeenCalledTimes(4))
+        expect(row.rebuildRevision).not.toBe(revision)
+        expect(get(ReloadChatPointer)[1]).toBe(pointer + 1)
     })
 
     test('submits form values captured at submit time through the complete conversation gateway', async () => {

@@ -6,7 +6,8 @@ import { resolve } from 'node:path'
 import { beforeAll, expect, test, vi } from 'vitest'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { requestChatData } from './request/request'
-import { readImage } from '../globalApi.svelte'
+import { fetchNative, readImage } from '../globalApi.svelte'
+import { HypaProcesser } from './memory/hypamemory'
 import { getCurrentCharacter, getCurrentChat, getDatabase } from '../storage/database.svelte'
 import { asBuffer, getUserIcon } from '../util'
 import { writeInlayImage } from './files/inlays'
@@ -29,7 +30,7 @@ import { captureGenerationConversationOperation } from './generationConversation
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { alertConfirm, alertNormal, alertToast } from '../alert'
 import { language } from '../../lang'
-import { DisplayReadRecord, recordAmbientChatVariableReads } from './scriptVariableReads'
+import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
 
 const continuationRuntime = vi.hoisted(() => ({
   session: null as ActiveConversationSession | null,
@@ -2161,6 +2162,150 @@ test('shows Lua variables at reloadDisplay and commits message edits at the end'
     expect(fixture.chat.scriptstate).toEqual({ $other: 'kept', $counter: '1', $after: '2' })
   } finally {
     vi.mocked(ScriptDisplayRefreshPointer.update).mockReset()
+    continuationRuntime.session = null
+  }
+})
+
+test.each([
+  ['reloadDisplay(id)', [true, true]],
+  ['reloadChat(id, 1)', [false, true]],
+  ["reloadChat(id, '1')", [false, true]],
+])('rebuilds the mounted rows that %s reaches', async (call, rebuilt) => {
+  const fixture = operationCharacterFixture('reload-rebuild')
+  fixture.char.triggerscript = luaTriggerScript(`
+    function onButtonClick(id, data)
+      ${call}
+    end
+  `)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  // Rows whose display read no chat variable.
+  const rows = [0, 1].map((index) => {
+    const row = registerDisplayRow(() => index)
+    row.track('body', new DisplayReadRecord())
+    return row
+  })
+  const initial = rows.map((row) => row.rebuildRevision)
+  const { runLuaInteractionTrigger } = await import('./scriptings')
+  try {
+    await runLuaInteractionTrigger('button', fixture.char, 'click')
+    await Promise.resolve()
+
+    expect(rows.map((row, index) => row.rebuildRevision !== initial[index])).toEqual(rebuilt)
+  } finally {
+    for (const row of rows) row.dispose()
+    continuationRuntime.session = null
+  }
+})
+
+test.each([
+  ['LLM', `LLM(id, {{ role = 'user', content = 'wait' }})`],
+  ['axLLM', `axLLM(id, {{ role = 'user', content = 'wait' }})`],
+  ['simpleLLM', `simpleLLM(id, 'wait'):await()`],
+  ['generateImage', `generateImage(id, 'prompt', 'negative'):await()`],
+  ['request', `request(id, 'https://example.invalid/wait'):await()`],
+  ['similarity', `similarity(id, 'source', { 'value' }):await()`],
+  ['sleep', `sleep(id, 4321):await()`],
+])('commits Lua variables before %s waits and message edits at the end', async (api, call) => {
+  const fixture = operationCharacterFixture(`wait-flush-${api}`)
+  fixture.char.lowLevelAccess = true
+  fixture.char.triggerscript = luaTriggerScript(`
+    onButtonClick = async(function(id, data)
+      setChat(id, 0, 'edited')
+      setChatVar(id, 'before', '1')
+      ${call}
+      setChatVar(id, 'after', '2')
+    end)
+  `)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const atWait: unknown[] = []
+  const observeWait = () => atWait.push({
+    messages: fixture.chat.message.map((entry) => entry.data),
+    scriptstate: { ...fixture.chat.scriptstate },
+  })
+  vi.mocked(requestChatData).mockReset().mockImplementation(async () => {
+    observeWait()
+    return { type: 'success', result: 'done' } as never
+  })
+  vi.mocked(generateAIImage).mockReset().mockImplementation(async () => {
+    observeWait()
+    return false
+  })
+  vi.mocked(fetchNative).mockReset().mockImplementation(async () => {
+    observeWait()
+    return new Response('done')
+  })
+  vi.mocked(HypaProcesser).mockReset().mockImplementation(function () {
+    return {
+      addText: async () => { observeWait() },
+      similaritySearch: async () => [],
+    } as never
+  })
+  const realSetTimeout = globalThis.setTimeout
+  const timeout = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, delay?: number) => {
+    if (delay !== 4321) return realSetTimeout(handler, delay)
+    observeWait()
+    return realSetTimeout(handler, 0)
+  }) as typeof setTimeout)
+  const { runLuaInteractionTrigger } = await import('./scriptings')
+  try {
+    await runLuaInteractionTrigger('button', fixture.char, 'click')
+
+    expect(atWait).toEqual([{ messages: ['message'], scriptstate: { $before: '1' } }])
+    expect(fixture.chat.message.map((entry) => entry.data)).toEqual(['edited'])
+    expect(fixture.chat.scriptstate).toEqual({ $before: '1', $after: '2' })
+  } finally {
+    timeout.mockRestore()
+    vi.mocked(requestChatData).mockReset()
+    vi.mocked(generateAIImage).mockReset()
+    vi.mocked(fetchNative).mockReset()
+    vi.mocked(HypaProcesser).mockReset()
+    continuationRuntime.session = null
+  }
+})
+
+test('stops a Lua handler at the next wait once its conversation is no longer current', async () => {
+  const fixture = operationCharacterFixture('wait-flush-stale')
+  const other = operationCharacterFixture('wait-flush-other')
+  fixture.char.lowLevelAccess = true
+  fixture.char.triggerscript = luaTriggerScript(`
+    onButtonClick = async(function(id, data)
+      setChatVar(id, 'before', '1')
+      LLM(id, {{ role = 'user', content = 'first' }})
+      setChatVar(id, 'after', '2')
+      LLM(id, {{ role = 'user', content = 'second' }})
+      setChatVar(id, 'last', '3')
+    end)
+  `)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  let resolveFirst!: (value: unknown) => void
+  vi.mocked(requestChatData).mockReset()
+    .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }) as never)
+    .mockResolvedValue({ type: 'success', result: 'second' } as never)
+  const { runLuaInteractionTrigger } = await import('./scriptings')
+  try {
+    const settled = runLuaInteractionTrigger('button', fixture.char, 'click').then(
+      () => null,
+      (error: unknown) => error,
+    )
+    await vi.waitFor(() => expect(requestChatData).toHaveBeenCalledOnce())
+    continuationRuntime.session = other.session
+    resolveFirst({ type: 'success', result: 'first' })
+
+    expect(await settled).toEqual(expect.objectContaining({ message: expect.stringMatching(/inactive/i) }))
+    expect(requestChatData).toHaveBeenCalledOnce()
+    expect(fixture.chat.scriptstate).toEqual({ $before: '1' })
+    expect(other.chat.scriptstate).toBeUndefined()
+  } finally {
+    vi.mocked(requestChatData).mockReset()
     continuationRuntime.session = null
   }
 })
