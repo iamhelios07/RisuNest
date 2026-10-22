@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const f = vi.hoisted(() => ({ fetch: vi.fn(), request: vi.fn(), alert: vi.fn(), translatorType: 'deepl', translator: 'ko', deeplXUrl: 'https://deeplx-a.invalid', experimentalGoogle: false }))
+const f = vi.hoisted(() => ({ fetch: vi.fn(), request: vi.fn(), alert: vi.fn(), translatorType: 'deepl', translator: 'ko', deeplXUrl: 'https://deeplx-a.invalid', experimentalGoogle: false, tauri: false }))
 vi.mock('../storage/database.svelte', () => ({
     getDatabase: () => ({
         characters: [], presetRegex: [], translator: f.translator, translatorInputLanguage: 'en', aiModel: 'gpt',
@@ -15,7 +15,12 @@ vi.mock('../globalApi.svelte', async importOriginal => ({ ...await importOrigina
 vi.mock('../process/request/request', async importOriginal => ({ ...await importOriginal<typeof import('../process/request/request')>(), requestChatData: f.request }))
 vi.mock('../alert', async importOriginal => ({ ...await importOriginal<typeof import('../alert')>(), alertError: f.alert }))
 vi.mock('localforage', async () => (await import('../plugins/localforage.testSupport')).localforageModule(new Map()))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => (
+    f.tauri ? { runtime: 'tauri', os: 'ios' } : { runtime: 'web', os: 'windows' }
+)))
+vi.mock('@tauri-apps/plugin-http', async () => (await import('../globalApi.testSupport')).tauriHttpModule())
 
+import { fetch as pluginFetch } from '@tauri-apps/plugin-http'
 import { getDatabase } from '../storage/database.svelte'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { doingChat } from '../process/generationState'
@@ -38,6 +43,7 @@ beforeEach(() => {
     f.translator = 'ko'
     f.deeplXUrl = 'https://deeplx-a.invalid'
     f.experimentalGoogle = false
+    f.tauri = false
     f.fetch.mockResolvedValue({ ok: false, data: 'synthetic unavailable' })
     f.request.mockResolvedValue({ type: 'fail', result: 'synthetic unavailable' })
 })
@@ -141,5 +147,36 @@ describe('live chat rows', () => {
             setRuntimePerformanceProfile('normal')
         }
         expect(f.fetch).toHaveBeenCalledTimes(2)
+    })
+})
+
+describe('Google Translate', () => {
+    type SentRequest = { method?: string, body?: string, dataText?: string }
+    function googleRequest(runtime: 'tauri' | 'web', response: () => Response) {
+        f.translatorType = 'google'
+        f.tauri = runtime === 'tauri'
+        const webFetch = vi.fn(async (_url: URL | string, _init: SentRequest) => response())
+        vi.stubGlobal('fetch', webFetch)
+        vi.mocked(pluginFetch).mockImplementation(async () => response())
+        return () => {
+            const [url, init] = (runtime === 'tauri' ? vi.mocked(pluginFetch) : webFetch).mock.calls[0] as [URL | string, SentRequest]
+            return { url: String(url), method: init.method, body: runtime === 'tauri' ? init.dataText : init.body }
+        }
+    }
+
+    it.each(['tauri', 'web'] as const)('sends a paragraph of any length in the request body on %s', async runtime => {
+        const sent = googleRequest(runtime, () => new Response(JSON.stringify([[['KO paragraph']]])))
+        const text = `${runtime} ` + 'A paragraph longer than a URL can carry. '.repeat(500).trim()
+        await expect(translate(text, false)).resolves.toBe('KO paragraph')
+        const request = sent()
+        expect(request.method).toBe('POST')
+        expect(request.url).toBe('https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=en&tl=ko')
+        expect(new URLSearchParams(request.body).get('q')).toBe(text)
+    })
+    it('keeps the original text and reports the status of a refused request on Tauri', async () => {
+        googleRequest('tauri', () => new Response('<html>synthetic refusal</html>', { status: 429 }))
+        const text = 'paragraph Google refuses'
+        await expect(translate(text, false)).resolves.toBe(text)
+        expect(f.alert).toHaveBeenCalledExactlyOnceWith('ERR::Google Translate Error 429')
     })
 })

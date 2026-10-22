@@ -7,7 +7,7 @@ import {
     getCurrentTranslatorPresetFromState,
     type TranslatorPreset,
 } from "./presets";
-import { globalFetch } from "../globalApi.svelte"
+import { fetchNative, globalFetch } from "../globalApi.svelte"
 import { isTauri } from "src/ts/platform"
 import { alertError } from "../alert"
 import { requestChatData } from "../process/request/request"
@@ -261,15 +261,22 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
     }
 
 
-    const url = `https://${arg.host}/translate_a/single?client=gtx&dt=t&sl=${db.translatorInputLanguage}&tl=${arg.to}&q=` + encodeURIComponent(text)
+    const url = `https://${arg.host}/translate_a/single?client=gtx&dt=t&sl=${db.translatorInputLanguage}&tl=${arg.to}`
 
+    // The text goes in the body, which has no URL length limit. Some Google error
+    // responses carry no CORS headers, so a WebView fetch sees them only as a network error.
+    const request = {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: 'q=' + encodeURIComponent(text),
+    }
+    const f = isTauri
+        ? await fetchNative(url, { ...request, logFetch: false })
+        : await fetch(url, request)
 
-
-    const f = await fetch(url, {
-
-        method: "GET",
-
-    })
+    if(!f.ok){
+        return `ERR::Google Translate Error ${f.status}`
+    }
 
     const res = await f.json()
 
