@@ -308,6 +308,14 @@
         }
     }
 
+    function alertParseError(error: any) {
+        const wrapped = new Error(`Error while parsing chat message: ${error?.message ?? error}`)
+        if(error instanceof Error){
+            wrapped.stack = error.stack
+        }
+        alertError(wrapped)
+    }
+
     const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, job:ChatBodyParseJob, tries?:number):Promise<string> => {
         const thoughtMode = captureContext ? 'off' : streamingThoughtMode
         job.controller.signal.throwIfAborted()
@@ -347,6 +355,7 @@
         retranslate;
         let lastParsedQueue = ''
         let mode = 'notrim' as const
+        let translationAttempted = false
         try {
             if((!isEqual(lastCharArg, charArg)) || (chatID !== lastChatId)){
                 lastParsedQueue = ''
@@ -387,6 +396,7 @@
                 }
             }
             if(retranslate || translated){
+                translationAttempted = true
                 // Translation runs its own script pass, which this record does not follow.
                 job.reads?.markUntracked()
                 const settings = captureContext?.settings ?? DBState.db
@@ -472,14 +482,23 @@
             }   
         } catch (error) {
             if (job.controller.signal.aborted) throw error
+            if (translationAttempted && !captureContext) {
+                translating = false
+                // A failed translation leaves the message as it renders untranslated.
+                job.deferredInlays.clear()
+                job.deferredInlays = new DeferredInlayMarkerRegistry()
+                const marked = await parseForRender(data, mode).catch(() => null)
+                if (marked !== null) {
+                    alertParseError(error)
+                    lastParsedQueue = marked
+                    lastCharArg = charArg
+                    return marked
+                }
+            }
             //retry
             if(tries > 2){
                 if(captureContext) throw error
-                const wrapped = new Error(`Error while parsing chat message: ${error?.message ?? error}`)
-                if(error instanceof Error){
-                    wrapped.stack = error.stack
-                }
-                alertError(wrapped)
+                alertParseError(error)
                 return data
             }
             if(job.disposed) return data

@@ -7,7 +7,7 @@ import {
     getCurrentTranslatorPresetFromState,
     type TranslatorPreset,
 } from "./presets";
-import { globalFetch } from "../globalApi.svelte"
+import { fetchNative, globalFetch } from "../globalApi.svelte"
 import { isTauri } from "src/ts/platform"
 import { alertError } from "../alert"
 import { requestChatData } from "../process/request/request"
@@ -261,15 +261,31 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
     }
 
 
-    const url = `https://${arg.host}/translate_a/single?client=gtx&dt=t&sl=${db.translatorInputLanguage}&tl=${arg.to}&q=` + encodeURIComponent(text)
+    const url = `https://${arg.host}/translate_a/single?client=gtx&dt=t&sl=${db.translatorInputLanguage}&tl=${arg.to}`
 
+    // The text goes in the body, which has no URL length limit.
+    const request = {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: 'q=' + encodeURIComponent(text),
+    }
+    // Google can refuse one HTTP client while it still answers another, and a refusal
+    // may reach the WebView only as a network error.
+    let f: Response | null = null
+    try {
+        f = await fetch(url, request)
+    } catch (error) {
+        if(!isTauri) throw error
+    }
+    if(isTauri && (f === null || f.status === 429)){
+        f = await fetchNative(url, { ...request, logFetch: false })
+    }
 
-
-    const f = await fetch(url, {
-
-        method: "GET",
-
-    })
+    if(!f.ok){
+        // An unread native body keeps its response open until the idle timeout.
+        await f.body?.cancel().catch(() => {})
+        return `ERR::Google Translate Error ${f.status}`
+    }
 
     const res = await f.json()
 
