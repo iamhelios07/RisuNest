@@ -87,6 +87,7 @@ describe('live row translation around a generation', () => {
         if (mounted) await unmount(mounted)
         mounted = undefined
         doingChat.set(false)
+        alertStore.set({ type: 'none', msg: '' })
         vi.unstubAllGlobals()
         document.body.replaceChildren()
     })
