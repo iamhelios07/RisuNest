@@ -30,7 +30,7 @@ import { captureGenerationConversationOperation } from './generationConversation
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { alertConfirm, alertNormal, alertToast } from '../alert'
 import { language } from '../../lang'
-import { DisplayReadRecord, recordAmbientChatVariableReads } from './scriptVariableReads'
+import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
 
 const continuationRuntime = vi.hoisted(() => ({
   session: null as ActiveConversationSession | null,
@@ -2162,6 +2162,39 @@ test('shows Lua variables at reloadDisplay and commits message edits at the end'
     expect(fixture.chat.scriptstate).toEqual({ $other: 'kept', $counter: '1', $after: '2' })
   } finally {
     vi.mocked(ScriptDisplayRefreshPointer.update).mockReset()
+    continuationRuntime.session = null
+  }
+})
+
+test.each([
+  ['reloadDisplay(id)', [true, true]],
+  ['reloadChat(id, 1)', [false, true]],
+])('rebuilds the mounted rows that %s reaches', async (call, rebuilt) => {
+  const fixture = operationCharacterFixture('reload-rebuild')
+  fixture.char.triggerscript = luaTriggerScript(`
+    function onButtonClick(id, data)
+      ${call}
+    end
+  `)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  // Rows whose display read no chat variable.
+  const rows = [0, 1].map((index) => {
+    const row = registerDisplayRow(() => index)
+    row.track('body', new DisplayReadRecord())
+    return row
+  })
+  const initial = rows.map((row) => row.rebuildRevision)
+  const { runLuaInteractionTrigger } = await import('./scriptings')
+  try {
+    await runLuaInteractionTrigger('button', fixture.char, 'click')
+    await Promise.resolve()
+
+    expect(rows.map((row, index) => row.rebuildRevision !== initial[index])).toEqual(rebuilt)
+  } finally {
+    for (const row of rows) row.dispose()
     continuationRuntime.session = null
   }
 })

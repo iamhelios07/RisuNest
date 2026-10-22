@@ -41,6 +41,7 @@ vi.mock('../stores.svelte', async () => {
         CurrentTriggerIdStore: writable(null),
         ReloadChatPointer: writable({}),
         ScriptDisplayRefreshPointer: writable(0),
+        ScriptDisplayRebuildPointer: writable(0),
     }
 })
 vi.mock('../globalApi.svelte', () => ({
@@ -67,10 +68,10 @@ vi.mock('./triggers', () => ({ runTrigger: vi.fn() }))
 vi.mock('../alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
 
 const { processScriptFull, resetScriptCache } = await import('./scripts')
-const { requestScriptDisplayRefresh } = await import('./scriptDisplayRefresh')
+const { rebuildScriptDisplayRow, requestScriptDisplayRefresh } = await import('./scriptDisplayRefresh')
 const { DisplayReadRecord, registerDisplayRow } = await import('./scriptVariableReads')
 const { getChatVar, getGlobalChatVar } = await import('../parser/chatVar.svelte')
-const { ReloadChatPointer } = await import('../stores.svelte')
+const { ReloadChatPointer, ScriptDisplayRebuildPointer } = await import('../stores.svelte')
 
 const statusPanel: customscript = {
     comment: 'status panel on the last message only',
@@ -176,12 +177,38 @@ test('refreshes only the rows whose display read a changed chat variable', async
 
     expect(await refreshedRows({ keys: ['hp'] })).toEqual([2])
     expect(await refreshedRows({ keys: ['mood'] })).toEqual([])
-    expect(await refreshedRows({ all: true })).toEqual([2])
+    // An explicit reload reaches every mounted row.
+    expect(await refreshedRows({ all: true })).toEqual([0, 1, 2])
 
     // A row rendered again from the cached regex result keeps its reads.
     rendered[2].row.dispose()
     expect((await renderRow(char, chat, 2)).data).toBe('turn 2 <b>HP 10</b>')
     expect(await refreshedRows({ keys: ['hp'] })).toEqual([2])
+})
+
+test('rebuilds the rows an explicit reload reaches, and not the rows a variable change refreshes', async () => {
+    const { char, chat } = installConversation([statusPanel])
+    const rendered = []
+    for (const index of [0, 1, 2]) rendered.push(await renderRow(char, chat, index))
+    const revisions = () => rendered.map(({ row }) => row.rebuildRevision)
+    const initial = revisions()
+    const background = get(ScriptDisplayRebuildPointer)
+
+    expect(await refreshedRows({ keys: ['hp'] })).toEqual([2])
+    expect(revisions()).toEqual(initial)
+    expect(get(ScriptDisplayRebuildPointer)).toBe(background)
+
+    await refreshedRows({ all: true })
+    const reloaded = revisions()
+    expect(reloaded.map((revision, index) => revision !== initial[index])).toEqual([true, true, true])
+    expect(get(ScriptDisplayRebuildPointer)).not.toBe(background)
+
+    // A reload of one message rebuilds the rows at its index at once.
+    const before = { ...get(ReloadChatPointer) }
+    rebuildScriptDisplayRow(1)
+    expect(get(ReloadChatPointer)[1]).not.toBe(before[1])
+    expect(get(ReloadChatPointer)[0]).toBe(before[0])
+    expect(revisions().map((revision, index) => revision !== reloaded[index])).toEqual([false, true, false])
 })
 
 test.each(['chat', 'global', 'local global'])('records the %s variables a Lua display listener reads', async (source) => {

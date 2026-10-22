@@ -7,7 +7,7 @@ import { getCurrentCharacter, getDatabase, setCharacterByIndex, setDatabase, typ
 import { tokenize } from "../tokenizer";
 import { getModuleTriggers } from "./modules";
 import { get } from "svelte/store";
-import { ReloadChatPointer, ReloadGUIPointer, CurrentTriggerIdStore, DBState } from "../stores.svelte";
+import { ReloadGUIPointer, CurrentTriggerIdStore, DBState } from "../stores.svelte";
 import { processMultiCommand, type CommandGeneration } from "./command";
 import { parseKeyValue, sleep } from "../util";
 import { alertError, alertInput, alertNormal, alertSelect } from "../alert";
@@ -23,7 +23,7 @@ import {
     type ConversationCommitObserver,
 } from "./conversationOperationContext";
 import { createScriptConversationAccess, type ScriptConversationAccess } from './scriptConversationAccess';
-import { requestScriptDisplayRefresh } from './scriptDisplayRefresh';
+import { rebuildScriptDisplayRow, requestScriptDisplayRefresh } from './scriptDisplayRefresh';
 import { noteChatVariableRead } from './scriptVariableReads';
 import { peekActiveConversationSession } from "../storage/persistentDataRuntime.svelte";
 import { runSerializedUserTrigger } from './conversationUserTrigger';
@@ -2540,10 +2540,7 @@ async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTrigge
                 }
                 case 'v2UpdateChatAt':{
                     access?.flushVariables()
-                    ReloadChatPointer.update((v) => {
-                        v[effect.index] = (v[effect.index] ?? 0) + 1
-                        return v
-                    })
+                    rebuildScriptDisplayRow(Number(effect.index))
                     break
                 }
                 case 'v2Wait':{

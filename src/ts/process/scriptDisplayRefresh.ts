@@ -1,11 +1,12 @@
-import { ReloadChatPointer, ScriptDisplayRefreshPointer } from '../stores.svelte'
-import { displayRowsToRefresh, type ScriptDisplayRefreshRequest } from './scriptVariableReads'
+import { ReloadChatPointer, ScriptDisplayRebuildPointer, ScriptDisplayRefreshPointer } from '../stores.svelte'
+import { displayRowsToRefresh, markDisplayRowsForRebuild, type ScriptDisplayRefreshRequest } from './scriptVariableReads'
 
 let pending: { all: boolean, keys: Set<string> } | null = null
 
 /**
- * Re-renders the chat rows that read what a script changed: the changed chat variables,
- * or any chat variable for an explicit `reloadDisplay`. Requests in one task coalesce.
+ * Re-renders the chat rows that read the chat variables a script changed. An explicit
+ * `reloadDisplay` re-renders every mounted row and the background, rebuilding their DOM.
+ * Requests in one task coalesce.
  */
 export function requestScriptDisplayRefresh(request: ScriptDisplayRefreshRequest): void {
     if (!('all' in request) && request.keys.length === 0) return
@@ -17,13 +18,24 @@ export function requestScriptDisplayRefresh(request: ScriptDisplayRefreshRequest
     else for (const key of request.keys) pending.keys.add(key)
 }
 
+/** Re-renders the mounted rows at a message index now and rebuilds their DOM, for a script reload of that message. */
+export function rebuildScriptDisplayRow(index: number): void {
+    markDisplayRowsForRebuild(index)
+    bumpReloadPointers([index])
+}
+
 function flushScriptDisplayRefresh(): void {
     const request = pending
     pending = null
     if (!request) return
-    const indexes = displayRowsToRefresh(request.all ? { all: true } : { keys: [...request.keys] })
+    const indexes = request.all ? markDisplayRowsForRebuild() : displayRowsToRefresh({ keys: [...request.keys] })
+    if (request.all) ScriptDisplayRebuildPointer.update((value) => value + 1)
     // Clears cached regex results and refreshes the background before rows render again.
     ScriptDisplayRefreshPointer.update((value) => value + 1)
+    bumpReloadPointers(indexes)
+}
+
+function bumpReloadPointers(indexes: number[]): void {
     if (indexes.length === 0) return
     ReloadChatPointer.update((pointers) => {
         for (const index of indexes) pointers[index] = (pointers[index] ?? 0) + 1

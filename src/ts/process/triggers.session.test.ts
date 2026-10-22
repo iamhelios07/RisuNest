@@ -5,7 +5,7 @@ import { DBState, selectedCharID } from '../stores.svelte'
 import { processMultiCommand } from './command'
 import { createConversationOperationContext } from './conversationOperationContext'
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
-import { DisplayReadRecord, recordAmbientChatVariableReads } from './scriptVariableReads'
+import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
 
 const runtime = vi.hoisted(() => ({
     unexpectedNativeRuntimeAccess: () => {
@@ -477,6 +477,30 @@ test.each([
 
     expect(atWait).toEqual([{ $state: 'new' }])
     expect(chat.scriptstate).toEqual({ $state: 'new', $out: expect.any(String) })
+})
+
+test.each([
+    { type: 'v2UpdateGUI', rebuilt: [true, true] },
+    { type: 'v2UpdateChatAt', index: '1', rebuilt: [false, true] },
+])('rebuilds the mounted rows that $type reaches', async ({ rebuilt, ...effect }) => {
+    const { chat, char, session } = fixture()
+    char.triggerscript[0].effect = [{ ...effect, indent: 0 }] as never
+    runtime.session = session
+    DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+    // Rows whose display read no chat variable.
+    const rows = [0, 1].map((index) => {
+        const row = registerDisplayRow(() => index)
+        row.track('body', new DisplayReadRecord())
+        return row
+    })
+    const initial = rows.map((row) => row.rebuildRevision)
+    try {
+        await runTrigger(char, 'manual', { chat, manualName: 'ordered' })
+
+        expect(rows.map((row, index) => row.rebuildRevision !== initial[index])).toEqual(rebuilt)
+    } finally {
+        for (const row of rows) row.dispose()
+    }
 })
 
 test('does not publish Trigger metadata to either conversation after navigation', async () => {

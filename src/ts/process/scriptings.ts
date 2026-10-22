@@ -11,7 +11,7 @@ import { hasher, type simpleCharacterArgument, risuChatParser } from "../parser/
 import type { LuaEngine, LuaFactory } from "wasmoon";
 import { getCurrentCharacter, getCurrentChat, getDatabase, setDatabase, type Chat, type Database, type Message, type character, type triggerscript } from "../storage/database.svelte";
 import { get } from "svelte/store";
-import { DBState, ReloadChatPointer, ReloadGUIPointer, selectedCharID } from "../stores.svelte";
+import { DBState, ReloadGUIPointer, selectedCharID } from "../stores.svelte";
 import { alertSelect, alertError, alertInput, alertNormal, alertConfirm } from "../alert";
 import { HypaProcesser } from "./memory/hypamemory";
 import { generateAIImage, type ImageGenerationOptions } from "./stableDiff";
@@ -50,7 +50,7 @@ import {
     createScriptConversationAccess,
     type ScriptConversationAccess,
 } from './scriptConversationAccess';
-import { requestScriptDisplayRefresh } from './scriptDisplayRefresh';
+import { rebuildScriptDisplayRow, requestScriptDisplayRefresh } from './scriptDisplayRefresh';
 import { beginDisplayScriptRun, noticeScriptTimeout } from './scriptTimeoutNotice';
 import { findCharacterById, findCharacterIndexById } from './scriptCharacterLookup';
 
@@ -601,10 +601,7 @@ export async function runScripted(code:string, arg:{
                     return
                 }
                 flushScriptingVariables()
-                ReloadChatPointer.update((v) => {
-                    v[index] = (v[index] ?? 0) + 1
-                    return v
-                })
+                rebuildScriptDisplayRow(index)
             })
 
             //Low Level Access
