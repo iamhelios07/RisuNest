@@ -2110,6 +2110,19 @@ impl PersistentStore {
         result
     }
 
+    /// `commit` with `hold` taken before the library commit and kept until it ends.
+    pub(crate) fn commit_holding<G>(
+        &mut self,
+        commit: &WorkingSetCommit,
+        hold: impl FnOnce(&Self) -> StoreResult<G>,
+    ) -> StoreResult<RevisionResult> {
+        let document = crate::generation_diagnostics::commit_document();
+        let mut committed_revision = None;
+        let result = self.lww_commit_holding(commit, &[], &mut committed_revision, hold);
+        crate::generation_diagnostics::commit_finished(document, commit.expected_revision, &result, committed_revision);
+        result
+    }
+
     pub(crate) fn commit_asset_alias(
         &mut self,
         alias: &AssetAlias,

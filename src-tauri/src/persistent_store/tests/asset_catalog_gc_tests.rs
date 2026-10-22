@@ -1781,3 +1781,51 @@ fn unused_file_cleanup_keeps_aliases_referenced_in_any_stored_form_or_held_by_an
     assert_eq!(deleted.iter().map(|alias| alias.key.as_str()).collect::<Vec<_>>(), ["assets/snapshotted.png"]);
     kept(&store, &["assets/ledger.png", "assets/snapshotted.png"]);
 }
+
+#[test]
+fn unused_alias_cleanup_keeps_device_plugin_writers_out_until_it_commits() {
+    use crate::server_sync::lww_tests::put_asset;
+    use super::super::asset_alias_orphans::OrphanAliasScope;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    put_asset(&mut store, "assets/orphan.png", b"synthetic orphan body");
+    backdate_alias(&store, "assets/orphan.png", 1_000);
+    let now = super::super::device_store::now_ms().unwrap();
+    let device_path = store.device_store().unwrap().connection().path().unwrap().to_owned();
+
+    // A plugin writer on another connection could save a reference to the key between the
+    // reference check and the commit, so it must find the device store locked by then.
+    let writer_locked_out = std::rc::Rc::new(std::cell::Cell::new(false));
+    let locked_out = writer_locked_out.clone();
+    super::super::lww::BEFORE_HELD_COMMIT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+        let writer = rusqlite::Connection::open(device_path).unwrap();
+        writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+        locked_out.set(writer.execute_batch("BEGIN IMMEDIATE").is_err());
+    })));
+    let deleted = store.delete_orphaned_asset_aliases(&OrphanAliasScope::Cleanup { now_ms: now }).unwrap();
+    assert_eq!(deleted.iter().map(|alias| alias.key.as_str()).collect::<Vec<_>>(), ["assets/orphan.png"]);
+    assert!(writer_locked_out.get());
+}
+
+#[test]
+fn a_commit_whose_hold_fails_is_not_applied_by_recovery() {
+    use crate::server_sync::lww_tests::put_asset;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    put_asset(&mut store, "assets/kept.png", b"synthetic kept body");
+    let delete = WorkingSetCommit {
+        expected_revision: store.revision().unwrap(),
+        unit_mutations: Some(vec![super::super::lww::UnitMutation::Delete {
+            key: super::super::lww::unit_key(&["asset", "assets/kept.png"]).unwrap(),
+        }]),
+        ..Default::default()
+    };
+    assert!(matches!(
+        store.commit_holding(&delete, |_| Err::<(), _>(StoreError::CommitBusy)),
+        Err(StoreError::CommitBusy)
+    ));
+    store.lww_recover_intents().unwrap();
+    assert!(alias_object(&store, "assets/kept.png").is_some());
+}

@@ -144,22 +144,26 @@ impl PersistentStore {
         if orphans.is_empty() {
             return Ok(Vec::new());
         }
-        let device_changed = match &search.device_fence {
-            Some(fence) => !self.device_store()?.plugin_gc_fence_is_current(fence)?,
-            None => false,
-        };
-        if device_changed || self.revision()? != search.revision {
+        if self.revision()? != search.revision {
             return Err(StoreError::CommitBusy);
         }
         let unit_mutations = orphans
             .iter()
             .map(|alias| Ok(lww::UnitMutation::Delete { key: lww::unit_key(&["asset", alias.key.as_str()])? }))
             .collect::<StoreResult<Vec<_>>>()?;
-        self.commit(&WorkingSetCommit {
-            expected_revision: search.revision,
-            unit_mutations: Some(unit_mutations),
-            ..Default::default()
-        })?;
+        // Other connections also write device plugin values, so their writers stay out from the
+        // fence check until the aliases are committed.
+        self.commit_holding(
+            &WorkingSetCommit {
+                expected_revision: search.revision,
+                unit_mutations: Some(unit_mutations),
+                ..Default::default()
+            },
+            |store| match &search.device_fence {
+                Some(fence) => Ok(Some(store.device_store()?.acquire_plugin_gc_barrier(fence)?)),
+                None => Ok(None),
+            },
+        )?;
         Ok(orphans)
     }
 
