@@ -27,11 +27,15 @@ Set `ANDROID_HOME` or pass `--adb=<adb-executable>`. Pass the exact emulator ser
 | `asset-bytes` | Measures native asset and inlay transfers and verifies concurrent DB/device/asset writes |
 | `asset-bytes-legacy` | Runs the same asset checks with the optional Android binary bridge disabled |
 | `regex-time-limit` | Measures 30 rendered rows at 0/50/200/500 display rules, 2 KB/30 KB inputs, and subsequent row updates |
+| `regex-cbs` | Uses the same matrix with CBS in every replacement, nested message-index conditions, buttons, capture substitution, and 24 variable reads per matching replacement |
 
 For a Windows before/after comparison, serve each revision with the agent streaming harness and run
 `node benchmarks/streaming/regex-time-limit.mjs <before-loopback-url> <after-loopback-url> <output-json>`.
 The same synthetic fixture must be present in both revisions. The after server also checks an 8,000-character
 unclosed regex input with the default timeouts, a concurrent UI timer, and repeat rendering.
+Append `cbs` to the Windows command to select the CBS workload. Half of its rules match, with half of those
+limited to the latest four messages. The other matching rules read variables on every row. Each input contains
+one token per rule, truncated to its size limit, followed by plain text padding. The mixed workload repeats its tokens.
 
 Examples:
 
@@ -49,4 +53,4 @@ Results contain environment identity, APK hash, assertion IDs, synthetic convers
 
 These runs validate display and persistence paths, not provider transport, full application bootstrap, real plugins, touch behavior, background generation, or physical-device performance.
 
-For the regex timeout responsiveness check on an Android build with timeout handling, add `--timeout=true` to `--profile=regex-time-limit`. The Windows regex driver also records 1/10/30-row scaling and retained UI heap after five repeated 200-rule runs; Worker input retention is covered by the protocol tests.
+For the regex timeout responsiveness check on an Android build with timeout handling, add `--timeout=true` to `--profile=regex-time-limit` or `--profile=regex-cbs`. The Windows regex driver also records 1/10/30-row scaling and retained UI heap after five repeated 200-rule runs; Worker input retention is covered by the protocol tests.

@@ -3,7 +3,8 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { REALM_BLOCKED_URL_PATTERNS } from '../../scripts/realmBlocklist.mjs'
 
-const [before, after, output = '.tmp/regex-time-limit/results.json'] = process.argv.slice(2)
+const [before, after, output = '.tmp/regex-time-limit/results.json', workload = 'mixed'] = process.argv.slice(2)
+if (!['mixed', 'cbs'].includes(workload)) throw new Error('Choose mixed or cbs workload')
 for (const url of [before, after]) {
     if (!url || !['127.0.0.1', 'localhost'].includes(new URL(url).hostname)) {
         throw new Error('Pass before and after loopback URLs serving the agent streaming harness')
@@ -21,15 +22,15 @@ try {
     for (const [variant, url] of [['before', before], ['after', after]]) {
         await page.goto(url, { timeout: 120_000 })
         await page.waitForFunction(() => window.__streamingSmoke?.marker === 'synthetic-v1', { timeout: 120_000 })
-        results.push({ variant, result: await page.evaluate(() => window.__streamingSmoke.regexTimeLimit()) })
+        results.push({ variant, result: await page.evaluate((workload) => window.__streamingSmoke.regexTimeLimit(undefined, undefined, undefined, undefined, workload), workload) })
     }
     const rowScaling = []
     for (const rows of [1, 10]) {
-        rowScaling.push(await page.evaluate((rows) => window.__streamingSmoke.regexTimeLimit([200], [30720], 3, rows), rows))
+        rowScaling.push(await page.evaluate(({ rows, workload }) => window.__streamingSmoke.regexTimeLimit([200], [30720], 3, rows, workload), { rows, workload }))
     }
     const retainedHeapBytes = []
     for (let repeat = 0; repeat < 5; repeat++) {
-        await page.evaluate(() => window.__streamingSmoke.regexTimeLimit([200], [30720], 1))
+        await page.evaluate((workload) => window.__streamingSmoke.regexTimeLimit([200], [30720], 1, undefined, workload), workload)
         await cdp.send('HeapProfiler.collectGarbage')
         retainedHeapBytes.push((await cdp.send('Runtime.getHeapUsage')).usedSize)
     }
