@@ -152,29 +152,36 @@ describe('live chat rows', () => {
 
 describe('Google Translate', () => {
     type SentRequest = { method?: string, body?: string, dataText?: string }
-    function googleRequest(runtime: 'tauri' | 'web', response: () => Response) {
+    const translated = () => new Response(JSON.stringify([[['KO paragraph']]]))
+    const refused = () => new Response('<html>synthetic refusal</html>', { status: 429 })
+    const unreachable = (): Response => { throw new TypeError('Load failed') }
+    function googleRequest(runtime: 'tauri' | 'web', webView: () => Response, native: () => Response = translated) {
         f.translatorType = 'google'
         f.tauri = runtime === 'tauri'
-        const webFetch = vi.fn(async (_url: URL | string, _init: SentRequest) => response())
+        const webFetch = vi.fn(async (_url: URL | string, _init: SentRequest) => webView())
         vi.stubGlobal('fetch', webFetch)
-        vi.mocked(pluginFetch).mockImplementation(async () => response())
-        return () => {
-            const [url, init] = (runtime === 'tauri' ? vi.mocked(pluginFetch) : webFetch).mock.calls[0] as [URL | string, SentRequest]
-            return { url: String(url), method: init.method, body: runtime === 'tauri' ? init.dataText : init.body }
-        }
+        vi.mocked(pluginFetch).mockImplementation(async () => native())
+        const requests = (calls: unknown[][], body: 'body' | 'dataText') => calls.map(([url, init]) => (
+            { url: String(url), method: (init as SentRequest).method, q: new URLSearchParams((init as SentRequest)[body]).get('q') }
+        ))
+        return () => ({ webView: requests(webFetch.mock.calls, 'body'), native: requests(vi.mocked(pluginFetch).mock.calls, 'dataText') })
     }
+    const endpoint = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=en&tl=ko'
 
-    it.each(['tauri', 'web'] as const)('sends a paragraph of any length in the request body on %s', async runtime => {
-        const sent = googleRequest(runtime, () => new Response(JSON.stringify([[['KO paragraph']]])))
+    it.each(['tauri', 'web'] as const)('sends a paragraph of any length in the WebView request body on %s', async runtime => {
+        const sent = googleRequest(runtime, translated)
         const text = `${runtime} ` + 'A paragraph longer than a URL can carry. '.repeat(500).trim()
         await expect(translate(text, false)).resolves.toBe('KO paragraph')
-        const request = sent()
-        expect(request.method).toBe('POST')
-        expect(request.url).toBe('https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=en&tl=ko')
-        expect(new URLSearchParams(request.body).get('q')).toBe(text)
+        expect(sent()).toEqual({ webView: [{ url: endpoint, method: 'POST', q: text }], native: [] })
     })
-    it('keeps the original text and reports the status of a refused request on Tauri', async () => {
-        googleRequest('tauri', () => new Response('<html>synthetic refusal</html>', { status: 429 }))
+    it.each([['a network error', unreachable], ['a 429', refused]])('asks the native client on Tauri when the WebView request ends in %s', async (failure, webView) => {
+        const sent = googleRequest('tauri', webView)
+        const text = `paragraph the WebView cannot get translated after ${failure}`
+        await expect(translate(text, false)).resolves.toBe('KO paragraph')
+        expect(sent().native).toEqual([{ url: endpoint, method: 'POST', q: text }])
+    })
+    it('keeps the original text and reports the status when both clients are refused on Tauri', async () => {
+        googleRequest('tauri', unreachable, refused)
         const text = 'paragraph Google refuses'
         await expect(translate(text, false)).resolves.toBe(text)
         expect(f.alert).toHaveBeenCalledExactlyOnceWith('ERR::Google Translate Error 429')

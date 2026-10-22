@@ -263,16 +263,23 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
 
     const url = `https://${arg.host}/translate_a/single?client=gtx&dt=t&sl=${db.translatorInputLanguage}&tl=${arg.to}`
 
-    // The text goes in the body, which has no URL length limit. Some Google error
-    // responses carry no CORS headers, so a WebView fetch sees them only as a network error.
+    // The text goes in the body, which has no URL length limit.
     const request = {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
         body: 'q=' + encodeURIComponent(text),
     }
-    const f = isTauri
-        ? await fetchNative(url, { ...request, logFetch: false })
-        : await fetch(url, request)
+    // Google can refuse one HTTP client while it still answers another, and a refusal
+    // without CORS headers reaches the WebView only as a network error.
+    let f: Response | null = null
+    try {
+        f = await fetch(url, request)
+    } catch (error) {
+        if(!isTauri) throw error
+    }
+    if(isTauri && (f === null || f.status === 429)){
+        f = await fetchNative(url, { ...request, logFetch: false })
+    }
 
     if(!f.ok){
         return `ERR::Google Translate Error ${f.status}`
