@@ -180,6 +180,10 @@ describe('Google Translate', () => {
         await expect(translate(text, false)).resolves.toBe('KO paragraph')
         expect(sent().native).toEqual([{ url: endpoint, method: 'POST', q: text }])
     })
+    it('passes on the native error when neither client reaches Google on Tauri', async () => {
+        googleRequest('tauri', unreachable, () => { throw new TypeError('synthetic native transport failure') })
+        await expect(translate('paragraph neither client can send', false)).rejects.toThrow('synthetic native transport failure')
+    })
     it('keeps the original text and reports the status when both clients are refused on Tauri', async () => {
         googleRequest('tauri', unreachable, refused)
         const text = 'paragraph Google refuses'

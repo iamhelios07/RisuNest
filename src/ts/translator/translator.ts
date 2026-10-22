@@ -270,7 +270,7 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
         body: 'q=' + encodeURIComponent(text),
     }
     // Google can refuse one HTTP client while it still answers another, and a refusal
-    // without CORS headers reaches the WebView only as a network error.
+    // may reach the WebView only as a network error.
     let f: Response | null = null
     try {
         f = await fetch(url, request)
