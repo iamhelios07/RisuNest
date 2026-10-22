@@ -12,6 +12,8 @@
     import { onDestroy, onMount } from "svelte";
     import { sleep, sortableOptions } from "src/ts/util";
     import { DBState } from 'src/ts/stores.svelte';
+    import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from 'src/ts/storage/deletedOwnerAssetCleanup';
+    import { flushPendingData } from 'src/ts/storage/persistentDataRuntime.svelte';
     import { v4 } from "uuid"
 
     let stb: Sortable = null
@@ -159,12 +161,15 @@
                 if(d){
                     const index = DBState.db.personas.findIndex(persona => persona.id === personaId)
                     if (index < 0 || DBState.db.personas.length <= 1) return
+                    const startedAtMs = Date.now()
                     saveUserPersona()
+                    const assetKeys = collectOwnedAssetKeys(DBState.db.personas[index])
                     const selectedId = DBState.db.personas[DBState.db.selectedPersona]?.id
                     let personas = DBState.db.personas
                     personas.splice(index, 1)
                     DBState.db.personas = personas
                     changeUserPersona(Math.max(0, personas.findIndex(persona => persona.id === selectedId)), 'noSave')
+                    scheduleDeletedOwnerAssetCleanup(assetKeys, startedAtMs, () => flushPendingData('persona-delete'))
                 }
             }}>{language.remove}</Button>
             <Check bind:check={DBState.db.personas[DBState.db.selectedPersona].largePortrait}>{language.largePortrait}</Check>

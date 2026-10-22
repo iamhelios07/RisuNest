@@ -65,6 +65,7 @@ import {
 } from './pluginMutationPublication'
 import { PENDING_SAVE_BYTE_LIMIT as PENDING_BYTE_LIMIT } from './pendingDataSize'
 import { jsonByteLength } from './nativePersistenceValue'
+import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from './deletedOwnerAssetCleanup'
 import { captureMessagePages, cloneConversationByMessage, createsConversation, planConversationInsertPages, type ConversationInsertPlan } from './conversationInsertPages'
 
 export { canonicalJson }
@@ -1947,6 +1948,9 @@ export class SaveCoordinator {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
         this.cancelDebounce()
+        // The native store compares this against its own wall clock, so no injected time.
+        const startedAtMs = Date.now()
+        const ownedAssetKeys = new Map<string, string[]>()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
             const residentsBefore = new Map([...deletedIds].map((id) => [id, this.captureResidentCharacter(id)]))
@@ -1970,6 +1974,7 @@ export class SaveCoordinator {
                     }
                     this.assertReadRevision(revision, targetValue.revision)
                     if (targetValue.value.chaId !== id) throw new Error(`Character ${id} returned mismatched detail`)
+                    ownedAssetKeys.set(id, collectOwnedAssetKeys(targetValue.value))
                 }
                 if (deletedIds.size === 0) return false
 
@@ -2037,6 +2042,12 @@ export class SaveCoordinator {
             )
             await this.finishExplicitCommit(committed.revision)
             return deletedIds.size
+        }).then((count) => {
+            if (count > 0) {
+                const keys = new Set([...deletedIds].flatMap((id) => ownedAssetKeys.get(id) ?? []))
+                scheduleDeletedOwnerAssetCleanup([...keys], startedAtMs, () => this.flushPendingData('deleted-owner-assets'))
+            }
+            return count
         })
     }
 

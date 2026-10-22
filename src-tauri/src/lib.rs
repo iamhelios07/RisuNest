@@ -866,6 +866,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_snapshot_delete,
         persistent_store::commands::pds_asset_gc_preview,
         persistent_store::commands::pds_asset_gc_execute,
+        persistent_store::commands::pds_asset_cleanup_deleted_owner,
         persistent_store::commands::data_health::pds_data_health_scan,
         persistent_store::commands::data_health::pds_data_health_deep_scan,
         persistent_store::commands::data_health::pds_data_health_result,

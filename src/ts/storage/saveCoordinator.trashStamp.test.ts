@@ -1,5 +1,7 @@
-import {describe, expect, it, vi} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({runtime:'tauri',os:'windows'}))
+const core=vi.hoisted(()=>({invoke:vi.fn(async()=>({}))}))
+vi.mock('@tauri-apps/api/core', async (importOriginal) => ({...await importOriginal<typeof import('@tauri-apps/api/core')>(),invoke:core.invoke}))
 import {SaveCoordinator} from './saveCoordinator'
 import {createLeaseStub,createStoreStub} from './persistentDataStore.testSupport'
 import {RevisionConflictError} from './persistentDataStore'
@@ -14,21 +16,25 @@ function fixture(stamp: string | undefined, recheck=stamp) {
     const summary={id:'char-a',name:'Synthetic',type:'character' as const,configuredIndex:0,recentAt:0,trashed:true,conversationCount:0,trashTime:1,trashStampMs:stamp}
     const commit=vi.fn(async()=>({revision:2}))
     const lease=createLeaseStub({revision:1,readRoot:async()=>({revision:1,value:capturePersistentRoot(database)}),
-        readCharacter:async()=>({revision:1,value:{...database.characters[0],trashTime:1}}),
+        readCharacter:async()=>({revision:1,value:{...database.characters[0],trashTime:1,image:'assets/expired.png',
+            additionalAssets:[['extra','assets/extra.png','png']]}}),
         readCharacterSummary:async()=>({...summary,trashStampMs:recheck}),
         queryCharacters:async()=>({revision:1,items:[]}),release:vi.fn(async()=>{}),
     })
     const store=createStoreStub({queryCharacters:async()=>({revision:1,items:[summary]}),acquireRevision:async()=>lease,commit})
-    const coordinator=new SaveCoordinator({store,captureRoot:()=>capturePersistentRoot(database),captureCharacter:()=>null,captureSelectedCharacter:()=>null,replaceDatabase:()=>{}})
+    const coordinator=new SaveCoordinator({store,captureRoot:()=>capturePersistentRoot(database),captureCharacter:()=>null,captureSelectedCharacter:()=>null,replaceDatabase:()=>{},
+        publishCharacterMutation:(result)=>{Object.assign(database,result.root)}})
     coordinator.initialize(1)
     return {coordinator,commit,lease}
 }
 
 describe('native stamped trash expiry', () => {
+    afterEach(()=>core.invoke.mockClear())
     it.each([undefined,String(9*day)])('ignores missing or recent native stamps despite old mutable trashTime: %s', async stamp=>{
         const f=fixture(stamp)
         await expect(f.coordinator.expirePersistentTrash(10*day)).resolves.toBe(0)
         expect(f.commit).not.toHaveBeenCalled()
+        expect(core.invoke).not.toHaveBeenCalled()
     })
     it('rechecks the latest pinned stamp before deleting a candidate', async()=>{
         const f=fixture('1',String(9*day))
@@ -44,6 +50,11 @@ describe('native stamped trash expiry', () => {
             {type:'set',key:'["order","characters"]',value:[]},
             {type:'set',key:'["record","loadouts","loadout"]',value:{id:'loadout',characterIds:['char-b']}},
         ]})
+        // The cleanup reads the library after the delete, and an open lease would still hold its assets.
+        await vi.waitFor(()=>expect(core.invoke).toHaveBeenCalledWith('pds_asset_cleanup_deleted_owner',{
+            keys:expect.arrayContaining(['assets/expired.png','assets/extra.png']),startedAtMs:expect.any(Number)}))
+        expect(vi.mocked(f.lease.release).mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
+        expect(f.commit.mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
     })
     it('does not retry an expired candidate against a newer unchecked revision',async()=>{
         const f=fixture('1')

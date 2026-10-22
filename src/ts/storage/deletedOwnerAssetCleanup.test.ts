@@ -1,0 +1,69 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+const platform = vi.hoisted(() => ({ runtime: 'tauri' as 'tauri' | 'web' }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
+const core = vi.hoisted(() => ({ invoke: vi.fn() }))
+vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: core.invoke }))
+
+import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from './deletedOwnerAssetCleanup'
+
+afterEach(() => {
+    platform.runtime = 'tauri'
+    vi.clearAllMocks()
+    vi.restoreAllMocks()
+})
+
+describe('collectOwnedAssetKeys', () => {
+    it('collects every owned key a character, module or persona names, wherever it is stored', () => {
+        const character = {
+            image: 'assets/portrait.png',
+            emotionImages: [['joy', 'assets/joy.png']],
+            additionalAssets: [['extra', 'assets/extra.webp', 'webp']],
+            desc: '<div><img src="assets/inline.png" alt=""></div> {{raw::assets/raw.png}}',
+            firstMessage: 'assets\\backslash.png',
+            ccAssets: [{ type: 'icon', uri: 'ccdefault:', name: 'main', ext: 'png' }],
+            note: 'sync-conflict-backups/backup.risudat assets/',
+        }
+        const module = { assets: [['map', 'assets/module.png', 'png']], lorebook: [{ content: 'see assets/lore.png' }] }
+        const persona = { icon: 'assets/icon.png', embeddedModule: { assets: [['badge', 'assets/embedded.png', 'png']] } }
+
+        expect(new Set(collectOwnedAssetKeys(character, module, persona))).toEqual(new Set([
+            'assets/portrait.png', 'assets/joy.png', 'assets/extra.webp', 'assets/inline.png', 'assets/raw.png',
+            'assets/backslash.png', 'assets/module.png', 'assets/lore.png', 'assets/icon.png', 'assets/embedded.png',
+        ]))
+    })
+})
+
+describe('scheduleDeletedOwnerAssetCleanup', () => {
+    it('commits pending edits, then deletes the assets with the time the delete started', async () => {
+        const flush = vi.fn(async () => {})
+        core.invoke.mockResolvedValue({})
+
+        scheduleDeletedOwnerAssetCleanup(['assets/a.png'], 123, flush)
+
+        await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith(
+            'pds_asset_cleanup_deleted_owner', { keys: ['assets/a.png'], startedAtMs: 123 }))
+        expect(flush.mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
+    })
+
+    it('leaves the web build and an owner without assets alone', async () => {
+        const flush = vi.fn(async () => {})
+        scheduleDeletedOwnerAssetCleanup([], 1, flush)
+        platform.runtime = 'web'
+        scheduleDeletedOwnerAssetCleanup(['assets/a.png'], 1, flush)
+        await Promise.resolve()
+
+        expect(flush).not.toHaveBeenCalled()
+        expect(core.invoke).not.toHaveBeenCalled()
+    })
+
+    it('reports a failed commit without deleting', async () => {
+        const failure = new Error('synthetic flush failure')
+        const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        scheduleDeletedOwnerAssetCleanup(['assets/a.png'], 1, async () => { throw failure })
+
+        await vi.waitFor(() => expect(logged).toHaveBeenCalledWith('Deleted owner asset cleanup failed', failure))
+        expect(core.invoke).not.toHaveBeenCalled()
+    })
+})

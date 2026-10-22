@@ -1420,7 +1420,7 @@ fn resolved_aliases_allow_gc_but_unknown_references_and_plugins_report_blocked()
             store.connection.execute("UPDATE root SET value = ?1 WHERE generation = ?2",
                 rusqlite::params![r#"{"image":"assets/unknown.bin"}"#, generation]).unwrap();
         }
-        let preview = store.prepare_asset_gc_preview().unwrap();
+        let preview = store.prepare_asset_gc_preview(100).unwrap();
         let (page, details) = store.asset_gc_preview_page_detail(&preview, 16, None, 100, 10).unwrap();
         assert!(!page.report.blockers.is_empty());
         assert!(page.report.potential_delete_hashes.is_empty());
@@ -1674,4 +1674,110 @@ fn catalog_pages_seek_past_objects_registered_at_the_same_time() {
     assert_eq!(steps.len(), 8);
     // A page that walked from the first object to its cursor would cost several first pages.
     assert!(steps.iter().all(|&step| step <= steps[0] * 2), "{steps:?}");
+}
+
+/// The object the `asset` alias for `key` names, when the alias exists.
+pub(crate) fn alias_object(store: &PersistentStore, key: &str) -> Option<String> {
+    store.read_asset_alias("asset", key, None).unwrap().and_then(|alias| alias.value.object_hash)
+}
+
+/// Moves the last write of the alias for `key` back to `physical_ms`, as if an older release had
+/// written it then.
+pub(crate) fn backdate_alias(store: &PersistentStore, key: &str, physical_ms: u64) {
+    let unit = super::super::lww::unit_key(&["asset", key]).unwrap();
+    let stamp: String = store.connection
+        .query_row("SELECT stamp FROM lww_units WHERE key = ?1", [unit.as_str()], |row| row.get(0))
+        .unwrap();
+    let mut stamp: risunest_sync_wire::stamp::Stamp = serde_json::from_str(&stamp).unwrap();
+    stamp.physical_ms = risunest_sync_wire::stamp::DecimalU64(physical_ms);
+    store.connection
+        .execute("UPDATE lww_units SET stamp = ?1 WHERE key = ?2",
+            rusqlite::params![serde_json::to_string(&stamp).unwrap(), unit.as_str()])
+        .unwrap();
+}
+
+pub(crate) fn add_synthetic_character(store: &mut PersistentStore, character_id: &str, desc: &str) {
+    store.commit(&WorkingSetCommit {
+        add_character: Some(json!({
+            "chaId": character_id, "type": "character", "name": "Synthetic", "image": "",
+            "desc": desc, "chats": [], "lastInteraction": 500,
+        })),
+        ..empty_working_set_commit(store.revision().unwrap())
+    }).unwrap();
+}
+
+#[test]
+fn unused_file_cleanup_keeps_aliases_referenced_in_any_stored_form_or_held_by_another_root() {
+    use crate::server_sync::lww_tests::put_asset;
+    use super::super::asset_alias_orphans::OrphanAliasScope;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let keys = [
+        "assets/shared.png", "assets/html.png", "assets/backslash.png", "assets/한글.png",
+        "assets/plugin-bare.png", "assets/setting.png", "assets/archived.png",
+        "assets/snapshotted.png", "assets/ledger.png",
+    ];
+    // Only this alias is old enough for the snapshot to hold it.
+    put_asset(&mut store, "assets/snapshotted.png", b"synthetic snapshotted body");
+    add_synthetic_character(&mut store, "snapshot-owner", "assets/snapshotted.png");
+    let snapshot = store.snapshot_create("synthetic-alias-cleanup").unwrap();
+    store.commit(&WorkingSetCommit {
+        delete_character_ids: Some(vec!["snapshot-owner".into()]),
+        ..empty_working_set_commit(store.revision().unwrap())
+    }).unwrap();
+    for key in keys.iter().filter(|key| **key != "assets/snapshotted.png") {
+        put_asset(&mut store, key, format!("synthetic body of {key}").as_bytes());
+    }
+    add_synthetic_character(&mut store, "kept",
+        r#"<div><img src="assets/html.png" alt=""></div>{{raw::assets/shared.png}} assets\backslash.png assets/한글.png"#);
+    data_health_tests::add_character_with_owner_manifest(
+        &mut store, "manifest-owner", "assets/manifest.png", "portrait.png");
+    // Only the owner manifest still names this key.
+    store.connection.execute(
+        "UPDATE characters SET detail = json_remove(detail, '$.additionalAssets') WHERE character_id = 'manifest-owner'",
+        []).unwrap();
+    store.connection.execute("DELETE FROM lww_units WHERE key = ?1",
+        [super::super::lww::unit_key(&["character", "manifest-owner", "additionalAssets"]).unwrap().as_str()]).unwrap();
+    // A newer body, so the manifest holds a different object than the alias names.
+    put_asset(&mut store, "assets/manifest.png", b"synthetic newer manifest body");
+    add_synthetic_character(&mut store, "archived", "assets/archived.png");
+    store.archive_character("archived", store.revision().unwrap(), 10).unwrap();
+    // Only the archived payload still names this key.
+    assert!(store.connection.execute(r#"DELETE FROM lww_units WHERE key LIKE '["character","archived"%'"#, []).unwrap() > 0);
+    store.commit(&WorkingSetCommit {
+        plugin_storage: Some(vec![PluginStorageMutation::Set {
+            owner: "synthetic-plugin".into(), key: "portrait".into(), value: json!({"id": "plugin-bare.png"}),
+        }]),
+        ..empty_working_set_commit(store.revision().unwrap())
+    }).unwrap();
+    let device = store.device_store().unwrap();
+    device.write_setting("official-account.pending-assets.v1", &json!([{"key": "assets/setting.png"}])).unwrap();
+    device.write_setting("official-account.asset-ledger.v1", &json!({"assets/ledger.png": 1})).unwrap();
+    for key in keys.iter().copied().chain(["assets/manifest.png"]) {
+        backdate_alias(&store, key, 1_000);
+    }
+    let now = super::super::device_store::now_ms().unwrap();
+    let kept = |store: &PersistentStore, deleted: &[&str]| {
+        for key in keys.iter().copied().chain(["assets/manifest.png"]).filter(|key| !deleted.contains(key)) {
+            assert!(alias_object(store, key).is_some(), "{key} must stay");
+        }
+    };
+
+    // An asset key nothing resolves blocks the cleanup, so no alias counts as unused.
+    let generation = super::active_generation(&store.connection).unwrap();
+    store.connection.execute("UPDATE root SET value = ?1 WHERE generation = ?2",
+        rusqlite::params![r#"{"image":"assets/unknown.bin"}"#, generation]).unwrap();
+    assert!(store.delete_orphaned_asset_aliases(&OrphanAliasScope::Cleanup { now_ms: now }).unwrap().is_empty());
+    kept(&store, &[]);
+    store.connection.execute("UPDATE root SET value = '{}' WHERE generation = ?1", [&generation]).unwrap();
+
+    let deleted = store.delete_orphaned_asset_aliases(&OrphanAliasScope::Cleanup { now_ms: now }).unwrap();
+    assert_eq!(deleted.iter().map(|alias| alias.key.as_str()).collect::<Vec<_>>(), ["assets/ledger.png"]);
+    kept(&store, &["assets/ledger.png"]);
+
+    store.snapshot_delete(&snapshot.id).unwrap();
+    let deleted = store.delete_orphaned_asset_aliases(&OrphanAliasScope::Cleanup { now_ms: now }).unwrap();
+    assert_eq!(deleted.iter().map(|alias| alias.key.as_str()).collect::<Vec<_>>(), ["assets/snapshotted.png"]);
+    kept(&store, &["assets/ledger.png", "assets/snapshotted.png"]);
 }

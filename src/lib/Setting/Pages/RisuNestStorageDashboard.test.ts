@@ -31,6 +31,8 @@ const alerts = vi.hoisted(() => ({
 }))
 
 vi.mock('src/ts/storage/nativePersistentMaintenance', () => maintenance)
+const runtime = vi.hoisted(() => ({ flushPendingData: vi.fn(async () => {}) }))
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => runtime)
 vi.mock('src/ts/storage/sync/syncConflictBackup', () => ({ getSyncConflictBackupStore: () => backups }))
 vi.mock('src/ts/alert', () => alerts)
 vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
@@ -298,6 +300,11 @@ describe('RisuNestStorageDashboard', () => {
                 maintenance.executeNativePersistentAssetGc,
             ).toHaveBeenCalledOnce(),
         )
+        // Pending edits are committed before each scan, so a file they use is not offered.
+        const [beforePreview, beforeExecute] = runtime.flushPendingData.mock.invocationCallOrder
+        expect(beforePreview).toBeLessThan(maintenance.previewNativePersistentAssetGc.mock.invocationCallOrder[0])
+        expect(beforeExecute).toBeGreaterThan(maintenance.previewNativePersistentAssetGc.mock.invocationCallOrder[0])
+        expect(beforeExecute).toBeLessThan(maintenance.executeNativePersistentAssetGc.mock.invocationCallOrder[0])
         expect(alerts.alertConfirm).toHaveBeenCalledWith(
             'This will delete 2 unused files (2.0 KiB). Continue?',
         )

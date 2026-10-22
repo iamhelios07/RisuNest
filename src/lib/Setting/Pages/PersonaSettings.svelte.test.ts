@@ -29,16 +29,25 @@ vi.mock('src/ts/pngChunk', () => ({}))
 vi.mock('src/ts/gui/highlight', () => ({ highlighter() {}, removeHighlight() {}, getNewHighlightId: () => 1, AllCBS: [] }))
 vi.mock('src/ts/gui/guisize', () => ({ textAreaSize: writable(0), textAreaTextSize: writable(0) }))
 vi.mock('src/ts/hotkey', () => ({ hotkeyMatches: () => false }))
+const platform = vi.hoisted(() => ({ runtime: 'web' as 'web' | 'tauri' }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
+const core = vi.hoisted(() => ({ invoke: vi.fn(async () => ({})) }))
+vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: core.invoke }))
+const runtime = vi.hoisted(() => ({ flushPendingData: vi.fn(async () => {}) }))
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => runtime)
 
 let instance: ReturnType<typeof mount>
 afterEach(async () => {
     if (instance) await unmount(instance)
     document.body.replaceChildren()
+    platform.runtime = 'web'
+    vi.clearAllMocks()
 })
 
-it('removes the confirmed persona after the active selection changes', async () => {
+it('removes the confirmed persona after the active selection changes and deletes its assets once saved', async () => {
+    platform.runtime = 'tauri'
     DBState.db = {
-        personas: ['First', 'Second', 'Third'].map(id => ({ id, name: id, icon: '', personaPrompt: '', note: '' })),
+        personas: ['First', 'Second', 'Third'].map(id => ({ id, name: id, icon: `assets/${id}.png`, personaPrompt: '', note: '' })),
         selectedPersona: 0, username: 'First', userIcon: '', personaPrompt: '', userNote: '', hotkeys: [],
     } as any
     deriveEffectivePersonaMirrors(DBState.db)
@@ -55,6 +64,10 @@ it('removes the confirmed persona after the active selection changes', async () 
     await vi.waitFor(() => expect(DBState.db.personas).toHaveLength(2))
     expect(DBState.db.personas.map(persona => persona.id)).toEqual(['Second', 'Third'])
     expect(DBState.db.personas[DBState.db.selectedPersona].id).toBe('Second')
+    await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith('pds_asset_cleanup_deleted_owner', {
+        keys: ['assets/First.png'], startedAtMs: expect.any(Number),
+    }))
+    expect(runtime.flushPendingData.mock.invocationCallOrder[0]).toBeLessThan(core.invoke.mock.invocationCallOrder[0])
 })
 
 it('updates the persona used by bound chats while editing its current name, note and prompt', async () => {
