@@ -2310,6 +2310,57 @@ test('stops a Lua handler at the next wait once its conversation is no longer cu
   }
 })
 
+test('keeps Lua variables committed before a wait when the handler later swallows a timeout', async () => {
+  const fixture = operationCharacterFixture('wait-flush-timeout')
+  fixture.char.lowLevelAccess = true
+  let now = 0
+  diagnosticEngineSetup.next = (engine) => {
+    engine.global.set('expire', () => { now = 1e12 })
+  }
+  fixture.char.triggerscript = luaTriggerScript(`
+    onButtonClick = async(function(id, data)
+      setChat(id, 0, 'edited')
+      setChatVar(id, 'before', '1')
+      sleep(id, 4321):await()
+      setChatVar(id, 'after', '2')
+      local tries = 0
+      repeat
+        tries = tries + 1
+        setChatVar(id, 'tries', tostring(tries))
+      until pcall(function() expire(); while true do end end) or tries >= 1e6
+    end)
+  `)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const atWait: unknown[] = []
+  const realSetTimeout = globalThis.setTimeout
+  const timeout = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, delay?: number) => {
+    if (delay !== 4321) return realSetTimeout(handler, delay)
+    atWait.push({ messages: fixture.chat.message.map((entry) => entry.data), scriptstate: { ...fixture.chat.scriptstate } })
+    return realSetTimeout(handler, 0)
+  }) as typeof setTimeout)
+  const deadlineClock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  vi.mocked(alertToast).mockClear()
+  const { runLuaInteractionTrigger } = await import('./scriptings')
+  try {
+    await runLuaInteractionTrigger('button', fixture.char, 'click')
+
+    expect(atWait).toEqual([{ messages: ['message'], scriptstate: { $before: '1' } }])
+    expect(fixture.chat.scriptstate).toEqual({ $before: '1', $after: '2', $tries: '1' })
+    expect(fixture.chat.message.map((entry) => entry.data)).toEqual(['edited'])
+    expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.scriptTimeout)
+  } finally {
+    diagnosticEngineSetup.next = null
+    deadlineClock.mockRestore()
+    errors.mockRestore()
+    timeout.mockRestore()
+    continuationRuntime.session = null
+  }
+})
+
 test.each([
   ['field edits', `
     setChat(id, 1, 'edited ' .. getChatData(id, 1))

@@ -366,6 +366,72 @@ it('interrupts source that yields too often to reach the instruction hook', asyn
     expect(child, child.stderr).toMatchObject({ code: 0, timedOut: false })
 })
 
+it.each([
+    ['pcall', 'pcall(longLoop)'],
+    ['xpcall', 'xpcall(longLoop, function(failure) return failure end)'],
+    ['coroutine.resume', 'coroutine.resume(coroutine.create(longLoop))'],
+])('ends a %s retry loop at the first timeout it catches', async (_label, attempt) => {
+    const child = await runIsolatedWasmoon(`
+        const timedEngine = await create(300)
+        let now = 0
+        const originalNow = performance.now
+        performance.now = () => now
+        timedEngine.global.set('expire', () => { now = 1e12 })
+        try {
+            await runLuaSource(timedEngine, \`
+                tries = 0
+                local function longLoop() expire(); while true do end end
+                function run()
+                    local ok
+                    repeat
+                        tries = tries + 1
+                        ok = ${attempt}
+                    until ok or tries >= 1e6
+                end
+            \`)
+            assert.throws(() => timedEngine.global.get('run')(), /thread timeout exceeded/)
+            assert.equal(timedEngine.global.get('tries'), 1)
+        } finally { performance.now = originalNow }
+    `)
+    expect(child, child.stderr).toMatchObject({ code: 0, timedOut: false })
+})
+
+it('runs a coroutine that caught a timeout at normal speed under its next deadline', async () => {
+    const child = await runIsolatedWasmoon(`
+        const lua = await factory.getLuaModule()
+        let hookCalls = 0
+        const add = lua.module.addFunction
+        lua.module.addFunction = (callback, signature) => add(signature === 'vii'
+            ? (...args) => { hookCalls++; return callback(...args) }
+            : callback, signature)
+        const timedEngine = await create(300)
+        lua.module.addFunction = add
+        let now = 0
+        const originalNow = performance.now
+        performance.now = () => now
+        timedEngine.global.set('expire', () => { now = 1e12 })
+        try {
+            await runLuaSource(timedEngine, \`
+                saved = coroutine.wrap(function()
+                    local ok = coroutine.resume(coroutine.create(function() expire(); while true do end end))
+                    coroutine.yield(ok)
+                    local total = 0
+                    for i = 1, 100000 do total = total + i end
+                    coroutine.yield(total)
+                end)
+                function run() local value = saved(); return value end
+            \`)
+            assert.throws(() => timedEngine.global.get('run')(), /thread timeout exceeded/)
+            now = 0
+            hookCalls = 0
+            assert.equal(timedEngine.global.get('run')(), 5000050000)
+            // About 400,000 instructions: one hook call per 1,000, not one per instruction.
+            assert.ok(hookCalls < 2000, String(hookCalls))
+        } finally { performance.now = originalNow }
+    `)
+    expect(child, child.stderr).toMatchObject({ code: 0, timedOut: false })
+})
+
 it.each([5_000, 60_000])('honors a %i ms handler budget at either side of its deadline', async (timeoutMs) => {
     const child = await runIsolatedWasmoon(`
         const timedEngine = await create(${timeoutMs})
