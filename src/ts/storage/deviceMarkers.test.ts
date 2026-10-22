@@ -69,6 +69,8 @@ describe('device markers', () => {
 
         vi.mocked(settings.set).mockRejectedValueOnce(new Error('device file is read only'))
         markers.setItem('nightlyWarned', 'true')
+        // The display recovery record waits for its own write without taking that failure.
+        await createDisplayRecovery(markers).beginWork({ characterId: 'synthetic-character', conversationId: 'synthetic-chat' }).ready
         await expect(markers.flush()).rejects.toThrow('device file is read only')
     })
 

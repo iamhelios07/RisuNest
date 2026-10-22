@@ -33,6 +33,8 @@ import { language } from '../../lang'
 import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
 import { pluginV2 } from '../plugins/plugins.svelte'
 import { forgetDisplayRecovery, installDisplayRecovery } from '../displayRecovery.svelte'
+import { captureSelectedConversationAuthority, getActiveConversationViewportSource } from '../storage/persistentDataRuntime.svelte'
+import { createMetadataOnlySelectedConversation } from '../storage/selectedConversationLifecycle'
 import { recoveryStore } from '../displayRecovery.testSupport'
 
 const continuationRuntime = vi.hoisted(() => ({
@@ -1882,13 +1884,86 @@ test('runs a timed-out display listener again only for a new row, message, input
     vi.mocked(getCurrentChat).mockReturnValue({ ...fixture.chat, id: 'display-timeout-other-chat' })
     expect(await render('slow zero', 0)).toBe('slow zero')
     expect([listenerRuns, timeouts()]).toEqual([5, 4])
+
+    // A conversation that keeps part of its history loaded has no active session and names its rows through the viewport.
+    const windowed = createMetadataOnlySelectedConversation({ ...fixture.chat, id: 'display-timeout-windowed' }) as Chat
+    continuationRuntime.session = null
+    let windowedMessageId = 'windowed-message'
+    vi.mocked(captureSelectedConversationAuthority).mockReturnValue({ conversationId: windowed.id } as never)
+    vi.mocked(getActiveConversationViewportSource).mockReturnValue({
+      snapshot: () => ({ rowAt: (index: number) => index === 0 ? { message: { chatId: windowedMessageId } } : undefined }),
+    } as never)
+    vi.mocked(getCurrentChat).mockReturnValue(windowed)
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([6, 5])
+    windowedMessageId = 'windowed-replacement'
+    expect(await render('slow zero', 0)).toBe('slow zero')
+    expect([listenerRuns, timeouts()]).toEqual([7, 6])
     vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+    continuationRuntime.session = fixture.session
 
     // An edited script is a new engine without the earlier failures.
     fixture.char.triggerscript = listener('edited')
     diagnosticEngineSetup.next = setupEngine
     expect(await render('slow zero', 0)).toBe('slow zero')
-    expect([listenerRuns, timeouts()]).toEqual([6, 5])
+    expect([listenerRuns, timeouts()]).toEqual([8, 7])
+  } finally {
+    vi.mocked(captureSelectedConversationAuthority).mockReturnValue(null)
+    vi.mocked(getActiveConversationViewportSource).mockReturnValue(null)
+    diagnosticEngineSetup.next = null
+    deadlineClock.mockRestore()
+    errors.mockRestore()
+    continuationRuntime.session = null
+    vi.mocked(risuChatParser).mockReset()
+    vi.stubGlobal('localStorage', previousLocalStorage)
+  }
+})
+
+test('spends one source budget on the display rows queued behind top-level code that timed out', async () => {
+  const fixture = operationCharacterFixture('display-timeout-source', undefined, [
+    { role: 'char', data: 'zero', chatId: 'message-zero' },
+    { role: 'char', data: 'one', chatId: 'message-one' },
+  ])
+  fixture.char.customscript = []
+  fixture.char.triggerscript = luaTriggerScript(`
+    noteSource()
+    local total = 0
+    for i = 1, 10000 do total = total + i end
+    listenEdit('editDisplay', function(id, value) return value .. '!' end)
+  `)
+  let now = 0
+  let sourceRuns = 0
+  const setupEngine = (engine: LuaEngine) => {
+    diagnosticEngineSetup.next = setupEngine
+    engine.global.set('noteSource', () => {
+      sourceRuns++
+      now += 5_001
+    })
+  }
+  diagnosticEngineSetup.next = setupEngine
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const previousLocalStorage = globalThis.localStorage
+  vi.stubGlobal('localStorage', { getItem: () => null })
+  vi.mocked(risuChatParser).mockImplementation(value => value)
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const deadlineClock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+  const { processScriptFull } = await import('./scripts')
+  const { nextDisplayListenerOrder } = await import('./luaDisplayTimeouts')
+  const render = async (data: string, index: number, displayRequestOrder?: number) =>
+    (await processScriptFull(fixture.char, data, 'editdisplay', index, {}, { displayRequestOrder })).data
+  try {
+    // Both rows asked for their display before the source ran.
+    const first = nextDisplayListenerOrder()
+    const second = nextDisplayListenerOrder()
+    expect(await render('zero', 0, first)).toBe('zero')
+    expect(await render('one', 1, second)).toBe('one')
+    // Rendering the same row again later skips it too.
+    expect(await render('zero', 0)).toBe('zero')
+    expect(sourceRuns).toBe(1)
   } finally {
     diagnosticEngineSetup.next = null
     deadlineClock.mockRestore()

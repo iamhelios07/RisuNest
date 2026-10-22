@@ -34,7 +34,11 @@ import {
     type ConversationOperationContext,
     type ConversationCommitObserver,
 } from './conversationOperationContext';
-import { peekActiveConversationSession } from '../storage/persistentDataRuntime.svelte';
+import {
+    captureSelectedConversationAuthority,
+    getActiveConversationViewportSource,
+    peekActiveConversationSession,
+} from '../storage/persistentDataRuntime.svelte';
 import type { ActiveConversationSession } from '../storage/activeConversationSession';
 import { runSerializedUserTrigger } from './conversationUserTrigger';
 import {
@@ -1390,6 +1394,8 @@ export async function runScripted(code:string, arg:{
             ScriptingEngineState.code = code
             } catch (error) {
                 discardFailedScriptingEngineState(ScriptingEngineState)
+                // Top-level code that times out would spend the same budget again for every queued row.
+                if (displayEngine && isLuaTimeoutError(error)) noteDisplayListenerTimeout(displayEngine, displayListener!, data as string)
                 throw error
             }
         }
@@ -1473,10 +1479,7 @@ export async function runScripted(code:string, arg:{
                     ScriptingEngineState.stopSending = true
                 }
             } catch (error) {
-                // Async coroutine rejection preserves the Lua string; synchronous calls wrap it in Error.
-                const firstLine = (typeof error === 'string' ? error : error instanceof Error ? error.message : '').split('\n', 1)[0]
-                // Lua wrap/error can prepend one or more source locations to the timeout string.
-                if (/(?:^|:\d+: )thread timeout exceeded$/.test(firstLine)) {
+                if (isLuaTimeoutError(error)) {
                     const diagnosticMode = ['input', 'output', 'start', 'onButtonClick', 'onFormSubmit', 'editRequest',
                         'editDisplay', 'editInput', 'editOutput', 'manual'].includes(mode) ? mode : 'custom'
                     console.error({ code: 'lua-listener-timeout', mode: diagnosticMode,
@@ -1634,6 +1637,13 @@ function finishScriptingEngineUse(state: ScriptingEngineState) {
     evictIdleScriptingEngines()
 }
 
+function isLuaTimeoutError(error: unknown): boolean {
+    // Async coroutine rejection preserves the Lua string; synchronous calls wrap it in Error.
+    const firstLine = (typeof error === 'string' ? error : error instanceof Error ? error.message : '').split('\n', 1)[0]
+    // Lua wrap/error can prepend one or more source locations to the timeout string.
+    return /(?:^|:\d+: )thread timeout exceeded$/.test(firstLine)
+}
+
 function discardFailedScriptingEngineState(state: ScriptingEngineState) {
     state.code = undefined
     if (state.type === 'lua') {
@@ -1764,10 +1774,22 @@ async function runLuaEditTriggerForMode<T extends string | OpenAIChat[]>(
 
 function createDisplayListenerRequest(order: number, chat: Chat | null | undefined, meta?: object): DisplayListenerRequest {
     const index = (meta as { index?: unknown } | undefined)?.index
-    if (!chat?.id || typeof index !== 'number' || isMetadataOnlySelectedConversation(chat)) return { order }
-    return {
-        order,
-        row: { conversationId: chat.id, index, messageId: getHistoryMessage(chat, index)?.chatId ?? '' },
+    if (!chat?.id || typeof index !== 'number') return { order }
+    const messageId = isMetadataOnlySelectedConversation(chat)
+        ? displayedWindowMessageId(chat.id, index)
+        : getHistoryMessage(chat, index)?.chatId ?? ''
+    if (messageId === undefined) return { order }
+    return { order, row: { conversationId: chat.id, index, messageId } }
+}
+
+/** A conversation that keeps only part of its history loaded shows its rows from the viewport source. */
+function displayedWindowMessageId(conversationId: string, index: number): string | undefined {
+    try {
+        if (captureSelectedConversationAuthority()?.conversationId !== conversationId) return undefined
+        const row = getActiveConversationViewportSource()?.snapshot().rowAt(index)
+        return row ? row.message.chatId ?? '' : undefined
+    } catch {
+        return undefined
     }
 }
 

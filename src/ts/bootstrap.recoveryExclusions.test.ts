@@ -114,7 +114,7 @@ import { initializeOfficialAccountBootstrap } from './storage/sync/officialAccou
 import { initializeNativeSyncBindings, installServerSyncProduction } from './storage/sync/serverSyncProduction'
 import { createSyncExitCoordinator } from './storage/syncExitCoordinator'
 import { getExternalStorageBridge } from './storage/sync/external/bridge'
-import { installDisplayRecovery, isDisplayRecoveryMarked } from './displayRecovery.svelte'
+import { beginDisplayWork, installDisplayRecovery, isDisplayRecoveryMarked } from './displayRecovery.svelte'
 
 beforeEach(() => {
     vi.clearAllMocks()
@@ -397,7 +397,7 @@ describe('renderer recovery notice', () => {
     })
 })
 
-describe('display recovery at startup', () => {
+describe('display recovery record', () => {
     beforeEach(() => {
         startup.native = true
         startup.exclusions = []
@@ -421,6 +421,22 @@ describe('display recovery at startup', () => {
             expect(isDisplayRecoveryMarked(kept)).toBe(true)
         } finally {
             startup.markers.getItem.mockImplementation(() => null)
+            await installDisplayRecovery(null)
+        }
+    })
+
+    it('removes the record of display work still running when the app exits normally', async () => {
+        type ExitDependencies = Parameters<typeof createSyncExitCoordinator>[0]
+        vi.mocked(alertTOS).mockReturnValueOnce(new Promise(() => {}))
+        try {
+            await loadData()
+            const target = { characterId: 'streaming-character', conversationId: 'streaming-chat' }
+            await beginDisplayWork(target).ready
+            expect(startup.markers.setItem).toHaveBeenLastCalledWith('risuNestDisplayRecovery', JSON.stringify({ working: [target], marked: [] }))
+            const dependencies = vi.mocked(createSyncExitCoordinator).mock.calls.at(-1)![0] as ExitDependencies
+            await dependencies.prepareExit!()
+            expect(startup.markers.removeItem).toHaveBeenLastCalledWith('risuNestDisplayRecovery')
+        } finally {
             await installDisplayRecovery(null)
         }
     })

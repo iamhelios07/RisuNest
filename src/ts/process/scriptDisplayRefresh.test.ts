@@ -55,7 +55,13 @@ vi.mock('./modules', () => ({
     getModuleAssets: () => [],
     getModuleRegexScripts: () => [],
 }))
-vi.mock('./memory/hypamemory', () => ({ HypaProcesser: class {} }))
+// Dynamic asset matching: every unknown asset name resolves to the one synthetic asset.
+vi.mock('./memory/hypamemory', () => ({
+    HypaProcesser: class {
+        async addText() {}
+        async similaritySearch() { return ['synthetic-portrait'] }
+    },
+}))
 // The Lua host: a display listener that runs the given reads and keeps the text.
 vi.mock('./scriptings', () => ({
     runLuaEditTrigger: async (_char: unknown, _mode: unknown, data: string) => {
@@ -217,6 +223,10 @@ test('rebuilds the rows an explicit reload reaches, and not the rows a variable 
 test('keeps the reload and refresh scope of a chat opened without Modify Display, and its mark', async () => {
     const { char, chat } = installConversation([statusPanel])
     chat.message[1].data = 'turn 1 {{getvar::mood}} [상태창]'
+    char.firstMessage = 'hello {{getvar::mood}} {{img::synthetic-portrai}} [상태창]'
+    char.additionalAssets = [['synthetic-portrait', 'synthetic-portrait.png', 'png']]
+    live.database.dynamicAssets = true
+    live.database.dynamicAssetsEditDisplay = true
     const listened: string[] = []
     lua.displayListener = async (data) => { listened.push(data) }
     plugins.editdisplay.add(async (data) => `${data} plugin`)
@@ -227,9 +237,34 @@ test('keeps the reload and refresh scope of a chat opened without Modify Display
     try {
         const rendered = []
         for (const index of [0, 1, 2]) rendered.push(await renderRow(char, chat, index))
-        const background = await processScriptFull(char, 'background {{getvar::hp}} [상태창]', 'editdisplay', -1, {}, { regexWorker: false })
+        // The background, and a greeting rendered without a parser projection, take the same path.
+        const background = await processScriptFull(char, 'background {{getvar::hp}} {{bg::synthetic-portrai}} [상태창]', 'editdisplay', -1, {}, { regexWorker: false })
+        const greeting = await processScriptFull(char, char.firstMessage, 'editdisplay', -1, {}, {
+            regexWorker: false,
+            cache: 'bypass',
+            captureContext: {
+                presetRegex: [],
+                moduleRegexScripts: [],
+                moduleAssets: [],
+                dynamicAssets: true,
+                dynamicAssetsEditDisplay: true,
+                parserContext: {
+                    database: live.database,
+                    character: char,
+                    userName: 'User',
+                    personaPrompt: '',
+                    modules: [],
+                    moduleLorebooks: [],
+                    selectedCharID: 0,
+                    chatVariables: { mood: 'calm' },
+                    globalChatVariables: {},
+                    currentTime: 1,
+                },
+            },
+        })
         expect(rendered.map(({ data }) => data)).toEqual(['turn 0 [상태창]', 'turn 1 calm [상태창]', 'turn 2 [상태창]'])
-        expect(background.data).toBe('background 10 [상태창]')
+        expect(background.data).toBe('background 10 {{bg::synthetic-portrai}} [상태창]')
+        expect(greeting.data).toBe('hello calm {{img::synthetic-portrai}} [상태창]')
         const revisions = () => rendered.map(({ row }) => row.rebuildRevision)
         const initial = revisions()
         const backgroundRebuilds = get(ScriptDisplayRebuildPointer)

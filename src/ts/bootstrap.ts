@@ -796,6 +796,8 @@ export async function loadData() {
                 }
             },
             selectedDrain: () => selectedExitDrain,
+            // The app handled the exit, so its display work is not frozen and must not be marked at the next launch.
+            prepareExit: () => suspendDisplayWork('normal-exit'),
             reportError: (error) =>
                 console.error('Normal exit drain failed', error),
         })

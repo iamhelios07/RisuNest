@@ -13,11 +13,15 @@ type DatabaseModule = typeof import('../../storage/database.svelte')
 type StoresModule = typeof import('../../stores.svelte')
 type HypamemoryModule = typeof import('../memory/hypamemory')
 
-/** The persistence runtime with the active conversation session that `session` returns. */
+/** The persistence runtime with the active conversation session that `session` returns, and no windowed selection. */
 export function persistentRuntimeModule(
     session: () => ReturnType<PersistentRuntimeModule['peekActiveConversationSession']> = () => null,
 ) {
-    return { peekActiveConversationSession: session } satisfies Partial<PersistentRuntimeModule>
+    return {
+        peekActiveConversationSession: session,
+        captureSelectedConversationAuthority: vi.fn(() => null),
+        getActiveConversationViewportSource: vi.fn(() => null),
+    } satisfies Partial<PersistentRuntimeModule>
 }
 
 export function parserModule() {

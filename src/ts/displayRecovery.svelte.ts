@@ -17,7 +17,7 @@ export interface DisplayWork {
     release(): void
 }
 
-export type DisplayRecoveryStore = Pick<DeviceMarkerStorage, 'getItem' | 'setItem' | 'removeItem' | 'flush'>
+export type DisplayRecoveryStore = Pick<DeviceMarkerStorage, 'getItem' | 'setItem' | 'removeItem' | 'flush' | 'settled'>
 
 export interface DisplayRecoveryTimers {
     set(callback: () => void, delayMs: number): unknown
@@ -96,7 +96,8 @@ export function createDisplayRecovery(store: DisplayRecoveryStore, options: Disp
         if (text === null) store.removeItem(RECORD_KEY)
         else store.setItem(RECORD_KEY, text)
         writing = true
-        const write: Promise<void> = store.flush().catch((error) => {
+        // Waiting for the write must not take a failure that another caller's flush reports.
+        const write: Promise<void> = (store.settled ? store.settled() : store.flush()).catch((error) => {
             console.error('The display recovery record could not be saved', error)
         }).then(() => {
             if (lastWrite === write) writing = false
