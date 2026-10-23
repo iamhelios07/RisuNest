@@ -16,6 +16,8 @@ node benchmarks/app-lock/android-smoke.mjs \
 - `--phase=timed`: return before and after a real one-minute background interval.
 - `--phase=native-auth`: OS authentication cancellation followed by common PIN unlock. If no OS credential is enrolled, the runner temporarily sets synthetic device PIN `1234` and clears it on completion. `--exercise-auth-success` additionally enters that temporary PIN through the real OS prompt and verifies successful unlock.
 - `--phase=all` (the default): standard checks plus owned file-picker cancellation and a rapid Home/return transition. `--exercise-native-auth` also runs the native-auth checks.
+- `--phase=keyboard`: untouched gate focus, hardware Tab/Enter/Backspace and numeric PIN input, and focus after returning.
+- `--phase=settings`: capture the app-lock settings through the real settings UI.
 - `--phase=seed`: prepare and capture the startup gate only.
 
 The output directory contains `result.json`, native screenshots, and a five-second busy-return video. A green synthetic marker distinguishes retained app content from native and shared covers. The standard phase checks the complete recorded return for marker exposure. A failed assertion produces a nonzero exit status and the failing stage in `result.json`.
