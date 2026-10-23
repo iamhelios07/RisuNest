@@ -10,8 +10,10 @@ const context={variables:[['v','A'],['score','7']].map(([k,v])=>[units(k),units(
 const lanes=widths=>widths.reduce((all,n)=>all.flatMap(t=>Array.from({length:n},(_,i)=>[...t,(i+0.5)/n])),[[]]);
 const histogram=values=>Object.fromEntries([...values.reduce((m,v)=>m.set(v,(m.get(v)??0)+1),new Map())].sort(([a],[b])=>a.localeCompare(b)));
 const assert=(name,ok)=>{if(!ok)throw Error(name)};
-const browser=await chromium.launch({headless:true}),native=nativeClient(binary);
+const browser=await chromium.launch({headless:true});
+let native;
 try {
+ native=nativeClient(binary);
  const page=await browser.newPage();
  await page.route('**/*',r=>['127.0.0.1','localhost'].includes(new URL(r.request().url()).hostname)?r.continue():r.abort());
  const cdp=await page.context().newCDPSession(page);await cdp.send('Network.enable');await cdp.send('Network.setBlockedURLs',{urls:REALM_BLOCKED_URL_PATTERNS});
@@ -143,4 +145,4 @@ try {
   }
   await fs.writeFile(out,JSON.stringify({results},null,2));console.log(JSON.stringify(results.map(({samples,...r})=>r),null,2));
  }
-}finally{native.close();await browser.close()}
+}finally{try{native?.close()}finally{await browser.close()}}

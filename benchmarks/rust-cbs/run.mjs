@@ -9,8 +9,10 @@ if(!['127.0.0.1','localhost'].includes(new URL(url).hostname))throw Error('Loopb
 const variables={enabled:'1',score:'7',next:'{{getvar::score}}',name:'equal',sep:'::',a:'a::a',list:'["x",1.0,null]',off:'0',surrogate:'\ud800',expr:'#if 1',close:'}}',open:'{{'};
 const globals={toggle_demo:'1'};
 const wire={variables:Object.entries(variables).map(([k,v])=>[toUnits(k),toUnits(v)]),globals:Object.entries(globals).map(([k,v])=>[toUnits(k),toUnits(v)]),index:7,user:toUnits('Synthetic'),seed:12345};
-const browser=await chromium.launch({headless:true}),native=nativeClient(binary);
+const browser=await chromium.launch({headless:true});
+let native;
 try{
+native=nativeClient(binary);
 const page=await browser.newPage();
 await page.route('**/*',r=>['127.0.0.1','localhost'].includes(new URL(r.request().url()).hostname)?r.continue():r.abort());
 const cdp=await page.context().newCDPSession(page);await cdp.send('Network.enable');await cdp.send('Network.setBlockedURLs',{urls:REALM_BLOCKED_URL_PATTERNS});
@@ -160,4 +162,4 @@ if(mode==='verify'){
  }
  await fs.writeFile(out,JSON.stringify({results,fallbackRows},null,2));const med=a=>a.sort((a,b)=>a-b)[a.length>>1];console.log(JSON.stringify(results.map(r=>({...r,rows:undefined,timing:Object.fromEntries(['product','native-cold','native-resident','native-folded'].map(v=>[v,{coreMs:med(r.rows.filter(x=>x.variant===v).map(x=>x.coreMs)),roundTripMs:med(r.rows.filter(x=>x.variant===v).map(x=>x.ms))}]))})),null,2));
 }
-}finally{native.close();await browser.close()}
+}finally{try{native?.close()}finally{await browser.close()}}
