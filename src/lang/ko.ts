@@ -1868,7 +1868,7 @@ export const languageKorean = {
         },
         pluginStartup: {
             delayLabel: '동기화 후 플러그인 불러오기',
-            delayHelp: '앱을 실행하면 동기화가 완료될 때까지 플러그인을 불러오지 않습니다. 체크를 해제하는 경우 플러그인 데이터가 이전 값으로 덮어씌워질 수 있습니다.',
+            delayHelp: '앱을 실행하면 동기화가 완료된 뒤 플러그인을 불러오며, Sync 서버를 사용할 수 없는 경우 이 기기의 데이터로 불러옵니다. 체크를 해제하는 경우 플러그인 데이터가 이전 값으로 덮어씌워질 수 있습니다.',
             waiting: '동기화가 완료되면 플러그인을 불러옵니다.',
             loadNow: '플러그인 불러오기',
             syncUnfinished: '동기화를 마치지 못해 플러그인을 불러오지 않았습니다.',
@@ -2279,7 +2279,7 @@ export const languageKorean = {
             registrationRequired: '새 등록 코드 필요',
             blocked: '자동 동기화 중지됨',
             failed: '동기화 실패',
-            offlineNotice: 'Sync 서버에 접속할 수 없습니다. 앱이 열려 있는 동안 자동으로 다시 시도합니다.',
+            offlineNotice: 'Sync 서버를 사용할 수 없으며, 앱이 열려 있는 동안 자동으로 다시 시도합니다.',
             errorHelp:
                 '동기화를 마치지 못했습니다. 이 기기에서 고친 내용은 그대로 있습니다. 다시 시도하세요.',
             "connectRowHelpScan": '서버에서 만든 등록 코드를 붙여넣거나 QR 코드를 스캔하세요. 기기마다 별도의 등록 코드가 필요합니다.',
