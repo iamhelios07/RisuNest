@@ -279,7 +279,7 @@ async function ensureActivated(captured: BindingContext): Promise<void> {
     if (activationPending !== captured) return
     if (!activating) {
         activating = during('applying', async () => {
-            await startupRequest(captured, 'server_sync_lww_activate', { request: header(), startup: initialReceive })
+            await startupRequest(captured, 'server_sync_lww_activate', { request: header(), startup: initialReceive && !binding })
             checkContext(captured)
             if (remoteAssetsRequested(captured)) await keepAssetsRemote(captured)
             activationPending = undefined

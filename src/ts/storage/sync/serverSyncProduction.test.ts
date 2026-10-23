@@ -1021,15 +1021,21 @@ describe('production server LWW composition', () => {
         expect(pending).toEqual([])
         expect(f.invoke.mock.calls.some(([command]) => command === 'server_sync_lww_pull' || command === 'server_sync_notify_start')).toBe(false)
     })
-    it('binds a server connection under a sync background task', async () => {
+    it.each(['connect', 'complete'])('keeps activation retries under a sync background task when binding via %s', async action => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         const { bindSyncTarget } = await import('./bindingRegistry')
         let inTask = false
         f.mobile.mockImplementation(async (_kind: string, operation: (task: object) => Promise<unknown>) => { inTask = true; try { return await operation({ progress() {}, async dispose() {} }) } finally { inTask = false } })
-        vi.mocked(bindSyncTarget).mockImplementation(async () => { expect(inTask).toBe(true); return { kind: 'cancelled' } })
-        await production.connectServerSync({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' })
-        await production.completeServerSyncBinding()
-        expect(bindSyncTarget).toHaveBeenCalledTimes(2)
-        expect(f.mobile.mock.calls.map(([kind]) => kind)).toEqual(['sync', 'sync'])
+        vi.mocked(bindSyncTarget).mockImplementation(async () => {
+            expect(inTask).toBe(true)
+            const context = bindingContext()
+            await f.transport!.resumeBinding(context)
+            return { kind: 'bound', action: 'replaced', state: context.state }
+        })
+        if (action === 'connect') await production.connectServerSync({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' })
+        else await production.completeServerSyncBinding()
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_activate', expect.objectContaining({ startup: false }))
+        expect(f.mobile.mock.calls.map(([kind]) => kind)).toEqual(['sync'])
     })
     it('publishes pending local work under a sync background task before it disconnects on hide', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()

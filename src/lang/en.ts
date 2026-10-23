@@ -2464,7 +2464,7 @@ export const languageEnglish = {
             registrationRequired: 'New registration code required',
             blocked: 'Automatic sync stopped',
             failed: 'Sync failed',
-            offlineNotice: 'Cannot connect to the Sync server. Sync will retry automatically while the app is open.',
+            offlineNotice: 'The Sync server is unavailable. Sync will retry automatically while the app is open.',
             errorHelp:
                 'Sync could not finish. Your edits on this device are unchanged. Try again.',
             "connectRowHelpScan": 'Paste the registration code from the server or scan its QR code. Each device needs its own registration code.',
