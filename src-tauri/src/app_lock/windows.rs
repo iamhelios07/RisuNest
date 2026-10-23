@@ -202,7 +202,7 @@ fn attach(window: &WebviewWindow) -> Result<(), String> {
         let class = WNDCLASSW { lpfnWndProc: Some(cover_proc), hInstance: instance, lpszClassName: COVER_CLASS.as_ptr(), ..std::mem::zeroed() };
         RegisterClassW(&class);
         let cover = CreateWindowExW(WS_EX_LAYERED, COVER_CLASS.as_ptr(), std::ptr::null(), WS_CHILD, 0, 0, 0, 0, parent, null_mut(), instance, std::ptr::null());
-        if cover.is_null() { return Err("app-lock cover creation failed".into()); }
+        if cover.is_null() { return Err(format!("app-lock cover creation failed: {}", std::io::Error::last_os_error())); }
         if SetLayeredWindowAttributes(cover, 0, 255, LWA_ALPHA) == 0 { DestroyWindow(cover); return Err("app-lock cover composition failed".into()); }
         if SetWindowSubclass(parent, Some(window_proc), SUBCLASS_ID, 0) == 0 { DestroyWindow(cover); return Err("app-lock lifecycle hook failed".into()); }
         if WTSRegisterSessionNotification(parent, NOTIFY_FOR_THIS_SESSION) == 0 { RemoveWindowSubclass(parent, Some(window_proc), SUBCLASS_ID); DestroyWindow(cover); return Err("app-lock session hook failed".into()); }
@@ -216,7 +216,22 @@ pub(super) fn setup(app: &AppHandle) -> Result<(), String> {
     let hook = unsafe { SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, null_mut(), Some(foreground_changed), 0, 0, WINEVENT_OUTOFCONTEXT) };
     if hook.is_null() { return Err("app-lock foreground hook failed".into()); }
     RUNTIME.with(|slot| *slot.borrow_mut() = Some(Runtime { app: app.clone(), state: Lifecycle::default(), surfaces: HashMap::new(), session_locked: false, provisional: false, _foreground_hook: hook }));
-    for window in app.webview_windows().values() { attach(window)?; }
+    for window in app.webview_windows().values() {
+        if let Err(error) = attach(window) {
+            let runtime = RUNTIME.with(|slot| slot.borrow_mut().take());
+            if let Some(runtime) = runtime {
+                unsafe {
+                    UnhookWinEvent(runtime._foreground_hook);
+                    for surface in runtime.surfaces.values() {
+                        WTSUnRegisterSessionNotification(surface.parent);
+                        RemoveWindowSubclass(surface.parent, Some(window_proc), SUBCLASS_ID);
+                        DestroyWindow(surface.cover);
+                    }
+                }
+            }
+            return Err(error);
+        }
+    }
     transition(foreground_active());
     Ok(())
 }

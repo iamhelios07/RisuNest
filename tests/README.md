@@ -44,3 +44,21 @@ The runner creates synthetic ELF/ZIP fixtures and invokes the actual alignment
 checker and Android tools. It checks case-sensitive resource names, missing and
 duplicate native libraries, and invalid ELF LOAD alignment. The PowerShell
 runner is outside the JavaScript test inventory and must be invoked explicitly.
+
+The desktop persistence boundary runs a hidden native window with a temporary
+synthetic profile:
+
+```sh
+node tests/native/run.mjs --debug
+```
+
+It checks native startup and app-lock cover initialization before the storage
+contracts. Windows builds embed the product's application manifest. To test an
+already built boundary executable, add `--reuse-build --binary=<path>`. The
+executable must be the hidden boundary build, never an installed application.
+
+On Windows, a copy of that executable whose manifest omits Windows 8 or later
+compatibility can be run with `--expect-app-lock-unavailable`. This checks that
+native cover setup fails explicitly, leaves no cover window, and allows the
+storage contracts and app-lock record recovery commands to finish. It does not
+change the stored lock policy or bypass the shared PIN screen.
