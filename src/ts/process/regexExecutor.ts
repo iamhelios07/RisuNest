@@ -149,7 +149,7 @@ export class RegexExecutor {
         return result
     }
 
-    async execute(plan: RegexExecutionPlan, input: string, parse: (text: string) => string | Promise<string>,
+    async execute(plan: RegexExecutionPlan, input: string, parse: (text: string, ruleInput: string) => string | Promise<string>,
         host: (entry: RegexExecutionPlanEntry, input: string, executor: RegexExecutor) => Promise<string>): Promise<RegexExecutionResult> {
         return runExclusive(this.options.signal, async () => {
             let data = input
@@ -220,12 +220,13 @@ export class RegexExecutor {
                         const current = plan.entries[step.index]
                         const before = step.index === next - 1 ? result.data : data
                         if (current.actions.length === 0 || step.matched) {
-                            data = await parse(before)
+                            data = await parse(before, step.index === next - 1 ? result.checkpointInput ?? data : data)
                             if (data !== before) {
                                 index = step.index + 1
                                 replayChanged = true
                                 break
                             }
+                            if (step.index === next - 1 && result.unchangedCbsFallback) compiledCbs = false
                         } else data = before
                     }
                     // Speculative failures after a parse changed the input are discarded too.

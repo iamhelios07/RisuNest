@@ -17,6 +17,7 @@ import { createHistoryWindowController } from './historyWindowController'
 import * as polyfill from '../polyfill'
 import { InMemoryWorker, StallingWorker } from '../../../tests/support/regexWorker'
 import { RegexWorkerClient } from './regexWorkerClient'
+import { executeRegexPlanSync, getRegexExecutionPlan } from './regexExecutionPlan'
 import { language } from '../../lang'
 import { alertToast } from '../alert'
 import { bindGenerationRegexOwner, reserveGeneration } from './generationState'
@@ -30,6 +31,7 @@ const mocks = vi.hoisted(() => {
     const state = {
         emotions: {} as Record<string, [string, string, number][]>,
         cbsPatternCalls: 0,
+        replayParser: null as null | ((source: string) => string),
         cbsFirstPattern: 'x',
         cbsFirstError: null as Error | null,
         workerFailure: null as unknown,
@@ -104,6 +106,7 @@ vi.mock('src/ts/alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn(), aler
 vi.mock('src/ts/util', () => ({ selectSingleFile: vi.fn() }))
 vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule({
     risuChatParser: (data: string, options?: { setChatVar?: (key: string, value: string) => void }) => {
+        if (mocks.state.replayParser) return mocks.state.replayParser(data)
         if (data === '{{setvar::scratch::regex}}') {
             options?.setChatVar?.('scratch', 'regex')
             return 'written'
@@ -238,6 +241,7 @@ describe('processScriptFull result caching', () => {
         resetScriptCache()
         mocks.state.emotions = {}
         mocks.state.cbsPatternCalls = 0
+        mocks.state.replayParser = null
         mocks.state.cbsFirstPattern = 'x'
         mocks.state.cbsFirstError = null
         mocks.state.workerFailure = null
@@ -511,6 +515,30 @@ describe('processScriptFull result caching', () => {
         expect(mocks.state.workerCalls).toBe(0)
         expect(mocks.state.nativeCalls).toBe(0)
         expect(result.data).toBe('a dog here')
+    })
+
+    it.each(['editinput', 'editoutput', 'editdisplay'] as const)('keeps completed rules when a later parser checkpoint throws in %s', async (mode) => {
+        const scripts = [makeScript('a', 'b'), makeScript('b', 'c{{boom}}')].map(script => ({ ...script, type: mode }))
+        const character = makeCharacter(scripts)
+        const calls: string[] = []
+        const parse = (source: string) => {
+            calls.push(source)
+            if (source.includes('{{boom}}')) throw new RangeError('synthetic parser checkpoint failure')
+            return source
+        }
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+        mocks.state.replayParser = parse
+        try {
+            const expected = executeRegexPlanSync(getRegexExecutionPlan(scripts, mode), 'a', parse)
+            expect(expected.data).toBe('b')
+            for (const regexWorker of [false, true]) {
+                calls.length = 0
+                mocks.state.workerClient = new RegexWorkerClient(() => new InMemoryWorker())
+                const result = await processScriptFull(character, 'a', mode, -1, {}, { cache: 'bypass', regexWorker })
+                expect(result.data).toBe(expected.data)
+                expect(calls.filter(source => source.includes('{{boom}}'))).toEqual(['c{{boom}}'])
+            }
+        } finally { mocks.state.replayParser = null; mocks.state.workerClient = null; error.mockRestore() }
     })
 
     it('preserves editinput output through the Worker', async () => {

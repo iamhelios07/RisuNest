@@ -43,6 +43,8 @@ export interface RegexExecutionResult {
     steps?: { index: number, matched: boolean }[]
     nextIndex?: number
     cbsReads?: string[]
+    checkpointInput?: string
+    unchangedCbsFallback?: boolean
 }
 
 function getPlanCacheByteBudget(): number {

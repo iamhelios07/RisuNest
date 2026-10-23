@@ -1091,7 +1091,8 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             console.error(error)
         }
     }
-    result ??= await executor.execute(plan, data, async (value) => {
+    result ??= await executor.execute(plan, data, async (value, ruleInput) => {
+        data = ruleInput
         try { await parseReplacement(value) }
         catch (error) {
             options.signal?.throwIfAborted()

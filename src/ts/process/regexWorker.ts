@@ -85,6 +85,8 @@ export function createRegexWorkerMessageHandler(
         const errors: [sourceIndex: number, message: string][] = []
         const steps: { index: number, matched: boolean }[] = []
         const cbsReads = new Set<string>()
+        let checkpointInput: string | undefined
+        let unchangedCbsFallback = false
         let nextIndex = request.continuation?.start ?? 0
         const end = request.continuation?.end ?? registeredEntries.length
         for (; nextIndex < end; nextIndex++) {
@@ -101,7 +103,8 @@ export function createRegexWorkerMessageHandler(
                     throw new Error('Regex Worker entry was not compiled')
                 }
                 entry.regex.lastIndex = 0
-                const matched = entry.regex.test(data)
+                // Only conditional rules need a separate match result before replacement.
+                const matched = !entry.conditional || entry.regex.test(data)
                 entry.regex.lastIndex = 0
                 const replaced = matched ? data.replace(entry.regex, entry.replacement) : data
                 if (request.continuation && request.cbsContext && displayCbs) {
@@ -116,6 +119,8 @@ export function createRegexWorkerMessageHandler(
                         continue
                     }
                     // Stop at this exact checkpoint, including unchanged regex output.
+                    checkpointInput = data
+                    unchangedCbsFallback = replaced === data
                     data = replaced
                     steps.push({ index: nextIndex, matched })
                     nextIndex++
@@ -130,6 +135,7 @@ export function createRegexWorkerMessageHandler(
                 }
                 steps.push({ index: nextIndex, matched })
                 if (request.continuation && replaced !== data) {
+                    checkpointInput = data
                     data = replaced
                     nextIndex++
                     break
@@ -145,6 +151,8 @@ export function createRegexWorkerMessageHandler(
         respond({ type: 'result', id: request.id, data, errors,
             ...(request.continuation ? { steps, nextIndex } : {}),
             ...(request.cbsContext ? { cbsReads: [...cbsReads] } : {}),
+            ...(checkpointInput !== undefined ? { checkpointInput } : {}),
+            ...(unchangedCbsFallback ? { unchangedCbsFallback: true } : {}),
         })
     }
 }

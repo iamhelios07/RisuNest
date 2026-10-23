@@ -43,6 +43,8 @@ export type RegexWorkerResponse = { type: 'ready' } | {
     steps?: { index: number, matched: boolean }[]
     nextIndex?: number
     cbsReads?: string[]
+    checkpointInput?: string
+    unchangedCbsFallback?: boolean
 } | {
     type: 'operationResult'
     id: number
@@ -205,6 +207,8 @@ export class RegexWorkerClient {
                     data: response.data,
                     errors: response.errors.map(([sourceIndex, message]) => ({ sourceIndex, error: new Error(message) })),
                     ...(response.cbsReads ? { cbsReads: response.cbsReads } : {}),
+                    ...(response.checkpointInput !== undefined ? { checkpointInput: response.checkpointInput } : {}),
+                    ...(response.unchangedCbsFallback ? { unchangedCbsFallback: true } : {}),
                     ...(response.steps ? { steps: response.steps, nextIndex: response.nextIndex } : {}),
                 })
             }

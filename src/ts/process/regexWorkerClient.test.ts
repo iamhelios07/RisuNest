@@ -161,6 +161,24 @@ describe('bounded regex execution through the real Worker handler', () => {
         expect(calls).toBe(3)
     })
 
+    it.each(['g', 'y', 'gy', 'i'])('avoids a separate match search for ordinary %s replacements', async flags => {
+        const plan = continuationPlan([['a(?:b)', '$&!', flags]], 'editinput')
+        const original = RegExp.prototype.test
+        let probes = 0
+        const probe = vi.spyOn(RegExp.prototype, 'test').mockImplementation(function (input) {
+            if (this.source === 'a(?:b)') probes++
+            return original.call(this, input)
+        })
+        try {
+            for (const input of ['abab', 'missing']) {
+                const expected = executeRegexPlanSync(plan, input, value => value)
+                const executor = new RegexExecutor({ worker: true, client: new RegexWorkerClient(() => new InMemoryWorker()) })
+                expect((await executePlan(executor, plan, input)).data).toBe(expected.data)
+            }
+            expect(probes).toBe(0)
+        } finally { probe.mockRestore() }
+    })
+
     it('stops at host rules and resumes using their changed input', async () => {
         const plan = continuationPlan([['none', 'unused'], ['dynamic', 'B', 'g<cbs>'], ['B', 'C'], ['C', '@@host'], ['D', 'E']])
         const executor = new RegexExecutor({ worker: true, client: new RegexWorkerClient(() => new InMemoryWorker()) })
@@ -516,6 +534,71 @@ describe('compiled display checkpoints through the real Worker', () => {
         expect(reads).toEqual(['value', 'value', 'value', 'value'])
         expect(worker.requests.filter((request) => request.type === 'register')).toHaveLength(3)
         expect(worker.requests.at(-1)).toEqual({ type: 'release' })
+    })
+
+    it.each(['hello {{unknownmacro}}', 'hello <user>', '```\n{{ x }}\n```'])('batches remaining unchanged unsupported checkpoints for %s', async (input) => {
+        const worker = new InMemoryWorker()
+        let projections = 0
+        const executor = new RegexExecutor({ worker: true, skipPlainCbs: true, client: new RegexWorkerClient(() => worker),
+            displayCbs: { project: () => { projections++; return { variables: { value: 'unused' } } }, record() {} },
+        })
+        const plan = continuationPlan([
+            ['missing', '{{getvar::value}}'],
+            ...Array.from({ length: 7 }, (_, index): [string, string] => ['missing' + index, 'unused']),
+        ])
+        let calls = 0
+        const result = await executePlan(executor, plan, input, source => { calls++; return source })
+        expect(result.data).toBe(input)
+        expect(calls).toBe(8)
+        expect(worker.requests.filter(request => request.type === 'execute')).toHaveLength(2)
+        expect(projections).toBe(1)
+    })
+
+    it.each([
+        { name: 'compiled prefix', value: 'b', rules: [['a', '{{getvar::value}}'], ['b', 'c{{boom}}'], ['b', 'done']], expected: 'done', hostInput: undefined },
+        { name: 'unchanged checkpoint after compiled output', value: '{{boom}}', rules: [['a', '{{getvar::value}}'], ['absent', 'unused'], ['boom', 'done']], expected: '{{done}}', hostInput: undefined },
+        { name: 'host boundary after compiled output', value: 'b', rules: [['a', '{{getvar::value}}'], ['b', '@@host'], ['c', 'd{{boom}}'], ['c', 'done']], expected: 'done', hostInput: 'b' },
+    ])('restores only the failing rule input after a $name', async ({ value, rules, expected, hostInput }) => {
+        const plan = continuationPlan(rules as [string, string][])
+        const executor = new RegexExecutor({ worker: true, skipPlainCbs: true,
+            client: new RegexWorkerClient(() => new InMemoryWorker()),
+            displayCbs: { project: () => ({ variables: { value } }), record() {} },
+        })
+        const failures: string[] = []
+        const hostInputs: string[] = []
+        const result = await executor.execute(plan, 'a', (source, ruleInput) => {
+            if (source.includes('{{boom}}')) { failures.push(source); return ruleInput }
+            return source
+        }, async (_entry, input) => { hostInputs.push(input); return 'c' })
+        expect(result.data).toBe(expected)
+        expect(failures).toHaveLength(1)
+        expect(hostInputs).toEqual(hostInput ? [hostInput] : [])
+    })
+
+    it('keeps fallback effects, conditional parsing, live reads and later host rules in order', async () => {
+        let value = '{{unknown}}'
+        let unchanged = 0
+        const reads: string[] = []
+        const events: string[] = []
+        const worker = new InMemoryWorker()
+        const executor = new RegexExecutor({ worker: true, skipPlainCbs: true, client: new RegexWorkerClient(() => worker),
+            displayCbs: { project: () => ({ variables: { value } }), record: keys => reads.push(...keys) },
+        })
+        const plan = continuationPlan([
+            ['x', '{{getvar::value}}'], ['absent', 'unused'], ['absent', 'unused', 'g<unknown>'],
+            ['unknown', '$&', 'g<unknown>'], ['unknown', 'wrong'], ['[', 'invalid'], ['live', '@@host'], ['after', '{{getvar::value}}'],
+        ])
+        const result = await executor.execute(plan, 'x', source => {
+            if (source === '{{unknown}}') { events.push('effect'); value = 'fresh'; return ++unchanged === 1 ? source : 'live' }
+            if (source === '{{getvar::value}}') { reads.push('value'); return value }
+            return source
+        }, async (_entry, input) => { events.push('host:' + input); return 'after' })
+        expect(result.data).toBe('fresh')
+        expect(result.errors.map(error => error.sourceIndex)).toEqual([5])
+        expect(events).toEqual(['effect', 'effect', 'host:live'])
+        expect(reads).toEqual(['value', 'value'])
+        const next = await executePlan(executor, continuationPlan([['x', '{{getvar::value}}']]), 'x', () => { throw new Error('Compilation must reset per invocation') })
+        expect(next.data).toBe('fresh')
     })
 
     it('refreshes context after an unsupported checkpoint and never retries completed host effects', async () => {

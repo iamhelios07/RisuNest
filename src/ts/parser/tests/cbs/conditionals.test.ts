@@ -556,7 +556,13 @@ test('compiled Worker checkpoints preserve the original parser outputs and rando
   const { RegexExecutor } = await import('../../../process/regexExecutor')
   const { RegexWorkerClient } = await import('../../../process/regexWorkerClient')
   const { InMemoryWorker } = await import('../../../../../tests/support/regexWorker')
-  const fixtures: Array<{ input: string, variables: Record<string, string>, rules: [string, string][] }> = [
+  const fixtures: Array<{ input: string, variables: Record<string, string>, rules: [string, string][], hostParses?: number, requests?: number, expectedData?: string }> = [
+    ...['hello {{unknownmacro}}', '```\n{{ x }}\n```', 'hello <user>'].map(input => ({
+      input, variables: { value: 'unused' },
+      rules: [['missing', '{{getvar::value}}'], ...Array.from({ length: 7 }, () => ['absent', 'unused'])] as [string, string][],
+      hostParses: input.includes('<user>') ? 1 : 8, requests: 2,
+      expectedData: input.includes('<user>') ? 'hello Synthetic' : input,
+    })),
     { input: 'x', variables: { value: '{{random::left::right}}', finish: 'done' },
       rules: [['x', '{{getvar::value}}'], ['absent', 'unused'], ['left|right', '{{getvar::finish}}']] },
     { input: 'x', variables: { finish: 'done' },
@@ -582,12 +588,14 @@ test('compiled Worker checkpoints preserve the original parser outputs and rando
     const plan = getRegexExecutionPlan(fixture.rules.map(([pattern, replacement]) => ({
       comment: '', type: 'editdisplay', in: pattern, out: replacement, flag: 'g', ableFlag: true,
     })), 'editdisplay')
-    const parse = (value: string) => risuChatParser(value, { chatVariables: fixture.variables })
+    let hostParses = 0
+    const parse = (value: string) => { hostParses++; return risuChatParser(value, { chatVariables: fixture.variables, userName: 'Synthetic' }) }
     const random = vi.spyOn(Math, 'random').mockReturnValue(0.25)
     try {
       const expected = executeRegexPlanSync(plan, fixture.input, parse)
       const expectedDraws = random.mock.calls.length
       random.mockClear()
+      hostParses = 0
       const worker = new InMemoryWorker()
       const executor = new RegexExecutor({ worker: true, skipPlainCbs: true,
         client: new RegexWorkerClient(() => worker),
@@ -598,6 +606,11 @@ test('compiled Worker checkpoints preserve the original parser outputs and rando
       })
       expect(actual.data).toBe(expected.data)
       expect(random.mock.calls.length).toBe(expectedDraws)
+      if (fixture.hostParses !== undefined) {
+        expect(actual.data).toBe(fixture.expectedData)
+        expect(hostParses).toBe(fixture.hostParses)
+        expect(worker.requests.filter(request => request.type === 'execute')).toHaveLength(fixture.requests!)
+      }
     } finally { random.mockRestore() }
   }
 })
