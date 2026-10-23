@@ -8,6 +8,10 @@ import { planChatParserHistory } from '../../../chatParserHistory'
 import { captureResidentCbsHistory, prepareCbsHistory, type CbsHistoryReader } from '../../../prepareCbsHistory'
 import { createCbsHistoryAccess, CbsHistoryAccessError } from '../../../cbsHistoryAccess'
 import type { PersistentDataRuntime } from '../../../storage/persistentDataRuntime'
+import { RegexExecutor } from '../../../process/regexExecutor'
+import { getRegexExecutionPlan } from '../../../process/regexExecutionPlan'
+import { RegexWorkerClient } from '../../../process/regexWorkerClient'
+import { InMemoryWorker } from '../../../../../tests/support/regexWorker'
 
 vi.mock('../../../platform', async () => (await import('../../../platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
 
@@ -568,6 +572,32 @@ test('a missing prepared row is observable and does not replay preceding variabl
     })).toThrow(CbsHistoryAccessError)
     expect(writes).toEqual(['score:changed'])
     expect(() => historyAccess.assertComplete()).toThrow(CbsHistoryAccessError)
+})
+
+test.each([false, true])('Worker continuations preserve nested CBS, capture substitution, and ordered variable reads and writes (plain bypass %s)', async (skipPlainCbs) => {
+    const character = makeCharacter('CBS worker')
+    const variables: Record<string, string> = { score: '2', next: '{{getvar::score}}' }
+    const reads: string[] = [], writes: string[] = []
+    const plan = getRegexExecutionPlan([
+        { in: '\\[board:(\\w+)\\]', out: '{{#if {{greater_equal::{{chat_index}}::{{? {{lastmessageid}}-3}}}}}}<section>' +
+            '{{#if {{and::{{? {{chat_index}}={{lastmessageid}}}}::{{greater_equal::{{getvar::score}}::2}}}}}}' +
+            Array.from({ length: 24 }, () => '{{getvar::score}}').join(',') + '{{/if}}:$1</section>{{/if}}' },
+        { in: 'item', out: '{{setvar::score::9}}item' },
+        { in: 'item', out: '{{getvar::score}}/{{getvar::next}}' },
+        { in: 'absent', out: 'unused' },
+    ].map((rule) => ({ ...rule, comment: '', type: 'editdisplay', flag: 'g', ableFlag: true })), 'editdisplay')
+    const parse = (value: string) => risuChatParser(value, {
+        db: makeDatabase(character, 'CBS worker'), chatID: 1, runVar: true,
+        getChatVar: (key) => { reads.push(`${key}:${variables[key]}`); return variables[key] },
+        setChatVar: (key, value) => { writes.push(`${key}:${value}`); variables[key] = value },
+    })
+    const padding = '문장😀 '.repeat(1000)
+    const executor = new RegexExecutor({ skipPlainCbs, worker: true, client: new RegexWorkerClient(() => new InMemoryWorker()) })
+    const result = await executor.execute(plan, padding + '[board:item]', parse, async () => { throw new Error('Unexpected host rule') })
+    expect(result.data).toBe(padding + `<section>${Array(24).fill('2').join(',')}:9/9</section>`)
+    expect(writes).toEqual(['score:9'])
+    expect(reads.slice(-3)).toEqual(['score:9', 'next:{{getvar::score}}', 'score:9'])
+    expect(result.errors).toEqual([])
 })
 
 test('does not rerun live display Lua after an obsolete translation finishes', async () => {

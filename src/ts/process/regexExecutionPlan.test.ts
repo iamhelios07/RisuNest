@@ -22,6 +22,29 @@ function script(
 const identity = (value: string) => value
 
 describe('regex execution plans', () => {
+    it('observes in-place edits, order and removal after reusing a plan', () => {
+        const scripts = [script('a', 'b'), script('b', 'c')]
+        const run = () => executeRegexPlanSync(getRegexExecutionPlan([...scripts], 'editoutput'), 'a A', identity).data
+        expect(run()).toBe('c A')
+        expect(run()).toBe('c A')
+        scripts[0].out = 'x'
+        expect(run()).toBe('x A')
+        scripts[0].in = 'A'
+        expect(run()).toBe('a x')
+        scripts[0].flag = 'gi'
+        expect(run()).toBe('x x')
+        scripts[0].ableFlag = false
+        expect(run()).toBe('a x')
+        scripts[0].type = 'editdisplay'
+        expect(run()).toBe('a A')
+        scripts[0] = script('a', 'b')
+        scripts.reverse()
+        expect(run()).toBe('b A')
+        scripts.pop()
+        expect(run()).toBe('a A')
+        scripts.push(script('a', 'tail'))
+        expect(run()).toBe('tail A')
+    })
     it('reuses a plan for the same ordered script content', () => {
         const scripts = [script('a', 'b')]
 

@@ -1,4 +1,5 @@
 import DOMPurify from 'dompurify';
+import { hasCbsSyntax } from './cbsSyntax';
 import { CbsHistoryAccessError, type CbsHistoryAccess } from '../cbsHistoryAccess';
 import markdownit from 'markdown-it'
 import { appVer, getCurrentCharacter, getDatabase, type Database, type character, type customscript, type loreBook, type triggerscript } from '../storage/database.svelte';
@@ -1836,6 +1837,12 @@ export function risuChatParser(da:string, arg:{
         }
     }
 
+    arg.callStack = (arg.callStack ?? 0) + 1
+    if(arg.callStack > 20){
+        return 'ERROR: Call stack limit reached'
+    }
+    if (typeof da === 'string' && !hasCbsSyntax(da)) return da
+
     let pointer = 0;
     let nested:string[] = [""]
     let stackType = new Uint8Array(512)
@@ -1856,12 +1863,6 @@ export function risuChatParser(da:string, arg:{
         data:string,
         arg:string[]
     }> = arg.functions ?? (new Map())
-
-    arg.callStack = (arg.callStack ?? 0) + 1
-
-    if(arg.callStack > 20){
-        return 'ERROR: Call stack limit reached'
-    }
 
     const matcherObj = {
         chatID: chatID,
