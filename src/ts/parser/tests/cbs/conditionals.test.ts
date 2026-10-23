@@ -440,6 +440,49 @@ describe('compiled display CBS spans', () => {
       .toBe(risuChatParser('{{split:{{getvar:value}}:,}}', { chatVariables: { value: 'a::b,c' } }))
   })
 
+  test('preserves array constructor aliases, remaining arrays and missing insertion values', () => {
+    const cases: [string, string][] = [
+      ['{{makearray}}', '[]'], ['{{makearray::}}', '[""]'],
+      ['{{array:a:b}}', '["a","b"]'], ['{{a::1::2}}', '["1","2"]'],
+      ['{{ARRAY_POP::[1,2,3]}}', '[1,2]'], ['{{arrayshift::[1,2,3]}}', '[2,3]'],
+      ['{{arraypush::[1,2]::x}}', '[1,2,"x"]'], ['{{arraypush::[]}}', '[null]'],
+      ['{{arraysplice::[1,2]}}', '[null,1,2]'], ['{{arraysplice::[1,2]::0::1}}', '[null,2]'],
+      ['{{arraysplice::[1,2]::Infinity::Infinity::x}}', '[1,2,"x"]'],
+      ['{{arraysplice::[1,2]::-Infinity::Infinity::x}}', '["x"]'],
+      ['{{arraysplice::[1,2]::-1::NaN::x}}', '[1,"x",2]'],
+      ['{{arraysplice::[1,2]::1e100::1e100::x}}', '[1,2,"x"]'],
+      ['{{arraypush::1§2}}', '["1","2",null]'],
+      ['{{arraypop::{{array::a::b::c}}}}', '["a","b"]'],
+      ['{{makearray::{{spread::["a","b"]}}}}', '["a","b"]'],
+    ]
+    for (const [text, expected] of cases) {
+      expect(evaluate(text), text).toEqual({ data: expected, reads: [] })
+      expect(risuChatParser(text), text).toBe(expected)
+    }
+    for (const name of ['arrayshift', 'arraypop', 'arraypush', 'arraysplice']) {
+      const text = '{{' + name + '}}'
+      expect(evaluate(text), text).toBeNull()
+      expect(risuChatParser(text), text).toBe(text)
+    }
+  })
+
+  test('preserves evaluated array delimiters, JSON fallback and serialization', () => {
+    for (const value of ['', 'null', '1', '"text"', '{"a":1}', '[', 'a§b', '[1,null,{"x":"::"},[2,3]]',
+      '["a\\u003a\\u003ab","\\ud800","\\n"]', 'x::y:z', '{{random::a::b}}']) {
+      for (const name of ['makearray', 'array', 'a', 'arrayshift', 'arraypop', 'arraypush', 'arraysplice']) {
+        for (const separator of [':', '::']) {
+          const text = '{{' + name + separator + '{{getvar::value}}' + separator + '-1' + separator + '1' + separator + 'x}}'
+          const actual = evaluate(text, { value })
+          if (actual) expect(actual.data, text + ':' + value).toBe(risuChatParser(text, { chatVariables: { value } }))
+        }
+      }
+    }
+    expect(evaluate('{{arraypush::{{getvar::value}}::end}}', { value: '1§2' }))
+      .toEqual({ data: '["1","2","end"]', reads: ['value'] })
+    expect(evaluate('{{makearray::{{getvar::value}}}}', { value: 'a'.repeat(16_384) })).toBeNull()
+    expect(compileDisplayCbs('{{arrayassert::[]::1000000000::x}}')).toBeNull()
+  })
+
   test('hands missing-argument errors and assembled arithmetic reads back to the original parser', () => {
     for (const source of ['{{trim}}', '{{split}}', '{{join}}', '{{calc}}', '{{arrayelement}}']) {
       expect(evaluate(source), source).toBeNull()
@@ -526,6 +569,10 @@ test('compiled Worker checkpoints preserve the original parser outputs and rando
       rules: [['x', '{{trim::{{getvar::value}}}}'], ['absent', 'unused'], ['left|right', '{{join::[1,2]::+}}']] },
     { input: 'x', variables: {},
       rules: [['x', '{{button::{{arrayelement::["left","right"]::1}}::{{calc::2+3}}}}']] },
+    { input: 'x', variables: { value: '{{random::left::right}}' },
+      rules: [['x', '{{arraypush::[]::{{getvar::value}}}}'], ['absent', 'unused'], ['left|right', '{{arrayshift::[1,2]}}']] },
+    { input: 'x', variables: {},
+      rules: [['x', '{{arraysplice::{{makearray::a::b::c}}::-1::1}}'], ['absent', '{{arraypop::[1,2]}}']] },
     { input: 'value=a::a', variables: {},
       rules: [['value=(.*)', '{{equal::$1::a}}']] },
     { input: 'x{random::left::right}}', variables: { finish: 'done' },

@@ -1236,44 +1236,28 @@ export function registerCBS(arg:CBSRegisterArg) {
 
     registerFunction({
         name: 'arrayshift',
-        callback: (str, matcherArg, args, vars) => {
-            const arr = parseArray(args[0])
-            arr.shift()
-            return makeArray(arr)
-        },
+        callback: (_str, _matcherArg, args) => pureCallbacks.arrayshift(args),
         alias: ['arrayshift'],
         description: 'Removes and discards the first element from a JSON array. Returns the modified array without the first element.\n\nUsage:: {{arrayshift::["a","b","c"]}} → ["b","c"]',
     });
 
     registerFunction({
         name: 'arraypop',
-        callback: (str, matcherArg, args, vars) => {
-            const arr = parseArray(args[0])
-            arr.pop()
-            return makeArray(arr)
-        },
+        callback: (_str, _matcherArg, args) => pureCallbacks.arraypop(args),
         alias: ['arraypop'],
         description: 'Removes and discards the last element from a JSON array. Returns the modified array without the last element.\n\nUsage:: {{arraypop::["a","b","c"]}} → ["a","b"]',
     });
 
     registerFunction({
         name: 'arraypush',
-        callback: (str, matcherArg, args, vars) => {
-            const arr = parseArray(args[0])
-            arr.push(args[1])
-            return makeArray(arr)
-        },
+        callback: (_str, _matcherArg, args) => pureCallbacks.arraypush(args),
         alias: ['arraypush'],
         description: 'Adds a new element to the end of a JSON array. Returns the modified array with the new element appended.\n\nUsage:: {{arraypush::["a","b"]::c}} → ["a","b","c"]',
     });
 
     registerFunction({
         name: 'arraysplice',
-        callback: (str, matcherArg, args, vars) => {
-            const arr = parseArray(args[0])
-            arr.splice(Number(args[1]), Number(args[2]), args[3])
-            return makeArray(arr)
-        },
+        callback: (_str, _matcherArg, args) => pureCallbacks.arraysplice(args),
         alias: ['arraysplice'],
         description: 'Modifies an array by removing elements and optionally inserting new ones at a specific index. Parameters: array, startIndex, deleteCount, newElement.\n\nUsage:: {{arraysplice::["a","b","c"]::1::1::x}} → ["a","x","c"]',
     });
@@ -1294,9 +1278,7 @@ export function registerCBS(arg:CBSRegisterArg) {
 
     registerFunction({
         name: 'makearray',
-        callback: (str, matcherArg, args, vars) => {
-            return makeArray(args)
-        },
+        callback: (_str, _matcherArg, args) => pureCallbacks.makearray(args),
         alias: ['array', 'a', 'makearray'],
         description: 'Creates a JSON array from the provided arguments. Each argument becomes an array element. Variable number of arguments supported.\n\nUsage:: {{makearray::a::b::c}} → ["a","b","c"]',
     });

@@ -23,7 +23,8 @@ function rejectArithmeticRead(_key: string): string {
 
 const arithmeticVariables = { getChatVar: rejectArithmeticRead, getGlobalChatVar: rejectArithmeticRead }
 const calcString = (text: string) => calculateCbsExpression(text, arithmeticVariables)
-const pureCallbacks = createPureCbsCallbacks({ parseArray, makeArray, calcString })
+const callbacks = createPureCbsCallbacks({ parseArray, makeArray, calcString })
+const pureCallbacks = { ...callbacks, array: callbacks.makearray, a: callbacks.makearray }
 
 const operations = new Set(['getvar', 'equal', 'notequal', 'greater', 'less', 'greaterequal', 'lessequal', 'and', 'or', 'not'])
 for (const name of Object.keys(pureCallbacks)) operations.add(name)

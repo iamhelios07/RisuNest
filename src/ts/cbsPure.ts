@@ -25,6 +25,29 @@ export function createPureCbsCallbacks({ parseArray, makeArray, calcString }: {
     calcString: (value: string) => number
 }) {
     return {
+        makearray: (args: string[]): string => {
+            return makeArray(args)
+        },
+        arrayshift: (args: string[]): string => {
+            const arr = parseArray(args[0])
+            arr.shift()
+            return makeArray(arr)
+        },
+        arraypop: (args: string[]): string => {
+            const arr = parseArray(args[0])
+            arr.pop()
+            return makeArray(arr)
+        },
+        arraypush: (args: string[]): string => {
+            const arr = parseArray(args[0])
+            arr.push(args[1])
+            return makeArray(arr)
+        },
+        arraysplice: (args: string[]): string => {
+            const arr = parseArray(args[0])
+            arr.splice(Number(args[1]), Number(args[2]), args[3])
+            return makeArray(arr)
+        },
         button: (args: string[]): string => {
             return `<button class="button-default" risu-trigger="${args[1]}">${args[0]}</button>`
         },
