@@ -45,9 +45,13 @@ export interface RegexExecutionResult {
     cbsReads?: string[]
 }
 
+function getPlanCacheByteBudget(): number {
+    return getRuntimePerformanceBudgets().regexPlanCacheEntries * 128 * 1024
+}
+
 function createPlanCache() {
     return new ByteBudgetLru<string, RegexExecutionPlan>(
-        getRuntimePerformanceBudgets().regexPlanCacheEntries * 128 * 1024,
+        getPlanCacheByteBudget(),
         (_key, plan) => plan.displayCbs?.estimatedBytes ?? 0,
         getRuntimePerformanceBudgets().regexPlanCacheEntries,
     )
@@ -187,12 +191,15 @@ export function getRegexExecutionPlan(scripts: customscript[], mode: string): Re
         && !entry.dynamicPattern
         && !parserRiskPattern.test(entry.replacement)
     ))
+    let displayCbs = mode === 'editdisplay' ? createDisplayCbsPlan(entries.map((entry) => entry.replacement)) : undefined
+    // Keep the regex plan reusable when its optional compiled CBS exceeds the cache budget.
+    if (displayCbs && displayCbs.estimatedBytes > getPlanCacheByteBudget()) displayCbs = undefined
     const plan: RegexExecutionPlan = {
         revision: nextPlanRevision++,
         mode,
         entries,
         workerEligible,
-        ...(mode === 'editdisplay' ? { displayCbs: createDisplayCbsPlan(entries.map((entry) => entry.replacement)) } : {}),
+        ...(mode === 'editdisplay' ? { displayCbs } : {}),
         requiresHostExecution,
     }
 

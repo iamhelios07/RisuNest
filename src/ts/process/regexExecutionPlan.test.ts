@@ -20,6 +20,7 @@ function script(
 }
 
 const identity = (value: string) => value
+const largeDisplayHtml = '{{#if 1}}<section>' + '<span class="value">{{trim::x}}</span>'.repeat(5000) + '</section>{{/}}'
 
 describe('regex execution plans', () => {
     it('observes in-place edits, order and removal after reusing a plan', () => {
@@ -58,17 +59,54 @@ describe('regex execution plans', () => {
         expect(changed.revision).toBeGreaterThan(first.revision)
     })
 
-    it('clears retained plans when switching to the lower low-spec budget', () => {
-        setRuntimePerformanceProfile('normal')
-        const scripts = [script('profile-cache', 'changed')]
-        const beforeSwitch = getRegexExecutionPlan(scripts, 'editoutput')
+    it('keeps HTML plans reusable across modes and reevaluates optional CBS after profile changes', () => {
+        const html = largeDisplayHtml
+        const scripts = [{ ...script('profile-cache', html), type: 'editdisplay' }, script('profile-output', 'changed')]
+        let previousRevision: number | undefined
+        try {
+            for (const profile of ['normal', 'low-spec', 'normal', 'low-spec'] as const) {
+                setRuntimePerformanceProfile(profile)
+                const plan = getRegexExecutionPlan(scripts, 'editdisplay')
+                if (previousRevision !== undefined) expect(plan.revision).toBeGreaterThan(previousRevision)
+                expect(getRegexExecutionPlan(scripts, 'editdisplay').revision).toBe(plan.revision)
+                for (let attempt = 0; attempt < 3; attempt++) {
+                    getRegexExecutionPlan(scripts, 'editoutput')
+                    expect(getRegexExecutionPlan(scripts, 'editdisplay').revision).toBe(plan.revision)
+                }
+                if (profile === 'normal') expect(plan.displayCbs).toBeDefined()
+                else expect(plan.displayCbs).toBeUndefined()
+                previousRevision = plan.revision
+            }
+        } finally { setRuntimePerformanceProfile('normal') }
+    })
 
+    it('observes edits and preserves ordered execution and errors without optional CBS', () => {
         setRuntimePerformanceProfile('low-spec')
-        const afterSwitch = getRegexExecutionPlan(scripts, 'editoutput')
-        setRuntimePerformanceProfile('normal')
+        const scripts = [
+            { ...script('start', largeDisplayHtml, 'g<order 3>'), type: 'editdisplay' },
+            { ...script('x', 'y', 'g<order 1>'), type: 'editdisplay' },
+            { ...script('[', 'broken', 'g<order 2>'), type: 'editdisplay' },
+        ]
+        try {
+            const first = getRegexExecutionPlan(scripts, 'editdisplay')
+            expect(first.displayCbs).toBeUndefined()
+            getRegexExecutionPlan([], 'editoutput')
+            const reused = getRegexExecutionPlan(scripts, 'editdisplay')
+            expect(reused.revision).toBe(first.revision)
+            const result = executeRegexPlanSync(reused, 'start', identity)
+            expect(result.data).toBe(largeDisplayHtml.replaceAll('x', 'y'))
+            expect(result.errors.map((error) => error.sourceIndex)).toEqual([2])
 
-        expect(afterSwitch).not.toBe(beforeSwitch)
-        expect(afterSwitch.revision).toBeGreaterThan(beforeSwitch.revision)
+            scripts[0].out = largeDisplayHtml.replaceAll('x', 'z')
+            scripts.reverse()
+            const changed = getRegexExecutionPlan(scripts, 'editdisplay')
+            expect(changed.revision).toBeGreaterThan(first.revision)
+            getRegexExecutionPlan([], 'editoutput')
+            expect(getRegexExecutionPlan(scripts, 'editdisplay').revision).toBe(changed.revision)
+            const changedResult = executeRegexPlanSync(changed, 'start', identity)
+            expect(changedResult.data).toBe(largeDisplayHtml.replaceAll('x', 'z'))
+            expect(changedResult.errors.map((error) => error.sourceIndex)).toEqual([0])
+        } finally { setRuntimePerformanceProfile('normal') }
     })
 
     it('applies descending order metadata with stable ties', () => {
