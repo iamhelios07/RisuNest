@@ -1934,9 +1934,9 @@ localRuntimeTest('runs a timed-out display listener again only for a new row, me
   }
 })
 
-test('spends one source budget on the display rows queued behind top-level code that timed out', async () => {
+test.each(['runtime', 'pipeline'] as const)('spends one source budget on the display rows queued behind top-level code that timed out (%s)', async boundary => {
   const worker = inject('luaWorker') === true
-  const fixture = operationCharacterFixture('display-timeout-source', undefined, [
+  const fixture = operationCharacterFixture(`display-timeout-source-${boundary}`, undefined, [
     { role: 'char', data: 'zero', chatId: 'message-zero' },
     { role: 'char', data: 'one', chatId: 'message-one' },
   ])
@@ -1967,20 +1967,26 @@ test('spends one source budget on the display rows queued behind top-level code 
   vi.mocked(risuChatParser).mockImplementation(value => value)
   const deadlineClock = worker ? undefined : vi.spyOn(performance, 'now').mockImplementation(() => now)
   const { nextDisplayListenerOrder } = await import('./luaDisplayTimeouts')
-  const render = async (data: string, index: number, displayRequestOrder?: number) =>
-    (await runScripted(code, { char: fixture.char, chat: fixture.chat, mode: 'editDisplay', data,
+  const { processScriptFull } = await import('./scripts')
+  const render = async (data: string, index: number, displayRequestOrder?: number) => {
+    if (boundary === 'pipeline') {
+      return (await processScriptFull(fixture.char, data, 'editdisplay', index, {}, { displayRequestOrder })).data
+    }
+    return (await runScripted(code, { char: fixture.char, chat: fixture.chat, mode: 'editDisplay', data,
       displayListener: { order: displayRequestOrder ?? nextDisplayListenerOrder(), row: {
         conversationId: fixture.chat.id, index, messageId: fixture.chat.message[index].chatId!,
       } },
     })).res
+  }
   try {
     // Both rows asked for their display before the source ran.
     const first = nextDisplayListenerOrder()
     const second = nextDisplayListenerOrder()
-    await expect(render('zero', 0, first)).rejects.toThrow(/thread timeout exceeded/)
-    expect(await render('one', 1, second)).toBeUndefined()
+    if (boundary === 'pipeline') expect(await render('zero', 0, first)).toBe('zero')
+    else await expect(render('zero', 0, first)).rejects.toThrow(/thread timeout exceeded/)
+    expect(await render('one', 1, second)).toBe(boundary === 'pipeline' ? 'one' : undefined)
     // Rendering the same row again later skips it too.
-    expect(await render('zero', 0)).toBeUndefined()
+    expect(await render('zero', 0)).toBe(boundary === 'pipeline' ? 'zero' : undefined)
     if (!worker) expect(sourceRuns).toBe(1)
   } finally {
     diagnosticEngineSetup.next = null
