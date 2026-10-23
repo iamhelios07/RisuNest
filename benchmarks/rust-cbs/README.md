@@ -38,3 +38,33 @@ For a syntax-only protocol probe, send one JSON object per line:
 ~~~
 
 Registration returns program count, retained capacity accounting and fold count, or a fallback reason. Reuse an identifier to replace its program. The eval response also contains output, random draw count and state. A syntax-only probe must leave fold false; folding evaluates literal operations. Empty-context evaluation measures only that context and does not prove admission with actual values or equality to the original parser. Text can be an array of UTF-16 integers when lone surrogate units must be preserved.
+
+## Optional finite RNG experiment
+
+The separate relax-register and relax-eval operations accept a different random sequence while preserving finite candidate sets, duplicate-option weights, logical choice sharing and fresh choices on each invocation. Existing register/eval behavior stays unchanged. Run the synthetic contract checks and timings with:
+
+~~~text
+node benchmarks/rust-cbs/relaxed-run.mjs http://127.0.0.1:<port> <shared-target>/release/rust-cbs-resident[.exe] <results.json>
+node benchmarks/rust-cbs/relaxed-run.mjs http://127.0.0.1:<port> <shared-target>/release/rust-cbs-resident[.exe] <timings.json> measure
+node benchmarks/rust-cbs/relaxed-run.mjs http://127.0.0.1:<port> <shared-target>/release/rust-cbs-resident[.exe] <cache-timings.json> cache-measure
+~~~
+
+~~~json
+{"op":"relax-register","id":"choice","text":"{{random::A::A::B}}","context":{"variables":[],"globals":[],"index":0,"user":[],"seed":0}}
+{"op":"relax-eval","id":"choice"}
+{"op":"relax-eval","id":"choice","tape":[0.5]}
+~~~
+
+Registration explores every finite outcome using private snapshot and temporary state before consuming entropy. It returns nodes, leaves, retainedBytes, revision and entropyWords:0, or a fallback reason. Any reachable unsupported callback, persistent write, semantic guard or resource bound rejects the entire registration. A failed replacement removes its previous relaxed handle. Context replacement and release invalidate all relaxed handles.
+
+Accepted handles contain output leaves and choice branches. Evaluation without a tape uses operating-system entropy and integer rejection sampling; a supplied unit-interval tape is an explicit verification control. The older seeded differential source is separate. No reproducibility option or product setting is added. Candidate and joint-probability structure are checked by finite outcome enumeration. This does not claim bit-level distribution identity with an engine's unspecified finite-precision Math.random implementation or treat a small empirical sample as a statistical proof.
+
+Supported random forms are finite random choices, bounded ordered safe-integer randint, and bounded integer dice/roll domains. Duplicate options retain separate weighted branches. roll with no arguments returns the product's constant 1. Bare continuous random, fractional/reversed/nonfinite numeric domains, tokenize-accurate mode, deterministic pick/rollp/rollpick/hash and host writes are excluded. These exclusions do not redefine those product operations.
+
+Limits are 16 alternatives per choice, 12 choice levels, 256 leaves, 512 tree nodes, a 65,536-unit source, 262,144 output units per leaf, 2 MiB accounted capacity per tree and a shared 1,000,000-node preflight work budget. At most 64 relaxed handles retain 8 MiB of accounted tree capacity. Independent choices grow exponentially; nine binary choices exceed the current bound. Capacity accounting is not a measured process-heap limit.
+
+Sampling errors return abort rather than fallback. A caller must also abort on pipe timeout, process loss, cancellation or a later failure after sampling; it must not retry the original invocation with fresh choices. For subsequent parser checkpoints, preserve the completed intermediate text and fall back only on the current checkpoint input. Whole-request recovery requires saved logical choices or completed checkpoints. The harness demonstrates these rules and a simulated result-dependent downstream failure; it does not implement asynchronous host recovery or Tauri cancellation.
+
+The cache-measure mode compares the shared-one-choice workload with an equivalent JavaScript cache: the original parser computes both leaves for one immutable context, then each invocation samples a fresh leaf. It aggregates browser invocations to reduce timer quantization, checks the UTF-16 unit that differs between choices against each selected index, verifies checksums and draw counts, and reports preparation, context invalidation and stored string payload separately. This distinguishes precomputation from a language or transport advantage. JavaScript string payload bytes and native Vec capacity accounting are different measures; neither reports actual heap usage.
+
+Abort-only handling prevents fresh-draw retry bias in this bounded experiment. It does not reproduce an existing product's automatic recovery behavior and is not permission to change that behavior. Product adoption requires equivalent logical-choice replay or a recovery boundary that preserves both completed choices and non-RNG behavior. Selective reactive read-dependency registration is also outside this snapshot-only protocol.

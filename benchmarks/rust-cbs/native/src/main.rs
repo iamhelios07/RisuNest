@@ -1,5 +1,6 @@
 mod arithmetic;
 pub mod cbs;
+mod relaxed;
 use cbs::{compile, evaluate, Budget, Context, Units};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -57,6 +58,7 @@ fn text(v: &Value) -> Result<Units, String> {
 fn main() {
     let mut programs: HashMap<String, (Vec<cbs::Node>, usize)> = HashMap::new();
     let mut ctx = Context::default();
+    let mut relaxed_programs: HashMap<String, (relaxed::Program, u64)> = HashMap::new();
     let mut revision = 0u64;
     let mut bytes = 0usize;
     let stdout = io::stdout();
@@ -68,6 +70,61 @@ fn main() {
             let req: Value = serde_json::from_str(&line).map_err(|_| "request")?;
             let op = req["op"].as_str().ok_or("op")?;
             match op {
+                "relax-register" => {
+                    let id = req["id"].as_str().ok_or("id")?.to_owned();
+                    relaxed_programs.remove(&id);
+                    let current = if req["context"].is_object() {
+                        context(&req["context"])?
+                    } else {
+                        ctx.clone()
+                    };
+                    let p = relaxed::prepare(&text(&req["text"])?, &current)?;
+                    let used: usize = relaxed_programs
+                        .values()
+                        .map(|(p, _)| p.retained_bytes)
+                        .sum();
+                    if relaxed_programs.len() >= 64 || used + p.retained_bytes > 8_388_608 {
+                        return Err("rng-resident-bound".into());
+                    }
+                    let response = json!({"nodes":p.nodes,"leaves":p.leaves,"retainedBytes":p.retained_bytes,"revision":revision,"entropyWords":0});
+                    relaxed_programs.insert(id, (p, revision));
+                    Ok(response)
+                }
+                "relax-eval" => {
+                    let result = (|| -> Result<Value, String> {
+                        if req["cancelled"] == true {
+                            return Err("cancelled".into());
+                        }
+                        let id = req["id"].as_str().ok_or("id")?;
+                        let (p, prepared_revision) =
+                            relaxed_programs.get(id).ok_or("missing-program")?;
+                        if *prepared_revision != revision
+                            || req["revision"].as_u64().is_some_and(|n| n != revision)
+                        {
+                            return Err("stale-context".into());
+                        }
+                        let tape: Option<Vec<f64>> = if req["tape"].is_array() {
+                            Some(
+                                serde_json::from_value(req["tape"].clone())
+                                    .map_err(|_| "rng-tape-domain")?,
+                            )
+                        } else {
+                            None
+                        };
+                        let sample = relaxed::sample(p, tape.as_deref())?;
+                        let output = match String::from_utf16(&sample.output) {
+                            Ok(s) => json!(s),
+                            Err(_) => json!(sample.output),
+                        };
+                        Ok(
+                            json!({"output":output,"choices":sample.choices,"entropyWords":sample.entropy_words,"revision":revision}),
+                        )
+                    })();
+                    Ok(match result {
+                        Ok(v) => v,
+                        Err(error) => json!({"abort":error}),
+                    })
+                }
                 "register" => {
                     let id = req["id"].as_str().ok_or("id")?.to_owned();
                     let source = text(&req["text"])?;
@@ -90,6 +147,7 @@ fn main() {
                 }
                 "context" => {
                     ctx = context(&req["context"])?;
+                    relaxed_programs.clear();
                     revision += 1;
                     Ok(json!({"revision":revision}))
                 }
@@ -145,6 +203,7 @@ fn main() {
                 }
                 "release" => {
                     programs.clear();
+                    relaxed_programs.clear();
                     programs.shrink_to_fit();
                     ctx = Context::default();
                     bytes = 0;

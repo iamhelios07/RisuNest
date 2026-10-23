@@ -296,6 +296,12 @@ pub fn compile(text: &[u16]) -> Result<Vec<Node>, String> {
     seq(text, &mut 0, 0, 0)
 }
 #[derive(Clone, Default)]
+pub struct ChoiceTape {
+    pub indices: Vec<usize>,
+    pub position: usize,
+    pub next_arity: Option<usize>,
+}
+#[derive(Clone, Default)]
 pub struct Context {
     pub variables: HashMap<Units, Units>,
     pub globals: HashMap<Units, Units>,
@@ -304,6 +310,89 @@ pub struct Context {
     pub user: Units,
     pub state: u32,
     pub draws: usize,
+    pub choices: Option<ChoiceTape>,
+}
+fn finite_choice(c: &mut Context, arity: usize) -> Result<usize, String> {
+    if arity == 0 {
+        return Ok(0);
+    }
+    if arity > 16 {
+        return Err("rng-choice-arity".into());
+    }
+    let tape = c.choices.as_mut().ok_or("rng-mode")?;
+    let Some(&index) = tape.indices.get(tape.position) else {
+        tape.next_arity = Some(arity);
+        return Err("rng-choice-needed".into());
+    };
+    if index >= arity {
+        return Err("rng-choice-index".into());
+    }
+    tape.position += 1;
+    Ok(index)
+}
+fn integer_domain(n: f64, low: f64, high: f64) -> bool {
+    n.is_finite() && n.fract() == 0.0 && n >= low && n <= high
+}
+fn finite_rng(name: &str, args: &[Units], c: &mut Context) -> Result<Units, String> {
+    if c.choices.is_none() {
+        return Err("unsupported-operator".into());
+    }
+    if name == "randint" {
+        if args.len() != 2 {
+            return Err("rng-integer-domain".into());
+        }
+        let lo = number(args.first())?;
+        let hi = number(args.get(1))?;
+        if !integer_domain(lo, -9_007_199_254_740_991.0, 9_007_199_254_740_991.0)
+            || !integer_domain(hi, lo, 9_007_199_254_740_991.0)
+            || hi - lo + 1.0 > 16.0
+        {
+            return Err("rng-integer-domain".into());
+        }
+        return Ok(number_string(
+            lo + finite_choice(c, (hi - lo + 1.0) as usize)? as f64,
+        ));
+    }
+    if name == "roll" && args.is_empty() {
+        return Ok(units("1"));
+    }
+    let Some(notation) = args.first() else {
+        return Err("rng-dice-domain".into());
+    };
+    let parts = split(notation, &[100]);
+    let (count, sides) = if name == "roll" {
+        match parts.len() {
+            1 => (1.0, number(parts.first())?),
+            2 => (
+                if parts[0].is_empty() {
+                    1.0
+                } else {
+                    number(parts.first())?
+                },
+                if parts[1].is_empty() {
+                    6.0
+                } else {
+                    number(parts.get(1))?
+                },
+            ),
+            _ => return Err("rng-dice-domain".into()),
+        }
+    } else {
+        if parts.len() != 2 {
+            return Err("rng-dice-domain".into());
+        }
+        (number(parts.first())?, number(parts.get(1))?)
+    };
+    if !integer_domain(count, if name == "roll" { 1.0 } else { 0.0 }, 8.0)
+        || !integer_domain(sides, 1.0, 16.0)
+    {
+        return Err("rng-dice-domain".into());
+    }
+    let mut total = 0usize;
+    for _ in 0..count as usize {
+        total += finite_choice(c, sides as usize)? + 1;
+    }
+    Ok(number_string(total as f64))
 }
 pub struct Budget {
     pub remaining: usize,
@@ -924,11 +1013,15 @@ pub fn evaluate(nodes: &[Node], c: &mut Context, b: &mut Budget) -> Result<Units
                         }
                         "calc" => units(&super::arithmetic::evaluate(&ascii(get(0))?)?),
                         "random" => {
-                            c.state = c.state.wrapping_mul(1664525).wrapping_add(1013904223);
-                            c.draws += 1;
-                            let rand = c.state as f64 / 4294967296.0;
+                            let rand = if c.choices.is_none() {
+                                c.state = c.state.wrapping_mul(1664525).wrapping_add(1013904223);
+                                c.draws += 1;
+                                Some(c.state as f64 / 4294967296.0)
+                            } else {
+                                None
+                            };
                             if a.is_empty() {
-                                number_string(rand)
+                                number_string(rand.ok_or("rng-continuous-domain")?)
                             } else {
                                 let ar = if a.len() > 1 {
                                     a.iter().cloned().map(Json::Str).collect::<Vec<_>>()
@@ -939,13 +1032,18 @@ pub fn evaluate(nodes: &[Node], c: &mut Context, b: &mut Budget) -> Result<Units
                                     let v = replace_literal(&v, &[58], &[44]);
                                     split(&v, &[44]).into_iter().map(Json::Str).collect()
                                 };
-                                match ar.get((rand * ar.len() as f64) as usize) {
+                                let at = match rand {
+                                    Some(r) => (r * ar.len() as f64) as usize,
+                                    None => finite_choice(c, ar.len())?,
+                                };
+                                match ar.get(at) {
                                     Some(Json::Str(s)) => replace_literal(s, &units("§X"), &[44]),
                                     Some(v) => json_string(v),
                                     None => vec![],
                                 }
                             }
                         }
+                        "randint" | "dice" | "roll" => finite_rng(&name, a, c)?,
                         "blank" => vec![],
                         "br" => vec![10],
                         "replace" => return Err("replace-substitution".into()),
