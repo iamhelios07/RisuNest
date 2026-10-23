@@ -83,6 +83,31 @@ test('parses very long plain text around a macro', () => {
   expect(result.slice(-2)).toBe('a2')
 })
 
+test('dispatches generated names and separators using the evaluated expression', () => {
+  const chatVariables = { operation: ' E_Q-u A_L ', separator: '::', double: 'a::a', single: 'a:a' }
+  expect(risuChatParser('{{{{getvar::operation}}::a::a}}', { chatVariables })).toBe('1')
+  expect(risuChatParser('{{equal{{getvar::separator}}a{{getvar::separator}}a}}', { chatVariables })).toBe('1')
+  expect(risuChatParser('{{equal::{{getvar::double}}::a}}', { chatVariables })).toBe('1')
+  expect(risuChatParser('{{equal:{{getvar::single}}:a}}', { chatVariables })).toBe('1')
+  expect(risuChatParser('{{equal:a::a}}')).toBe('0')
+  expect(risuChatParser('{{equal::a:::a}}')).toBe('0')
+})
+
+test('normalizes noncanonical names without activating unreachable registrations', () => {
+  expect(risuChatParser('{{ \tEQUAL\n::a::a}}|{{not_equal::a::b}}')).toBe('1|1')
+  expect(risuChatParser('{{SPLIT::a,b::,}}')).toBe('["a","b"]')
+  expect(risuChatParser('{{splİt::a,b::,}}')).toBe('{{splİt::a,b::,}}')
+  expect(risuChatParser('{{__::x}}')).toBe('{{__::x}}')
+  expect(risuChatParser('{{? 1+1}}')).toBe('2')
+})
+
+test('preserves absent and empty callback arguments and unresolved expressions', () => {
+  expect(risuChatParser('{{equal}}|{{equal::}}|{{equal::::}}|{{equal:}}')).toBe('1|0|1|0')
+  expect(risuChatParser('{{trim}}{{split}}')).toBe('{{trim}}{{split}}')
+  expect(risuChatParser('{{unknown::{{settempvar::x::1}}::{{tempvar::x}}}}{{tempvar::x}}'))
+    .toBe('{{unknown::::1}}1')
+})
+
 test('startswith, endswith, contains', () => {
   expect(quickParse('startswith', 'Hello World', 'Hello')).toBe('1')
   expect(quickParse('endswith', 'Hello World', 'World')).toBe('1')

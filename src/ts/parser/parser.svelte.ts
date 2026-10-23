@@ -1202,6 +1202,7 @@ let matcherInitialized = false
 let activeMatcherContext: matcherArg | null = null
 
 const matcherMap = new Map<string, RegisterCallback>()
+const directMatcherMap = new Map<string, RegisterCallback>()
 
 function readMatcherChatVar(context: matcherArg | null, key: string): string {
     noteChatVariableRead(key)
@@ -1235,6 +1236,7 @@ function initMatcher(){
             const names = [arg.name, ...arg.alias]
             for (const name of names) {
                 matcherMap.set(name, callback)
+                if (/^[a-z0-9]+$/.test(name)) directMatcherMap.set(name, callback)
             }
         },
         getDatabase: () => activeMatcherContext?.db ?? getDatabase(),
@@ -1290,17 +1292,11 @@ function matcher (p1:string,matcherArg:matcherArg,vars:{[key:string]:string}|nul
             return calcString(substring).toString()
         }
         const colonIndex = p1.indexOf(':')
-        let splited: string[]
-        if(colonIndex !== -1 && p1[colonIndex + 1] === ':'){
-            splited = p1.split('::')
-        }
-        else{
-            splited = p1.split(':')
-        }
-        const name = splited[0].toLocaleLowerCase().replace(/[\s_-]/g, '')
-        const args = splited.slice(1)
-        const callback = matcherMap.get(name)
+        const name = colonIndex === -1 ? p1 : p1.substring(0, colonIndex)
+        const callback = directMatcherMap.get(name) ?? matcherMap.get(name.toLocaleLowerCase().replace(/[\s_-]/g, ''))
         if(callback){
+            const separator = p1[colonIndex + 1] === ':' ? '::' : ':'
+            const args = colonIndex === -1 ? [] : p1.substring(colonIndex + separator.length).split(separator)
             const previousContext = activeMatcherContext
             activeMatcherContext = matcherArg
             try {
