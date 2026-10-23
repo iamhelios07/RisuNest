@@ -1,5 +1,11 @@
 # Product and verification boundaries
 
+`pnpm exec vitest run --project app-lua-worker` reruns the core scripting and history
+contracts with actual Worker message transport and the shipped Lua WASM. `pnpm test`
+includes this project. Cases that inject a main-thread clock or inspect its factory
+run in the ordinary project; Worker deadline and recovery cases run in
+`src/ts/process/scriptings.worker.test.ts`.
+
 `support/responsesInternals.ts` is installed only by `vitest.config.ts`. It lets
 the existing exact Responses assertions inspect private functions in Vitest's
 transformed module without changing provider algorithms or product exports.

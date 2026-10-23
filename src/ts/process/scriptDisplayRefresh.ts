@@ -2,6 +2,36 @@ import { ReloadChatPointer, ScriptDisplayRebuildPointer, ScriptDisplayRefreshPoi
 import { displayRowsToRefresh, markDisplayRowsForRebuild, type ScriptDisplayRefreshRequest } from './scriptVariableReads'
 
 let pending: { all: boolean, keys: Set<string> } | null = null
+let deferRequest: ((request: ScriptDisplayRefreshRequest) => void) | undefined
+let deferRow: ((index: number | string) => void) | undefined
+
+export function createScriptDisplayRefreshBatch() {
+    let all = false
+    const keys = new Set<string>()
+    const indexes = new Map<string, number | string>()
+    return {
+        run<T>(callback: () => T): T {
+            const previous = deferRequest
+            const previousRow = deferRow
+            deferRow = index => { indexes.set(String(index), index) }
+            deferRequest = request => {
+                if ('all' in request) all = true
+                else for (const key of request.keys) keys.add(key)
+            }
+            try { return callback() }
+            finally { deferRequest = previous; deferRow = previousRow }
+        },
+        flush(): void {
+            if (all) requestScriptDisplayRefresh({ all: true })
+            else if (keys.size) requestScriptDisplayRefresh({ keys: [...keys] })
+            for (const index of indexes.values()) markDisplayRowsForRebuild(index)
+            bumpReloadPointers([...indexes.values()])
+            all = false
+            keys.clear()
+            indexes.clear()
+        },
+    }
+}
 
 /**
  * Re-renders the chat rows that read the chat variables a script changed. An explicit
@@ -9,6 +39,7 @@ let pending: { all: boolean, keys: Set<string> } | null = null
  * Requests in one task coalesce.
  */
 export function requestScriptDisplayRefresh(request: ScriptDisplayRefreshRequest): void {
+    if (deferRequest) { deferRequest(request); return }
     if (!('all' in request) && request.keys.length === 0) return
     if (!pending) {
         pending = { all: false, keys: new Set() }
@@ -23,6 +54,7 @@ export function requestScriptDisplayRefresh(request: ScriptDisplayRefreshRequest
  * of that message. Scripts may pass the index as a string, which is used as the reload pointer key.
  */
 export function rebuildScriptDisplayRow(index: number | string): void {
+    if (deferRow) { deferRow(index); return }
     markDisplayRowsForRebuild(index)
     bumpReloadPointers([index])
 }

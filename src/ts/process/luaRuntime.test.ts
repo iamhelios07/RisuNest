@@ -30,6 +30,8 @@ async function runIsolatedWasmoon(body: string) {
         const javascript = ts.transpileModule(source, {
             compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2023 },
         }).outputText.replaceAll("'wasmoon'", JSON.stringify(wasmoonUrl))
+            .replace("import wasmUrl from 'wasmoon/dist/glue.wasm?url';",
+                `const wasmUrl = ${JSON.stringify(resolve('node_modules/wasmoon/dist/glue.wasm'))};`)
         return 'data:text/javascript;base64,' + Buffer.from(javascript).toString('base64')
     }
     const runtimeSource = await readFile(resolve(process.cwd(), 'src/ts/process/luaRuntime.ts'), 'utf8')
