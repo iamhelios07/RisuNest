@@ -2052,7 +2052,7 @@ export const languageEnglish = {
         },
         pluginStartup: {
             delayLabel: 'Load plugins after sync',
-            delayHelp: 'Plugins load after synchronization completes when the app starts. If the Sync server cannot be reached, plugins load using local data. Turning this off may cause plugin data to be overwritten with older values.',
+            delayHelp: 'Plugins load after synchronization completes when the app starts. If the Sync server is unavailable, plugins load using data on this device. Turning this off may cause plugin data to be overwritten with older values.',
             waiting: 'Plugins will load after synchronization.',
             loadNow: 'Load plugins',
             syncUnfinished: 'Plugins have not loaded because synchronization did not finish.',

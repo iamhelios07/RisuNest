@@ -107,7 +107,7 @@ async function pluginStartup() {
     let starts = 0
     const gate = createPluginStartupGate({ enabled: () => true, delay: () => true,
         context: async () => ({ identity: 'server', bound: true, assertCurrent: async () => {},
-            receive: signal => (f.transport!.preparePluginStartup ?? f.transport!.receiveAvailableChanges)!({...bindingContext(), signal}) }),
+            receive: signal => f.transport!.preparePluginStartup!({...bindingContext(), signal}) }),
         start: async () => { if (await gate.ensure()) starts++ },
     })
     await gate.ensure(); await settle()
@@ -143,6 +143,10 @@ describe('production server LWW composition', () => {
         {code: 'incomplete-response', status: 503, retryable: true},
         {code: 'sync-retry-budget-exhausted', status: 503, retryable: true},
         {code: 'unknown-error', status: 503, retryable: true},
+        {code: 'invalid-directory-envelope', status: 502, retryable: true},
+        {code: 'server-response-error', status: 401, retryable: false},
+        {code: 'server-response-error', status: 404, retryable: true},
+        {code: 'server-incompatible', status: 409, retryable: false},
     ])('keeps plugins waiting after $code', async failure => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         await f.transport!.resumeBinding(bindingContext())
@@ -167,15 +171,24 @@ describe('production server LWW composition', () => {
         expect(startup.starts()).toBe(0)
         expect(startup.gate.refuse()).toBe(true)
     })
-    it.each(['server-timeout', 'directory-unreachable', 'request-timeout', 'server-response-error'])('loads local plugins on an initial %s', async code => {
+    it.each([
+        {code: 'server-timeout', status: 503},
+        {code: 'directory-unreachable', status: 503},
+        {code: 'directory-response-error', status: 503},
+        {code: 'directory-incomplete-response', status: 503},
+        {code: 'request-timeout', status: 408},
+        {code: 'server-updating', status: 503},
+        ...[500, 502, 503, 504, 521, 530, 599].map(status => ({code: 'server-response-error', status})),
+    ].flatMap(failure => ['server_sync_lww_activate', 'server_sync_lww_pull'].map(command => ({...failure, command}))))('loads local plugins on an initial $command $code ($status)', async ({command: failedCommand, ...failure}) => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
-        await f.transport!.resumeBinding(bindingContext())
         const base = f.invoke.getMockImplementation()!
         f.invoke.mockImplementation(async (command, args) => {
-            if (command === 'server_sync_lww_pull') throw {code, status: code === 'request-timeout' ? 408 : 504, retryable: true}
+            if (command === failedCommand) throw {...failure, retryable: true, startupLocalReady: true}
             return base(command, args)
         })
+        await f.transport!.resumeBinding(bindingContext())
         expect((await pluginStartup()).starts()).toBe(1)
+        expect(f.invoke).toHaveBeenCalledWith(failedCommand, expect.objectContaining({startup: true}))
     })
     it('does not release plugins when the server disappears after an intermediate receive page', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()

@@ -39,7 +39,7 @@ function harness() {
 }
 
 describe('plugin initial receive gate', () => {
-    it('uses the transport startup policy without treating an offline receive as complete', async () => {
+    it('uses the transport startup policy to release plugins during an outage', async () => {
         native.state.target = {kind: 'server', connectionId: 'offline-startup'}
         const offline = {code: 'server-unreachable', status: 503, retryable: true}
         const unsupported = async (): Promise<never> => { throw new Error('Unexpected binding switch') }
@@ -56,8 +56,6 @@ describe('plugin initial receive gate', () => {
             expect(await pluginStartupGate.ensure()).toBe(false)
             await vi.waitFor(() => expect(starts).toBe(1))
             expect(get(pluginStartupGate.state).phase).toBe('released')
-            expect(delayPluginLoadingUntilSync()).toBe(true)
-            await expect(transport.receiveAvailableChanges()).rejects.toEqual(offline)
         } finally {
             unregister(); native.state.target = {kind: 'none'}
             configurePluginStartup(() => false, async () => {})

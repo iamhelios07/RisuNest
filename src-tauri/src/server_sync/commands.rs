@@ -394,8 +394,8 @@ pub(crate) async fn server_sync_lww_fence(app:AppHandle,new_device:bool)->Result
 }
 
 #[tauri::command]
-pub(crate) async fn server_sync_lww_activate(app:AppHandle,request:crate::persistent_store::lww::Header)->Result<()> {
-    logged_blocking("activate",move|| within(&LANES.binding,|| {super::binding::activate(&mut job_store(&app)?,&request,None)})).await
+pub(crate) async fn server_sync_lww_activate(app:AppHandle,request:crate::persistent_store::lww::Header,startup:Option<bool>)->Result<()> {
+    logged_blocking("activate",move|| within(&LANES.binding,|| {let mut store=job_store(&app)?;if startup.unwrap_or(false) {super::binding::activate_for_startup(&mut store,&request)} else {super::binding::activate(&mut store,&request,None)}})).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_lww_pending_binding(app:AppHandle)->Result<Option<super::binding::PendingBinding>> {logged_blocking("pending-binding",move||{super::binding::pending_binding(&job_store(&app)?)}).await}

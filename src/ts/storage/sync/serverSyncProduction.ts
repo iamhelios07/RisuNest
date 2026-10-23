@@ -271,15 +271,15 @@ function canStartPluginsOffline(value: unknown): boolean {
         || scheduler.isBlocked() || !context || !persistedBinding || bindingIdentity(persistedBinding) !== bindingIdentity(context.state)) return false
     if (typeof value !== 'object' || !value || ('retryable' in value && value.retryable === false)) return false
     const code = serverSyncErrorCode(value)
-    if (['server-unreachable', 'server-timeout', 'directory-unreachable', 'request-timeout'].includes(code)) return true
-    return code === 'server-response-error' && 'status' in value && [502, 503, 504].includes(Number(value.status))
+    if (['server-unreachable', 'server-timeout', 'directory-unreachable', 'directory-response-error', 'directory-incomplete-response', 'request-timeout', 'server-updating'].includes(code)) return true
+    return code === 'server-response-error' && isServerSyncUnavailable(value)
 }
 async function ensureActivated(captured: BindingContext): Promise<void> {
     checkContext(captured)
     if (activationPending !== captured) return
     if (!activating) {
         activating = during('applying', async () => {
-            await startupRequest(captured, 'server_sync_lww_activate', { request: header() })
+            await startupRequest(captured, 'server_sync_lww_activate', { request: header(), startup: initialReceive })
             checkContext(captured)
             if (remoteAssetsRequested(captured)) await keepAssetsRemote(captured)
             activationPending = undefined
