@@ -74,7 +74,7 @@ vi.mock('./triggers', () => ({ runTrigger: vi.fn() }))
 vi.mock('../alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
 
 const { processScriptFull, resetScriptCache } = await import('./scripts')
-const { rebuildScriptDisplayRow, requestScriptDisplayRefresh } = await import('./scriptDisplayRefresh')
+const { createScriptDisplayRefreshBatch, rebuildScriptDisplayRow, requestScriptDisplayRefresh } = await import('./scriptDisplayRefresh')
 const { DisplayReadRecord, registerDisplayRow } = await import('./scriptVariableReads')
 const { getChatVar, getGlobalChatVar } = await import('../parser/chatVar.svelte')
 const { ReloadChatPointer, ScriptDisplayRebuildPointer, ScriptDisplayRefreshPointer } = await import('../stores.svelte')
@@ -193,6 +193,35 @@ test('refreshes only the rows whose display read a changed chat variable', async
     rendered[2].row.dispose()
     expect((await renderRow(char, chat, 2)).data).toBe('turn 2 <b>HP 10</b>')
     expect(await refreshedRows({ keys: ['hp'] })).toEqual([2])
+})
+
+test('coalesces Worker transport tasks until a script boundary without capturing unrelated refreshes', async () => {
+    const { char, chat } = installConversation([statusPanel])
+    for (const index of [0, 1, 2]) await renderRow(char, chat, index)
+    const batch = createScriptDisplayRefreshBatch()
+    const before = { ...get(ReloadChatPointer) }
+    for (let i = 0; i < 4; i++) {
+        batch.run(() => requestScriptDisplayRefresh({ all: true }))
+        await Promise.resolve()
+    }
+    expect(get(ReloadChatPointer)).toEqual(before)
+    // Another invocation is free to refresh while this one waits for transport.
+    expect(await refreshedRows({ keys: ['hp'] })).toEqual([2])
+    const prior = { ...get(ReloadChatPointer) }
+    batch.flush()
+    await Promise.resolve()
+    for (const index of [0, 1, 2]) expect(get(ReloadChatPointer)[index]).toBe((prior[index] ?? 0) + 1)
+    const after = { ...get(ReloadChatPointer) }
+    batch.flush()
+    await Promise.resolve()
+    expect(get(ReloadChatPointer)).toEqual(after)
+    for (let i = 0; i < 4; i++) {
+        batch.run(() => rebuildScriptDisplayRow(i % 2 ? '1' : 1))
+        await Promise.resolve()
+    }
+    expect(get(ReloadChatPointer)).toEqual(after)
+    batch.flush()
+    expect(get(ReloadChatPointer)[1]).toBe((after[1] ?? 0) + 1)
 })
 
 test('rebuilds the rows an explicit reload reaches, and not the rows a variable change refreshes', async () => {

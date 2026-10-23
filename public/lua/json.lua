@@ -223,6 +223,12 @@ local function parse_string(str, i)
   while j <= #str do
     local x = str:byte(j)
 
+    if x >= 32 and x ~= 34 and x ~= 92 then
+      j = str:find('[%z\1-\31\\"]', j + 1) or (#str + 1)
+      if j > #str then break end
+      x = str:byte(j)
+    end
+
     if x < 32 then
       decode_error(str, j, "control character in string")
 

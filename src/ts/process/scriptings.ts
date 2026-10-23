@@ -28,6 +28,8 @@ import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
 import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
 import { createLuaFactory, runLuaSource } from './luaRuntime';
+import { LuaWorkerExecutor } from './luaWorkerExecutor';
+import { createLuaHistoryJSON } from './luaHistoryJSON';
 import { luaCodeWrapper } from './luaCodeWrapper';
 import { withObjectUrl } from '../objectUrl';
 import {
@@ -55,7 +57,7 @@ import {
     createScriptConversationAccess,
     type ScriptConversationAccess,
 } from './scriptConversationAccess';
-import { rebuildScriptDisplayRow, requestScriptDisplayRefresh } from './scriptDisplayRefresh';
+import { createScriptDisplayRefreshBatch, rebuildScriptDisplayRow, requestScriptDisplayRefresh } from './scriptDisplayRefresh';
 import { beginDisplayScriptRun, noticeScriptTimeout } from './scriptTimeoutNotice';
 import {
     displayListenerEngine,
@@ -72,6 +74,7 @@ const LUA_LISTENER_TIMEOUT_MS = 5_000
 /** Deadline for each synchronous Lua segment of a handler the user started. */
 const LUA_USER_HANDLER_TIMEOUT_MS = 60_000
 let luaFactory:LuaFactory
+let luaJSONSource = ''
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
 let ScriptingLowLevelIds = new Set<string>()
@@ -105,12 +108,14 @@ interface BasicScriptingEngineState {
     writeChat?: () => Chat
     readDatabase?: () => Database
     flushVariables?: () => void
+    historyJSON?: ReturnType<typeof createLuaHistoryJSON>
     stopSending?: boolean
     displayListenerEngine?: string
 }
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
     engine?: LuaEngine;
+    worker?: LuaWorkerExecutor;
     type: 'lua';
 }
 
@@ -135,6 +140,7 @@ function clearScriptingEngineInvocationState(state: ScriptingEngineState) {
     state.writeChat = undefined
     state.readDatabase = undefined
     state.flushVariables = undefined
+    state.historyJSON = undefined
     state.stopSending = undefined
 }
 
@@ -162,6 +168,7 @@ export async function runScripted(code:string, arg:{
     access?: ScriptConversationAccess
     /** A button or manual trigger the user started, which gets the longer deadline. */
     userStarted?: boolean
+    signal?: AbortSignal
     createConversationChat?: () => Chat
     /** An editDisplay request, which skips a listener that timed out for it. */
     displayListener?: DisplayListenerRequest
@@ -231,11 +238,13 @@ export async function runScripted(code:string, arg:{
     
     try {
     return await ScriptingEngineState.mutex.runExclusive(async () => {
+        arg.signal?.throwIfAborted()
         if (displayEngine && skipsDisplayListener(displayEngine, displayListener!, data as string)) {
             return { stopSending: false, chat, res: undefined }
         }
         try {
         ScriptingEngineState.chat = chat
+        ScriptingEngineState.historyJSON = createLuaHistoryJSON()
         ScriptingEngineState.setVar = setVar
         ScriptingEngineState.getVar = getVar
         ScriptingEngineState.operationCharacter = char
@@ -271,21 +280,28 @@ export async function runScripted(code:string, arg:{
             }
         ScriptingEngineState.flushVariables = access ? () => { access.flushVariables() } : undefined
         ScriptingEngineState.stopSending = false
-        if (code !== ScriptingEngineState.code) {
+        if (code !== ScriptingEngineState.code || (ScriptingEngineState.type === 'lua' && ScriptingEngineState.worker?.isClosed())) {
             try {
             let declareAPI:(name: string, func:Function) => void
 
             if(ScriptingEngineState.type === 'lua'){
                 console.log('Creating new Lua engine for mode:', mode)
                 ScriptingEngineState.engine?.global.close()
-                ScriptingEngineState.engine = await luaFactory.createEngine({
-                    injectObjects: true,
-                    enableProxy: false,
-                    functionTimeout,
-                })
-                const luaEngine = ScriptingEngineState.engine
-                declareAPI = (name:string, func:Function) => {
-                    luaEngine.global.set(name, func)
+                ScriptingEngineState.worker?.close()
+                if (typeof Worker !== 'undefined') {
+                    const worker = new LuaWorkerExecutor(functionTimeout, createScriptDisplayRefreshBatch())
+                    ScriptingEngineState.worker = worker
+                    declareAPI = (name: string, func: Function) => worker.register(name, func)
+                } else {
+                    ScriptingEngineState.engine = await luaFactory.createEngine({
+                        injectObjects: true,
+                        enableProxy: false,
+                        functionTimeout,
+                    })
+                    const luaEngine = ScriptingEngineState.engine
+                    declareAPI = (name:string, func:Function) => {
+                        luaEngine.global.set(name, func)
+                    }
                 }
             }
             if(ScriptingEngineState.type === 'py'){
@@ -530,15 +546,7 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('getFullChatMain', (id:string) => {
-                const data = JSON.stringify(readScriptingChat().message.map((v) => {
-                    return {
-                        role: v.role,
-                        data: v.data,
-                        chatId: v.chatId,
-                        time: v.time ?? 0,
-                    }
-                }))
-                return data
+                return ScriptingEngineState.historyJSON(readScriptingChat().message)
             })
 
             declareAPI('sleep', (id:string, time:number) => {
@@ -1386,7 +1394,9 @@ export async function runScripted(code:string, arg:{
 
             console.log('Running Lua code:', code)
             if(ScriptingEngineState.type === 'lua'){
-                await runLuaSource(ScriptingEngineState.engine, luaCodeWrapper(code))
+                if (ScriptingEngineState.worker) {
+                    await ScriptingEngineState.worker.initialize(luaCodeWrapper(code), luaJSONSource, arg.signal)
+                } else await runLuaSource(ScriptingEngineState.engine, luaCodeWrapper(code))
             }
             if(ScriptingEngineState.type === 'py'){
                 await ScriptingEngineState.pyodide?.init(code)
@@ -1413,39 +1423,43 @@ export async function runScripted(code:string, arg:{
         let res:any
         if(ScriptingEngineState.type === 'lua'){
             const luaEngine = ScriptingEngineState.engine
+            const worker = ScriptingEngineState.worker
+            const getFunction = (name: string) => worker
+                ? (...args: unknown[]) => worker.invoke(name, args, arg.signal)
+                : luaEngine.global.get(name)
             const listenerStartedAt = performance.now()
             try {
                 switch(mode){
                     case 'input':{
-                        const func = luaEngine.global.get('onInput')
+                        const func = getFunction('onInput')
                         if(func){
                             res = await func(accessKey)
                         }
                         break
                     }
                     case 'output':{
-                        const func = luaEngine.global.get('onOutput')
+                        const func = getFunction('onOutput')
                         if(func){
                             res = await func(accessKey)
                         }
                         break
                     }
                     case 'start':{
-                        const func = luaEngine.global.get('onStart')
+                        const func = getFunction('onStart')
                         if(func){
                             res = await func(accessKey)
                         }
                         break
                     }
                     case 'onButtonClick':{
-                        const func = luaEngine.global.get('onButtonClick')
+                        const func = getFunction('onButtonClick')
                         if(func){
                             res = await func(accessKey, data)
                         }
                         break
                     }
                     case 'onFormSubmit':{
-                        const func = luaEngine.global.get('onFormSubmit')
+                        const func = getFunction('onFormSubmit')
                         if(func){
                             res = await func(accessKey, data, JSON.stringify(meta))
                         }
@@ -1455,7 +1469,7 @@ export async function runScripted(code:string, arg:{
                     case 'editDisplay':
                     case 'editInput':
                     case 'editOutput':{
-                        const func = luaEngine.global.get('callListenMain')
+                        const func = getFunction('callListenMain')
                         if(func){
                             // editDisplay takes a raw string, and must output a raw string
                             const directString = mode === 'editDisplay'
@@ -1468,7 +1482,7 @@ export async function runScripted(code:string, arg:{
                         break
                     }
                     default:{
-                        const func = luaEngine.global.get(mode)
+                        const func = getFunction(mode)
                         if(func){
                             res = await func(accessKey)
                         }
@@ -1479,6 +1493,8 @@ export async function runScripted(code:string, arg:{
                     ScriptingEngineState.stopSending = true
                 }
             } catch (error) {
+                if (worker?.isClosed()) discardFailedScriptingEngineState(ScriptingEngineState)
+                arg.signal?.throwIfAborted()
                 if (isLuaTimeoutError(error)) {
                     const diagnosticMode = ['input', 'output', 'start', 'onButtonClick', 'onFormSubmit', 'editRequest',
                         'editDisplay', 'editInput', 'editOutput', 'manual'].includes(mode) ? mode : 'custom'
@@ -1547,7 +1563,7 @@ export async function runScripted(code:string, arg:{
 }
 
 async function makeLuaFactory(){
-    const _luaFactory = await createLuaFactory()
+    const _luaFactory = typeof Worker === 'undefined' ? await createLuaFactory() : undefined
     async function mountFile(name:string){
         let code = ''
         for(let i = 0; i < 3; i++){
@@ -1559,7 +1575,8 @@ async function makeLuaFactory(){
                 }
             } catch (error) {}
         }
-        await _luaFactory.mountFile(name,code)
+        luaJSONSource = code
+        await _luaFactory?.mountFile(name,code)
     }
 
     await mountFile('json.lua')
@@ -1567,7 +1584,7 @@ async function makeLuaFactory(){
 }
 
 async function ensureLuaFactory() {
-    if (luaFactory) return;
+    if (luaFactory || (typeof Worker !== 'undefined' && luaJSONSource)) return;
 
     const pendingFactory = (luaFactoryPromise ??= makeLuaFactory())
     try {
@@ -1621,6 +1638,8 @@ function evictIdleScriptingEngines() {
         if (oldest.type === 'lua') {
             oldest.engine?.global.close()
             oldest.engine = undefined
+            oldest.worker?.close()
+            oldest.worker = undefined
         } else {
             oldest.pyodide?.close()
             oldest.pyodide = undefined
@@ -1649,6 +1668,8 @@ function discardFailedScriptingEngineState(state: ScriptingEngineState) {
     if (state.type === 'lua') {
         state.engine?.global.close()
         state.engine = undefined
+        state.worker?.close()
+        state.worker = undefined
     } else {
         state.pyodide?.close()
         state.pyodide = undefined
@@ -1858,6 +1879,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
                     chat: historyWindow?.chat,
                     createConversationChat: createWindowChat,
                     displayListener: displayRequest,
+                    signal,
                 })
                 data = runResult.res ?? data
             }

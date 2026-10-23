@@ -7,6 +7,10 @@ type EngineBudget = {
     timeoutMs: number
     hook: number
     formatter: number
+    remaining?: number
+    segmentDeadline?: number
+    sourceDeadline?: number
+    timedOut?: boolean
 }
 
 const budgets = new WeakMap<LuaWasm, LuaExecutionBudget>()
@@ -68,13 +72,18 @@ class LuaExecutionBudget {
         if (!owner) return run()
 
         const now = performance.now()
-        const sourceDeadline = this.sourceDeadlines.get(address)
+        const sourceDeadline = this.sourceDeadlines.get(address) ?? owner.sourceDeadline
         // Frequent yields may never reach the instruction hook between resumes.
-        if (checkSourceDeadline && sourceDeadline !== undefined && now > sourceDeadline) {
+        if ((checkSourceDeadline && sourceDeadline !== undefined && now > sourceDeadline)
+            || (owner.segmentDeadline !== undefined && now > owner.segmentDeadline)
+            || (owner.remaining !== undefined && owner.remaining <= 0)) {
+            owner.timedOut = true
             throw new Error('thread timeout exceeded')
         }
         const deadline = Math.min(
             sourceDeadline ?? now + owner.timeoutMs,
+            owner.remaining === undefined ? Infinity : now + owner.remaining,
+            owner.segmentDeadline ?? Infinity,
             this.deadlines.at(-1) ?? Infinity,
         )
         this.lua.lua_sethook(address, owner.hook, LuaEventMasks.Count, INSTRUCTION_HOOK_COUNT)
@@ -83,9 +92,27 @@ class LuaExecutionBudget {
         try {
             return run()
         } finally {
+            if (owner.remaining !== undefined && this.entered.length === 1) {
+                owner.remaining -= performance.now() - now
+            }
             this.deadlines.pop()
             this.entered.pop()
         }
+    }
+
+    startSegment(engine: LuaEngine, timeoutMs: number): void {
+        const owner = this.owner(engine.global.address)!
+        owner.remaining = timeoutMs
+        owner.segmentDeadline = performance.now() + timeoutMs
+        owner.timedOut = false
+    }
+
+    didTimeout(engine: LuaEngine): boolean {
+        return this.owner(engine.global.address)?.timedOut === true
+    }
+
+    setSourceDeadline(engine: LuaEngine, deadline: number | undefined): void {
+        this.owner(engine.global.address)!.sourceDeadline = deadline
     }
 
     attach(engine: LuaEngine, timeoutMs = DEFAULT_TIMEOUT_MS): void {
@@ -96,6 +123,7 @@ class LuaExecutionBudget {
         const hook: number = this.lua.module.addFunction((address: number) => {
             const deadline = this.deadlines.at(-1)
             if (deadline !== undefined && performance.now() > deadline) {
+                this.owner(address)!.timedOut = true
                 // pcall, xpcall or coroutine.resume may catch the timeout. Checking every
                 // instruction of this thread and of the thread the host entered raises it again.
                 this.lua.lua_sethook(address, hook, LuaEventMasks.Count, 1)

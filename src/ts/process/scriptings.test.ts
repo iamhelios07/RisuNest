@@ -151,8 +151,10 @@ beforeAll(async () => {
 
 test('rejects Python scripting on Tauri mobile before creating a Worker', async () => {
   const worker = vi.fn()
+  const originalWorker = globalThis.Worker
   vi.stubGlobal('Worker', worker)
 
+  try {
   await expect(runScripted('print("blocked")', {
     char: {} as never,
     chat: { message: [] } as never,
@@ -161,6 +163,9 @@ test('rejects Python scripting on Tauri mobile before creating a Worker', async 
   })).rejects.toThrow(/Python scripting is unavailable on Tauri mobile/)
 
   expect(worker).not.toHaveBeenCalled()
+  } finally {
+    vi.stubGlobal('Worker', originalWorker)
+  }
 })
 
 test('captures field ownership before the Lua factory wait and rejects navigation', async () => {
