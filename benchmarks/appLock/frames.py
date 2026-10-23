@@ -72,7 +72,7 @@ def frames(path, crop, tail=None, scale=None):
     if scale:
         filters += f',scale={scale[0]}:{scale[1]}:flags=neighbor'
         width, height = scale
-    command += ['-i', str(path), '-vf', filters, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']
+    command += ['-i', str(path), '-vf', filters, '-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     size = width * height * 3
     try:
