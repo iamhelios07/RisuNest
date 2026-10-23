@@ -1,3 +1,4 @@
+import type { DisplayCbsContext } from './displayCbsCompiler'
 import { Mutex } from '../mutex'
 import { hasCbsSyntax } from '../parser/cbsSyntax'
 import { ByteBudgetLru } from '../util/byteBudgetLru'
@@ -48,6 +49,7 @@ async function runExclusive<T>(signal: AbortSignal | undefined, action: () => Pr
 export interface RegexExecutorOptions {
     // Only callers whose parse callback is identity on CBS-free text may opt in.
     skipPlainCbs?: boolean
+    displayCbs?: { project(keys: readonly string[]): DisplayCbsContext | undefined, record(reads: readonly string[]): void }
     signal?: AbortSignal
     scope?: RegexTimeoutScope
     worker?: boolean
@@ -153,6 +155,7 @@ export class RegexExecutor {
             let data = input
             let index = 0
             let isolateUntil = 0
+            let compiledCbs = true
             const errors: RegexExecutionResult['errors'] = []
             const keys: string[] = []
             const keyAt = (index: number) => keys[index] ??= regexRuleKey(plan.entries[index])
@@ -180,10 +183,16 @@ export class RegexExecutor {
                         if (i > index && i < end) { end = i; break }
                     }
                     let result: RegexExecutionResult
+                    let cbsContext: DisplayCbsContext | undefined
                     try {
-                        result = await this.request<RegexExecutionResult>((timeoutMs) => this.client.execute(plan, data, {
-                            timeoutMs, signal: this.options.signal, continuation: { start: index, end, skipPlainCbs },
-                        }), () => ({ data, errors: [], nextIndex: index, steps: [] }))
+                        result = await this.request<RegexExecutionResult>((timeoutMs) => {
+                            cbsContext = compiledCbs && this.options.skipPlainCbs && plan.displayCbs
+                                ? this.options.displayCbs?.project(plan.displayCbs.keys) : undefined
+                            return this.client.execute(plan, data, {
+                                timeoutMs, signal: this.options.signal, continuation: { start: index, end, skipPlainCbs },
+                                ...(cbsContext ? { cbsContext } : {}),
+                            })
+                        }, () => ({ data, errors: [], nextIndex: index, steps: [] }))
                     } catch (error) {
                         if (!(error instanceof RegexExecutionTimeoutError)) throw error
                         if (index < isolateUntil) {
@@ -196,6 +205,15 @@ export class RegexExecutor {
                     }
                     this.options.signal?.throwIfAborted()
                     if (!this.worker) continue
+                    if (cbsContext && result.cbsReads?.length) {
+                        const current = this.options.displayCbs?.project(result.cbsReads)
+                        if (!current || result.cbsReads.some((key) => current.variables[key] !== cbsContext!.variables[key])) {
+                            // Only this read-only Worker run is discarded. Earlier host checkpoints are committed.
+                            compiledCbs = false
+                            continue
+                        }
+                    }
+                    if (result.cbsReads) this.options.displayCbs?.record(result.cbsReads)
                     const next = result.nextIndex!
                     let replayChanged = false
                     for (const step of result.steps!) {

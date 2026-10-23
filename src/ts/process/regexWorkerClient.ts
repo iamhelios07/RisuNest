@@ -1,3 +1,4 @@
+import type { DisplayCbsContext, DisplayCbsPlan } from './displayCbsCompiler'
 import type { RegexExecutionPlan, RegexExecutionResult } from './regexExecutionPlan'
 import type { RegexOperation, RegexOperationResults } from './regexOperations'
 
@@ -17,6 +18,7 @@ export type RegexWorkerRequest = {
     type: 'register'
     revision: number
     entries: RegexWorkerPlanEntry[]
+    displayCbs?: DisplayCbsPlan
 } | {
     type: 'execute'
     id: number
@@ -24,6 +26,7 @@ export type RegexWorkerRequest = {
     input: string
     continuation?: { start: number, end: number, skipPlainCbs?: boolean }
     reuseInput?: boolean
+    cbsContext?: DisplayCbsContext
 } | {
     type: 'operation'
     id: number
@@ -39,6 +42,7 @@ export type RegexWorkerResponse = { type: 'ready' } | {
     errors: [sourceIndex: number, message: string][]
     steps?: { index: number, matched: boolean }[]
     nextIndex?: number
+    cbsReads?: string[]
 } | {
     type: 'operationResult'
     id: number
@@ -60,11 +64,13 @@ export interface RegexWorkerExecuteOptions {
     signal?: AbortSignal
     timeoutMs?: number
     continuation?: { start: number, end: number, skipPlainCbs?: boolean }
+    cbsContext?: DisplayCbsContext
 }
 
 interface PendingRequest {
     plan?: RegexExecutionPlan
     operation?: RegexOperation
+    cbsContext?: DisplayCbsContext
     continuation?: { start: number, end: number, skipPlainCbs?: boolean }
     input: string
     timeoutMs: number
@@ -123,7 +129,7 @@ export class RegexWorkerClient {
     constructor(private readonly workerFactory: () => RegexWorkerLike = createModuleWorker) {}
 
     execute(plan: RegexExecutionPlan, input: string, options: RegexWorkerExecuteOptions = {}): Promise<RegexExecutionResult> {
-        return this.enqueue({ plan, input, continuation: options.continuation }, options)
+        return this.enqueue({ plan, input, continuation: options.continuation, cbsContext: options.cbsContext }, options)
     }
 
     operate<K extends keyof RegexOperationResults>(operation: RegexOperation<K>, options: RegexWorkerExecuteOptions = {}): Promise<RegexOperationResults[K]> {
@@ -138,7 +144,7 @@ export class RegexWorkerClient {
         }
     }
 
-    private enqueue<T>(work: Pick<PendingRequest, 'plan' | 'operation' | 'input' | 'continuation'>, options: RegexWorkerExecuteOptions): Promise<T> {
+    private enqueue<T>(work: Pick<PendingRequest, 'plan' | 'operation' | 'input' | 'continuation' | 'cbsContext'>, options: RegexWorkerExecuteOptions): Promise<T> {
         if (options.signal?.aborted) return Promise.reject(createAbortError(options.signal))
         return new Promise((resolve, reject) => {
             const id = this.nextRequestId++
@@ -198,6 +204,7 @@ export class RegexWorkerClient {
                 request.resolve({
                     data: response.data,
                     errors: response.errors.map(([sourceIndex, message]) => ({ sourceIndex, error: new Error(message) })),
+                    ...(response.cbsReads ? { cbsReads: response.cbsReads } : {}),
                     ...(response.steps ? { steps: response.steps, nextIndex: response.nextIndex } : {}),
                 })
             }
@@ -231,6 +238,7 @@ export class RegexWorkerClient {
                 this.continuation = undefined
                 this.registeredRevision = plan.revision
                 this.worker.postMessage({ type: 'register', revision: plan.revision,
+                    ...(plan.displayCbs ? { displayCbs: plan.displayCbs } : {}),
                     entries: plan.entries.map((entry) => [entry.sourceIndex, entry.pattern, entry.replacement, entry.flags,
                         entry.requiresHostExecution || entry.dynamicPattern, entry.actions.length > 0]),
                 })
@@ -239,6 +247,7 @@ export class RegexWorkerClient {
                 && this.continuation?.revision === plan.revision && this.continuation.data === request.input
             this.worker.postMessage({ type: 'execute', id, revision: plan.revision, input: reuseInput ? '' : request.input,
                 ...(reuseInput ? { reuseInput: true } : {}),
+                ...(request.cbsContext ? { cbsContext: request.cbsContext } : {}),
                 ...(request.continuation ? { continuation: request.continuation } : {}),
             })
         } catch (error) {

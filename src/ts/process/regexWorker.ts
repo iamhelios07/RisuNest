@@ -2,6 +2,7 @@ import type {
     RegexWorkerRequest,
     RegexWorkerResponse,
 } from './regexWorkerClient'
+import { DisplayCbsExecutor } from './displayCbsCompiler'
 import { executeRegexOperation } from './regexOperations'
 import { hasCbsSyntax } from '../parser/cbsSyntax'
 
@@ -25,6 +26,7 @@ export function createRegexWorkerMessageHandler(
     let registeredRevision: number | undefined
     let registeredEntries: CompiledEntry[] | undefined
     let retainedInput: string | undefined
+    let displayCbs: DisplayCbsExecutor | undefined
 
     return (request) => {
         if (request.type === 'release') {
@@ -42,6 +44,7 @@ export function createRegexWorkerMessageHandler(
         if (request.type === 'register') {
             retainedInput = undefined
             registeredRevision = request.revision
+            displayCbs = request.displayCbs ? new DisplayCbsExecutor(request.displayCbs) : undefined
             registeredEntries = request.entries.map(([
                 sourceIndex,
                 pattern,
@@ -81,6 +84,7 @@ export function createRegexWorkerMessageHandler(
         let needsParse = !request.continuation?.skipPlainCbs || hasCbsSyntax(data)
         const errors: [sourceIndex: number, message: string][] = []
         const steps: { index: number, matched: boolean }[] = []
+        const cbsReads = new Set<string>()
         let nextIndex = request.continuation?.start ?? 0
         const end = request.continuation?.end ?? registeredEntries.length
         for (; nextIndex < end; nextIndex++) {
@@ -100,6 +104,23 @@ export function createRegexWorkerMessageHandler(
                 const matched = entry.regex.test(data)
                 entry.regex.lastIndex = 0
                 const replaced = matched ? data.replace(entry.regex, entry.replacement) : data
+                if (request.continuation && request.cbsContext && displayCbs) {
+                    if (entry.conditional && !matched) {
+                        data = replaced
+                        continue
+                    }
+                    const parsed = displayCbs.evaluate(replaced, request.cbsContext)
+                    if (parsed) {
+                        data = parsed.data
+                        for (const key of parsed.reads) cbsReads.add(key)
+                        continue
+                    }
+                    // Stop at this exact checkpoint, including unchanged regex output.
+                    data = replaced
+                    steps.push({ index: nextIndex, matched })
+                    nextIndex++
+                    break
+                }
                 if (request.continuation?.skipPlainCbs) {
                     if (replaced !== data) needsParse = hasCbsSyntax(replaced)
                     if (!needsParse) {
@@ -123,6 +144,7 @@ export function createRegexWorkerMessageHandler(
         retainedInput = request.continuation ? data : undefined
         respond({ type: 'result', id: request.id, data, errors,
             ...(request.continuation ? { steps, nextIndex } : {}),
+            ...(request.cbsContext ? { cbsReads: [...cbsReads] } : {}),
         })
     }
 }

@@ -1,3 +1,4 @@
+import { compileDisplayCbs, createDisplayCbsPlan, DisplayCbsExecutor, projectDisplayCbsContext } from '../../../process/displayCbsCompiler'
 import fc from 'fast-check'
 import { writable } from 'svelte/store'
 import { afterEach, describe, expect, test, vi } from 'vitest'
@@ -382,4 +383,127 @@ SBC{{slot::n}}
       expect(risuChatParser(template)).toBe(`SBC1SBC2SBC3`)
     })
   })
+})
+
+describe('compiled display CBS spans', () => {
+  const evaluate = (source: string, variables: Record<string, string> = {}) => {
+    const plan = createDisplayCbsPlan([source])
+    expect(plan).toBeDefined()
+    return new DisplayCbsExecutor(plan!).evaluate(source, { variables })
+  }
+
+  test('preserves dynamic separators, JS coercion and conditional whitespace', () => {
+    const templates = [
+      '{{equal::{{getvar::value}}::a}}',
+      '{{equal:{{getvar:value}}:a}}',
+      '{{greater::{{getvar::value}}::2}}|{{not::{{getvar::value}}}}',
+      '{{#if {{equal::{{getvar::value}}::1}}}} \n  first \n    second \n {{/if}}',
+      '{{#if_pure {{getvar::value}}}} \n  unchanged \n {{/if}}',
+      '{{#when::{{getvar::value}}}}yes{{:else}}no{{/when}}',
+      '{{#when {{getvar::value}}}}\n  yes\n{{:else}}\n  no\n{{/}}',
+      '{{#if 1}}{{#when 0}}a{{:else}}b{{/}}{{/}}',
+    ]
+    for (const source of templates) {
+      for (const value of ['', '1', 'true', '0', 'a::a', 'a:a', ' 3 ', 'NaN', '{{random::a::b}}', 'a\nb']) {
+        const variables = { value }
+        const result = evaluate(source, variables)
+        if (result) expect(result.data).toBe(risuChatParser(source, { chatVariables: variables }))
+      }
+    }
+    expect(evaluate(templates[0], { value: 'a::a' })?.data).toBe('1')
+    expect(evaluate(templates[1], { value: 'a:a' })?.data).toBe('1')
+  })
+
+  test('reports actual reads including discarded when branches but excludes false if bodies', () => {
+    const source = '{{#if 0}}{{getvar::skipped}}{{/if}}'
+      + '{{#when 0}}{{getvar::discarded}}{{:else}}{{getvar::shown}}{{/when}}'
+    expect(evaluate(source, { skipped: 'x', discarded: 'y', shown: 'z' })).toEqual({
+      data: 'z', reads: ['discarded', 'shown'],
+    })
+  })
+
+  test('preserves generated text until the next checkpoint and rejects changed spans', () => {
+    const source = '{{getvar::value}}'
+    const plan = createDisplayCbsPlan([source])!
+    const executor = new DisplayCbsExecutor(plan)
+    const context = { variables: { value: '{{random::a::b}}' } }
+    expect(executor.evaluate(source, context)).toEqual({ data: '{{random::a::b}}', reads: ['value'] })
+    for (const checkpoint of ['{{random::a::b}}', '{{getvar::other}}', '<user>', '{#if 1\nyes#}', '{{' + source]) {
+      expect(executor.evaluate(checkpoint, context)).toBeNull()
+    }
+    expect(executor.evaluate(source, { variables: {} })).toBeNull()
+  })
+
+  test('rejects effects, dynamic names and keys, malformed blocks and deep parser boundaries', () => {
+    for (const source of [
+      '{{random::a::b}}', '{{settempvar::x::1}}', '{{gettempvar::x}}',
+      '{{getvar::{{getvar::key}}}}', '{{{{getvar::name}}::x}}',
+      '{{#if 0}}{{call::hidden}}{{/if}}', '{{#each a as x}}x{{/each}}',
+      '{{unknown::{{getvar::value}}}}', '{{equal::a', '{{equal::a#}b}}', '{{#if 1}}x',
+      '{{#if 1}}x{{/wrong}}', '<char>', '{#if 1\nx#}',
+      '{{equal::'.repeat(512) + 'x' + '::x}}'.repeat(512),
+    ]) expect(compileDisplayCbs(source)).toBeNull()
+  })
+
+  test('bounds reusable syntax by source units, nodes and nesting rather than context values', () => {
+    expect(compileDisplayCbs('{{not::1}}', { sourceUnits: 5, nodes: 10, depth: 10 })).toBeNull()
+    expect(compileDisplayCbs('{{not::{{not::1}}}}', { sourceUnits: 100, nodes: 1, depth: 10 })).toBeNull()
+    expect(compileDisplayCbs('{{not::{{not::1}}}}', { sourceUnits: 100, nodes: 10, depth: 1 })).toBeNull()
+    const plan = createDisplayCbsPlan(['{{getvar::a}}', '{{getvar::b}}'], { sourceUnits: 100, nodes: 1, depth: 10 })!
+    const executor = new DisplayCbsExecutor(plan)
+    expect(executor.evaluate('{{getvar::a}}', { variables: { a: 'first' } })?.data).toBe('first')
+    expect(executor.evaluate('{{getvar::a}}', { variables: { a: 'changed' } })?.data).toBe('changed')
+    expect(executor.evaluate('{{getvar::b}}', { variables: { b: 'excluded' } })).toBeNull()
+  })
+})
+
+test('compiled Worker checkpoints preserve the original parser outputs and random order across fallback', async () => {
+  const { getRegexExecutionPlan, executeRegexPlanSync } = await import('../../../process/regexExecutionPlan')
+  const { RegexExecutor } = await import('../../../process/regexExecutor')
+  const { RegexWorkerClient } = await import('../../../process/regexWorkerClient')
+  const { InMemoryWorker } = await import('../../../../../tests/support/regexWorker')
+  const fixtures: Array<{ input: string, variables: Record<string, string>, rules: [string, string][] }> = [
+    { input: 'x', variables: { value: '{{random::left::right}}', finish: 'done' },
+      rules: [['x', '{{getvar::value}}'], ['absent', 'unused'], ['left|right', '{{getvar::finish}}']] },
+    { input: 'x', variables: { finish: 'done' },
+      rules: [['x', '{{settempvar::t::1}}{{random::left::right}}{{gettempvar::t}}'], ['left1|right1', '{{getvar::finish}}']] },
+    { input: 'x', variables: { finish: 'done' },
+      rules: [['x', '{{unknown::{{random::left::right}}}}'], ['missing', '{{getvar::finish}}']] },
+    { input: 'value=a::a', variables: {},
+      rules: [['value=(.*)', '{{equal::$1::a}}']] },
+    { input: 'x{random::left::right}}', variables: { finish: 'done' },
+      rules: [['x', '{'], ['left|right', '{{getvar::finish}}']] },
+  ]
+  for (const fixture of fixtures) {
+    const plan = getRegexExecutionPlan(fixture.rules.map(([pattern, replacement]) => ({
+      comment: '', type: 'editdisplay', in: pattern, out: replacement, flag: 'g', ableFlag: true,
+    })), 'editdisplay')
+    const parse = (value: string) => risuChatParser(value, { chatVariables: fixture.variables })
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.25)
+    try {
+      const expected = executeRegexPlanSync(plan, fixture.input, parse)
+      const expectedDraws = random.mock.calls.length
+      random.mockClear()
+      const worker = new InMemoryWorker()
+      const executor = new RegexExecutor({ worker: true, skipPlainCbs: true,
+        client: new RegexWorkerClient(() => worker),
+        displayCbs: { project: () => ({ variables: fixture.variables }), record() {} },
+      })
+      const actual = await executor.execute(plan, fixture.input, parse, async () => {
+        throw new Error('These fixtures have no host regex actions')
+      })
+      expect(actual.data).toBe(expected.data)
+      expect(random.mock.calls.length).toBe(expectedDraws)
+    } finally { random.mockRestore() }
+  }
+})
+
+test('bounds projected values and dependency keys before sending a Worker request', () => {
+  expect(projectDisplayCbsContext(['x'], () => '1234', 5)).toEqual({ variables: { x: '1234' } })
+  expect(projectDisplayCbsContext(['x'], () => '12345', 5)).toBeUndefined()
+  expect(projectDisplayCbsContext(Array.from({ length: 257 }, (_, index) => String(index)), () => '')).toBeUndefined()
+  const plan = createDisplayCbsPlan(['{{getvar::a}}', '{{getvar::b}}'], { sourceUnits: 100, nodes: 10, depth: 10, variables: 1 })!
+  const executor = new DisplayCbsExecutor(plan)
+  expect(executor.evaluate('{{getvar::a}}', { variables: { a: 'kept' } })?.data).toBe('kept')
+  expect(executor.evaluate('{{getvar::b}}', { variables: { b: 'excluded' } })).toBeNull()
 })

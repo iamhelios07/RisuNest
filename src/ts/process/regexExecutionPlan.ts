@@ -1,3 +1,4 @@
+import { createDisplayCbsPlan, type DisplayCbsPlan } from './displayCbsCompiler'
 import type { customscript } from '../storage/database.svelte'
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { ByteBudgetLru } from '../util/byteBudgetLru'
@@ -27,6 +28,7 @@ export interface RegexExecutionPlan {
     mode: string
     entries: RegexExecutionPlanEntry[]
     workerEligible: boolean
+    displayCbs?: DisplayCbsPlan
     requiresHostExecution: boolean
 }
 
@@ -40,12 +42,13 @@ export interface RegexExecutionResult {
     errors: RegexExecutionError[]
     steps?: { index: number, matched: boolean }[]
     nextIndex?: number
+    cbsReads?: string[]
 }
 
 function createPlanCache() {
     return new ByteBudgetLru<string, RegexExecutionPlan>(
-        Number.POSITIVE_INFINITY,
-        () => 0,
+        getRuntimePerformanceBudgets().regexPlanCacheEntries * 128 * 1024,
+        (_key, plan) => plan.displayCbs?.estimatedBytes ?? 0,
         getRuntimePerformanceBudgets().regexPlanCacheEntries,
     )
 }
@@ -189,6 +192,7 @@ export function getRegexExecutionPlan(scripts: customscript[], mode: string): Re
         mode,
         entries,
         workerEligible,
+        ...(mode === 'editdisplay' ? { displayCbs: createDisplayCbsPlan(entries.map((entry) => entry.replacement)) } : {}),
         requiresHostExecution,
     }
 

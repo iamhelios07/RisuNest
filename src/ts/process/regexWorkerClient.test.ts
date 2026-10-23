@@ -13,6 +13,7 @@ import {
     REGEX_WORKER_READY_TIMEOUT_MS,
     RegexWorkerClient,
     type RegexWorkerRequest,
+    type RegexWorkerResponse,
 } from './regexWorkerClient'
 import { FakeWorker, InMemoryWorker, StallingWorker } from '../../../tests/support/regexWorker'
 import { createRegexWorkerMessageHandler } from './regexWorker'
@@ -493,4 +494,106 @@ describe('RegexWorkerClient', () => {
             )).toBe(false)
         }
     })
+})
+
+describe('compiled display checkpoints through the real Worker', () => {
+    it('reuses syntax with fresh request variables and discards programs on plan changes', async () => {
+        const worker = new InMemoryWorker()
+        const client = new RegexWorkerClient(() => worker)
+        let value = 'first'
+        const reads: string[] = []
+        const executor = new RegexExecutor({ worker: true, skipPlainCbs: true, client,
+            displayCbs: { project: () => ({ variables: { value } }), record: (keys) => reads.push(...keys) },
+        })
+        const first = continuationPlan([['x', '<b>{{getvar::value}}</b>']])
+        const second = continuationPlan([['x', '{{equal::{{getvar::value}}::second}}']])
+        const host = () => { throw new Error('Admitted checkpoints must execute in the Worker') }
+        expect((await executePlan(executor, first, 'x', host)).data).toBe('<b>first</b>\n')
+        value = 'second'
+        expect((await executePlan(executor, first, 'x', host)).data).toBe('<b>second</b>\n')
+        expect((await executePlan(executor, second, 'x', host)).data).toBe('1')
+        expect((await executePlan(executor, first, 'x', host)).data).toBe('<b>second</b>\n')
+        expect(reads).toEqual(['value', 'value', 'value', 'value'])
+        expect(worker.requests.filter((request) => request.type === 'register')).toHaveLength(3)
+        expect(worker.requests.at(-1)).toEqual({ type: 'release' })
+    })
+
+    it('refreshes context after an unsupported checkpoint and never retries completed host effects', async () => {
+        const worker = new InMemoryWorker()
+        let value = 'before'
+        let effects = 0
+        const executor = new RegexExecutor({ worker: true, skipPlainCbs: true,
+            client: new RegexWorkerClient(() => worker),
+            displayCbs: { project: () => ({ variables: { value } }), record() {} },
+        })
+        const plan = continuationPlan([
+            ['x', '{{getvar::value}}'],
+            ['before', '{{effect}}'],
+            ['next', '{{getvar::value}}'],
+        ])
+        const result = await executePlan(executor, plan, 'x', (source) => {
+            expect(source).toBe('{{effect}}')
+            effects++
+            value = 'after'
+            return 'next'
+        })
+        expect(result.data).toBe('after')
+        expect(effects).toBe(1)
+    })
+
+    it('stops unchanged unsupported checkpoints before a later replacement can erase their effects', async () => {
+        const plan = continuationPlan([
+            ['x', '{{getvar::value}}'],
+            ['absent', 'unused'],
+            ['effect', 'erased'],
+        ])
+        const executor = new RegexExecutor({ worker: true, skipPlainCbs: true,
+            client: new RegexWorkerClient(() => new InMemoryWorker()),
+            displayCbs: { project: () => ({ variables: { value: '{{effect}}' } }), record() {} },
+        })
+        let effects = 0
+        const result = await executePlan(executor, plan, 'x', (source) => {
+            expect(source).toBe('{{effect}}')
+            effects++
+            return 'effect'
+        })
+        expect(result.data).toBe('erased')
+        expect(effects).toBe(1)
+    })
+    it('discards stale variable snapshots without replaying preceding host effects', async () => {
+        let value = 'old'
+        let effects = 0
+        let reached!: () => void
+        const paused = new Promise<void>((resolve) => { reached = resolve })
+        class PausingWorker extends InMemoryWorker {
+            private held?: RegexWorkerResponse
+            private pause = true
+            override respond(response: RegexWorkerResponse): void {
+                if (this.pause && response.type === 'result' && response.cbsReads?.length) {
+                    this.pause = false
+                    this.held = response
+                    reached()
+                } else super.respond(response)
+            }
+            resume(): void { super.respond(this.held!) }
+        }
+        const worker = new PausingWorker()
+        const executor = new RegexExecutor({ worker: true, skipPlainCbs: true,
+            client: new RegexWorkerClient(() => worker),
+            displayCbs: { project: () => ({ variables: { value } }), record() {} },
+        })
+        const pending = executePlan(executor, continuationPlan([
+            ['x', '{{effect}}'], ['next', '{{getvar::value}}'],
+        ]), 'x', (source) => {
+            if (source === '{{effect}}') { effects++; return 'next' }
+            expect(source).toBe('{{getvar::value}}')
+            return value
+        })
+        await paused
+        value = 'fresh'
+        worker.resume()
+        expect((await pending).data).toBe('fresh')
+        expect(effects).toBe(1)
+    })
+
 })

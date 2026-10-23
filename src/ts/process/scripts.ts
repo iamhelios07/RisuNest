@@ -18,6 +18,7 @@ import { pluginV2 } from "../plugins/plugins.svelte";
 import { runTrigger } from "./triggers";
 import { ByteBudgetLru } from "../util/byteBudgetLru";
 import { canExecuteRegexPlanInWorker, getRegexExecutionPlan, type RegexExecutionPlanEntry, type RegexExecutionResult } from "./regexExecutionPlan";
+import { projectDisplayCbsContext } from './displayCbsCompiler';
 import { isRegexWorkerAvailable } from "./regexWorkerClient";
 import { RegexExecutor, RegexRuleSkippedError, regexRuleKey } from './regexExecutor';
 import { generationRegexTimeoutScope, type RegexTimeoutScope } from './regexTimeoutScope';
@@ -37,6 +38,7 @@ import {
 } from "../storage/activeConversationSession";
 import {
     getChatVarFromConversation,
+    getChatVar,
     setChatVarOnConversation,
 } from "../parser/chatVar.svelte";
 import { findActiveHistoryWindow, resolveHistoryWindowChat, toWindowIndex } from "./historyWindowIndex";
@@ -912,6 +914,17 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
 
     const executor = new RegexExecutor({
         skipPlainCbs: !prepareHistory,
+        displayCbs: mode === 'editdisplay' && !prepareHistory ? {
+            project: (keys) => recordChatVariableReads({ note() {}, markUntracked() {} }, () =>
+                projectDisplayCbsContext(keys, (key) =>
+                    captureContext ? captureContext.parserContext.chatVariables[key] ?? 'null'
+                        : conversationAccess !== 'none' && operationChat && conversationOwner
+                            ? getChatVarFromConversation(operationDatabase, conversationOwner.selectedCharacterId, operationChat, key)
+                            : getChatVar(key),
+                )),
+
+            record: (keys) => { for (const key of keys) parseReads.note(key) },
+        } : undefined,
         signal: options.signal, scope: options.regexScope, worker: options.regexWorker,
         onTimeout: noticeRegexTimeout,
     })
