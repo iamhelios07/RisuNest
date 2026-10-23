@@ -133,7 +133,7 @@ def start_appearance_capture(directory, label, platform, capture_input, capture_
     log = (directory / f'{label}-capture.log').open('w')
     started = time.monotonic()
     experiment_options = ['-nostdin', '-benchmark', '-t', '6', '-f', 'nut'] if experiment_codec else []
-    process = subprocess.Popen(['ffmpeg', '-hide_banner', '-loglevel', 'info' if experiment_codec else 'warning', '-n', *timestamp_options, *source,
+    process = subprocess.Popen(['ffmpeg', '-hide_banner', '-loglevel', 'info' if experiment_codec else 'warning', '-n', *timestamp_options, '-thread_queue_size', '32', *source,
         '-an', '-c:v', experiment_codec or 'ffv1', '-fps_mode', 'passthrough', '-progress', str(progress),
         *experiment_options, str(video)],
         stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
