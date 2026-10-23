@@ -356,7 +356,7 @@ def main():
             raise RuntimeError('App-lock capture requires an empty artifact directory')
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'appLock'))
         from frames import run_macos
-        run_macos(app, artifacts, args.capture_input, start_appearance_capture, finish_appearance_capture)
+        run_macos(app, artifacts, args.capture_input, start_appearance_capture, finish_appearance_capture, activate_owned_process)
         return
     if args.appearance or args.capture_codec_experiment or args.capture_bgra_experiment:
         if any(artifacts.iterdir()):
