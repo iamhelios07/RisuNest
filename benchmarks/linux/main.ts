@@ -450,6 +450,17 @@ async function streaming() {
   return result;
 }
 
+async function appLock(phase: string) {
+  await guard();
+  const events: { stage: string; result: unknown }[] = [];
+  Object.assign(window, { __linuxAppLockEvents: events });
+  const { appLockFixture } = await import("../appLock/fixture");
+  await appLockFixture("linux", phase, initialize, async (stage, result) => {
+    events.push({ stage, result });
+  });
+  return { passed: true };
+}
+
 Object.assign(window, {
-  __RISUNEST_LINUX_BENCHMARK__: { persistence, reload, regex, startupAppearance, app, appRestart, streaming },
+  __RISUNEST_LINUX_BENCHMARK__: { persistence, reload, regex, startupAppearance, app, appRestart, streaming, appLock },
 });

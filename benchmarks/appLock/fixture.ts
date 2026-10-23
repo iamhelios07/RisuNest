@@ -12,8 +12,10 @@ async function until(condition: () => boolean, message: string, timeout = 90_000
 }
 const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
 
-export async function appLockFixture(platform: 'ios' | 'macos', phase: string, initialize: () => Promise<unknown>) {
-    const report = (stage: string, result: unknown) => invoke(`${platform}_bench_report`, { stage, result })
+export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase: string, initialize: () => Promise<unknown>,
+    sendReport?: (stage: string, result: unknown) => Promise<unknown>) {
+    if (platform === 'linux' && !sendReport) throw new Error('Linux fixture requires an external report reader')
+    const report = sendReport ?? ((stage: string, result: unknown) => invoke(`${platform}_bench_report`, { stage, result }))
     const timed = phase === 'app-lock-timed'
     const ui = phase === 'app-lock-ui'
     const mutant = phase === 'app-lock-immediate-mutant'
