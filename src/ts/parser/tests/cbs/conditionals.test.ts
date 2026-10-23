@@ -559,8 +559,12 @@ test('bounds projected values and dependency keys before sending a Worker reques
   expect(projectDisplayCbsContext(['x'], () => '1234', 5)).toEqual({ variables: { x: '1234' } })
   expect(projectDisplayCbsContext(['x'], () => '12345', 5)).toBeUndefined()
   expect(projectDisplayCbsContext(Array.from({ length: 257 }, (_, index) => String(index)), () => '')).toBeUndefined()
-  const plan = createDisplayCbsPlan(['{{getvar::a}}', '{{getvar::b}}'], { sourceUnits: 100, nodes: 10, depth: 10, variables: 1 })!
+  const sources = ['{{getvar::a}}', '{{getvar::b}}', '{{equal::{{getvar::a}}::kept}}']
+  const plan = createDisplayCbsPlan([...sources, ...sources], { sourceUnits: 100, nodes: 10, depth: 10, variables: 1 })!
+  expect(projectDisplayCbsContext(plan.keys, (key) => key === 'a' ? 'kept' : 'excluded'))
+    .toEqual({ variables: { a: 'kept' } })
   const executor = new DisplayCbsExecutor(plan)
   expect(executor.evaluate('{{getvar::a}}', { variables: { a: 'kept' } })?.data).toBe('kept')
   expect(executor.evaluate('{{getvar::b}}', { variables: { b: 'excluded' } })).toBeNull()
+  expect(executor.evaluate(sources[2], { variables: { a: 'kept' } })).toEqual({ data: '1', reads: ['a'] })
 })

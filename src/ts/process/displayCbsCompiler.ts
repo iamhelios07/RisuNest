@@ -141,12 +141,17 @@ export function compileDisplayCbs(source: string, limits: DisplayCbsLimits = DIS
 export function createDisplayCbsPlan(sources: readonly string[], limits: DisplayCbsLimits = DISPLAY_CBS_LIMITS): DisplayCbsPlan | undefined {
     const programs = new Map<string, DisplayCbsProgram>()
     const keys = new Set<string>()
+    const seenSources = new Set<string>()
     let units = 0
     let nodes = 0
     for (const source of sources) {
+        if (source.length > limits.sourceUnits || seenSources.has(source)) continue
+        seenSources.add(source)
         for (const program of compileDisplayCbs(source, limits) ?? []) {
             if (programs.has(program.source)) continue
-            if (new Set([...keys, ...program.keys]).size > (limits.variables ?? 256)) continue
+            let additionalKeys = 0
+            for (const key of program.keys) if (!keys.has(key)) additionalKeys++
+            if (keys.size + additionalKeys > (limits.variables ?? 256)) continue
             if (units + program.source.length > limits.sourceUnits || nodes + program.nodes > limits.nodes) continue
             units += program.source.length
             nodes += program.nodes
