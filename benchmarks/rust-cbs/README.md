@@ -1,16 +1,19 @@
 # Rust CBS resident experiment
 
-This standalone benchmark consumes the unmodified product parser as its oracle. It uses synthetic fixtures and is excluded from product entry points.
+This standalone benchmark consumes the unmodified product parser as its oracle and the [experimental CBS library](../../crates/cbs-experimental/README.md) through a Cargo path dependency. It uses synthetic fixtures and is excluded from product entry points. The executable owns JSONL transport, context snapshots, resident handles and timing controls; the library owns evaluation.
 
-Prepare the checkout with its frozen pnpm dependencies and Playwright Chromium installed. The URL, native executable and output file are explicit inputs; the driver does not discover external checkouts or profiles. Set CARGO_TARGET_DIR to the existing shared cache and CARGO_BUILD_JOBS=1. Build and run:
+Prepare the checkout with its frozen pnpm dependencies and Playwright Chromium installed. The URL, native executable and output file are explicit inputs; the driver does not discover external checkouts or profiles. Set CARGO_TARGET_DIR to the existing shared cache, CARGO_BUILD_JOBS=1 and RUST_TEST_THREADS=1. Run these commands from the repository root:
 
 ~~~text
+cargo test --locked --manifest-path crates/cbs-experimental/Cargo.toml
 cargo test --locked --manifest-path benchmarks/rust-cbs/native/Cargo.toml
 cargo build --release --locked --manifest-path benchmarks/rust-cbs/native/Cargo.toml
 pnpm exec vite --config benchmarks/streaming/vite.config.ts --mode agent --host 127.0.0.1 --port <port> --strictPort
 node benchmarks/rust-cbs/run.mjs http://127.0.0.1:<port> <shared-target>/release/rust-cbs-resident[.exe] <results.json>
 node benchmarks/rust-cbs/run.mjs http://127.0.0.1:<port> <shared-target>/release/rust-cbs-resident[.exe] <timings.json> measure
 ~~~
+
+The release build writes rust-cbs-resident (rust-cbs-resident.exe on Windows) under the shared target release directory. The driver writes verification results or measurements to the explicit JSON output path. Product application crates and frontend entry points do not depend on this library or executable.
 
 The driver opens only the synthetic streaming harness, blocks non-loopback requests and Realm paths, and calls the actual product risuChatParser in Chromium. The original parser defines the expected output and number of random draws. Timings require a quiet machine. Browser control round trips are reported separately from browser execution time; pipe timings are not Tauri IPC or rendering measurements.
 
