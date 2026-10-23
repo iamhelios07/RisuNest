@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url'
 import ts from 'typescript'
 
 /** Node's real message boundary, using the same worker entry and WASM as the browser. */
-export async function nodeLuaWorkers() {
+export async function nodeLuaWorkers(options: { failWasm?: boolean } = {}) {
     const directory = await mkdtemp(join(tmpdir(), 'risunest-lua-worker-'))
     const names = ['luaWorkerProtocol', 'luaExecutionBudget', 'luaAsyncifyRuntime', 'luaWorker']
     const wasmoon = pathToFileURL(resolve('node_modules/wasmoon/dist/index.js')).href
@@ -23,8 +23,13 @@ export async function nodeLuaWorkers() {
     }
     const bootstrap = resolve(directory, 'bootstrap.mjs')
     await writeFile(bootstrap, `import {parentPort} from 'node:worker_threads';
+        import {readFile} from 'node:fs/promises';
         globalThis.self = globalThis;
         globalThis.postMessage = message => parentPort.postMessage(message);
+        globalThis.fetch = async url => {
+            if (url !== ${JSON.stringify(resolve('src/ts/process/lua/worker.wasm'))}) throw new Error('Unexpected Worker fetch');
+            return new Response(${options.failWasm ? "'unavailable', {status: 503}" : 'await readFile(url)'});
+        };
         await import('./luaWorker.mjs');
         parentPort.on('message', data => self.onmessage({data}));`)
     const running = new Set<NodeWorker>()

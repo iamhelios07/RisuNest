@@ -23,7 +23,7 @@ patchedDependencies:
     hash: b19010ee7d16dd5c3a984ba66a2ff3d77d900633b07ed0cd01cf5180f9049cd8
     path: patches/playwright@1.63.0.patch
   wasmoon@1.16.0:
-    hash: 75ebed5ada717abe461755817a05328500533f35271a3ce68fa3bec0de085e5a
+    hash: 9526cf793968f2553046cd6132aea603cc5abc6294f6e31019004fa2e671abcb
     path: patches/wasmoon@1.16.0.patch
 
 importers:
@@ -224,7 +224,7 @@ importers:
         version: 14.0.2
       wasmoon:
         specifier: ^1.16.0
-        version: 1.16.0(patch_hash=75ebed5ada717abe461755817a05328500533f35271a3ce68fa3bec0de085e5a)
+        version: 1.16.0(patch_hash=9526cf793968f2553046cd6132aea603cc5abc6294f6e31019004fa2e671abcb)
       wavefile:
         specifier: ^11.0.0
         version: 11.0.0
@@ -4581,7 +4581,7 @@ snapshots:
     dependencies:
       xml-name-validator: 5.0.0
 
-  wasmoon@1.16.0(patch_hash=75ebed5ada717abe461755817a05328500533f35271a3ce68fa3bec0de085e5a):
+  wasmoon@1.16.0(patch_hash=9526cf793968f2553046cd6132aea603cc5abc6294f6e31019004fa2e671abcb):
     dependencies:
       '@types/emscripten': 1.39.10
 

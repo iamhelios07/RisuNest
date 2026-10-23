@@ -3,7 +3,10 @@
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { beforeAll, expect, test, vi } from 'vitest'
+import { beforeAll, expect, inject, test, vi } from 'vitest'
+
+// Factory inspection and injected clocks apply only to the main-thread runtime.
+const localRuntimeTest = test.skipIf(inject('luaWorker') === true)
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { requestChatData } from './request/request'
 import { fetchNative, readImage } from '../globalApi.svelte'
@@ -168,7 +171,7 @@ test('rejects Python scripting on Tauri mobile before creating a Worker', async 
   }
 })
 
-test('captures field ownership before the Lua factory wait and rejects navigation', async () => {
+localRuntimeTest('captures field ownership before the Lua factory wait and rejects navigation', async () => {
   const original = operationCharacterFixture('factory-owner-original')
   const replacement = operationCharacterFixture('factory-owner-replacement')
   installOperationCharacterFixture(original)
@@ -306,7 +309,7 @@ test('rejects concurrent malformed Lua source callers', async () => {
   ])
 })
 
-test('evicts the least recently used idle Lua engine after 17 modes', async () => {
+localRuntimeTest('evicts the least recently used idle Lua engine after 17 modes', async () => {
   const code = `
     counter = 0
     for i = 0, 16 do
@@ -337,7 +340,7 @@ test('evicts the least recently used idle Lua engine after 17 modes', async () =
   expect(result.res).toBe(1)
 })
 
-test('trims idle Lua engines when switching to the lower low-spec budget', async () => {
+localRuntimeTest('trims idle Lua engines when switching to the lower low-spec budget', async () => {
   setRuntimePerformanceProfile('normal')
   const code = `
     counter = 0
@@ -371,7 +374,7 @@ test('trims idle Lua engines when switching to the lower low-spec budget', async
   expect(result.res).toBe(1)
 })
 
-test('keeps active Lua engines open during a profile switch and evicts after completion', async () => {
+localRuntimeTest('keeps active Lua engines open during a profile switch and evicts after completion', async () => {
   setRuntimePerformanceProfile('normal')
   const pendingInputs = Array.from({ length: 5 }, () => {
     let resolve!: (value: unknown) => void
@@ -635,7 +638,7 @@ test('records Lua global persistence with owner and mode isolation', async () =>
   await expect(invoke('k3-owner-b', 'editInput')).resolves.toMatchObject({ res: 1 })
 })
 
-test('releases cached invocation state while preserving Lua globals', async () => {
+localRuntimeTest('releases cached invocation state while preserving Lua globals', async () => {
   const fixture = operationCharacterFixture('cached-invocation-release')
   installOperationCharacterFixture(fixture)
   const operationContext = createConversationOperationContext(
@@ -1688,7 +1691,7 @@ test('passes host errors to Lua without JS constructors', async () => {
   expect(result.res).toEqual({ ok: false, constructorHidden: true })
 })
 
-test.each([
+localRuntimeTest.each([
   ['listener', 5_000],
   ['button', 60_000],
   ['form', 60_000],
@@ -1722,7 +1725,7 @@ test.each([
   expect(createdLuaEngineOptions.at(-1)).toEqual({ injectObjects: true, enableProxy: false, functionTimeout })
 })
 
-test.each([
+localRuntimeTest.each([
   { kind: 'direct', invocation: 'return work()', asynchronous: false, ordinary: false },
   { kind: 'wrapped', invocation: 'return coroutine.wrap(work)()', asynchronous: false, ordinary: false },
   { kind: 'rethrown', invocation: 'local ok, failure = pcall(work); if not ok then error(failure) end', asynchronous: false, ordinary: false },
@@ -1779,7 +1782,7 @@ test.each([
   }
 })
 
-test('shows one Lua timeout notice for queued display pipelines and another for a later refresh', async () => {
+localRuntimeTest('shows one Lua timeout notice for queued display pipelines and another for a later refresh', async () => {
   const fixture = operationCharacterFixture('display-timeout-notice')
   fixture.char.customscript = []
   let now = 0
@@ -1828,7 +1831,7 @@ test('shows one Lua timeout notice for queued display pipelines and another for 
   }
 })
 
-test('runs a timed-out display listener again only for a new row, message, input, conversation or script', async () => {
+localRuntimeTest('runs a timed-out display listener again only for a new row, message, input, conversation or script', async () => {
   const fixture = operationCharacterFixture('display-timeout-rows', undefined, [
     { role: 'char', data: 'zero', chatId: 'message-zero' },
     { role: 'char', data: 'one', chatId: 'message-one' },
@@ -1925,7 +1928,7 @@ test('runs a timed-out display listener again only for a new row, message, input
   }
 })
 
-test('spends one source budget on the display rows queued behind top-level code that timed out', async () => {
+localRuntimeTest('spends one source budget on the display rows queued behind top-level code that timed out', async () => {
   const fixture = operationCharacterFixture('display-timeout-source', undefined, [
     { role: 'char', data: 'zero', chatId: 'message-zero' },
     { role: 'char', data: 'one', chatId: 'message-one' },
@@ -2024,7 +2027,7 @@ test('opens a chat left in the display recovery record without its Modify Displa
   }
 })
 
-test('resumes a Lua listener after an LLM wait longer than its CPU deadline', async () => {
+localRuntimeTest('resumes a Lua listener after an LLM wait longer than its CPU deadline', async () => {
   let now = 0
   const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
   const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
@@ -2517,7 +2520,7 @@ test('stops a Lua handler at the next wait once its conversation is no longer cu
   }
 })
 
-test('keeps Lua variables committed before a wait when the handler later swallows a timeout', async () => {
+localRuntimeTest('keeps Lua variables committed before a wait when the handler later swallows a timeout', async () => {
   const fixture = operationCharacterFixture('wait-flush-timeout')
   fixture.char.lowLevelAccess = true
   let now = 0

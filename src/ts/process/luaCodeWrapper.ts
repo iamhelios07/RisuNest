@@ -11,7 +11,7 @@ do
     local stringMeta = getmeta('')
     local stringIndex = stringMeta.__index
     local originals = {string.byte, string.find, string.sub, string.match, string.format, string.char, math.floor,
-        tonumber, tostring, error, type, pairs, table.insert}
+        tonumber, tostring, error, type, pairs, table.insert, table.concat}
     local entries, size = {}, 0
     local function copy(value)
         if kind(value) ~= 'table' then return value end
@@ -21,7 +21,7 @@ do
     end
     decodeJSON = function(value)
         local current = {string.byte, string.find, string.sub, string.match, string.format, string.char, math.floor,
-            tonumber, tostring, error, type, pairs, table.insert}
+            tonumber, tostring, error, type, pairs, table.insert, table.concat}
         if json ~= original or json.decode ~= decode then return json.decode(value) end
         if getmeta('') ~= stringMeta or stringMeta.__index ~= stringIndex then return json.decode(value) end
         for i = 1, #originals do

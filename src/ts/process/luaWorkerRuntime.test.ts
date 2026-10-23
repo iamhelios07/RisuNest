@@ -114,10 +114,14 @@ test('does not reuse decoded output after a decoder dependency changes', async (
             string.char=function() return 'changed' end
             local second=getState('id','key')
             string.char=original
-            return first..':'..second..':'..getState('id','key')
+            local originalConcat=table.concat
+            table.concat=function() return 'joined' end
+            local joined=getState('id','key')
+            table.concat=originalConcat
+            return first..':'..second..':'..joined..':'..getState('id','key')
         end
     `, { getChatVar: () => '"\\u0061"' })
-    expect(await runtime.invoke('run', [])).toBe('a:changed:a')
+    expect(await runtime.invoke('run', [])).toBe('a:changed:joined:a')
 })
 
 test('runs Lua finalizers with host APIs when new invocation arguments trigger collection', async () => {

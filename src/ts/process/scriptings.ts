@@ -28,7 +28,7 @@ import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
 import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
 import { createLuaFactory, runLuaSource } from './luaRuntime';
-import { LuaWorkerExecutor } from './luaWorkerExecutor';
+import { LuaWorkerExecutor, LuaWorkerUnavailableError } from './luaWorkerExecutor';
 import { createLuaHistoryJSON } from './luaHistoryJSON';
 import { luaCodeWrapper } from './luaCodeWrapper';
 import { withObjectUrl } from '../objectUrl';
@@ -75,6 +75,21 @@ const LUA_LISTENER_TIMEOUT_MS = 5_000
 const LUA_USER_HANDLER_TIMEOUT_MS = 60_000
 let luaFactory:LuaFactory
 let luaJSONSource = ''
+let luaWorkerUnavailable = false
+let luaLocalFactoryPromise: Promise<LuaFactory> | undefined
+
+function canUseLuaWorker() { return typeof Worker !== 'undefined' && !luaWorkerUnavailable }
+
+async function ensureLocalLuaFactory() {
+    if (luaFactory) return luaFactory
+    const pending = luaLocalFactoryPromise ??= createLuaFactory().then(async factory => {
+        await factory.mountFile('json.lua', luaJSONSource)
+        luaFactory = factory
+        return factory
+    })
+    try { return await pending }
+    finally { if (luaLocalFactoryPromise === pending) luaLocalFactoryPromise = undefined }
+}
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
 let ScriptingLowLevelIds = new Set<string>()
@@ -283,25 +298,31 @@ export async function runScripted(code:string, arg:{
         if (code !== ScriptingEngineState.code || (ScriptingEngineState.type === 'lua' && ScriptingEngineState.worker?.isClosed())) {
             try {
             let declareAPI:(name: string, func:Function) => void
+            const luaCallbacks = new Map<string, Function>()
 
             if(ScriptingEngineState.type === 'lua'){
                 console.log('Creating new Lua engine for mode:', mode)
                 ScriptingEngineState.engine?.global.close()
                 ScriptingEngineState.worker?.close()
-                if (typeof Worker !== 'undefined') {
-                    const worker = new LuaWorkerExecutor(functionTimeout, createScriptDisplayRefreshBatch())
-                    ScriptingEngineState.worker = worker
-                    declareAPI = (name: string, func: Function) => worker.register(name, func)
-                } else {
-                    ScriptingEngineState.engine = await luaFactory.createEngine({
+                ScriptingEngineState.worker = undefined
+                if (canUseLuaWorker()) {
+                    try { ScriptingEngineState.worker = new LuaWorkerExecutor(functionTimeout, createScriptDisplayRefreshBatch()) }
+                    catch (error) {
+                        if (!(error instanceof LuaWorkerUnavailableError)) throw error
+                        luaWorkerUnavailable = true
+                    }
+                }
+                if (!ScriptingEngineState.worker) {
+                    ScriptingEngineState.engine = await (await ensureLocalLuaFactory()).createEngine({
                         injectObjects: true,
                         enableProxy: false,
                         functionTimeout,
                     })
-                    const luaEngine = ScriptingEngineState.engine
-                    declareAPI = (name:string, func:Function) => {
-                        luaEngine.global.set(name, func)
-                    }
+                }
+                declareAPI = (name: string, func: Function) => {
+                    luaCallbacks.set(name, func)
+                    if (ScriptingEngineState.worker) ScriptingEngineState.worker.register(name, func)
+                    else ScriptingEngineState.engine.global.set(name, func)
                 }
             }
             if(ScriptingEngineState.type === 'py'){
@@ -1395,7 +1416,20 @@ export async function runScripted(code:string, arg:{
             console.log('Running Lua code:', code)
             if(ScriptingEngineState.type === 'lua'){
                 if (ScriptingEngineState.worker) {
-                    await ScriptingEngineState.worker.initialize(luaCodeWrapper(code), luaJSONSource, arg.signal)
+                    try { await ScriptingEngineState.worker.initialize(luaCodeWrapper(code), luaJSONSource, arg.signal) }
+                    catch (error) {
+                        if (!(error instanceof LuaWorkerUnavailableError)) throw error
+                        luaWorkerUnavailable = true
+                        ScriptingEngineState.worker.close()
+                        ScriptingEngineState.worker = undefined
+                        arg.signal?.throwIfAborted()
+                        const engine = await (await ensureLocalLuaFactory()).createEngine({
+                            injectObjects: true, enableProxy: false, functionTimeout,
+                        })
+                        ScriptingEngineState.engine = engine
+                        for (const [name, func] of luaCallbacks) engine.global.set(name, func)
+                        await runLuaSource(engine, luaCodeWrapper(code))
+                    }
                 } else await runLuaSource(ScriptingEngineState.engine, luaCodeWrapper(code))
             }
             if(ScriptingEngineState.type === 'py'){
@@ -1563,7 +1597,7 @@ export async function runScripted(code:string, arg:{
 }
 
 async function makeLuaFactory(){
-    const _luaFactory = typeof Worker === 'undefined' ? await createLuaFactory() : undefined
+    const _luaFactory = canUseLuaWorker() ? undefined : await createLuaFactory()
     async function mountFile(name:string){
         let code = ''
         for(let i = 0; i < 3; i++){
@@ -1584,7 +1618,7 @@ async function makeLuaFactory(){
 }
 
 async function ensureLuaFactory() {
-    if (luaFactory || (typeof Worker !== 'undefined' && luaJSONSource)) return;
+    if (luaFactory || (canUseLuaWorker() && luaJSONSource)) return;
 
     const pendingFactory = (luaFactoryPromise ??= makeLuaFactory())
     try {

@@ -13,6 +13,8 @@ export class LuaWorkerTransport {
     private heartbeat = 0
     private watchdog?: ReturnType<typeof setInterval>
     private closed = false
+    private running?: { engine: number; started: number }
+    private executionMs = 0
 
     static connect(listener: Listener, createWorker = createDefaultWorker) {
         let transport = transports.get(createWorker)
@@ -29,6 +31,14 @@ export class LuaWorkerTransport {
         this.worker = createWorker()
         this.worker.onmessage = (message: MessageEvent<LuaWorkerResponse>) => {
             this.heartbeat = performance.now()
+            if (message.data.event.kind === 'execution') {
+                if (message.data.event.running) this.running = { engine: message.data.engine, started: performance.now() }
+                else if (this.running?.engine === message.data.engine) {
+                    this.executionMs += performance.now() - this.running.started
+                    this.running = undefined
+                }
+                return
+            }
             if (message.data.event.kind === 'disposed') { this.end(message.data.engine); return }
             this.listeners.get(message.data.engine)?.receive(message.data.event)
         }
@@ -44,10 +54,20 @@ export class LuaWorkerTransport {
         if (this.watchdog !== undefined) return
         this.heartbeat = performance.now()
         this.watchdog = setInterval(() => {
-            // A long handler can occupy the shared Worker while other engines await IO.
-            const deadline = Math.max(5_000, ...this.active.values()) + 1_000
-            if (performance.now() - this.heartbeat > deadline) this.fail(new Error('thread timeout exceeded'))
+            const running = this.running
+            const deadline = Math.max(5_000, running ? this.active.get(running.engine) ?? 5_000 : 5_000) + 1_000
+            if (performance.now() - (running?.started ?? this.heartbeat) > deadline) {
+                const listeners = [...this.listeners]
+                this.shutdown()
+                for (const [engine, listener] of listeners) listener.fail(new Error(!running ? 'Lua worker did not respond'
+                    : engine === running.engine ? 'thread timeout exceeded' : 'Lua worker stopped while another engine was running'))
+            }
         }, 250)
+    }
+
+    startupClock(): number {
+        const now = performance.now()
+        return now - this.executionMs - (this.running ? now - this.running.started : 0)
     }
 
     end(engine: number): void {

@@ -78,13 +78,14 @@ test('retains the existing async host shape and display write restrictions', asy
     expect(waited.res).toBe('before')
 })
 
-test('does not renew a handler deadline on synchronous RPC and terminates a suspended failed engine', async () => {
+test('does not renew a handler deadline on synchronous RPC and retains globals after timeout', async () => {
     const executor = new LuaWorkerExecutor(30)
     executor.register('ping', () => 1)
     try {
-        await executor.initialize(luaCodeWrapper('function run() while true do ping() end end'), await readFile('public/lua/json.lua', 'utf8'))
+        await executor.initialize(luaCodeWrapper('count=7; function run() count=count+1; while true do ping() end end; function read() return count end'), await readFile('public/lua/json.lua', 'utf8'))
         await expect(executor.invoke('run', [])).rejects.toThrow(/thread timeout exceeded/)
-        expect(executor.isClosed()).toBe(true)
+        expect(executor.isClosed()).toBe(false)
+        expect(await executor.invoke('read', [])).toBe(8)
     } finally { executor.close() }
 }, 10_000)
 
@@ -104,7 +105,7 @@ test('keeps the handler deadline separate from a genuine async wait', async () =
     } finally { executor.close() }
 })
 
-test('aborts a pending invocation without replaying completed effects or running its late continuation', async () => {
+test('finishes an aborted invocation without replaying effects or discarding the engine', async () => {
     const executor = new LuaWorkerExecutor(1_000)
     const other = new LuaWorkerExecutor(1_000)
     const writes: string[] = []
@@ -124,11 +125,10 @@ test('aborts a pending invocation without replaying completed effects or running
         const failed = expect(result).rejects.toThrow('cancelled')
         await ready
         controller.abort(new Error('cancelled'))
-        await failed
         finish()
-        await Promise.resolve()
-        expect(executor.isClosed()).toBe(true)
-        expect(writes).toEqual(['before'])
+        await failed
+        expect(executor.isClosed()).toBe(false)
+        expect(writes).toEqual(['before', 'after'])
         expect(await other.invoke('run', [])).toBe(2)
         expect(other.isClosed()).toBe(false)
     } finally { executor.close(); other.close() }
@@ -212,7 +212,7 @@ test('keeps host Error userdata and primitive rejection values compatible', asyn
     } finally { executor.close() }
 })
 
-test('propagates product cancellation and keeps only effects completed before the wait', async () => {
+test('propagates product cancellation after the existing Lua invocation finishes', async () => {
     const { alertInput } = await import('../alert')
     let finish!: (value: string) => void
     let started!: () => void
@@ -231,21 +231,132 @@ test('propagates product cancellation and keeps only effects completed before th
     const rejected = expect(result).rejects.toThrow('cancelled')
     await ready
     controller.abort(new Error('cancelled'))
-    try { await rejected }
-    finally { finish('late') }
-    expect(chat.message[0].data).toBe('before')
+    finish('late')
+    await rejected
+    expect(chat.message[0].data).toBe('after')
+})
+
+test('keeps display globals when a newer render cancels an in-flight invocation', async () => {
+    const controller = new AbortController()
+    const code = `counter=0
+        listenEdit('editDisplay', function(id, text)
+            counter=counter+1
+            if text=='slow' then getChatVar(id, 'gate') end
+            return text..':'..counter
+        end)`
+    const arg = { char: { chaId: 'worker-render-cancel' } as never, chat: { message: [] } as Chat, mode: 'editDisplay',
+        getVar: () => { controller.abort(new Error('superseded render')); return 'gate' } }
+    expect((await runScripted(code, { ...arg, data: 'a' })).res).toBe('a:1')
+    const aborted = runScripted(code, { ...arg, data: 'slow', signal: controller.signal })
+    await expect(aborted).rejects.toThrow('superseded render')
+    expect((await runScripted(code, { ...arg, data: 'b' })).res).toBe('b:3')
+})
+
+test('does not charge another engine computation to a synchronous host caller', async () => {
+    const a = new LuaWorkerExecutor(100)
+    const b = new LuaWorkerExecutor(2_000)
+    let other!: Promise<unknown>
+    a.register('ping', () => { other = b.invoke('run', []); return 'pong' })
+    try {
+        const json = await readFile('public/lua/json.lua', 'utf8')
+        await a.initialize('function run() return ping() end', json)
+        await b.initialize('function run() local t=os.clock(); while os.clock()-t<0.4 do end; return "done" end', json)
+        const result = a.invoke('run', [])
+        await expect(result).resolves.toBe('pong')
+        expect(await other).toBe('done')
+        expect(a.isClosed()).toBe(false)
+    } finally { a.close(); b.close() }
 })
 
 test('recovers on the next request after a Worker cannot run its instruction hook', async () => {
     const executor = new LuaWorkerExecutor(30)
+    const waiting = new LuaWorkerExecutor(1_000)
+    let started!: () => void
+    let finish!: () => void
+    const ready = new Promise<void>(resolve => { started = resolve })
+    waiting.register('wait', () => { started(); return new Promise<void>(resolve => { finish = resolve }) })
     try {
+        await waiting.initialize(luaCodeWrapper('onOutput=async(function() return wait():await() end)'), await readFile('public/lua/json.lua', 'utf8'))
+        const waitingResult = waiting.invoke('onOutput', [])
+        const collateral = expect(waitingResult).rejects.toThrow('another engine')
+        await ready
         await executor.initialize('function run() debug.sethook(); while true do end end', await readFile('public/lua/json.lua', 'utf8'))
-        await expect(executor.invoke('run', [])).rejects.toThrow('thread timeout exceeded')
+        await Promise.all([expect(executor.invoke('run', [])).rejects.toThrow('thread timeout exceeded'), collateral])
         expect(executor.isClosed()).toBe(true)
         const next = new LuaWorkerExecutor(1_000)
         try {
             await next.initialize('function run() return "recovered" end', await readFile('public/lua/json.lua', 'utf8'))
             expect(await next.invoke('run', [])).toBe('recovered')
         } finally { next.close() }
+    } finally { finish?.(); waiting.close(); executor.close() }
+}, 15_000)
+
+test('charges synchronous main-thread API work and keeps globals after the budget expires', async () => {
+    const executor = new LuaWorkerExecutor(30)
+    executor.register('slow', () => { const started=performance.now(); while (performance.now()-started<80) {} })
+    try {
+        await executor.initialize('count=0; function run() count=count+1; slow() end; function read() return count end', await readFile('public/lua/json.lua', 'utf8'))
+        await expect(executor.invoke('run', [])).rejects.toThrow('thread timeout exceeded')
+        expect(executor.isClosed()).toBe(false)
+        expect(await executor.invoke('read', [])).toBe(1)
+    } finally { executor.close() }
+})
+
+test.each(['constructor', 'load', 'wasm'])('falls back before user code when Worker %s fails', async failure => {
+    const unavailable = failure === 'wasm' ? await nodeLuaWorkers({ failWasm: true }) : undefined
+    class FailedWorker {
+        onerror?: (event: { message: string; preventDefault(): void }) => void
+        constructor() {
+            if (failure === 'constructor') throw new Error('synthetic constructor failure')
+            queueMicrotask(() => this.onerror?.({ message: 'synthetic load failure', preventDefault() {} }))
+        }
+        postMessage() {}
+        terminate() {}
+    }
+    vi.resetModules()
+    vi.stubGlobal('Worker', unavailable?.Worker ?? FailedWorker)
+    try {
+        const run = (await import('./scriptings')).runScripted
+        const code = 'count=0; function onStart() count=count+1; return count end'
+        const arg = { char: { chaId: `worker-startup-${failure}` } as never, chat: { message: [] } as Chat, mode: 'start' }
+        expect((await run(code, arg)).res).toBe(1)
+        expect((await run(code, arg)).res).toBe(2)
+    } finally {
+        await unavailable?.close()
+        vi.stubGlobal('Worker', workers.Worker)
+        vi.resetModules()
+        runScripted = (await import('./scriptings')).runScripted
+    }
+})
+
+test('does not replay a failing source through the fallback after a host API has run', async () => {
+    let reads = 0
+    const chat = { message: [{ role: 'user', get data() { reads++; return 'synthetic' } }] } as Chat
+    await expect(runScripted('getFullChat("unused"); error("synthetic source failure")', {
+        char: { chaId: 'worker-no-source-replay' } as never, chat, mode: 'start',
+    })).rejects.toThrow('synthetic source failure')
+    expect(reads).toBe(1)
+})
+
+test('excludes another engine computation from the five-second source budget', async () => {
+    const a = new LuaWorkerExecutor(1_000)
+    const b = new LuaWorkerExecutor(10_000)
+    let other!: Promise<unknown>
+    a.register('ping', () => { other = b.invoke('run', []); return 'pong' })
+    try {
+        const json = await readFile('public/lua/json.lua', 'utf8')
+        await b.initialize('function run() local t=os.clock(); while os.clock()-t<5.2 do end; return "done" end', json)
+        await a.initialize('value=ping(); function read() return value end', json)
+        expect(await other).toBe('done')
+        expect(await a.invoke('read', [])).toBe('pong')
+    } finally { a.close(); b.close() }
+}, 15_000)
+
+test('still limits genuine asynchronous waits during source initialization to five seconds', async () => {
+    const executor = new LuaWorkerExecutor(60_000)
+    executor.register('wait', () => new Promise(resolve => setTimeout(resolve, 5_200)))
+    try {
+        await expect(executor.initialize(luaCodeWrapper('wait():await()'), await readFile('public/lua/json.lua', 'utf8')))
+            .rejects.toThrow('thread timeout exceeded')
     } finally { executor.close() }
 }, 15_000)

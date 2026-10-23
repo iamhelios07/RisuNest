@@ -1,13 +1,15 @@
 export type LuaWorkerCommand =
-    | { kind: 'initialize'; sequence: number; source: string; json: string; names: string[]; timeout: number }
+    | { kind: 'prepare'; sequence: number; json: string; names: string[]; timeout: number }
+    | { kind: 'initialize'; sequence: number; source: string }
     | { kind: 'invoke'; sequence: number; name: string; args: unknown[] }
-    | { kind: 'reply'; call: number; value?: unknown; error?: string; failure?: LuaWorkerFailure; promise?: number; stringId?: number; resetStrings?: boolean }
+    | { kind: 'reply'; call: number; value?: unknown; error?: string; failure?: LuaWorkerFailure; promise?: number; stringId?: number; resetStrings?: boolean; elapsed?: number }
     | { kind: 'settled'; promise: number; value?: unknown; failure?: LuaWorkerFailure }
 
 export type LuaWorkerEvent =
     | { kind: 'result'; sequence: number; value?: unknown; error?: string; failure?: LuaWorkerFailure; fatal?: boolean }
     | { kind: 'call'; sequence: number; call: number; name: string; args: unknown[] }
     | { kind: 'heartbeat' }
+    | { kind: 'execution'; running: boolean }
     | { kind: 'disposed' }
 
 export type LuaWorkerRequest = { engine: number; command: LuaWorkerCommand | { kind: 'dispose' } }

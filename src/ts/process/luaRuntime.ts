@@ -1,4 +1,5 @@
 import type { LuaEngine, LuaFactory } from 'wasmoon'
+import wasmUrl from 'wasmoon/dist/glue.wasm?url'
 
 export async function runLuaSource(
     engine: LuaEngine,
@@ -27,7 +28,7 @@ export function createLuaFactoryLoader(
         }
 
         const { LuaFactory } = wasmoonModule
-        const factory = new LuaFactory()
+        const factory = new LuaFactory(typeof process !== 'undefined' && process.versions?.node ? undefined : wasmUrl)
         const createEngine = factory.createEngine
         factory.createEngine = async (options) => {
             const { getLuaExecutionBudget } = await import('./luaExecutionBudget')

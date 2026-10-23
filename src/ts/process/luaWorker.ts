@@ -3,12 +3,25 @@ import wasmUrl from './lua/worker.wasm?url'
 import { LuaAsyncifyRuntime } from './luaAsyncifyRuntime'
 import { LuaWorkerStrings, luaErrorMessage, encodeLuaFailure, decodeLuaFailure, type LuaWorkerCommand, type LuaWorkerEvent, type LuaWorkerRequest, type LuaWorkerResponse } from './luaWorkerProtocol'
 
+let totalExecutionMs = 0
+let compiledModule: Promise<WebAssembly.Module> | undefined
+
+async function loadModule(): Promise<WebAssembly.Module> {
+    const pending = compiledModule ??= fetch(wasmUrl).then(async response => {
+        if (!response.ok) throw new Error('Lua Worker WASM could not be loaded')
+        return WebAssembly.compile(await response.arrayBuffer())
+    })
+    try { return await pending }
+    catch (error) { if (compiledModule === pending) compiledModule = undefined; throw error }
+}
+
 class WorkerEngine {
     active = false
     private runtime?: LuaAsyncifyRuntime
     private sequence = 0
     private call = 0
     private disposed = false
+    private executionMs = 0
     private readonly strings = new LuaWorkerStrings()
     private readonly replies = new Map<number, (reply: Extract<LuaWorkerCommand, { kind: 'reply' }>) => void>()
     private readonly promises = new Map<number, {
@@ -54,9 +67,9 @@ class WorkerEngine {
         this.sequence = message.sequence
         try {
             let value: unknown
-            if (message.kind === 'initialize') {
+            if (message.kind === 'prepare') {
                 if (this.runtime) throw new Error('Lua worker already initialized')
-                const factory = new LuaFactory(wasmUrl)
+                const factory = new LuaFactory(wasmUrl, undefined, await loadModule())
                 await factory.mountFile('json.lua', message.json)
                 if (this.disposed) return
                 const engine = await factory.createEngine({ injectObjects: true, enableProxy: false })
@@ -72,12 +85,26 @@ class WorkerEngine {
                         const entry = this.promises.get(id)
                         if (!entry) throw new Error('Missing Lua host promise')
                         return entry.promise
+                    }, {
+                        // Source waits retain their wall budget, excluding other engines' execution.
+                        now: () => performance.now() - totalExecutionMs + this.executionMs,
+                        run: run => {
+                            this.send({ kind: 'execution', running: true })
+                            const started = performance.now()
+                            try { return run() }
+                            finally {
+                                const elapsed = performance.now() - started
+                                totalExecutionMs += elapsed
+                                this.executionMs += elapsed
+                                this.send({ kind: 'execution', running: false })
+                            }
+                        },
                     })
                 for (const name of message.names) this.runtime.register(name)
-                await this.runtime.initialize(message.source)
             } else {
                 if (!this.runtime) throw new Error('Lua worker is not initialized')
-                value = await this.runtime.invoke(message.name, message.args)
+                if (message.kind === 'initialize') await this.runtime.initialize(message.source)
+                else value = await this.runtime.invoke(message.name, message.args)
             }
             this.send({ kind: 'result', sequence: this.sequence, value })
         } catch (error) {
@@ -110,6 +137,6 @@ self.onmessage = (event: MessageEvent<LuaWorkerRequest>) => {
         postMessage({ engine: id, event: { kind: 'disposed' } } satisfies LuaWorkerResponse)
         return
     }
-    if (command.kind === 'initialize' && !engines.has(id)) engines.set(id, new WorkerEngine(id))
+    if (command.kind === 'prepare' && !engines.has(id)) engines.set(id, new WorkerEngine(id))
     void engines.get(id)?.receive(command)
 }

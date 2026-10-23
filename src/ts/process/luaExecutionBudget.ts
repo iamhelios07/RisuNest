@@ -8,9 +8,10 @@ type EngineBudget = {
     hook: number
     formatter: number
     remaining?: number
-    segmentDeadline?: number
     sourceDeadline?: number
     timedOut?: boolean
+    clock: () => number
+    resumable: boolean
 }
 
 const budgets = new WeakMap<LuaWasm, LuaExecutionBudget>()
@@ -71,29 +72,28 @@ class LuaExecutionBudget {
         const owner = this.owner(address)
         if (!owner) return run()
 
-        const now = performance.now()
+        const now = owner.clock()
         const sourceDeadline = this.sourceDeadlines.get(address) ?? owner.sourceDeadline
         // Frequent yields may never reach the instruction hook between resumes.
         if ((checkSourceDeadline && sourceDeadline !== undefined && now > sourceDeadline)
-            || (owner.segmentDeadline !== undefined && now > owner.segmentDeadline)
             || (owner.remaining !== undefined && owner.remaining <= 0)) {
             owner.timedOut = true
-            throw new Error('thread timeout exceeded')
+            // Asyncify must rewind into Lua before raising, keeping the native stack usable.
+            if (!owner.resumable) throw new Error('thread timeout exceeded')
         }
         const deadline = Math.min(
             sourceDeadline ?? now + owner.timeoutMs,
             owner.remaining === undefined ? Infinity : now + owner.remaining,
-            owner.segmentDeadline ?? Infinity,
             this.deadlines.at(-1) ?? Infinity,
         )
-        this.lua.lua_sethook(address, owner.hook, LuaEventMasks.Count, INSTRUCTION_HOOK_COUNT)
+        this.lua.lua_sethook(address, owner.hook, LuaEventMasks.Count, owner.timedOut ? 1 : INSTRUCTION_HOOK_COUNT)
         this.deadlines.push(deadline)
         this.entered.push(address)
         try {
             return run()
         } finally {
             if (owner.remaining !== undefined && this.entered.length === 1) {
-                owner.remaining -= performance.now() - now
+                owner.remaining -= owner.clock() - now
             }
             this.deadlines.pop()
             this.entered.pop()
@@ -103,8 +103,19 @@ class LuaExecutionBudget {
     startSegment(engine: LuaEngine, timeoutMs: number): void {
         const owner = this.owner(engine.global.address)!
         owner.remaining = timeoutMs
-        owner.segmentDeadline = performance.now() + timeoutMs
         owner.timedOut = false
+    }
+
+    consumeHost(engine: LuaEngine, elapsed: number): void {
+        const owner = this.owner(engine.global.address)!
+        if (owner.remaining !== undefined) owner.remaining -= Math.max(0, elapsed)
+    }
+
+    expired(engine: LuaEngine): boolean {
+        const owner = this.owner(engine.global.address)!
+        if ((owner.remaining !== undefined && owner.remaining <= 0)
+            || (owner.sourceDeadline !== undefined && owner.clock() > owner.sourceDeadline)) owner.timedOut = true
+        return owner.timedOut === true
     }
 
     didTimeout(engine: LuaEngine): boolean {
@@ -115,14 +126,14 @@ class LuaExecutionBudget {
         this.owner(engine.global.address)!.sourceDeadline = deadline
     }
 
-    attach(engine: LuaEngine, timeoutMs = DEFAULT_TIMEOUT_MS): void {
+    attach(engine: LuaEngine, timeoutMs = DEFAULT_TIMEOUT_MS, clock = () => performance.now(), resumable = false): void {
         if (engine.global.isClosed()) throw new Error('Cannot attach a closed Lua engine')
         const key = this.lua.lua_topointer(engine.global.address, LUA_REGISTRYINDEX)
         if (this.owners.has(key)) return
 
         const hook: number = this.lua.module.addFunction((address: number) => {
             const deadline = this.deadlines.at(-1)
-            if (deadline !== undefined && performance.now() > deadline) {
+            if (deadline !== undefined && clock() > deadline) {
                 this.owner(address)!.timedOut = true
                 // pcall, xpcall or coroutine.resume may catch the timeout. Checking every
                 // instruction of this thread and of the thread the host entered raises it again.
@@ -145,7 +156,7 @@ class LuaExecutionBudget {
             this.lua.module.removeFunction(hook)
             throw error
         }
-        this.owners.set(key, { timeoutMs, hook, formatter })
+        this.owners.set(key, { timeoutMs, hook, formatter, clock, resumable })
         const close = engine.global.close.bind(engine.global)
         let closed = false
         engine.global.close = () => {

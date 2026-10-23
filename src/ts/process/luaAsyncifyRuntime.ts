@@ -2,7 +2,7 @@ import { LUA_REGISTRYINDEX, LuaReturn, LuaType, type LuaEngine, type LuaThread }
 import { getLuaExecutionBudget } from './luaExecutionBudget'
 import { decodeLuaFailure, encodeLuaFailure, type LuaWorkerFailure } from './luaWorkerProtocol'
 
-type Reply = { value?: unknown; error?: string; failure?: LuaWorkerFailure; promise?: number }
+type Reply = { value?: unknown; error?: string; failure?: LuaWorkerFailure; promise?: number; elapsed?: number }
 type AsyncifyExports = {
     asyncify_get_state(): number
     asyncify_start_unwind(data: number): void
@@ -38,6 +38,7 @@ export class LuaAsyncifyRuntime {
         private readonly timeout: number,
         private readonly request: (name: string, args: unknown[]) => Promise<Reply>,
         private readonly hostPromise: (id: number) => Promise<unknown>,
+        private readonly execution = { now: () => performance.now(), run: <T>(run: () => T): T => run() },
     ) {
         this.lua = engine.global.lua
         this.module = this.lua.module as typeof this.lua.module & {
@@ -50,7 +51,7 @@ export class LuaAsyncifyRuntime {
         this.exports = this.module.risuAsyncifyExports
         this.controlCall = this.lua.lua_pcallk.bind(this.lua)
         this.budget = getLuaExecutionBudget(this.lua)
-        this.budget.attach(engine, timeout)
+        this.budget.attach(engine, timeout, this.execution.now, true)
         engine.global.loadString(`local gc = collectgarbage
             local running = gc('isrunning')
             return function(resume)
@@ -133,6 +134,11 @@ export class LuaAsyncifyRuntime {
                 this.exports.asyncify_stop_rewind()
                 const reply = this.reply!
                 this.reply = undefined
+                this.budget.consumeHost(this.engine, reply.elapsed ?? 0)
+                if (this.budget.expired(this.engine)) {
+                    this.lua.lua_pushstring(address, 'thread timeout exceeded')
+                    return this.lua.lua_error(address)
+                }
                 if (reply.failure !== undefined || reply.error !== undefined) {
                     this.pushReply(thread, reply.failure === undefined ? new Error(reply.error) : decodeLuaFailure(reply.failure))
                     return this.lua.lua_error(address)
@@ -166,18 +172,19 @@ export class LuaAsyncifyRuntime {
             let returned = false
             try {
                 this.controlGC(true)
-                let status = this.lua.lua_resume(thread.address, null, count, pointer)
+                let status = this.execution.run(() => this.lua.lua_resume(thread.address, null, count, pointer))
                 while (this.exports.asyncify_get_state() === 1) {
                     this.exports.asyncify_stop_unwind()
                     this.reply = await this.pending!
                     this.pending = undefined
                     if (this.closed) throw new Error('Lua executor closed')
                     this.exports.asyncify_start_rewind(this.data)
-                    status = this.lua.lua_resume(thread.address, null, count, pointer)
+                    status = this.execution.run(() => this.lua.lua_resume(thread.address, null, count, pointer))
                 }
                 returned = true
                 this.controlGC(false)
                 thread.assertOk(status)
+                if (this.budget.expired(this.engine)) throw new Error('thread timeout exceeded')
                 if (status === LuaReturn.Yield) {
                     const count = this.module.getValue(pointer, 'i32') as number
                     const yielded = count > 0 ? thread.getValue(-1) : undefined
@@ -202,7 +209,7 @@ export class LuaAsyncifyRuntime {
             if (result.yielded instanceof Promise) await result.yielded
             else await new Promise(resolve => setTimeout(resolve, 0))
             await this.exclusive(() => this.budget.startSegment(this.engine,
-                this.sourceDeadline === undefined ? this.timeout : this.sourceDeadline - performance.now()))
+                this.sourceDeadline === undefined ? this.timeout : this.sourceDeadline - this.execution.now()))
             count = 0
         }
     }
@@ -210,7 +217,7 @@ export class LuaAsyncifyRuntime {
     private async withThread(load: (thread: LuaThread) => number | void, args: unknown[], invocation = this.invocation) {
         const owned = await this.exclusive(() => {
             this.budget.startSegment(this.engine,
-                this.sourceDeadline === undefined ? this.timeout : this.sourceDeadline - performance.now())
+                this.sourceDeadline === undefined ? this.timeout : this.sourceDeadline - this.execution.now())
             const thread = this.engine.global.newThread()
             const reference = this.lua.luaL_ref(this.engine.global.address, LUA_REGISTRYINDEX)
             try {
@@ -260,7 +267,7 @@ export class LuaAsyncifyRuntime {
     async initialize(source: string): Promise<void> {
         this.invocation++
         this.active = true
-        this.sourceDeadline = performance.now() + 5_000
+        this.sourceDeadline = this.execution.now() + 5_000
         this.budget.setSourceDeadline(this.engine, this.sourceDeadline)
         try { await this.withThread(thread => {
             this.lua.lua_rawgeti(thread.address, LUA_REGISTRYINDEX, BigInt(this.sourceLoader))
