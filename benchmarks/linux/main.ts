@@ -1,3 +1,4 @@
+import { showNativeHarness } from "../nativeAppLock";
 import { runUnicodePersistenceProbe, verifyUnicodePersistenceProbe } from "../unicodePersistenceProbe";
 import { invoke } from "@tauri-apps/api/core";
 import { getIdentifier } from "@tauri-apps/api/app";
@@ -70,6 +71,7 @@ async function digest(value: string) {
 }
 async function persistence() {
   let revision = await initialize();
+  await showNativeHarness();
   const samples: Record<string, unknown>[] = [];
   const commands: string[] = [];
   const transport = new NativeCommitTransport({
@@ -187,6 +189,7 @@ async function persistence() {
 }
 async function reload() {
   await guard();
+  await showNativeHarness();
   await invoke("pds_open");
   const unicode = await verifyUnicodePersistenceProbe();
   const final = await readMessage();
@@ -198,6 +201,7 @@ async function reload() {
 }
 async function regex() {
   await guard();
+  await showNativeHarness();
   const data = makeRegexFixture(500, 256 * 1024);
   const plan = getRegexExecutionPlan(data.scripts, "editoutput");
   const safe = classifyRegexSafePlan(plan, data.input);
