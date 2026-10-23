@@ -554,7 +554,51 @@ describe('compiled display checkpoints through the real Worker', () => {
         expect(projections).toBe(1)
     })
 
+    it('keeps compilation after generated unsupported CBS is removed by a later rule', async () => {
+        const worker = new InMemoryWorker()
+        const variables = { value: 'first', tail: 'done' }
+        const executor = new RegexExecutor({ worker: true, skipPlainCbs: true, client: new RegexWorkerClient(() => worker),
+            displayCbs: { project: () => ({ variables }), record() {} },
+        })
+        const plan = continuationPlan([
+            ['x', '{{unknownmacro}}'], ['\\{\\{unknownmacro\\}\\}', 'clean'],
+            ['clean', '{{getvar::value}}'], ['first', '{{getvar::tail}}'],
+        ])
+        const parse = (source: string) => source.replaceAll('{{getvar::value}}', variables.value).replaceAll('{{getvar::tail}}', variables.tail)
+        const result = await executePlan(executor, plan, 'x', parse)
+        expect(result.data).toBe('done')
+        expect(result.data).toBe(executeRegexPlanSync(plan, 'x', parse).data)
+        expect(result.errors).toEqual([])
+        expect(worker.requests.filter(request => request.type === 'execute')).toHaveLength(2)
+    })
+
+    it.each([false, true])('omits redundant checkpoint input with compiled CBS %s, including retained continuations', async compiled => {
+        const worker = new InMemoryWorker()
+        const responses = vi.spyOn(worker, 'respond')
+        const client = new RegexWorkerClient(() => worker)
+        const plan = continuationPlan([['x', '{{unknown1}}'], ['unknown1', 'unknown2'], ['absent', '{{getvar::unused}}']])
+        expect(plan.displayCbs).toBeDefined()
+        const context = compiled ? { cbsContext: { variables: {} } } : {}
+        try {
+            const first = await client.execute(plan, 'x', { continuation: { start: 0, end: 2 }, ...context })
+            expect(first.data).toBe('{{unknown1}}')
+            const second = await client.execute(plan, first.data, { continuation: { start: first.nextIndex!, end: 2 }, ...context })
+            expect(second.data).toBe('{{unknown2}}')
+            const requests = worker.requests.filter(request => request.type === 'execute')
+            expect(requests).toHaveLength(2)
+            expect(requests[1]).toMatchObject({ reuseInput: true, input: '' })
+            const results = responses.mock.calls.map(([response]) => response).filter(response => response.type === 'result')
+            expect(results).toHaveLength(2)
+            for (const result of results) expect(result).not.toHaveProperty('checkpointInput')
+        } finally {
+            client.releaseContinuation()
+            responses.mockRestore()
+        }
+    })
+
     it.each([
+        { name: 'plain prefix', value: 'unused', rules: [['a', 'b'], ['b', 'c{{boom}}'], ['b', 'done']], expected: 'done', hostInput: undefined },
+        { name: 'empty prefix', value: 'unused', rules: [['a', ''], ['^$', '{{boom}}'], ['^$', 'done']], expected: 'done', hostInput: undefined },
         { name: 'compiled prefix', value: 'b', rules: [['a', '{{getvar::value}}'], ['b', 'c{{boom}}'], ['b', 'done']], expected: 'done', hostInput: undefined },
         { name: 'unchanged checkpoint after compiled output', value: '{{boom}}', rules: [['a', '{{getvar::value}}'], ['absent', 'unused'], ['boom', 'done']], expected: '{{done}}', hostInput: undefined },
         { name: 'host boundary after compiled output', value: 'b', rules: [['a', '{{getvar::value}}'], ['b', '@@host'], ['c', 'd{{boom}}'], ['c', 'done']], expected: 'done', hostInput: 'b' },

@@ -80,7 +80,8 @@ export function createRegexWorkerMessageHandler(
             respond({ type: 'error', id: request.id, message: 'Regex continuation input is unavailable' })
             return
         }
-        let data = request.reuseInput ? retainedInput! : request.input
+        const input = request.reuseInput ? retainedInput! : request.input
+        let data = input
         let needsParse = !request.continuation?.skipPlainCbs || hasCbsSyntax(data)
         const errors: [sourceIndex: number, message: string][] = []
         const steps: { index: number, matched: boolean }[] = []
@@ -151,7 +152,7 @@ export function createRegexWorkerMessageHandler(
         respond({ type: 'result', id: request.id, data, errors,
             ...(request.continuation ? { steps, nextIndex } : {}),
             ...(request.cbsContext ? { cbsReads: [...cbsReads] } : {}),
-            ...(checkpointInput !== undefined ? { checkpointInput } : {}),
+            ...(checkpointInput !== undefined && checkpointInput !== input ? { checkpointInput } : {}),
             ...(unchangedCbsFallback ? { unchangedCbsFallback: true } : {}),
         })
     }
