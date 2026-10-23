@@ -836,7 +836,19 @@ pub(crate) fn activate(
         target.config.resolve(store.repository_root())?,
     )?;
     core.access = Some(target.config.clone());
-    if core.client.resolve_identity()?.epoch != target.epoch {
+    let head = core.client.resolve_identity().map_err(|mut error| {
+        let active = log.verified::<VerifiedTarget>("bindings", "active").ok();
+        let applied = stage.as_ref().is_none_or(|stage| {
+            store.lww_receive_progress(header.binding_authority).is_ok_and(|progress| {
+                progress.iter().any(|progress| progress.kind == "server" && progress.cursor >= stage.cursor)
+            })
+        });
+        error.startup_local_ready = Some(authorization.is_none() && applied && active.is_some_and(|active| {
+            active.target_id == target.target_id && active.config == target.config
+        }));
+        error
+    })?;
+    if head.epoch != target.epoch {
         return Err(SyncError::new("server-epoch-changed", 409));
     }
     target.config.endpoint = core.client.config().endpoint;
@@ -1040,6 +1052,26 @@ mod tests {
         };
         activate(store, &request, None).unwrap();
         request
+    }
+    #[test]
+    fn offline_activation_reports_local_readiness_only_for_an_established_binding() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let offline = Arc::new(AtomicBool::new(false));
+        let server = crate::server_sync::lww_tests::unavailable_server(offline.clone());
+        let (_ready_root, mut ready) = local();
+        configure(&server, &ready);
+        let ready_header = bind(&mut ready);
+        let (_pending_root, mut pending) = local();
+        configure(&server, &pending);
+        let inspected = inspect(&pending, &header(&pending), false).unwrap();
+        switch_to(&mut pending, SyncTarget::Server("server".into()), Some(inspected.inspection_id));
+        let pending_header = header(&pending);
+        offline.store(true, Ordering::SeqCst);
+        for (store, request, expected) in [(&mut ready, &ready_header, true), (&mut pending, &pending_header, false)] {
+            let error = activate(store, request, None).unwrap_err();
+            assert_eq!(error.code, "server-response-error");
+            assert_eq!(serde_json::to_value(error).unwrap()["startupLocalReady"], expected);
+        }
     }
     #[test]
     fn first_binding_is_database_first_and_remote_assets_are_held_before_activation() {

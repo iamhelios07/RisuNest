@@ -1951,3 +1951,64 @@ fn receive_frontier_survives_retry_and_old_page_readers() {
     assert_eq!(complete.receive_frontier, Some(complete.page.progress.cursor));
     assert_eq!(b.query_plugin_storage(None).unwrap().items.len(), 300);
 }
+
+pub(crate) fn unavailable_server(unavailable: Arc<std::sync::atomic::AtomicBool>) -> LocalServerFixture {
+    LocalServerFixture::with_router(move |router| {
+        router.layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let unavailable = unavailable.clone();
+            async move {
+                if unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+                    return axum::response::Response::builder().status(503).body(axum::body::Body::empty()).unwrap();
+                }
+                next.run(request).await
+            }
+        }))
+    })
+}
+
+#[test]
+fn plugin_changes_saved_offline_win_after_an_initial_receive_outage() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let offline = Arc::new(AtomicBool::new(false));
+    let server = unavailable_server(offline.clone());
+    let (_a, mut a) = local();
+    let (_b, mut b) = local();
+    let ca = server.client(&a);
+    let mut cb = server.client(&b);
+    let clock = Arc::new(crate::external_storage::fake::FakeLeaseClock::new(wall_ms()));
+    crate::persistent_store::lww::test_clock::register(&a, clock.clone());
+    crate::persistent_store::lww::test_clock::register(&b, clock.clone());
+    let key = ["plugin", "synthetic", "settings"];
+    let untouched = ["plugin", "synthetic", "other"];
+    save(&mut a, &key, serde_json::json!({"value": "original"}));
+    save(&mut a, &untouched, serde_json::json!("original"));
+    drain_publications(&ca, &mut a, &[]).unwrap();
+    receive(&cb, &mut b);
+    clock.advance(1);
+    save(&mut a, &key, serde_json::json!({"value": "unseen remote"}));
+    save(&mut a, &untouched, serde_json::json!("remote edit"));
+    drain_publications(&ca, &mut a, &[]).unwrap();
+
+    offline.store(true, Ordering::SeqCst);
+    cb.client.retry_transient = false;
+    let cursor = server_cursor(&b);
+    let error = receive_cycle(&cb, &mut b, &[]).err().unwrap();
+    assert_eq!(error.code, "server-response-error");
+    assert_eq!(server_cursor(&b), cursor);
+    assert_eq!(b.read_plugin_storage("synthetic", "settings", None).unwrap().unwrap().value, serde_json::json!({"value": "original"}));
+    assert!(b.lww_read_outbox(0.into(), 256).unwrap().entries.is_empty());
+    clock.advance(1);
+    save(&mut b, &key, serde_json::json!({"value": "offline edit"}));
+
+    offline.store(false, Ordering::SeqCst);
+    cb.client.retry_transient = true;
+    receive(&cb, &mut b);
+    assert_eq!(b.read_plugin_storage("synthetic", "settings", None).unwrap().unwrap().value, serde_json::json!({"value": "offline edit"}));
+    drain_publications(&cb, &mut b, &[]).unwrap();
+    receive(&ca, &mut a);
+    for store in [&a, &b] {
+        assert_eq!(store.read_plugin_storage("synthetic", "settings", None).unwrap().unwrap().value, serde_json::json!({"value": "offline edit"}));
+        assert_eq!(store.read_plugin_storage("synthetic", "other", None).unwrap().unwrap().value, serde_json::json!("remote edit"));
+    }
+    assert!(b.lww_read_outbox(0.into(), 256).unwrap().entries.is_empty());
+}

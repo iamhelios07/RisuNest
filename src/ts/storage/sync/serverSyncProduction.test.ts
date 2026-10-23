@@ -102,7 +102,116 @@ const pullCalls = () => f.invoke.mock.calls.filter(([command]) => command === 's
 const openConversation = (conversationId: string) => { f.conversation = { characterId: 'selected-stable-id', conversationId }; f.viewport!({}) }
 const callOrder = (command: string) => f.invoke.mock.invocationCallOrder[f.invoke.mock.calls.findIndex(([name]) => name === command)]
 
+async function pluginStartup() {
+    const { createPluginStartupGate } = await import('../../plugins/pluginStartupGate')
+    let starts = 0
+    const gate = createPluginStartupGate({ enabled: () => true, delay: () => true,
+        context: async () => ({ identity: 'server', bound: true, assertCurrent: async () => {},
+            receive: signal => (f.transport!.preparePluginStartup ?? f.transport!.receiveAvailableChanges)!({...bindingContext(), signal}) }),
+        start: async () => { if (await gate.ensure()) starts++ },
+    })
+    await gate.ensure(); await settle()
+    return { gate, starts: () => starts }
+}
+
 describe('production server LWW composition', () => {
+    it.each(['server_sync_lww_activate', 'server_sync_lww_pull'])('loads local plugins after an offline %s and still receives after reconnection', async failedCommand => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const base = f.invoke.getMockImplementation()!
+        let offline = true
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === failedCommand && offline) throw { code: 'server-unreachable', status: 503, retryable: true, startupLocalReady: true }
+            return base(command, args)
+        })
+        await f.transport!.resumeBinding(bindingContext())
+        const startup = await pluginStartup()
+        expect(startup.starts()).toBe(1)
+        expect(startup.gate.refuse()).toBe(false)
+        expect(f.apply).not.toHaveBeenCalled()
+        expect(production.getServerSyncController().snapshot().error).toBe('server-unreachable')
+        await expect(f.transport!.receiveAvailableChanges!(bindingContext())).rejects.toMatchObject({code: 'server-unreachable'})
+        offline = false
+        await f.transport!.receiveAvailableChanges!(bindingContext())
+        expect(f.apply).toHaveBeenCalledWith(expect.objectContaining({progress: {kind: 'server', cursor: '0'}}))
+        expect(startup.starts()).toBe(1)
+    })
+    it.each([
+        {code: 'unauthorized', status: 401, retryable: false},
+        {code: 'server-epoch-changed', status: 409, retryable: false},
+        {code: 'equal-stamp-integrity', status: 409, retryable: false},
+        {code: 'local-storage', status: 503, retryable: true},
+        {code: 'incomplete-response', status: 503, retryable: true},
+        {code: 'sync-retry-budget-exhausted', status: 503, retryable: true},
+        {code: 'unknown-error', status: 503, retryable: true},
+    ])('keeps plugins waiting after $code', async failure => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        await f.transport!.resumeBinding(bindingContext())
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_lww_pull') throw failure
+            return base(command, args)
+        })
+        const startup = await pluginStartup()
+        expect(startup.starts()).toBe(0)
+        expect(startup.gate.refuse()).toBe(true)
+    })
+    it.each([false, undefined])('keeps an incomplete native activation closed when startupLocalReady is %s', async startupLocalReady => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_lww_activate') throw {code: 'server-unreachable', status: 503, retryable: true, startupLocalReady}
+            return base(command, args)
+        })
+        await f.transport!.resumeBinding(bindingContext())
+        const startup = await pluginStartup()
+        expect(startup.starts()).toBe(0)
+        expect(startup.gate.refuse()).toBe(true)
+    })
+    it.each(['server-timeout', 'directory-unreachable', 'request-timeout', 'server-response-error'])('loads local plugins on an initial %s', async code => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        await f.transport!.resumeBinding(bindingContext())
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_lww_pull') throw {code, status: code === 'request-timeout' ? 408 : 504, retryable: true}
+            return base(command, args)
+        })
+        expect((await pluginStartup()).starts()).toBe(1)
+    })
+    it('does not release plugins when the server disappears after an intermediate receive page', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        await f.transport!.resumeBinding(bindingContext())
+        const base = f.invoke.getMockImplementation()!
+        let pulled = false
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command !== 'server_sync_lww_pull') return base(command, args)
+            if (pulled) throw {code: 'server-unreachable', status: 503, retryable: true}
+            pulled = true
+            return {...emptyReceive(), more: true, receiveFrontier: '2', progress: {kind: 'server', cursor: '1'}}
+        })
+        const startup = await pluginStartup()
+        expect(f.apply).toHaveBeenCalledWith(expect.objectContaining({progress: {kind: 'server', cursor: '1'}}))
+        expect(startup.starts()).toBe(0)
+        expect(startup.gate.refuse()).toBe(true)
+    })
+    it('retains a file-operation hold and rejects a different binding after an offline startup', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        await f.transport!.resumeBinding(bindingContext())
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_lww_pull') throw {code: 'server-unreachable', status: 503, retryable: true}
+            return base(command, args)
+        })
+        const { reserveLibraryFileOperation } = await import('../libraryFileOperation')
+        const release = reserveLibraryFileOperation()
+        try { expect((await pluginStartup()).starts()).toBe(0) }
+        finally { release() }
+        const changed = bindingContext()
+        changed.state.selectionEpoch = '1'
+        await expect(f.transport!.preparePluginStartup!(changed)).rejects.toThrow('Sync binding changed')
+        const cancelled = new AbortController(); cancelled.abort()
+        await expect(f.transport!.preparePluginStartup!({...bindingContext(), signal: cancelled.signal})).rejects.toThrow()
+        expect((await pluginStartup()).starts()).toBe(1)
+    })
     it('does not claim the offline warning for an unknown operation failure before a real outage', async () => {
         f.database.risunestSyncStatusUi = true
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
