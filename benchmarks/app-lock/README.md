@@ -15,7 +15,7 @@ node benchmarks/app-lock/android-smoke.mjs \
 - `--phase=standard`: startup PIN, delayed WebView return frames, gated Back with and without WebView history, recent-app preview on/off, ordinary screenshots, and launch-only return.
 - `--phase=timed`: return before and after a real one-minute background interval.
 - `--phase=native-auth`: OS authentication cancellation followed by common PIN unlock. If no OS credential is enrolled, the runner temporarily sets synthetic device PIN `1234` and clears it on completion. `--exercise-auth-success` additionally enters that temporary PIN through the real OS prompt and verifies successful unlock.
-- `--phase=all` (the default): standard checks plus owned file-picker cancellation and a rapid Home/return transition. `--exercise-native-auth` also runs the native-auth checks.
+- `--phase=all` (the default): standard checks plus owned file-picker cancellation, a rapid Home/return observation, and a sustained picker departure on Android 12L and later. Picker time is excluded from the away interval. Rapid departures may remain unobserved while the task is still visible, and Android versions below 12L cannot observe task visibility during the picker. An observed departure must still lock. `--exercise-native-auth` also runs the native-auth checks.
 - `--phase=keyboard`: untouched gate focus, hardware Tab/Enter/Backspace and numeric PIN input, and focus after returning.
 - `--phase=settings`: capture the app-lock settings through the real settings UI.
 - `--phase=seed`: prepare and capture the startup gate only.
