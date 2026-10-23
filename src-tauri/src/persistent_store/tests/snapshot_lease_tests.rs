@@ -240,7 +240,12 @@ fn snapshot_restore_stages_large_message_manifests_and_archive_metadata() {
 #[test]
 fn snapshot_restore_rejects_damaged_large_units_and_oversized_reference_pages() {
     use risunest_sync_wire::{descriptor::{RecordDescriptor,ReferencePage},unit::{UnitKey,UnitValue}};
-    for damage in ["missing","hash","noncanonical","reference-page"] {
+    for (damage,expected_error) in [
+        ("missing","unit-object-body-required"),
+        ("hash","message object hash mismatch"),
+        ("noncanonical","invalid-large-unit"),
+        ("reference-page","Backup reference tree integrity failed"),
+    ] {
         let (directory,mut store,_)=open_fixture();
         commit_snapshot_plugin(&mut store,risunest_sync_wire::MAX_METADATA_BYTES+1);
         let expected=store.materialize(None).unwrap();
@@ -283,7 +288,11 @@ fn snapshot_restore_rejects_damaged_large_units_and_oversized_reference_pages() 
         let snapshot=archive.insert(&scratch.path,store.revision().unwrap(),"damaged-originals",Default::default()).unwrap();
         drop(archive);
         for _ in 0..2 {
-            assert!(store.snapshot_restore_stage(&snapshot.id,"damaged-originals").is_err(),"{damage}");
+            match store.snapshot_restore_stage(&snapshot.id,"damaged-originals") {
+                Err(StoreError::Validation {message})=>assert_eq!(message,expected_error,"{damage}"),
+                Err(error)=>panic!("unexpected error for {damage}: {error:?}"),
+                Ok(_)=>panic!("damaged snapshot was accepted: {damage}"),
+            }
             assert_eq!(store.materialize(None).unwrap(),expected);
             assert_eq!(store.revision().unwrap(),revision);
             assert_eq!(serde_json::to_value(store.lww_clock_state().unwrap()).unwrap(),clock);
