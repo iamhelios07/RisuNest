@@ -1,3 +1,6 @@
+import { createPureCbsCallbacks, makeArray, parseArray } from '../cbsPure'
+import { calculateCbsExpression } from './cbsArithmetic'
+
 type CbsPart = string | CbsCall | CbsBlock
 interface CbsCall { kind: 'call', parts: CbsPart[], key?: string }
 interface CbsBlock { kind: 'if' | 'if_pure' | 'when', header: CbsPart[], body: CbsPart[] }
@@ -14,7 +17,16 @@ export interface DisplayCbsPlan { programs: DisplayCbsProgram[], keys: string[],
 export interface DisplayCbsContext { variables: Record<string, string> }
 export interface DisplayCbsResult { data: string, reads: string[] }
 
+function rejectArithmeticRead(_key: string): string {
+    throw new Error('Arithmetic host read requires fallback')
+}
+
+const arithmeticVariables = { getChatVar: rejectArithmeticRead, getGlobalChatVar: rejectArithmeticRead }
+const calcString = (text: string) => calculateCbsExpression(text, arithmeticVariables)
+const pureCallbacks = createPureCbsCallbacks({ parseArray, makeArray, calcString })
+
 const operations = new Set(['getvar', 'equal', 'notequal', 'greater', 'less', 'greaterequal', 'lessequal', 'and', 'or', 'not'])
+for (const name of Object.keys(pureCallbacks)) operations.add(name)
 const opening = /\{[{#]|<(?:user|char|bot)>/ig
 
 function splitExpression(text: string): string[] {
@@ -60,9 +72,14 @@ export function compileDisplayCbs(source: string, limits: DisplayCbsLimits = DIS
     }
     function call(parts: CbsPart[]): CbsCall {
         if (typeof parts[0] !== 'string') return fail()
+        if (parts[0].startsWith('? ')) {
+            if (parts.some(part => typeof part === 'string' && /[$@][a-zA-Z0-9_]+/.test(part))) return fail()
+            return { kind: 'call', parts }
+        }
         const prefix = splitExpression(parts[0])
         const name = operationName(prefix[0])
         if (!operations.has(name) || (parts.length > 1 && prefix.length === 1)) return fail()
+        if (name === 'calc' && parts.some(part => typeof part === 'string' && /[$@][a-zA-Z0-9_]+/.test(part))) return fail()
         if (name === 'getvar') {
             if (parts.length !== 1 || prefix.length < 2) return fail()
             keys.add(prefix[1])
@@ -165,7 +182,7 @@ function evaluateParts(parts: CbsPart[], context: DisplayCbsContext, reads: Set<
     let result = ''
     for (const part of parts) {
         const value = typeof part === 'string' ? part : evaluateNode(part, context, reads)
-        if (value === null) return null
+        if (value === null || result.length + value.length > DISPLAY_CBS_LIMITS.sourceUnits) return null
         result += value
     }
     return result
@@ -180,8 +197,10 @@ function evaluateNode(node: CbsCall | CbsBlock, context: DisplayCbsContext, read
         }
         const text = evaluateParts(node.parts, context, reads)
         if (text === null) return null
-        const [name, a, b] = splitExpression(text)
-        switch (operationName(name)) {
+        const segments = splitExpression(text)
+        const [rawName, a, b] = segments
+        const name = operationName(rawName)
+        switch (name) {
             case 'equal': return a === b ? '1' : '0'
             case 'notequal': return a !== b ? '1' : '0'
             case 'greater': return Number(a) > Number(b) ? '1' : '0'
@@ -191,7 +210,7 @@ function evaluateNode(node: CbsCall | CbsBlock, context: DisplayCbsContext, read
             case 'and': return a === '1' && b === '1' ? '1' : '0'
             case 'or': return a === '1' || b === '1' ? '1' : '0'
             case 'not': return a === '1' ? '0' : '1'
-            default: return null
+            default: return evaluatePureCallback(text, name, segments.slice(1))
         }
     }
     const header = evaluateParts(node.header, context, reads)
@@ -263,3 +282,27 @@ export class DisplayCbsExecutor {
     }
 }
 
+
+function evaluatePureCallback(text: string, name: string, args: string[]): string | null {
+    if (text.length > 16_384) return null
+    const arithmetic = text.startsWith('? ') ? text.substring(2) : name === 'calc' ? args[0] : undefined
+    if (arithmetic !== undefined && (/[$@][a-zA-Z0-9_]+/.test(arithmetic) || arithmetic.length > 4_096)) return null
+    if (name === 'replace' && args[0] !== undefined) {
+        const input = args[0], pattern = String(args[1]), replacement = String(args[2])
+        let matches = pattern.length === 0 ? input.length + 1 : 0
+        if (pattern.length !== 0) {
+            for (let at = input.indexOf(pattern); at !== -1; at = input.indexOf(pattern, at + pattern.length)) matches++
+        }
+        const substitutions = ['$&', '$' + String.fromCharCode(96), "$'"].reduce((sum, token) => sum + replacement.split(token).length - 1, 0)
+        const possibleUnits = input.length + matches * (replacement.length + substitutions * input.length)
+        if (possibleUnits > DISPLAY_CBS_LIMITS.sourceUnits) return null
+    }
+    // Parsed JSON objects can expand to "[object Object]" during array joining.
+    if (name === 'join' && args[0] !== undefined
+        && args[0].length * 16 + (args[0].length + 1) * (args[1]?.length ?? 1) > DISPLAY_CBS_LIMITS.sourceUnits) return null
+    try {
+        const result = text.startsWith('? ') ? calcString(arithmetic!).toString()
+            : Object.hasOwn(pureCallbacks, name) ? pureCallbacks[name as keyof typeof pureCallbacks](args) : null
+        return typeof result === 'string' && result.length <= DISPLAY_CBS_LIMITS.sourceUnits ? result : null
+    } catch { return null }
+}

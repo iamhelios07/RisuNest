@@ -414,6 +414,57 @@ describe('compiled display CBS spans', () => {
     expect(evaluate(templates[1], { value: 'a:a' })?.data).toBe('1')
   })
 
+  test('executes pure string, array, button and arithmetic callbacks with original JS results', () => {
+    const cases: [string, string][] = [
+      ['{{button::<b>Go</b>::a"b}}', '<button class="button-default" risu-trigger="a"b"><b>Go</b></button>'],
+      ['{{button}}', '<button class="button-default" risu-trigger="undefined">undefined</button>'],
+      ['{{startswith::abc::a}}', '1'], ['{{endswith::abc::c}}', '1'], ['{{contains::abc::b}}', '1'],
+      ['{{replace::aba::a::x}}', 'xbx'], ['{{split::a,b::,}}', '["a","b"]'],
+      ['{{join::[1,null,{"a":2},[3,4]]::|}}', '1||[object Object]|3,4'],
+      ['{{spread::a§b}}', 'a::b'], ['{{trim::  x  }}', 'x'], ['{{length::😀}}', '2'],
+      ['{{arraylength::null}}', '1'], ['{{lower::ABC}}', 'abc'], ['{{upper::abc}}', 'ABC'],
+      ['{{capitalize::ßeta}}', 'SSeta'], ['{{round::-1.5}}', '-1'], ['{{floor::-1.5}}', '-2'],
+      ['{{ceil::-1.5}}', '-1'], ['{{abs::-2}}', '2'], ['{{remaind::-5::2}}', '-1'],
+      ['{{tonumber::a 1.2z}}', ' 1.2'], ['{{pow::2::3}}', '8'], ['{{round}}', 'NaN'],
+      ['{{arrayelement::[1,{"a":2},null]::-2}}', '{"a":2}'],
+      ['{{arrayelement::[1,null]::1}}', 'null'], ['{{calc::2^3^2}}', '64'], ['{{? (2+3)*4}}', '20'],
+    ]
+    for (const [source, expected] of cases) {
+      expect(evaluate(source), source).toEqual({ data: expected, reads: [] })
+      expect(risuChatParser(source), source).toBe(expected)
+    }
+    const dynamic = '{{replace::{{spread::["a","a","b"]}}}}'
+    expect(evaluate(dynamic)).toEqual({ data: 'b', reads: [] })
+    expect(evaluate('{{ S_P-L I T ::a,b::,}}')?.data).toBe('["a","b"]')
+    expect(evaluate('{{split:{{getvar:value}}:,}}', { value: 'a::b,c' })?.data)
+      .toBe(risuChatParser('{{split:{{getvar:value}}:,}}', { chatVariables: { value: 'a::b,c' } }))
+  })
+
+  test('hands missing-argument errors and assembled arithmetic reads back to the original parser', () => {
+    for (const source of ['{{trim}}', '{{split}}', '{{join}}', '{{calc}}', '{{arrayelement}}']) {
+      expect(evaluate(source), source).toBeNull()
+      expect(risuChatParser(source), source).toBe(source)
+    }
+    for (const [source, expected] of [['{{? $(1)}}', '1'], ['{{calc::@(1)}}', '0']]) {
+      expect(evaluate(source), source).toBeNull()
+      expect(risuChatParser(source), source).toBe(expected)
+    }
+    expect(evaluate('{{calc::{{getvar::expression}}}}', { expression: '$1+2' })).toBeNull()
+    expect(compileDisplayCbs('{{? $1+2}}')).toBeNull()
+    expect(compileDisplayCbs('{{calc::@1+2}}')).toBeNull()
+  })
+
+  test('bounds callback expansion, repeated replacement substitutions and intermediate text', () => {
+    const replacement = "$$'".repeat(500)
+    expect(evaluate('{{replace::' + 'a'.repeat(100) + '::a::' + replacement + '}}')).toBeNull()
+    expect(evaluate('{{join::' + 'a§'.repeat(100) + 'a::' + 'b'.repeat(2000) + '}}')).toBeNull()
+    expect(evaluate('{{length::' + 'a'.repeat(16_384) + '}}')).toBeNull()
+    expect(evaluate('{{? ' + '1+'.repeat(2048) + '1}}')).toBeNull()
+    const source = '{{#if 1}}' + '{{getvar::value}}'.repeat(4) + '{{/}}'
+    expect(evaluate(source, { value: 'a'.repeat(70_000) })).toBeNull()
+    expect(evaluate('{{replace::aba::a::$&}}')).toEqual({ data: 'aba', reads: [] })
+  })
+
   test('reports actual reads including discarded when branches but excludes false if bodies', () => {
     const source = '{{#if 0}}{{getvar::skipped}}{{/if}}'
       + '{{#when 0}}{{getvar::discarded}}{{:else}}{{getvar::shown}}{{/when}}'
@@ -469,6 +520,12 @@ test('compiled Worker checkpoints preserve the original parser outputs and rando
       rules: [['x', '{{settempvar::t::1}}{{random::left::right}}{{gettempvar::t}}'], ['left1|right1', '{{getvar::finish}}']] },
     { input: 'x', variables: { finish: 'done' },
       rules: [['x', '{{unknown::{{random::left::right}}}}'], ['missing', '{{getvar::finish}}']] },
+    { input: 'x', variables: { expression: '$(1)', finish: 'done' },
+      rules: [['x', '{{random::left::right}}'], ['left|right', '{{calc::{{getvar::expression}}}}'], ['1', '{{upper::{{getvar::finish}}}}']] },
+    { input: 'x', variables: { value: '{{random::left::right}}' },
+      rules: [['x', '{{trim::{{getvar::value}}}}'], ['absent', 'unused'], ['left|right', '{{join::[1,2]::+}}']] },
+    { input: 'x', variables: {},
+      rules: [['x', '{{button::{{arrayelement::["left","right"]::1}}::{{calc::2+3}}}}']] },
     { input: 'value=a::a', variables: {},
       rules: [['value=(.*)', '{{equal::$1::a}}']] },
     { input: 'x{random::left::right}}', variables: { finish: 'done' },

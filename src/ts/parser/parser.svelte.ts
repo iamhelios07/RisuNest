@@ -1,3 +1,4 @@
+import { parseArray, makeArray } from '../cbsPure';
 import DOMPurify from 'dompurify';
 import { hasCbsSyntax } from './cbsSyntax';
 import { CbsHistoryAccessError, type CbsHistoryAccess } from '../cbsHistoryAccess';
@@ -1370,33 +1371,12 @@ const legacyBlockMatcher = (p1:string,matcherArg:matcherArg) => {
 
 type blockMatch = 'ignore'|'parse'|'nothing'|'ifpure'|'pure'|'each'|'function'|'pure-display'|'normalize'|'escape'|'newif'|'newif-falsy'
 
-function parseArray(p1:string): unknown[]{
-    try {
-        const arr = JSON.parse(p1)
-        if(Array.isArray(arr)){
-            return arr
-        }
-        return p1.split('§')
-    } catch (error) {
-        return p1.split('§')
-    }
-}
-
 function parseDict(p1 :string): {[key:string]: unknown}{
     try {
         return JSON.parse(p1)
     } catch (error) {
         return {}
     }
-}
-
-function makeArray(p1: unknown[]): string{
-    return JSON.stringify(p1.map((f) => {
-        if(typeof(f) === 'string'){
-            return f.replace(/::/g, '\\u003A\\u003A')
-        }
-        return f
-    }))
 }
 
 function blockStartMatcher(p1:string,matcherArg:matcherArg):{type:blockMatch,type2?:string,funcArg?:string[],mode?:string}{
