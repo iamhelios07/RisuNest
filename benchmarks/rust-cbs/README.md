@@ -13,6 +13,8 @@ node benchmarks/rust-cbs/run.mjs http://127.0.0.1:<port> <shared-target>/release
 node benchmarks/rust-cbs/run.mjs http://127.0.0.1:<port> <shared-target>/release/rust-cbs-resident[.exe] <timings.json> measure
 ~~~
 
+Both Rust test targets are also included in `node scripts/testNative.mjs --harness`. Default protocol and host test runs exclude them.
+
 The release build writes rust-cbs-resident (rust-cbs-resident.exe on Windows) under the shared target release directory. The driver writes verification results or measurements to the explicit JSON output path. Product application crates and frontend entry points do not depend on this library or executable.
 
 The driver opens only the synthetic streaming harness, blocks non-loopback requests and Realm paths, and calls the actual product risuChatParser in Chromium. The original parser defines the expected output and number of random draws. Timings require a quiet machine. Browser control round trips are reported separately from browser execution time; pipe timings are not Tauri IPC or rendering measurements.
