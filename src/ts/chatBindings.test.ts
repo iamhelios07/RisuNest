@@ -53,7 +53,7 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
         },
     }),
 }))
-import { bindPersona, captureChatBindingTarget, captureOnboardingTarget, chatBindingBlockedByGeneration, conversationMutationBlockedByGeneration, finishOnboarding, updateChatBinding } from './chatBindings.svelte'
+import { bindPersona, bindPromptPreset, captureChatBindingTarget, captureOnboardingTarget, chatBindingBlockedByGeneration, conversationMutationBlockedByGeneration, finishOnboarding, updateChatBinding } from './chatBindings.svelte'
 import { doingChat } from './process/generationState'
 import { activeRerollConversations } from './durableReroll'
 import { DisplayReadRecord, registerDisplayRow } from './process/scriptVariableReads'
@@ -297,4 +297,26 @@ it('holds onboarding answers while a response is generating', async () => {
     expect(state.promotions).toBe(0)
     expect(state.bindings).toEqual([])
     expect(selectedChat().onboardingDone).toBeUndefined()
+})
+
+
+it('persists and removes prompt bindings on a metadata-only chat without changing the global preset', async () => {
+    state.db.botPresetsId = 0
+    state.db.botPresets = [{ id: 'global-prompt' }, { id: 'bound-prompt' }]
+    const target = captureChatBindingTarget()!
+    expect(() => target.conversation.message).toThrow('metadata-only')
+    await bindPromptPreset(target.conversation, 'bound-prompt')
+    expect(target.conversation.bindedBotPreset).toBe('bound-prompt')
+    expect(state.db.botPresetsId).toBe(0)
+    await expect(bindPromptPreset(target.conversation, 'missing')).rejects.toThrow('no longer available')
+    expect(target.conversation.bindedBotPreset).toBe('bound-prompt')
+    await bindPromptPreset(target.conversation, null)
+    expect(target.conversation.bindedBotPreset).toBe('')
+})
+
+
+it('invalidates an open binding picker when another library reuses the same chat IDs', () => {
+    const target = captureChatBindingTarget()!
+    state.epoch++
+    expect(target.isCurrent()).toBe(false)
 })

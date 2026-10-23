@@ -4,7 +4,7 @@ import {
     deriveEffectivePersonaMirrors, deriveEffectivePresetMirrors, deriveEffectiveToggleVariables,
     flushEffectivePersonaEdits, flushEffectivePresetEdits, flushEffectiveToggleEdits,
     getEffectivePresetId, getExplicitGlobalChatVariables, prepareImportedIdentityState,
-    presetMirrorMap, setEffectivePresetOverride, translateRootUnitIntents,
+    presetMirrorMap, setEffectivePresetBinding, setEffectivePresetOverride, translateRootUnitIntents,
 } from './effectiveIdentityState'
 
 function database(): Database {
@@ -385,5 +385,37 @@ describe('plugin root intent adapters', () => {
             { key: '["variable","other"]', type: 'delete' },
             { key: '["variable","extension"]', type: 'delete' },
         ])
+    })
+})
+
+
+describe('chat prompt binding', () => {
+    it('applies the whole bound preset and restores the global preset without changing the global selection', () => {
+        const db = database()
+        Object.assign(db.botPresets[0], { aiModel: 'model-a', temperature: 40, maxResponse: 100 })
+        Object.assign(db.botPresets[1], { aiModel: 'model-b', temperature: 120, maxResponse: 500 })
+        derive(db)
+        setEffectivePresetBinding(db, 'preset-b', apply)
+        setEffectivePresetOverride(db, 'preset-a', apply)
+        expect([getEffectivePresetId(db), db.mainPrompt, db.aiModel, db.temperature, db.maxResponse]).toEqual(['preset-b', 'B', 'model-b', 120, 500])
+        expect(db.botPresetsId).toBe(0)
+        db.mainPrompt = 'Edited bound prompt'
+        setEffectivePresetBinding(db, null, apply)
+        expect(db.botPresets[1].mainPrompt).toBe('Edited bound prompt')
+        expect([getEffectivePresetId(db), db.mainPrompt, db.aiModel, db.temperature]).toEqual(['preset-a', 'A', 'model-a', 40])
+    })
+    it('keeps the UUID binding across reordering and falls back when it is deleted', () => {
+        const db = database()
+        derive(db)
+        setEffectivePresetBinding(db, 'preset-b', apply)
+        db.botPresets.reverse()
+        db.botPresetsId = 1
+        deriveEffectivePresetMirrors(db, apply)
+        expect(getEffectivePresetId(db)).toBe('preset-b')
+        db.botPresets.splice(0, 1)
+        db.botPresetsId = 0
+        deriveEffectivePresetMirrors(db, apply)
+        expect(db.mainPrompt).toBe('A')
+        expect(getEffectivePresetId(db)).toBe('preset-a')
     })
 })

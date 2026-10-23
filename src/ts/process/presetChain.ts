@@ -1,6 +1,6 @@
 export interface PresetChainState {
     presetChain?: string
-    botPresets: Array<{ name?: string }>
+    botPresets: Array<{ name?: string; id?: string }>
 }
 
 export async function activatePresetChain(
@@ -29,6 +29,8 @@ export async function activatePresetChainForRequest(
     setOverride: (index: number | null) => Promise<void>,
     random: () => number,
     onMissing: (name: string) => void,
+    boundPresetId?: string,
 ): Promise<void> {
+    if (boundPresetId && database.botPresets.some(preset => preset.id === boundPresetId)) return
     await activatePresetChain(database, setOverride, random, onMissing)
 }

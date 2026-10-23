@@ -68,3 +68,20 @@ describe('preset chain activation', () => {
         expect(events).not.toContain('request')
     })
 })
+
+
+it('keeps a valid chat binding ahead of a chain, including a missing chain target', async () => {
+    let applied = 'bound'
+    const missing: string[] = []
+    await activatePresetChainForRequest(
+        { presetChain: 'Missing', botPresets: [{ id: 'bound', name: 'Bound' }] },
+        async () => { applied = 'chain' }, () => 0, name => missing.push(name), 'bound',
+    )
+    expect(applied).toBe('bound')
+    expect(missing).toEqual([])
+    await activatePresetChainForRequest(
+        { presetChain: 'Bound', botPresets: [{ id: 'bound', name: 'Bound' }] },
+        async () => { applied = 'chain' }, () => 0, name => missing.push(name), 'deleted',
+    )
+    expect(applied).toBe('chain')
+})

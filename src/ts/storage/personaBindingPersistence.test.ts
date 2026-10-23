@@ -147,3 +147,12 @@ it('stores toggle bindings as metadata and drops the field again when the bindin
     expect(committed[1]).toEqual([{ key: JSON.stringify(['conversation', character.chaId, 'other', 'savedToggleValues']), type: 'delete' }])
     expect(other).not.toHaveProperty('savedToggleValues')
 })
+
+
+it('stores prompt binding UUIDs as shared metadata without opening the conversation body', async () => {
+    const { character, other, coordinator, commit, readConversation } = setup()
+    await coordinator.mutateConversationBinding(character.chaId, 'other', { bindedBotPreset: 'prompt' }, patch => applyConversationBindingPatch(other, patch))
+    expect(other.bindedBotPreset).toBe('prompt')
+    expect(commit.mock.calls[0][0].unitMutations).toContainEqual({ key: JSON.stringify(['conversation', character.chaId, 'other', 'bindedBotPreset']), type: 'set', value: 'prompt' })
+    expect(readConversation).not.toHaveBeenCalled()
+})

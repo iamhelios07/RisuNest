@@ -2379,7 +2379,7 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
                 if let Some((expanded, fields)) = payload {
                     messages = expanded;
                     if let Some(mut fields) = fields {
-                        for field in ["savedToggleValues", "bindedPersona"] {
+                        for field in ["savedToggleValues", "bindedPersona", "bindedBotPreset"] {
                             if let Some(value) = fields.remove(field) { detail.insert(field.to_owned(), value); }
                         }
                         for field in ["hypaV2Data", "hypaV3Data", "scriptstate", "localLore"] {
@@ -2471,7 +2471,7 @@ impl<'de> Visitor<'de> for ColdChatVisitor<'_> {
         while let Some(key) = map.next_key_seed(BoundedStringSeed(self.0.record_bytes))? {
             if key == "message" {
                 messages = Some(map.next_value_seed(MessagesSeed { ..self.0 })?);
-            } else if matches!(key.as_str(), "savedToggleValues" | "bindedPersona" | "hypaV2Data" | "hypaV3Data" | "scriptstate" | "localLore") {
+            } else if matches!(key.as_str(), "savedToggleValues" | "bindedPersona" | "bindedBotPreset" | "hypaV2Data" | "hypaV3Data" | "scriptstate" | "localLore") {
                 let value = map.next_value_seed(BoundedValueSeed(self.0.record_bytes))?;
                 insert_detail::<A::Error>(&mut fields, self.0.record_bytes.limit, key, value)?;
             } else { map.next_value::<IgnoredAny>()?; }

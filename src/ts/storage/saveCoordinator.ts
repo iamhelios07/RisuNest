@@ -4627,6 +4627,7 @@ export class SaveCoordinator {
                     name: conversation.name,
                     folderId: conversation.folderId,
                     bindedPersona: conversation.bindedPersona,
+                    bindedBotPreset: conversation.bindedBotPreset,
                     lastDate: conversation.lastDate,
                 }
             }),

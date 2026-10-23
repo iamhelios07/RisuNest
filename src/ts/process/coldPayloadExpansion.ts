@@ -44,6 +44,7 @@ function applyChatPayload(chat: Record<string, unknown>, payload: unknown): bool
     chat.message = source.message
     if (Object.hasOwn(source, 'savedToggleValues')) chat.savedToggleValues = source.savedToggleValues
     if (Object.hasOwn(source, 'bindedPersona')) chat.bindedPersona = source.bindedPersona
+    if (Object.hasOwn(source, 'bindedBotPreset')) chat.bindedBotPreset = source.bindedBotPreset
     chat.hypaV2Data = source.hypaV2Data
     chat.hypaV3Data = source.hypaV3Data
     chat.scriptstate = source.scriptstate

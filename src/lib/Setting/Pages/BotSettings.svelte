@@ -8,7 +8,12 @@
     import { language } from "src/lang";
     import Help from "src/lib/Others/Help.svelte";
     
-    import { DBState } from 'src/ts/stores.svelte';
+    import { DBState, selectedCharID } from 'src/ts/stores.svelte';
+    let previewPreset = $derived.by(() => {
+        const character = DBState.db.characters?.[$selectedCharID]
+        const binding = character?.chats?.[character.chatPage]?.bindedBotPreset
+        return DBState.db.botPresets.find(preset => binding && preset.id === binding) ?? DBState.db.botPresets[DBState.db.botPresetsId]
+    })
     import { customProviderStore } from "src/ts/plugins/plugins.svelte";
     import { downloadFile } from "src/ts/globalApi.svelte";
     import { isTauri } from "src/ts/platform"
@@ -800,9 +805,9 @@
                 {language.preview}
             </span>
             <div class="flex items-center justify-center gap-2">
-                {#if DBState.db.botPresets[DBState.db.botPresetsId]?.image}
-                    <img src={DBState.db.botPresets[DBState.db.botPresetsId]?.image} alt="icon" class="w-6 h-6 rounded-md" decoding="async"/>
-                    <span class="text-textcolor2">{DBState.db.botPresets[DBState.db.botPresetsId]?.name}</span>
+                {#if previewPreset?.image}
+                    <img src={previewPreset?.image} alt="icon" class="w-6 h-6 rounded-md" decoding="async"/>
+                    <span class="text-textcolor2">{previewPreset?.name}</span>
                 {:else}
                     <span class="text-textcolor2">{language.noImages}</span>
                 {/if}

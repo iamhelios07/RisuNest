@@ -24,6 +24,7 @@ type Conversation = Database['characters'][number]['chats'][number]
 interface ToggleBinding { characterId: string; conversationId: string }
 interface IdentityState {
     override: string | null
+    boundPresetId: string | null
     presetId: string | undefined
     personaId: string | undefined
     preset: Snapshot
@@ -46,7 +47,7 @@ function state(db: Database): IdentityState {
     let current = states.get(db)
     if (!current) {
         current = {
-            override: null, presetId: db.botPresets?.[db.botPresetsId]?.id,
+            override: null, boundPresetId: null, presetId: db.botPresets?.[db.botPresetsId]?.id,
             personaId: db.personas?.[db.selectedPersona]?.id,
             preset: snapshot(db, presetMirrorMap), persona: snapshot(db, personaMirrorMap),
             flags: Object.fromEntries(Object.values(protectedPresetGroups).map(key => [key, root(db)[key]])),
@@ -69,7 +70,21 @@ export function getEffectivePresetOverride(db: Database): string | null {
 }
 
 export function getEffectivePresetId(db: Database): string | undefined {
-    return state(db).override ?? db.botPresets?.[db.botPresetsId]?.id
+    const current = state(db)
+    return current.boundPresetId ?? current.override ?? db.botPresets?.[db.botPresetsId]?.id
+}
+
+export function getEffectivePresetBinding(db: Database): string | null {
+    return states.get(db)?.boundPresetId ?? null
+}
+
+export function setEffectivePresetBinding(db: Database, id: string | null, apply: (db: Database, preset: botPreset) => void): void {
+    if (id !== null && !db.botPresets?.some(preset => preset.id === id)) throw new Error('Preset was not found')
+    flushEffectivePresetEdits(db)
+    const current = state(db)
+    if (current.boundPresetId !== id) current.override = null
+    current.boundPresetId = id
+    deriveEffectivePresetMirrors(db, apply)
 }
 
 export function flushEffectivePresetEdits(db: Database): void {
@@ -107,6 +122,7 @@ export function flushEffectivePresetEdits(db: Database): void {
 export function deriveEffectivePresetMirrors(db: Database, apply: (db: Database, preset: botPreset) => void): void {
     const current = state(db)
     if (current.override && !db.botPresets?.some(preset => preset.id === current.override)) current.override = null
+    if (current.boundPresetId && !db.botPresets?.some(preset => preset.id === current.boundPresetId)) current.boundPresetId = null
     const id = getEffectivePresetId(db)
     const preset = id ? db.botPresets?.find(preset => preset.id === id) : undefined
     const flags = Object.fromEntries(Object.values(protectedPresetGroups).map(key => [key, root(db)[key]]))

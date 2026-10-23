@@ -698,6 +698,8 @@ pub(super) fn query_conversations(
                  THEN json_extract(detail, '$.folderId') END,
              CASE WHEN json_type(detail, '$.bindedPersona') = 'text'
                  THEN json_extract(detail, '$.bindedPersona') END,
+             CASE WHEN json_type(detail, '$.bindedBotPreset') = 'text'
+                 THEN json_extract(detail, '$.bindedBotPreset') END,
              CASE WHEN json_type(detail, '$.fmIndex') = 'integer'
                        AND typeof(json_extract(detail, '$.fmIndex')) = 'integer'
                  THEN json_extract(detail, '$.fmIndex') END
@@ -718,10 +720,11 @@ pub(super) fn query_conversations(
             name: row.get(2)?,
             folder_id: row.get(6)?,
             binded_persona: row.get(7)?,
+            binded_bot_preset: row.get(8)?,
             configured_index: row.get(3)?,
             recent_at: row.get(4)?,
             message_count: row.get(5)?,
-            fm_index: row.get(8)?,
+            fm_index: row.get(9)?,
         });
     }
     let has_more = items.len() as i64 > limit;

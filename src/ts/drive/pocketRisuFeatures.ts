@@ -69,6 +69,7 @@ export function normalizePocketChat(value: unknown, fallbackId: string): void {
         else delete value.savedToggleValues
     }
     if (value.bindedPersona !== undefined && typeof value.bindedPersona !== 'string') delete value.bindedPersona
+    if (value.bindedBotPreset !== undefined && typeof value.bindedBotPreset !== 'string') delete value.bindedBotPreset
     if (Array.isArray(value.message))
         value.message.forEach((message, index) =>
             normalizePocketMessage(

@@ -339,6 +339,7 @@ export interface ConversationSummary {
     name: string
     folderId?: string
     bindedPersona?: string
+    bindedBotPreset?: string
     configuredIndex: number
     recentAt: number
     messageCount: number

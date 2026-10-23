@@ -80,7 +80,7 @@ fn apply_chat_payload(chat: &mut Value, payload: Value) -> bool {
         return false;
     }
     chat.insert("message".to_owned(), source.remove("message").unwrap());
-    for field in ["savedToggleValues", "bindedPersona"] {
+    for field in ["savedToggleValues", "bindedPersona", "bindedBotPreset"] {
         if let Some(value) = source.remove(field) {
             chat.insert(field.to_owned(), value);
         }

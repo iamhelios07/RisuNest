@@ -8,6 +8,8 @@ const runtime = vi.hoisted(() => ({
 vi.mock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule())
 vi.mock('./persistentDataRuntime.svelte', async (importOriginal) => ({
     ...await importOriginal<typeof import('./persistentDataRuntime.svelte')>(),
+    getPersistentNavigationGeneration: () => 0,
+    getPersistentStorageAuthorityEpoch: () => 0,
     flushPendingData: runtime.flushPendingData,
     getPersistentDataRuntime: () => ({ store: { readPreset: runtime.readPreset } }),
 }))
@@ -16,13 +18,14 @@ import { selectedCharID } from '../stores.svelte'
 import type { Database, botPreset } from './database.svelte'
 import {
     activatePresetOverride,
+    activateChatPresetBinding,
     getDatabase,
     getEffectivePresetId,
     normalizeDatabaseDefaults,
     setDatabase,
     setEffectivePresetOverride,
 } from './database.svelte'
-import { isLoadedPreset } from './persistentDataRuntime.svelte'
+import { isLoadedPreset, createProductionStateAdapter } from './persistentDataRuntime.svelte'
 
 function presetDatabase(): Database {
     const database = normalizeDatabaseDefaults({} as Database)
@@ -135,4 +138,75 @@ describe('preset chain override activation', () => {
         expect(getEffectivePresetId()).toBe('preset-a')
         expect(getDatabase().mainPrompt).toBe('Prompt A')
     })
+})
+
+
+function selectBoundChat() {
+    const db = getDatabase()
+    db.characters = [{ chaId: 'owner', chatPage: 0, chats: [{ id: 'chat-a', bindedBotPreset: 'preset-b', message: [], note: '', name: 'A', localLore: [] }] }] as Database['characters']
+    selectedCharID.set(0)
+    return db.characters[0].chats[0]
+}
+
+it('hydrates a bound catalog entry before applying its model and prompt', async () => {
+    const chat = selectBoundChat()
+    stored.get('preset-b')!.aiModel = 'bound-model'
+    getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
+    expect(await activateChatPresetBinding()).toBe(true)
+    expect(getDatabase().mainPrompt).toBe('Prompt B')
+    expect(getDatabase().aiModel).toBe('bound-model')
+    expect(getDatabase().botPresetsId).toBe(0)
+    chat.bindedBotPreset = ''
+    expect(await activateChatPresetBinding()).toBe(true)
+    expect(getDatabase().mainPrompt).toBe('Prompt A')
+})
+
+it('does not activate a delayed preset read after a different chat is selected', async () => {
+    selectBoundChat()
+    const db = getDatabase()
+    db.botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
+    const gate = deferred()
+    runtime.readPreset.mockImplementation(async () => { await gate.promise; return { revision: 1, value: stored.get('preset-b')! } })
+    const activation = activateChatPresetBinding()
+    await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalled())
+    db.characters[0].chats.push({ id: 'chat-b', message: [], note: '', name: 'B', localLore: [] })
+    db.characters[0].chatPage = 1
+    gate.resolve()
+    expect(await activation).toBe(false)
+    expect(db.mainPrompt).toBe('Prompt A')
+})
+
+it('retains a missing binding UUID while falling back to the global prompt', async () => {
+    selectBoundChat().bindedBotPreset = 'missing'
+    expect(await activateChatPresetBinding()).toBe(true)
+    expect(getDatabase().mainPrompt).toBe('Prompt A')
+    expect(getDatabase().characters[0].chats[0].bindedBotPreset).toBe('missing')
+})
+
+
+it('carries the bound preset through a working-set replacement and applies remote preset changes', async () => {
+    selectBoundChat()
+    await activateChatPresetBinding()
+    const replacement = getDatabase({ snapshot: true })
+    replacement.botPresets[1].mainPrompt = 'Received prompt'
+    replacement.botPresets[1].aiModel = 'received-model'
+    createProductionStateAdapter().replaceDatabase(replacement)
+    expect(getEffectivePresetId()).toBe('preset-b')
+    expect(getDatabase().botPresetsId).toBe(0)
+    expect([getDatabase().mainPrompt, getDatabase().aiModel]).toEqual(['Received prompt', 'received-model'])
+})
+
+
+it('allows the request and lifecycle to load the same binding concurrently', async () => {
+    selectBoundChat()
+    getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
+    const gate = deferred()
+    runtime.readPreset.mockImplementation(async () => { await gate.promise; return { revision: 1, value: stored.get('preset-b')! } })
+    const first = activateChatPresetBinding()
+    await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledTimes(1))
+    const second = activateChatPresetBinding()
+    await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledTimes(2))
+    gate.resolve()
+    expect(await Promise.all([first, second])).toEqual([true, true])
+    expect(getDatabase().mainPrompt).toBe('Prompt B')
 })

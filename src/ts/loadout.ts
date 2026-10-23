@@ -1,5 +1,5 @@
 import { changeUserPersona } from "./persona"
-import { changeToPreset, getCurrentCharacter } from "./storage/database.svelte"
+import { changeToPreset, getCurrentCharacter, getEffectivePresetId } from "./storage/database.svelte"
 import { DBState } from "./stores.svelte"
 
 export type Loadout = {
@@ -20,7 +20,7 @@ export function makeLoadout(options:{
 }): Loadout {
     const character = getCurrentCharacter()
     const id = crypto.randomUUID()
-    const preset = DBState.db.botPresets[DBState.db.botPresetsId]
+    const preset = DBState.db.botPresets.find(preset => preset.id === getEffectivePresetId()) ?? DBState.db.botPresets[DBState.db.botPresetsId]
     const icons = []
 
     if(character?.image){

@@ -1,7 +1,7 @@
 <script lang="ts">
     import { untrack } from 'svelte'
     import { DBState, selectedCharID } from 'src/ts/stores.svelte'
-    import { flushEffectiveToggleEdits, deriveEffectiveToggleVariables } from 'src/ts/storage/database.svelte'
+    import { flushEffectiveToggleEdits, deriveEffectiveToggleVariables, activateChatPresetBinding } from 'src/ts/storage/database.svelte'
     import { isConversationSummaryStub } from 'src/ts/storage/conversationResidency'
     import { activeRerollConversations, recoverInterruptedReroll } from 'src/ts/durableReroll'
     import { getHistoryWindowMemoryMode, openSelectedHistoryWindow, type SelectedHistoryWindow } from 'src/ts/process/index.svelte'
@@ -11,6 +11,18 @@
         flushPendingData,
     } from 'src/ts/storage/persistentDataRuntime.svelte'
     import { alertError } from 'src/ts/alert'
+    $effect(() => {
+        const db = DBState.db
+        const character = db?.characters?.[$selectedCharID]
+        const chat = character?.chats?.[character.chatPage]
+        void chat?.bindedBotPreset
+        // IDs also change when a missing bound preset is imported or deleted.
+        db?.botPresets?.map(preset => preset.id)
+        if (!db || (chat && isConversationSummaryStub(chat))) return
+        untrack(() => {
+            void activateChatPresetBinding().catch(error => alertError(error))
+        })
+    })
     let recovering = new Set<string>()
     $effect(() => {
         const character = DBState.db?.characters?.[$selectedCharID]

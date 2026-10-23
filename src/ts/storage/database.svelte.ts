@@ -1,3 +1,4 @@
+import { isConversationSummaryStub } from './conversationResidency'
 import { importMessageNameSettings, exportMessageNameSettings } from './upstreamImport'
 import { get } from 'svelte/store';
 import { checkNullish, decryptBuffer, encryptBuffer, selectSingleFile } from '../util';
@@ -1841,6 +1842,7 @@ export interface Chat{
     rerollRecovery?: import('../responseVariants').RerollRecovery
     savedToggleValues?: Record<string, string>
     bindedPersona?:string
+    bindedBotPreset?:string
     fmIndex?:number
     hypaV3Data?:SerializableHypaV3Data
     folderId?:string
@@ -2103,6 +2105,50 @@ export function setEffectivePresetOverride(id: string | null, db: Database = get
     identity.setEffectivePresetOverride(db, id, applyEffectivePreset)
 }
 
+export function setEffectivePresetBinding(id: string | null, db: Database = getDatabase()): void {
+    identity.setEffectivePresetBinding(db, id, applyEffectivePreset)
+}
+
+/** Loads only the selected chat's preset body; stale navigation never activates it. */
+export async function activateChatPresetBinding(): Promise<boolean> {
+    const database = getDatabase()
+    const character = getCurrentCharacter()
+    const chat = getCurrentChat()
+    if (chat && isConversationSummaryStub(chat)) return false
+    const characterId = character?.chaId
+    const conversationId = chat?.id
+    const binding = chat?.bindedBotPreset || null
+    const preset = binding ? database.botPresets.find(preset => preset.id === binding) : undefined
+    if (!preset || !binding) {
+        setEffectivePresetBinding(null)
+        return true
+    }
+    // Catalog entries have no prompt body; already resident records need no storage I/O.
+    if (Object.hasOwn(preset, 'mainPrompt')) {
+        setEffectivePresetBinding(binding)
+        return true
+    }
+    const runtime = await import('./persistentDataRuntime.svelte')
+    if (getDatabase() !== database) return false
+    const navigation = runtime.getPersistentNavigationGeneration()
+    const epoch = runtime.getPersistentStorageAuthorityEpoch()
+    const isCurrent = () => runtime.getPersistentNavigationGeneration() === navigation
+        && runtime.getPersistentStorageAuthorityEpoch() === epoch
+        && getCurrentCharacter()?.chaId === characterId && getCurrentChat()?.id === conversationId
+        && (getCurrentChat()?.bindedBotPreset || null) === binding
+    if (!isCurrent()) return false
+    await runtime.flushPendingData('prompt-binding')
+    if (!isCurrent()) return false
+    const stored = await runtime.getPersistentDataRuntime().store.readPreset(binding)
+    if (!isCurrent()) return false
+    const current = getDatabase()
+    const index = current.botPresets.findIndex(preset => preset.id === binding)
+    if (!stored || index < 0) throw new Error('Preset was not found')
+    if (!runtime.isLoadedPreset(current.botPresets[index])) current.botPresets[index] = stored.value
+    setEffectivePresetBinding(binding, current)
+    return true
+}
+
 let presetMirrorDefaults: Record<string, unknown> | undefined
 function applyEffectivePreset(db: Database, preset: botPreset): void {
     if (!presetMirrorDefaults) {
@@ -2194,6 +2240,7 @@ const presetWorkingSetController = createPresetWorkingSetController({
     getDatabase,
     captureCurrentPreset,
     getEffectivePresetId,
+    getEffectivePresetBinding: () => identity.getEffectivePresetBinding(getDatabase()),
     getEffectivePresetOverride: () => identity.getEffectivePresetOverride(getDatabase()),
     clearEffectivePresetOverride() {
         identity.adoptEffectivePresetSelection(getDatabase(), applyEffectivePreset)

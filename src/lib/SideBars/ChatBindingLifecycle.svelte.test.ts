@@ -18,6 +18,7 @@ vi.mock('src/ts/stores.svelte', async () => {
     return { DBState, selectedCharID: writable(0) }
 })
 vi.mock('src/ts/storage/database.svelte', () => ({
+    activateChatPresetBinding: async () => true,
     flushEffectiveToggleEdits: () => {},
     deriveEffectiveToggleVariables: () => {},
 }))

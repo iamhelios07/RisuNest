@@ -723,10 +723,10 @@ fn conversation_catalog_extracts_only_typed_summary_fields_from_large_details() 
     let (_directory, store, _) = open_fixture();
     for mut detail in [
         json!({}),
-        json!({"folderId": null, "bindedPersona": null, "fmIndex": null}),
-        json!({"folderId": "", "bindedPersona": "persona", "fmIndex": -1}),
-        json!({"folderId": [], "bindedPersona": {}, "fmIndex": 1.0}),
-        json!({"folderId": true, "bindedPersona": 1, "fmIndex": true}),
+        json!({"folderId": null, "bindedPersona": null, "bindedBotPreset": null, "fmIndex": null}),
+        json!({"folderId": "", "bindedPersona": "persona", "bindedBotPreset": "prompt", "fmIndex": -1}),
+        json!({"folderId": [], "bindedPersona": {}, "bindedBotPreset": {}, "fmIndex": 1.0}),
+        json!({"folderId": true, "bindedPersona": 1, "bindedBotPreset": 1, "fmIndex": true}),
         json!({"fmIndex": i64::MIN}),
         json!({"fmIndex": i64::MAX}),
         json!({"fmIndex": u64::MAX}),
@@ -742,6 +742,7 @@ fn conversation_catalog_extracts_only_typed_summary_fields_from_large_details() 
         let summary = page.items.iter().find(|item| item.id == "conv-short").unwrap();
         assert_eq!(summary.folder_id.as_deref(), detail.get("folderId").and_then(Value::as_str));
         assert_eq!(summary.binded_persona.as_deref(), detail.get("bindedPersona").and_then(Value::as_str));
+        assert_eq!(summary.binded_bot_preset.as_deref(), detail.get("bindedBotPreset").and_then(Value::as_str));
         assert_eq!(summary.fm_index, detail.get("fmIndex").and_then(Value::as_i64));
         assert!(serde_json::to_vec(summary).unwrap().len() < 512);
     }

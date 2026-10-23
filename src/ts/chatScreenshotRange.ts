@@ -150,6 +150,7 @@ export function snapshotChatScreenshotCharacter(
         modules: chat.modules ?? [],
         id: chat.id,
         bindedPersona: chat.bindedPersona,
+        bindedBotPreset: chat.bindedBotPreset,
         fmIndex: chat.fmIndex ?? -1,
         bookmarks: chat.bookmarks ?? [],
         bookmarkNames: chat.bookmarkNames ?? {},

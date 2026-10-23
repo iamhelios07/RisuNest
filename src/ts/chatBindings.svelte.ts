@@ -41,6 +41,7 @@ export function captureChatBindingTarget() {
     const conversation = character?.chats[character.chatPage]
     if (!conversation || isConversationSummaryStub(conversation)) return null
     const navigation = getPersistentNavigationGeneration()
+    const epoch = getPersistentStorageAuthorityEpoch()
     const currentConversation = () =>
         DBState.db.characters
             .find((item) => item.chaId === character.chaId)
@@ -54,6 +55,7 @@ export function captureChatBindingTarget() {
             const current = selected?.chats[selected.chatPage]
             return (
                 navigation === getPersistentNavigationGeneration() &&
+                epoch === getPersistentStorageAuthorityEpoch() &&
                 selected?.chaId === character.chaId &&
                 current?.id === conversation.id &&
                 !isConversationSummaryStub(current)
@@ -107,6 +109,13 @@ export async function bindPersona(conversation: Chat, index: number): Promise<vo
     if (index >= 0 && !persona) throw new Error('Persona is no longer available')
     if (persona) persona.id ||= v4()
     await updateChatBinding(conversation, { bindedPersona: persona?.id ?? '' })
+}
+
+export async function bindPromptPreset(conversation: Chat, id: string | null): Promise<void> {
+    if (id !== null && !DBState.db.botPresets.some(preset => preset.id === id)) {
+        throw new Error('Preset is no longer available')
+    }
+    await updateChatBinding(conversation, { bindedBotPreset: id ?? '' })
 }
 
 export async function saveChatBinding(): Promise<void> {

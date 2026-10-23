@@ -21,8 +21,8 @@ import type {
 } from './activeWorkingSet.svelte'
 import type { ConversationViewportSource } from '../conversationViewportSource'
 import type { Chat, Database, botPreset, character } from './database.svelte'
-import { fillRootFieldDefaults, getDatabase, setDatabase, setEffectivePresetOverride } from './database.svelte'
-import { getEffectivePresetOverride } from './effectiveIdentityState'
+import { fillRootFieldDefaults, getDatabase, setDatabase, setEffectivePresetOverride, setEffectivePresetBinding } from './database.svelte'
+import { getEffectivePresetOverride, getEffectivePresetBinding } from './effectiveIdentityState'
 import { prepareDatabaseForPersistence, preparePersistentRootForWorkingSet } from './databasePreparation'
 import { getPersistentDataStore, getPersistentStorageAuthority } from './persistentDataStoreFactory'
 import type {
@@ -100,26 +100,34 @@ const catalogPresetKeys = new Set(['id', 'name', 'image', 'localNetworkMode', 'l
 export const isLoadedPreset = (value: botPreset | undefined): boolean =>
     !!value && Object.keys(value).some((key) => !catalogPresetKeys.has(key))
 
-/// A whole replacement starts a new identity state, so a preset chain override
-/// is applied again when its preset is still in the library.
-function carryPresetOverride(id: string, readPreset?: (id: string) => Promise<{ value: botPreset } | null>): void {
+/// Restores transient prompt selection after a working-set replacement.
+function carryPresetOverride(id: string, readPreset?: (id: string) => Promise<{ value: botPreset } | null>, binding = false): void {
+    const apply = binding ? setEffectivePresetBinding : setEffectivePresetOverride
     const database = getDatabase()
+    const boundOwner = database.characters[get(selectedCharID)]
+    if (binding && boundOwner?.chats[boundOwner.chatPage]?.bindedBotPreset !== id) return
     const record = database.botPresets?.find((value) => value?.id === id)
     if (!record) return
     if (isLoadedPreset(record)) {
-        setEffectivePresetOverride(id, database)
+        apply(id, database)
         return
     }
     if (!readPreset) return
     const selectedId = database.botPresets[database.botPresetsId]?.id
+    const owner = database.characters[get(selectedCharID)]
+    const ownerId = owner?.chaId
+    const conversationId = owner?.chats[owner.chatPage]?.id
     void readPreset(id).then((value) => {
         const current = getDatabase()
-        if (!value || current !== database || getEffectivePresetOverride(current) !== null ||
+        const selected = current.characters[get(selectedCharID)]
+        if (binding && (selected?.chaId !== ownerId || selected?.chats[selected.chatPage]?.id !== conversationId
+            || selected?.chats[selected.chatPage]?.bindedBotPreset !== id)) return
+        if (!value || current !== database || (!binding && getEffectivePresetOverride(current) !== null) ||
             current.botPresets[current.botPresetsId]?.id !== selectedId) return
         const index = current.botPresets.findIndex((preset) => preset?.id === id)
         if (index < 0) return
         if (!isLoadedPreset(current.botPresets[index])) current.botPresets[index] = value.value
-        setEffectivePresetOverride(id, current)
+        apply(id, current)
     }).catch((error) => productionConfiguration.onBackgroundError?.(error))
 }
 
@@ -213,6 +221,7 @@ export function createProductionStateAdapter(options: {
         replaceDatabase(database, activeCharacterIds, forceScalableProjection) {
             const liveDatabase = getDatabase()
             const presetOverride = getEffectivePresetOverride(liveDatabase)
+            const presetBinding = getEffectivePresetBinding(liveDatabase)
             const selectedCharacter = liveDatabase.characters[get(selectedCharID)]
             const selectedCharacterId = selectedCharacter?.chaId ?? null
             const selectedConversationId = selectedCharacter
@@ -238,6 +247,7 @@ export function createProductionStateAdapter(options: {
                 (index) => selectedCharID.set(index),
             )
             if (presetOverride) carryPresetOverride(presetOverride, options.readPreset)
+            if (presetBinding) carryPresetOverride(presetBinding, options.readPreset, true)
         },
         publishPresetWorkingSet({ revision, root, presets }) {
             const database = getDatabase()

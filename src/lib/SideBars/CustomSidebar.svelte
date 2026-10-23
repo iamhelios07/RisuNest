@@ -1,12 +1,12 @@
 <script lang="ts">
-    import { DBState, loadoutModalStore, openPresetList } from 'src/ts/stores.svelte'
+    import { DBState, loadoutModalStore } from 'src/ts/stores.svelte'
     import Button from '../UI/GUI/Button.svelte';
     import { language } from 'src/lang';
     import { getFullSettingsData } from 'src/ts/setting/utils';
-    import { get } from 'svelte/store';
     import SettingRenderer from '../Setting/SettingRenderer.svelte';
     import ModelBind from './ModelBind.svelte'
     import PersonaBind from './PersonaBind.svelte'
+    import PromptBind from './PromptBind.svelte'
 </script>
 
 
@@ -16,13 +16,7 @@
         {#if item.type === 'model'}
             <ModelBind />
         {:else if item.type === 'preset'}
-            <Button onclick={() => {
-                openPresetList.set(!get(openPresetList))
-            }}>{
-                DBState.db.botPresets?.[DBState.db.botPresetsId]?.name
-                ||
-                language.presets
-            }</Button>
+            <PromptBind />
         {:else if item.type === 'loadout'}
             <Button onclick={() => {
                 loadoutModalStore.open = !loadoutModalStore.open

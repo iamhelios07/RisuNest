@@ -68,6 +68,7 @@ impl IdentityRemap {
             value["id"] = Value::String(self.conversation(owner, id));
         }
         self.field(value, "bindedPersona", "persona");
+        self.field(value, "bindedBotPreset", "preset");
         self.list(value, "modules", "modules");
     }
     fn root(&self, value: &mut Value) {
@@ -544,7 +545,7 @@ mod tests {
                 &[json!({"id":"preset","name":"kept upstream name","aiModel":"model"})],
             )
             .unwrap();
-        store.replace_add_characters(&id,&[json!({"chaId":"char","type":"character","name":"synthetic","modules":["module"],"chats":[{"id":"chat","name":"synthetic chat","bindedPersona":"persona","modules":["module"],"message":[{"role":"user","data":"synthetic","chatId":"message"}],"bookmarks":["message"],"bookmarkNames":{"message":"kept"},"hypaV3Data":{"memos":["message"]}}]})]).unwrap();
+        store.replace_add_characters(&id,&[json!({"chaId":"char","type":"character","name":"synthetic","modules":["module"],"chats":[{"id":"chat","name":"synthetic chat","bindedPersona":"persona","bindedBotPreset":"preset","modules":["module"],"message":[{"role":"user","data":"synthetic","chatId":"message"}],"bookmarks":["message"],"bookmarkNames":{"message":"kept"},"hypaV3Data":{"memos":["message"]}}]})]).unwrap();
         id
     }
     fn retire(store: &mut PersistentStore, p: &[&str]) {
@@ -630,6 +631,7 @@ mod tests {
         let chat = &char["chats"][0];
         assert_ne!(chat["id"], "chat");
         assert_eq!(chat["bindedPersona"], db["personas"][0]["id"]);
+        assert_eq!(chat["bindedBotPreset"], db["botPresets"][0]["id"]);
         assert_eq!(chat["message"][0]["chatId"], "message");
         assert_eq!(chat["bookmarks"], json!(["message"]));
         assert_eq!(chat["bookmarkNames"], json!({"message":"kept"}));

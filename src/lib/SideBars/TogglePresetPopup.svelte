@@ -13,7 +13,7 @@
         UploadIcon,
         XIcon,
     } from '@lucide/svelte'
-    import { DBState } from 'src/ts/stores.svelte'
+    import { DBState, selectedCharID } from 'src/ts/stores.svelte'
     import { language } from 'src/lang'
     import { alertConfirm, alertError, alertInput, alertSelect, alertToast } from 'src/ts/alert'
     import { modalNavigation } from 'src/ts/ui/modalNavigation'
@@ -43,7 +43,12 @@
     let openMenu = $state<number | null>(null)
     /** Nested alerts in progress. Escape and Back belong to them, not to this popup. */
     let busy = $state(0)
-    let promptPresetName = $derived(DBState.db.botPresets?.[DBState.db.botPresetsId]?.name)
+    let promptPresetName = $derived.by(() => {
+        const character = DBState.db.characters?.[$selectedCharID]
+        const binding = character?.chats?.[character.chatPage]?.bindedBotPreset
+        return (DBState.db.botPresets?.find(preset => binding && preset.id === binding)
+            ?? DBState.db.botPresets?.[DBState.db.botPresetsId])?.name
+    })
     let presets = $derived(DBState.db.togglePresets ?? [])
     let visible = $derived(
         presets

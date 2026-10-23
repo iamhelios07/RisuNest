@@ -2027,6 +2027,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 ...item.summary,
                 folderId: item.detail.folderId,
                 bindedPersona: item.detail.bindedPersona,
+                bindedBotPreset: item.detail.bindedBotPreset,
                 ...(item.detail.fmIndex === undefined ? {} : { fmIndex: item.detail.fmIndex }),
             })),
             nextCursor: result.nextCursor,

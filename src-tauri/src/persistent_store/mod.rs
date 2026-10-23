@@ -696,6 +696,8 @@ pub(crate) struct ConversationSummary {
     pub(crate) folder_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) binded_persona: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) binded_bot_preset: Option<String>,
     pub(crate) configured_index: i64,
     pub(crate) recent_at: i64,
     pub(crate) message_count: i64,

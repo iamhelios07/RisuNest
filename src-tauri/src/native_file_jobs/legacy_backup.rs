@@ -1102,7 +1102,7 @@ impl<'de> Visitor<'de> for ColdRootVisitor<'_> {
                 "character" => {
                     map.next_value_seed(ColdFeatureSeed("character", self.0))?;
                 }
-                "savedToggleValues" | "bindedPersona" => {
+                "savedToggleValues" | "bindedPersona" | "bindedBotPreset" => {
                     map.next_value_seed(restore::BoundedValueSeed(self.0))?;
                 }
                 _ => {
@@ -1153,7 +1153,7 @@ impl<'de> Visitor<'de> for ColdFeatureSeed<'_> {
                 "message" if self.0 == "chat" => {
                     map.next_value_seed(ColdFeatureSeed("messages", self.1))?;
                 }
-                "savedToggleValues" | "bindedPersona" if self.0 == "chat" => {
+                "savedToggleValues" | "bindedPersona" | "bindedBotPreset" if self.0 == "chat" => {
                     map.next_value_seed(restore::BoundedValueSeed(self.1))?;
                 }
                 _ => {

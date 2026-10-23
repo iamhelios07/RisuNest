@@ -382,6 +382,7 @@ pub(super) const CHARACTER_FIELDS: &[&str] = &[
 ];
 pub(super) const CONVERSATION_FIELDS: &[&str] = &[
     "GLGlobalVariables",
+    "bindedBotPreset",
     "bindedPersona",
     "bookmarkNames",
     "bookmarks",
