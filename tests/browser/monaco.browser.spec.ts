@@ -1,6 +1,34 @@
 import { test, expect } from './fixture'
 import type {} from './monacoMain'
 
+test('closing Find with Escape after searching a scrollable document does not fail rendering', async ({ page }) => {
+    const errors: string[] = []
+    page.on('pageerror', error => errors.push(error.message))
+    await page.goto('/monaco.html')
+    await page.waitForFunction(() => !!window.monacoDriver)
+    const mac = await page.evaluate(() => navigator.userAgent.includes('Macintosh'))
+    const text = Array.from({ length: 200 }, (_, index) => `${index === 0 || index === 119 ? 'needle ' : ''}line ${index + 1}`).join('\n')
+    for (const language of ['markdown', 'lua'] as const) {
+        await page.evaluate(language => window.monacoDriver.open(language), language)
+        const input = page.locator('#editor textarea.inputarea')
+        await expect(input).toBeFocused()
+        await page.evaluate(text => window.monacoDriver.place(text, 1, 1), text)
+        await page.keyboard.press(mac ? 'Meta+f' : 'Control+f')
+        const find = page.locator('#editor').getByRole('textbox', { name: 'Find', exact: true })
+        await expect(find).toBeFocused()
+        await find.fill('needle')
+        await expect(page.locator('#editor .find-widget .matchesCount')).toContainText('1 of 2')
+        await page.keyboard.press('Escape')
+        await expect(find).toBeHidden()
+        await expect(input).toBeFocused()
+        expect(await page.evaluate(() => window.monacoDriver.state().value)).toBe(text)
+        await page.keyboard.press(mac ? 'Meta+ArrowDown' : 'Control+End')
+        await page.keyboard.type(' edited')
+        await expect.poll(() => page.evaluate(() => window.monacoDriver.state().value)).toBe(`${text} edited`)
+    }
+    expect(errors).toEqual([])
+})
+
 test('real markdown and Lua editors retain editing, find, undo and save with a responding editor worker', async ({ page }) => {
     const errors: string[] = []
     page.on('pageerror', error => errors.push(error.message))
