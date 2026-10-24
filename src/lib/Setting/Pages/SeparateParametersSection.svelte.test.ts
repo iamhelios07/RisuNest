@@ -1,14 +1,18 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { language } from 'src/lang'
+import type { LLMModel } from 'src/ts/model/types'
+import type { Database } from 'src/ts/storage/database.svelte'
 import { DBState } from 'src/ts/stores.svelte'
 import SeparateParametersSection from './SeparateParametersSection.svelte'
 
 vi.mock('src/ts/stores.svelte', () => {
-    const DBState = $state({ db: {} })
-    return { DBState }
+    const DBState = $state({ db: {} as Database })
+    return { DBState } satisfies Partial<typeof import('src/ts/stores.svelte')>
 })
-vi.mock('src/ts/model/modellist', () => ({ getModelInfo: () => ({ parameters: ['temperature'], flags: [] }) }))
+vi.mock('src/ts/model/modellist', () => ({
+    getModelInfo: () => ({ parameters: ['temperature'], flags: [] }) as LLMModel,
+}) satisfies Partial<typeof import('src/ts/model/modellist')>)
 vi.mock('src/ts/globalApi.svelte', () => ({}))
 vi.mock('src/ts/util', () => ({}))
 vi.mock('src/lib/Others/Help.svelte', () => ({ default: () => {} }))
