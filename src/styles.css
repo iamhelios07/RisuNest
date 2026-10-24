@@ -9,6 +9,10 @@
   }
 }
 
+body > iframe[data-app-lock-covered] {
+  display: none !important;
+}
+
 .chat-message-container[data-chat-height-pending="true"] {
   visibility: hidden;
   overflow-anchor: none;
@@ -500,6 +504,10 @@ select optgroup {
 
 /* Alerts, confirmations, permission prompts, and other full-screen modals. Sits above the
    z-[1000] work dialogs (import progress, screenshot) so errors and confirmations stay visible. */
+@utility z-app-lock {
+  z-index: 3000;
+}
+
 @utility z-modal {
   z-index: 2000;
 }

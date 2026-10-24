@@ -1,5 +1,6 @@
 package io.github.rsyumi.risunest
 
+import android.app.Activity
 import android.app.AlertDialog
 import android.content.ComponentCallbacks2
 import android.content.Context
@@ -21,6 +22,7 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.ActivityCompat
 import androidx.core.content.IntentCompat
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
@@ -568,6 +570,14 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   @androidx.annotation.Keep
   fun cleanupWebviewStatus(): Int = webviewCleanup.status()
 
+  @androidx.annotation.Keep
+  private external fun appLockReply(id: Long, response: String)
+
+  private val appLock = AndroidAppLock(this, ::appLockReply)
+
+  @androidx.annotation.Keep
+  fun appLockCommand(id: Long, operation: String, payload: String) = appLock.command(id, operation, payload)
+
   private val backNavigationPolicy = BackNavigationPolicy()
   private var lifecycleWebView: WebView? = null
   private var frontendReady = AndroidFrontendReady()
@@ -667,7 +677,36 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
   private var exitFlushSequence = 0L
 
+  private companion object {
+    private var permissionDelegateInstalled = false
+
+    fun installPermissionDelegate() {
+      if (permissionDelegateInstalled) return
+      ActivityCompat.setPermissionCompatDelegate(object : ActivityCompat.PermissionCompatDelegate {
+        override fun requestPermissions(activity: Activity, permissions: Array<String>, requestCode: Int): Boolean {
+          if (activity !is MainActivity || requestCode < 0) return false
+          val permission = permissions.singleOrNull() ?: return false
+          if (permission != android.Manifest.permission.CAMERA &&
+            !(Build.VERSION.SDK_INT >= 33 && permission == android.Manifest.permission.POST_NOTIFICATIONS)) return false
+          activity.validateRequestPermissionsRequestCode(requestCode)
+          activity.appLock.beginOwnedPermission(requestCode)
+          try {
+            activity.requestPermissions(permissions, requestCode)
+          } catch (error: Exception) {
+            activity.appLock.finishOwnedPermission(requestCode)
+            throw error
+          }
+          return true
+        }
+
+        override fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, data: Intent?): Boolean = false
+      })
+      permissionDelegateInstalled = true
+    }
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
+    installPermissionDelegate()
     consumedOpenedFileFingerprint = savedInstanceState?.getString(OPENED_FILE_FINGERPRINT_STATE)
     savedInstanceState?.let { state ->
       state.getString(BACKUP_SOURCE_REQUEST_STATE)
@@ -767,6 +806,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
     frontendReady = AndroidFrontendReady()
     lifecycleWebView = webView
+    appLock.attach(webView)
     exitListenerReady = false
     deliveredLegacyPaths.clear()
     exitWaitDialog?.dismiss()
@@ -816,6 +856,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       object : OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
           if (lifecycleWebView !== webView) return
+          if (appLock.backgroundForBack()) return
           val pressedAt = SystemClock.elapsedRealtime()
           if (webView.canGoBack()) {
             navigateBack(webView, canGoBack = true, pressedAt)
@@ -860,6 +901,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   override fun onStop() {
+    appLock.onStop()
     // Promote first, so a hold the hide flush begins starts protected.
     if (!isFinishing) GenerationForegroundService.setVisible(this, false)
     lifecycleFlushDispatcher.onStop()
@@ -868,13 +910,57 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   override fun onResume() {
     super.onResume()
+    appLock.onResume()
     rendererRestartGate.onResume()
     dispatchNotificationStateRefresh()
   }
 
   override fun onPause() {
+    appLock.onPause()
     rendererRestartGate.onPause()
     super.onPause()
+  }
+
+  override fun onWindowFocusChanged(hasFocus: Boolean) {
+    super.onWindowFocusChanged(hasFocus)
+    appLock.onWindowFocusChanged(hasFocus)
+  }
+
+  @androidx.annotation.RequiresApi(29)
+  override fun onTopResumedActivityChanged(isTopResumedActivity: Boolean) {
+    super.onTopResumedActivityChanged(isTopResumedActivity)
+    appLock.onTopResumedActivityChanged(isTopResumedActivity)
+  }
+
+  override fun onUserLeaveHint() {
+    appLock.onUserLeaveHint()
+    super.onUserLeaveHint()
+  }
+
+  @Suppress("DEPRECATION")
+  override fun startActivityForResult(intent: Intent, requestCode: Int, options: Bundle?) {
+    val owned = requestCode >= 0 && (intent.action in setOf(
+      Intent.ACTION_OPEN_DOCUMENT, Intent.ACTION_CREATE_DOCUMENT, Intent.ACTION_GET_CONTENT,
+      Intent.ACTION_OPEN_DOCUMENT_TREE, "android.app.action.CONFIRM_DEVICE_CREDENTIAL",
+    ) || intent.component?.packageName == packageName)
+    if (owned) appLock.beginOwnedActivity(requestCode)
+    try {
+      super.startActivityForResult(intent, requestCode, options)
+    } catch (error: Exception) {
+      if (owned) appLock.finishOwnedActivity(requestCode)
+      throw error
+    }
+  }
+
+  @Suppress("DEPRECATION")
+  override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+    appLock.finishOwnedActivity(requestCode)
+    super.onActivityResult(requestCode, resultCode, data)
+  }
+
+  override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+    appLock.finishOwnedPermission(requestCode)
+    super.onRequestPermissionsResult(requestCode, permissions, grantResults)
   }
 
   private fun dispatchNotificationStateRefresh() {
@@ -916,6 +1002,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   override fun onDestroy() {
+    appLock.close()
     exitWaitDialog?.dismiss()
     exitWaitDialog = null
     notificationPermissionResult?.cancel()
