@@ -1,5 +1,6 @@
 import { parseArray, makeArray } from '../cbsPure';
 import DOMPurify from 'dompurify';
+import { prepareYouTubeIframe } from './youtubeEmbed';
 import { hasCbsSyntax } from './cbsSyntax';
 import { CbsHistoryAccessError, type CbsHistoryAccess } from '../cbsHistoryAccess';
 import markdownit from 'markdown-it'
@@ -68,8 +69,7 @@ let activeSanitizeHideAllImages: boolean | undefined
 
 DOMPurify.addHook("uponSanitizeElement", (node: HTMLElement, data) => {
     if (data.tagName === "iframe") {
-       const src = node.getAttribute("src") || "";
-       if (!src.startsWith("https://www.youtube.com/embed/")) {
+       if (!prepareYouTubeIframe(node)) {
           return node.parentNode.removeChild(node);
        }
     }
@@ -873,6 +873,8 @@ async function parseMarkdownForDisplay(
 
 const trimPurifyConfig = {
     ADD_TAGS: ["iframe", "style", "risu-style", "x-em", 'annotation', 'semantics', 'mrow', 'mi', 'mo', 'mn', 'msup', 'msub', 'mfrac', 'msqrt'],
+    // Permissions Policy can contain origins but is not a navigation URL.
+    ADD_URI_SAFE_ATTR: ['allow'],
     ADD_ATTR: ["allow", "allowfullscreen", "frameborder", "scrolling", "risu-btn", "risu-ctrl", 'risu-form', 'risu-trigger', 'risu-mark', 'risu-id', 'x-hl-lang', 'x-hl-text'],
 }
 
