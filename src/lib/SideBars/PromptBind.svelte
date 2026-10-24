@@ -48,11 +48,11 @@
 </script>
 
 <div class="flex flex-col gap-1 w-full">
-    <div class="text-xs text-textcolor2 px-0.5">{language.promptBinding}</div>
+    <div class="text-xs text-textcolor2 px-0.5">{language.promptPresets}</div>
     <button
         class="flex items-center gap-2 w-full min-h-10 px-3 py-2 rounded-md bg-darkbutton border text-left transition-colors hover:bg-selected {bound
             ? 'border-selected text-textcolor' : 'border-darkborderc text-textcolor2 hover:text-textcolor'}"
-        title={language.promptBinding}
+        title={language.promptPresets}
         onclick={() => {
             if (chatBindingBlockedByGeneration()) return
             query = ''
@@ -65,29 +65,31 @@
     </button>
 </div>
 {#if target}
-    <div class="fixed inset-0 z-modal bg-black/50 flex items-center justify-center"
+    <div class="fixed inset-0 z-modal bg-black/50 flex items-center justify-center p-4"
         use:modalNavigation={{ close: () => { if (!saving) target = null } }}>
-        <div class="bg-darkbg p-4 rounded-md flex flex-col w-124 max-w-full max-h-full overflow-y-auto" role="dialog" aria-modal="true" aria-label={language.promptBinding}>
-            <div class="flex items-center justify-between gap-2 mb-3 text-textcolor">
-                <h2 class="text-lg">{language.promptBinding}</h2>
+        <div class="bg-darkbg p-4 rounded-md flex flex-col w-124 max-w-full min-h-0 max-h-[min(90dvh,calc(100dvh-2rem))] overflow-hidden" role="dialog" aria-modal="true" aria-label={language.promptPresets}>
+            <div class="flex shrink-0 items-center justify-between gap-2 mb-3 text-textcolor">
+                <h2 class="text-lg">{language.promptPresets}</h2>
                 <button disabled={saving} aria-label={language.close} onclick={() => { target = null }}><XIcon size={24} /></button>
             </div>
-            <div class="flex items-center gap-2 rounded-md border border-darkborderc px-3 mb-2">
+            <div class="flex shrink-0 items-center gap-2 rounded-md border border-darkborderc px-3 mb-2">
                 <SearchIcon size={16} class="text-textcolor2 shrink-0" />
                 <input class="w-full py-2 text-sm bg-transparent text-textcolor outline-none" placeholder={language.search} aria-label={language.search} bind:value={query} />
             </div>
-            <button class="text-left text-textcolor p-3 border-b border-darkborderc hover:bg-selected/30"
-                class:bg-selected={!target.conversation.bindedBotPreset} disabled={saving} onclick={() => select(null)}>
-                {language.inheritPromptPreset} ({globalPreset?.name ?? language.presets})
-            </button>
-            {#each visible as preset (preset.id)}
-                <button class="flex items-center gap-2 text-left text-textcolor p-3 border-b border-darkborderc hover:bg-selected/30"
-                    class:bg-selected={preset.id === target.conversation.bindedBotPreset} disabled={saving || !preset.id} onclick={() => select(preset.id!)}>
-                    {#if preset.image}<img src={preset.image} alt="" class="h-7 w-7 shrink-0 rounded-md object-cover" />{/if}
-                    <span class="truncate">{preset.name}</span>
+            <div class="flex flex-col flex-1 min-h-0 overflow-y-auto overscroll-contain">
+                <button class="shrink-0 text-left text-textcolor p-3 border-b border-darkborderc hover:bg-selected/30"
+                    class:bg-selected={!target.conversation.bindedBotPreset} disabled={saving} onclick={() => select(null)}>
+                    {language.inheritPromptPreset} ({globalPreset?.name ?? language.presets})
                 </button>
-            {/each}
-            <button class="flex items-center gap-2 mt-3 pt-3 border-t border-darkborderc text-sm text-textcolor2 hover:text-textcolor"
+                {#each visible as preset (preset.id)}
+                    <button class="flex shrink-0 items-center gap-2 text-left text-textcolor p-3 border-b border-darkborderc hover:bg-selected/30"
+                        class:bg-selected={preset.id === target.conversation.bindedBotPreset} disabled={saving || !preset.id} onclick={() => select(preset.id!)}>
+                        {#if preset.image}<img src={preset.image} alt="" class="h-7 w-7 shrink-0 rounded-md object-cover" />{/if}
+                        <span class="truncate">{preset.name}</span>
+                    </button>
+                {/each}
+            </div>
+            <button class="flex shrink-0 items-center gap-2 mt-3 pt-3 border-t border-darkborderc text-sm text-textcolor2 hover:text-textcolor"
                 disabled={saving} onclick={managePresets}>
                 <SettingsIcon size={16} /><span>{language.presetManage}</span>
             </button>

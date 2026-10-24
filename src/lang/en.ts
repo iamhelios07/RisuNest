@@ -141,7 +141,7 @@ export const languageEnglish = {
     inheritPersona: 'Use current persona',
     missingBoundPersona: 'Persona unavailable, using current persona',
     personaBinding: 'Persona binding',
-    promptBinding: 'Prompt binding',
+    promptPresets: 'Prompt presets',
     inheritPromptPreset: 'Use global prompt preset',
     missingBoundPromptPreset: 'Bound prompt preset not found',
     presetManage: 'Manage presets',

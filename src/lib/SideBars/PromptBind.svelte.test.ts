@@ -27,7 +27,7 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', async (importOriginal) =>
 
 let instance: ReturnType<typeof mount>
 const chat = () => DBState.db.characters[0].chats[0]
-const trigger = () => document.querySelector<HTMLButtonElement>(`button[title="${languageEnglish.promptBinding}"]`)!
+const trigger = () => document.querySelector<HTMLButtonElement>(`button[title="${languageEnglish.promptPresets}"]`)!
 const option = (text: string) => [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find(button => button.textContent?.includes(text))!
 
 beforeEach(async () => {

@@ -139,7 +139,7 @@ export const languageKorean = {
     inheritPersona: '현재 페르소나 사용',
     missingBoundPersona: '바인딩한 페르소나 없음 · 현재 페르소나 사용',
     personaBinding: '페르소나 바인딩',
-    promptBinding: '프롬프트 바인딩',
+    promptPresets: '프롬프트 프리셋',
     inheritPromptPreset: '전역 프롬프트 프리셋 따르기',
     missingBoundPromptPreset: '연결된 프롬프트 프리셋을 찾을 수 없음',
     presetManage: '프리셋 관리',
