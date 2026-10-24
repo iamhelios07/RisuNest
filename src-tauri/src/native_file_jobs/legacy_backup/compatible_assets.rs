@@ -226,7 +226,8 @@ fn allocate_asset_name(key: &str, extension: &str, used: &mut HashSet<String>) -
     }
 }
 
-/// Pins then streams into a private file, checking the exact hash and length.
+/// Downloads a body only the Sync server holds, pins it, then streams it into a
+/// private file, checking the exact hash and length.
 fn copy_verified(
     cas: &PayloadCas,
     pins: &mut DurableCasJob,
@@ -241,12 +242,12 @@ fn copy_verified(
         ));
     }
     check_cancelled(cancellation).map_err(local_backup_error)?;
-    pins.pin_existing(cas, hash, expected, role)
-        .map_err(io_job_error)?;
     let mut source = cas
         .open_available_object(hash)
         .map_err(io_job_error)?
         .ok_or_else(|| invalid_source("attachment object is missing"))?;
+    pins.pin_existing(cas, hash, expected, role)
+        .map_err(io_job_error)?;
     let mut output = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -1635,6 +1636,30 @@ mod tests {
             &crate::local_backup::NeverCancelled
         )
         .is_err());
+        // A body that only the Sync server holds is downloaded before it is pinned.
+        use crate::server_sync::residency::test_remote;
+        let store = crate::persistent_store::PersistentStore::open(&root.join("repository")).unwrap();
+        let remote = cas.prepare_bytes(b"synthetic server-held attachment").unwrap();
+        std::fs::remove_file(cas.object_path(&remote.content_hash).unwrap().unwrap()).unwrap();
+        test_remote::hold(&root.join("repository"), &[(&remote.content_hash, remote.byte_size)]);
+        test_remote::serve(
+            &root.join("repository"),
+            &remote.content_hash,
+            b"synthetic server-held attachment".to_vec(),
+        );
+        copy_verified(
+            &cas,
+            &mut pins,
+            &remote.content_hash,
+            remote.byte_size,
+            CasObjectRole::DirectObject,
+            &root.join("remote"),
+            &crate::local_backup::NeverCancelled,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(root.join("remote")).unwrap(), b"synthetic server-held attachment");
+        assert_eq!(test_remote::fetched(&root.join("repository")), 1);
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
