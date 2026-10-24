@@ -55,6 +55,7 @@ export const MobileGUI = writable(false)
 export const MobileGUIStack = writable(0)
 export const MobileSideBar = writable(0)
 export const SettingsMenuIndex = writable(-1)
+export const BotSettingsSubMenu = writable<0 | 1 | 2 | 3>(0)
 export const ReloadGUIPointer = writable(0)
 export const ReloadChatPointer = writable({} as Record<number, number>)
 /** Advanced when a script's variable change refreshes the rows that read it. */

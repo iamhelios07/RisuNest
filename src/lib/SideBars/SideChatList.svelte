@@ -20,7 +20,6 @@
     import { language } from "src/lang";
     import { bindPersona, chatBindingBlockedByGeneration, saveChatBinding } from 'src/ts/chatBindings.svelte'
     import Toggles from "./Toggles.svelte";
-    import PromptBind from './PromptBind.svelte'
     import { changeChatTo } from "src/ts/globalApi.svelte";
     import { isWorkingSetCharacterStub } from "src/ts/storage/workingSetCatalog";
     import { indexSideChatListRows, orderChatsByDroppedRows, orderFoldersByDroppedIds, type DroppedChatRow } from "./sideChatListRows";
@@ -528,7 +527,6 @@
         </div>
 
         {#if DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}            
-            <PromptBind />
             <Toggles bind:chara={chara} noContainer />
         {/if}
     </div>

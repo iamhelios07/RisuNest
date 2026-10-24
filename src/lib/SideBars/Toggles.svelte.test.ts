@@ -39,6 +39,7 @@ vi.mock('src/ts/util', () => ({
     parseToggleSyntax: () => [{ type: syntax.type, key: 'example', value: 'Example toggle', options: ['A', 'B'] }],
 }))
 vi.mock('./ModelBind.svelte', () => ({ default: () => {} }))
+vi.mock('./PromptBind.svelte', () => ({ default: () => {} }))
 vi.mock('./PersonaBind.svelte', () => ({ default: () => {} }))
 // The binding controls are covered by Chat.windowedInteractions.test.ts; here they expose what they receive.
 vi.mock('./ToggleBind.svelte', () => ({ default: (_anchor: unknown, props: typeof toggleBind.props) => { toggleBind.props = props } }))

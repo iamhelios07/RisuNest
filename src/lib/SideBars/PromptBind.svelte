@@ -1,7 +1,8 @@
 <script lang="ts">
     import { modalNavigation } from 'src/ts/ui/modalNavigation'
-    import { ScrollTextIcon, SearchIcon, XIcon } from '@lucide/svelte'
-    import { DBState, selectedCharID, openPresetList } from 'src/ts/stores.svelte'
+    import { tick } from 'svelte'
+    import { ScrollTextIcon, SearchIcon, SettingsIcon, XIcon } from '@lucide/svelte'
+    import { BotSettingsSubMenu, DBState, selectedCharID, openPresetList, settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
     import { language } from 'src/lang'
     import { bindPromptPreset, captureChatBindingTarget, chatBindingBlockedByGeneration, saveChatBinding } from 'src/ts/chatBindings.svelte'
     import { activateChatPresetBinding } from 'src/ts/storage/database.svelte'
@@ -18,6 +19,16 @@
         : `${language.inheritPromptPreset} (${globalPreset?.name ?? language.presets})`))
     let visible = $derived(DBState.db.botPresets.filter(preset =>
         (preset.name ?? '').toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())))
+
+    async function managePresets() {
+        if (saving) return
+        target = null
+        BotSettingsSubMenu.set(3)
+        SettingsMenuIndex.set(1)
+        settingsOpen.set(true)
+        await tick()
+        openPresetList.set(true)
+    }
 
     async function select(id: string | null) {
         const captured = target
@@ -61,7 +72,6 @@
                 <h2 class="text-lg">{language.promptBinding}</h2>
                 <button disabled={saving} aria-label={language.close} onclick={() => { target = null }}><XIcon size={24} /></button>
             </div>
-            <div class="text-sm text-textcolor2 mb-3">{language.promptBindingDesc}</div>
             <div class="flex items-center gap-2 rounded-md border border-darkborderc px-3 mb-2">
                 <SearchIcon size={16} class="text-textcolor2 shrink-0" />
                 <input class="w-full py-2 text-sm bg-transparent text-textcolor outline-none" placeholder={language.search} aria-label={language.search} bind:value={query} />
@@ -77,6 +87,10 @@
                     <span class="truncate">{preset.name}</span>
                 </button>
             {/each}
+            <button class="flex items-center gap-2 mt-3 pt-3 border-t border-darkborderc text-sm text-textcolor2 hover:text-textcolor"
+                disabled={saving} onclick={managePresets}>
+                <SettingsIcon size={16} /><span>{language.presetManage}</span>
+            </button>
         </div>
     </div>
 {/if}

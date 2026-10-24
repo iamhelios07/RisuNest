@@ -8,7 +8,7 @@
     import { language } from "src/lang";
     import Help from "src/lib/Others/Help.svelte";
     
-    import { DBState, selectedCharID } from 'src/ts/stores.svelte';
+    import { BotSettingsSubMenu, DBState, selectedCharID } from 'src/ts/stores.svelte';
     let previewPreset = $derived.by(() => {
         const character = DBState.db.characters?.[$selectedCharID]
         const binding = character?.chats?.[character.chatPage]?.bindedBotPreset
@@ -121,7 +121,7 @@
     }
 
 
-    let submenu = $state(DBState.db.useLegacyGUI ? -1 : 0)
+    let submenu = $derived(DBState.db.useLegacyGUI ? -1 : $BotSettingsSubMenu)
     let modelInfo = $derived(getModelInfo(DBState.db.aiModel))
     let subModelInfo = $derived(getModelInfo(DBState.db.subModel))
     let nanogptInputMode = $state<'list' | 'manual'>(DBState.db.nanogptRequestModel && !DBState.db.nanogptRequestModelName ? 'manual' : 'list')
@@ -143,22 +143,22 @@
 {#if submenu !== -1}
     <div class="flex w-full rounded-md border border-darkborderc mb-4">
         <button onclick={() => {
-            submenu = 0
+            BotSettingsSubMenu.set(0)
         }} class="p-2 flex-1 border-r border-darkborderc" class:bg-darkbutton={submenu === 0}>
             <span>{language.model}</span>
         </button>
         <button onclick={() => {
-            submenu = 1
+            BotSettingsSubMenu.set(1)
         }} class="p2 flex-1 border-r border-darkborderc" class:bg-darkbutton={submenu === 1}>
             <span>{language.parameters}</span>
         </button>
         <button onclick={() => {
-            submenu = 2
+            BotSettingsSubMenu.set(2)
         }} class="p-2 flex-1 border-r border-darkborderc" class:bg-darkbutton={submenu === 2}>
             <span>{language.prompt}</span>
         </button>
         <button onclick={() => {
-            submenu = 3
+            BotSettingsSubMenu.set(3)
         }} class="p-2 flex-1" class:bg-darkbutton={submenu === 3}>
             <span>{language.others}</span>
         </button>

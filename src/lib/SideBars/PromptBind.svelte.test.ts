@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
+import { get } from 'svelte/store'
 import { languageEnglish } from 'src/lang/en'
-import { DBState, selectedCharID } from 'src/ts/stores.svelte'
+import { BotSettingsSubMenu, DBState, selectedCharID, openPresetList, settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
 import { getDatabase, normalizeDatabaseDefaults, setDatabase, type Database } from 'src/ts/storage/database.svelte'
 import { doingChat } from 'src/ts/process/generationState'
 import PromptBind from './PromptBind.svelte'
@@ -33,6 +34,10 @@ beforeEach(async () => {
     storage.metadata = {}
     storage.navigation = 0
     doingChat.set(false)
+    BotSettingsSubMenu.set(0)
+    SettingsMenuIndex.set(-1)
+    settingsOpen.set(false)
+    openPresetList.set(false)
     const db = normalizeDatabaseDefaults({ language: 'en' } as Database)
     Object.assign(db.botPresets[0], { id: 'global', name: 'Global prompt', mainPrompt: 'Global text', aiModel: 'model-a', temperature: 40 })
     db.botPresets.push({ ...structuredClone(db.botPresets[0]), id: 'bound', name: 'Writing prompt', mainPrompt: 'Writing text', aiModel: 'model-b', temperature: 120 })
@@ -49,7 +54,26 @@ beforeEach(async () => {
 afterEach(async () => {
     await unmount(instance)
     doingChat.set(false)
+    BotSettingsSubMenu.set(0)
+    SettingsMenuIndex.set(-1)
+    settingsOpen.set(false)
+    openPresetList.set(false)
     document.body.replaceChildren()
+})
+
+it('opens preset management over the chatbot other settings without changing the binding or preset', async () => {
+    chat().bindedBotPreset = 'bound'
+    trigger().click()
+    await tick()
+    option(languageEnglish.presetManage).click()
+    await vi.waitFor(() => expect(get(openPresetList)).toBe(true))
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(get(settingsOpen)).toBe(true)
+    expect(get(SettingsMenuIndex)).toBe(1)
+    expect(get(BotSettingsSubMenu)).toBe(3)
+    expect(chat().bindedBotPreset).toBe('bound')
+    expect(getDatabase().botPresetsId).toBe(0)
+    expect(storage.metadata).toEqual({})
 })
 
 it('searches and binds the complete prompt preset, then restores the global model on unbind', async () => {

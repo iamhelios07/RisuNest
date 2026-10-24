@@ -13,6 +13,7 @@
     import TextAreaInput from '../UI/GUI/TextAreaInput.svelte'
     import TextInput from "../UI/GUI/TextInput.svelte";
     import ModelBind from './ModelBind.svelte'
+    import PromptBind from './PromptBind.svelte'
     import PersonaBind from './PersonaBind.svelte'
     import ToggleBind from './ToggleBind.svelte'
     import CustomSideBar from "./CustomSidebar.svelte";
@@ -302,6 +303,7 @@
 
 <div class="flex flex-col gap-4 w-full mt-3">
     {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'model')}<ModelBind />{/if}
+    {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'preset')}<PromptBind />{/if}
     {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'persona')}<PersonaBind />{/if}
     <ToggleBind values={toggleEditor.values} unpinKeys={toggleEditor.unpinKeys} onApplyPreset={applyTogglePreset} bind:saving={savingToggles} />
 </div>
