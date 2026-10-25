@@ -101,9 +101,13 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             dependencies.recovered?.()
         }
     }
+    // A settled, cancelled publication can report server-unreachable with a nonretryable 409.
+    const blocks = (error: unknown) => (typeof error === 'object' && !!error && 'retryable' in error && error.retryable === false && code(error) !== 'server-unreachable') || integrityCodes.includes(code(error))
     const fail = (error: unknown, lane?: Lane) => {
         if (isCancellation(error)) return
         if (blocked && !clockCodes.includes(blockedCode) && !formatCodes.includes(blockedCode)) return
+        // A check that cannot reach the server keeps the format stop it already reports.
+        if (blocked && formatCodes.includes(blockedCode) && !blocks(error)) return
         if (lane) failedLanes.add(lane)
         else if (isServerSyncUnavailable(error)) failedLanes.add('pull')
         // Concurrent lane failures share one delay. Edits and foreground changes do not bypass it.
@@ -113,8 +117,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             clear()
             scheduleOutage()
         }
-        // A settled, cancelled publication can report server-unreachable with a nonretryable 409.
-        if ((typeof error === 'object' && error && 'retryable' in error && error.retryable === false && code(error) !== 'server-unreachable') || integrityCodes.includes(code(error))) {
+        if (blocks(error)) {
             blocked = true
             blockedCode = code(error)
             clear()
@@ -230,7 +233,9 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         },
         localChange(immediate = false) {
             clearTimeout(pushTimer)
-            if (!foreground || blocked) return
+            if (!foreground) return
+            // Edits made during a library format stop check the level again.
+            if (blocked) { if (formatCodes.includes(blockedCode)) pushTimer = setTimeout(() => { void recheck() }, 2000); return }
             if (immediate) void push().catch(() => {})
             else pushTimer = setTimeout(() => { void push().catch(() => {}) }, 2000)
         },

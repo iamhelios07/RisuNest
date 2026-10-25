@@ -346,8 +346,12 @@ describe('bounded LWW ownership under latency', () => {
         const f = fixture(); await started(f)
         f.publish.mockRejectedValueOnce({ kind: 'libraryFormatSwitchRequired' })
         f.scheduler.dirty(true); await f.scheduler.settled()
-        for (let i = 0; i < 6; i++) { f.scheduler.dirty(true); await vi.advanceTimersByTimeAsync(20_000) }
-        expect(f.checkFormat).not.toHaveBeenCalled(); expect(f.publish).toHaveBeenCalledTimes(1)
+        // Edits check the level again once they settle.
+        f.checkFormat.mockRejectedValueOnce({ kind: 'libraryFormatSwitchRequired' })
+        for (let i = 0; i < 6; i++) { f.scheduler.dirty(true); await vi.advanceTimersByTimeAsync(1_000) }
+        expect(f.checkFormat).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(1_000)
+        expect(f.checkFormat).toHaveBeenCalledTimes(1); expect(f.publish).toHaveBeenCalledTimes(1)
         f.checkFormat.mockRejectedValueOnce({ kind: 'appUpdateRequired' })
         await f.scheduler.conversationOpened()
         expect(f.failed).toHaveBeenLastCalledWith({ kind: 'appUpdateRequired' }, 'publish')
@@ -357,7 +361,7 @@ describe('bounded LWW ownership under latency', () => {
         await f.scheduler.conversationOpened()
         expect(f.failed).not.toHaveBeenCalled(); expect(f.publish).toHaveBeenCalledTimes(1)
         await f.scheduler.resumeForeground()
-        expect(f.checkFormat).toHaveBeenCalledTimes(3); expect(f.publish).toHaveBeenCalledTimes(2)
+        expect(f.checkFormat).toHaveBeenCalledTimes(4); expect(f.publish).toHaveBeenCalledTimes(2)
         f.scheduler.stop()
     })
     it('checks a library format block before a manual sync publishes', async () => {

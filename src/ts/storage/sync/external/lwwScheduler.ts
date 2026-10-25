@@ -68,6 +68,7 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
     let wakeTimer: unknown
     let receiveTimer: unknown
     let maintenanceTimer: unknown
+    let formatTimer: unknown
     let inFlight: Promise<void> | undefined
     let maintenance: Promise<void> | undefined
     let rechecking: Promise<void> | undefined
@@ -98,6 +99,7 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
     const clearWake = () => { if (wakeTimer !== undefined) clearTimer(wakeTimer); wakeTimer = undefined }
     const clearReceive = () => { if (receiveTimer !== undefined) clearTimer(receiveTimer); receiveTimer = undefined }
     const clearMaintenance = () => { if (maintenanceTimer !== undefined) clearTimer(maintenanceTimer); maintenanceTimer = undefined }
+    const clearFormat = () => { if (formatTimer !== undefined) clearTimer(formatTimer); formatTimer = undefined }
     const hasPublish = () => dirtyVersion !== coveredVersion
     const sendDue = () => Math.max(retryAt.publish, immediate ? 0 : Math.min(lastDirty + 15_000, (firstDirty ?? now()) + 60_000))
     const rememberFailure = (error: unknown, operation: LwwOperation) => {
@@ -295,6 +297,8 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
         lastDirty = now()
         immediate ||= generationComplete
         resetListing(); pump()
+        // Edits made during a library format stop check the level again once they settle.
+        if (formatBlocks().includes('publish')) { clearFormat(); formatTimer = setTimer(() => { formatTimer = undefined; recheck() }, 2_000) }
     }
     const receiveNow = (force = false, signal?: AbortSignal) => {
         if (force) return requestExplicit('receive', signal)
@@ -311,7 +315,7 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
     }
     const pauseAutomatic = () => {
         enabled = false
-        clearWake(); clearReceive(); clearMaintenance()
+        clearWake(); clearReceive(); clearMaintenance(); clearFormat()
         coveredVersion = dirtyVersion; firstDirty = undefined; immediate = false; receivePending = false; receiveMore = false; receiveBehind = false
     }
     return {

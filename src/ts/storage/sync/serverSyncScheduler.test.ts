@@ -409,9 +409,17 @@ describe('server LWW foreground scheduler', () => {
         f.checkFormat.mockRejectedValueOnce({ code: 'sync-server-update-required', retryable: false })
         await f.scheduler.conversationOpened(); await vi.advanceTimersByTimeAsync(0)
         expect(f.scheduler.blockedCode()).toBe('sync-server-update-required'); expect(f.retryClock).not.toHaveBeenCalled()
+        // A check that cannot reach the server keeps the stop it already reports.
+        f.failed.mockClear(); f.checkFormat.mockRejectedValueOnce({ code: 'server-unreachable', retryable: true })
+        await f.scheduler.conversationOpened(); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.blockedCode()).toBe('sync-server-update-required'); expect(f.failed).not.toHaveBeenCalled()
+        // Edits check again once they settle.
+        f.checkFormat.mockRejectedValueOnce({ code: 'sync-server-update-required', retryable: false })
+        f.scheduler.localChange(); await vi.advanceTimersByTimeAsync(1_000); f.scheduler.localChange(); await vi.advanceTimersByTimeAsync(2_000)
+        expect(f.checkFormat).toHaveBeenCalledTimes(3); expect(f.scheduler.isBlocked()).toBe(true)
         f.push.mockClear(); f.pull.mockClear()
         await f.scheduler.foreground(false); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
-        expect(f.checkFormat).toHaveBeenCalledTimes(2); expect(f.scheduler.isBlocked()).toBe(false)
+        expect(f.checkFormat).toHaveBeenCalledTimes(4); expect(f.scheduler.isBlocked()).toBe(false)
         expect(f.pull).toHaveBeenCalled(); expect(f.push).toHaveBeenCalled()
         f.scheduler.dispose()
     })
