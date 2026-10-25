@@ -81,6 +81,8 @@ async_commands![
     external_storage::lww_commands::external_lww_inspect,
     external_storage::lww_commands::external_lww_stage_binding,
     external_storage::lww_commands::external_lww_publish,
+    external_storage::lww_commands::external_lww_check_format,
+    external_storage::lww_commands::external_lww_switch_format,
     external_storage::lww_commands::external_lww_receive,
     external_storage::lww_commands::external_lww_maintenance,
     external_storage::lww_commands::external_lww_fence,

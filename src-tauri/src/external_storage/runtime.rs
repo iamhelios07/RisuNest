@@ -1002,6 +1002,8 @@ pub(crate) fn error_dto(error: &ProviderError) -> Value {
         ErrorKind::LocationOccupied => ("Choose an empty repository folder.", "check-endpoint", false),
         ErrorKind::RepositoryMismatch => ("This location holds a different repository.", "check-endpoint", false),
         ErrorKind::RecoveryKeyMismatch => ("The recovery key does not match this repository.", "unlock-key", false),
+        ErrorKind::LibraryFormatSwitchRequired => ("Switch the library data format to continue syncing.", "none", false),
+        ErrorKind::AppUpdateRequired => ("Update the app to continue syncing.", "none", false),
         ErrorKind::LocalStorageFull => ("This device has insufficient space.", "free-space", false),
         ErrorKind::LocalPermissionDenied => ("Allow access to the local files and retry.", "retry", false),
         ErrorKind::LocalFailure => ("This device could not complete the operation.", "retry", true),

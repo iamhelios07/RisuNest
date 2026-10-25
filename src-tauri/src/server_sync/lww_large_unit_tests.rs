@@ -318,17 +318,35 @@ fn a_structured_plugin_value_moves_with_its_parts_through_the_server() {
     }
     let ca = server.client(&a);
     let cb = server.client(&b);
-    let part = vec![0u8, 255, 128];
-    let hash = structure::put_part(a.device_store().unwrap().connection(), &part).unwrap();
-    let text = format!(
-        "#risunest-structured:1\n{{\"parts\":[\"p:{hash}\"],\"bytes\":3,\"nodes\":[{{\"type\":\"ArrayBuffer\",\"offset\":0,\"byteLength\":3}}],\"root\":{{\"ref\":0}}}}");
-    a.device_store_mut().unwrap().write_plugin_device_values("synthetic-owner", &[
-        PluginDeviceMutation::Set { space: "json".into(), key: "structured".into(), value: text.clone() },
-    ]).unwrap();
+    let full = structure::PART_BYTES as usize;
+    // A small value, a value of one full part, and a value whose last part is a remainder.
+    let values = [
+        ("small", vec![vec![0u8, 255, 128]]),
+        ("full", vec![vec![1u8; full]]),
+        ("remainder", vec![vec![2u8; full], vec![3u8; 5]]),
+    ];
+    let mut texts = Vec::new();
+    for (key, parts) in &values {
+        let hashes = parts.iter()
+            .map(|part| structure::put_part(a.device_store().unwrap().connection(), part).unwrap())
+            .collect::<Vec<_>>();
+        let length = parts.iter().map(Vec::len).sum::<usize>();
+        let text = format!(
+            "#risunest-structured:1
+{{\"parts\":[{}],\"bytes\":{length},\"nodes\":[{{\"type\":\"ArrayBuffer\",\"offset\":0,\"byteLength\":{length}}}],\"root\":{{\"ref\":0}}}}",
+            hashes.iter().map(|hash| format!("\"p:{hash}\"")).collect::<Vec<_>>().join(","));
+        a.device_store_mut().unwrap().write_plugin_device_values("synthetic-owner", &[
+            PluginDeviceMutation::Set { space: "json".into(), key: (*key).into(), value: text.clone() },
+        ]).unwrap();
+        texts.push(text);
+    }
     drain_publications(&ca, &mut a, &[]).unwrap();
     assert_eq!((pending(&a), server.server.library_format()), (0, 2));
     receive_available(&cb, &mut b, &[]).unwrap();
-    let device = b.device_store().unwrap();
-    assert_eq!(device.read_plugin_device_value("synthetic-owner", "json", "structured").unwrap(), Some(text));
-    assert_eq!(structure::read_part(device.connection(), &hash, 0).unwrap(), part);
+    for ((key, parts), text) in values.iter().zip(texts) {
+        assert_eq!(b.device_store().unwrap().read_plugin_device_value("synthetic-owner", "json", key).unwrap(), Some(text));
+        for part in parts {
+            assert_eq!(b.lww_object_body(&risunest_sync_wire::hash(part)).unwrap().as_ref(), Some(part));
+        }
+    }
 }
