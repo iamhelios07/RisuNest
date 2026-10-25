@@ -60,3 +60,23 @@ describe('error dialogs for local save failures', () => {
         expect(get(alertStore)).toMatchObject({ type: 'error', msg: 'Synthetic import failure' })
     })
 })
+
+describe('error dialogs for exports that lack a file', () => {
+    const jobError = (code: string) =>
+        Object.assign(new Error(`pinned character asset is missing: assets/private.png (${code})`), { code })
+
+    it.each([
+        ['asset-missing', language.risuNest.importDialog.reasonAssetMissing],
+        ['remote-asset-unavailable', language.risuNest.importDialog.reasonRemoteAssetUnavailable],
+    ])('shows the export reason for %s instead of the job message', (code, text) => {
+        alertError(jobError(code))
+        const shown = get(alertStore)
+        expect(shown).toMatchObject({ type: 'error', msg: text })
+        expect(JSON.stringify(shown)).not.toContain('private')
+    })
+
+    it('keeps the message of other job errors', () => {
+        alertError(jobError('invalid-input'))
+        expect(get(alertStore).msg).toContain('assets/private.png')
+    })
+})
