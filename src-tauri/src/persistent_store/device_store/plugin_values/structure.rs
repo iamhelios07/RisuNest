@@ -57,7 +57,7 @@ pub(crate) fn read_summary(input: impl Read) -> io::Result<Option<(StructurePref
     let Some(prefix) = prefix(&mut input)? else { return Ok(None) };
     expect(&mut input, br#"[{"type":""#)?;
     let mut name = word(&mut input)?;
-    if name == "View" || name == "Primitive" {
+    if name == "View" || name == "Primitive" || name == "Box" {
         expect(&mut input, br#","name":""#)?;
         name = word(&mut input)?;
     }
@@ -239,6 +239,7 @@ impl PartUploads {
         Ok(id)
     }
 
+    #[cfg(target_os = "android")]
     pub(crate) fn attach_receiver(&mut self, id: &str, receiver: std::sync::Arc<crate::asset_byte_transport::AndroidReceiver>) -> StoreResult<()> {
         let upload = self.uploads.get_mut(id).ok_or_else(|| invalid("plugin structure part upload is unavailable"))?;
         upload._receiver = Some(receiver);
@@ -284,6 +285,7 @@ impl super::super::DeviceStore {
         self.plugin_parts.open(owner, byte_length)
     }
 
+    #[cfg(target_os = "android")]
     pub(crate) fn attach_plugin_device_part_receiver(&mut self, id: &str, receiver: std::sync::Arc<crate::asset_byte_transport::AndroidReceiver>) -> StoreResult<()> {
         self.plugin_parts.attach_receiver(id, receiver)
     }
@@ -330,6 +332,7 @@ mod tests {
         let body = |nodes: &str| format!("{}{{\"parts\":[],\"bytes\":0,\"nodes\":{nodes},\"root\":{{\"ref\":0}}}}", std::str::from_utf8(MARKER).unwrap());
         assert_eq!(read_summary(body(r#"[{"type":"Map","entries":[]}]"#).as_bytes()).unwrap().unwrap().1, "Map");
         assert_eq!(read_summary(body(r#"[{"type":"Primitive","name":"bigint","value":"1"}]"#).as_bytes()).unwrap().unwrap().1, "bigint");
+        assert_eq!(read_summary(body(r#"[{"type":"Box","name":"String","value":"a"}]"#).as_bytes()).unwrap().unwrap().1, "String");
         assert_eq!(read_summary(b"{}".as_slice()).unwrap(), None);
         for broken in [r#"[]"#, r#"[{"name":"Map","type":"Map"}]"#, r#"[{"type":"a b"}]"#] {
             assert!(read_summary(body(broken).as_bytes()).is_err(), "{broken}");

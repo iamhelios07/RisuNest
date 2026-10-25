@@ -24,6 +24,10 @@ const errorTypes: Record<string, ErrorConstructor> = {
     Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError,
 }
 
+// A boxed primitive is stored under its constructor's name and rebuilt from
+// a primitive of the matching type.
+const boxTypes = { Number: 'number', String: 'string', Boolean: 'boolean', BigInt: 'bigint' } as const
+
 // RAB is newer than the project's ES2023 type library. Feature detection keeps
 // ordinary buffers usable in browsers that do not implement resize().
 type ResizableBuffer = ArrayBuffer & { resizable?: boolean; maxByteLength?: number; resize(size: number): void }
@@ -94,7 +98,7 @@ type StoredNode =
     | { type: 'RegExp'; source: string; flags: string }
     | { type: 'Error'; name: string; message?: string; stack?: string }
     | { type: 'Primitive'; name: 'undefined' | 'bigint' | 'number'; value: string }
-    | { type: 'Box'; value: StoredValue }
+    | { type: 'Box'; name: keyof typeof boxTypes; value: StoredValue }
 
 type ByteNode = Extract<StoredNode, { offset: number }>
 
@@ -173,7 +177,7 @@ export function encodeStructuredLocalPluginValue(value: unknown): StructuredLoca
             if (message && 'value' in message) node.message = String(message.value)
             if (typeof error.stack === 'string') node.stack = error.stack
         } else if (['[object Number]', '[object Boolean]', '[object String]', '[object BigInt]'].includes(tag)) {
-            node = { type: 'Box', value: store((item as { valueOf(): unknown }).valueOf()) }
+            node = { type: 'Box', name: tag.slice(8, -1) as keyof typeof boxTypes, value: store((item as { valueOf(): unknown }).valueOf()) }
         } else if (Array.isArray(item) || tag === '[object Object]') {
             const record = item as Record<string, unknown>
             const properties = Object.keys(record).map((key): [string, StoredValue] => [key, store(record[key])])
@@ -252,16 +256,6 @@ export function parseStructureText(text: string, partBytes = STRUCTURE_PART_BYTE
     return { parts: hashes, byteLength: bytes, nodes: nodes as StoredNode[], root: root as StoredValue }
 }
 
-/** The root's type and the stream size, for listing a value without its bytes. */
-export function describeStructure(structure: ParsedStructure): string {
-    const root = structure.root
-    const node = root && typeof root === 'object' && natural(root.ref) ? structure.nodes[root.ref] : undefined
-    if (!node || typeof node !== 'object' || typeof node.type !== 'string') return invalid()
-    if (node.type === 'View') return node.name
-    if (node.type === 'Primitive') return node.name
-    return node.type
-}
-
 /**
  * Rebuilds the value. `readPart(index)` returns that part's bytes; parts are
  * read in order and each byte node copies its range out of them.
@@ -295,8 +289,7 @@ export async function decodeStructuredLocalPluginValue<T>(
 
     let partIndex = 0, partStart = 0
     let part: Uint8Array = new Uint8Array()
-    const take = async (length: number): Promise<Uint8Array[]> => {
-        const pieces: Uint8Array[] = []
+    const take = async (length: number, sink: (piece: Uint8Array) => void): Promise<void> => {
         while (length > 0) {
             if (partStart === part.length) {
                 if (partIndex >= structure.parts.length) return invalid()
@@ -306,14 +299,12 @@ export async function decodeStructuredLocalPluginValue<T>(
                 partStart = 0
             }
             const count = Math.min(length, part.length - partStart)
-            pieces.push(part.subarray(partStart, partStart + count))
+            sink(part.subarray(partStart, partStart + count))
             partStart += count; length -= count
         }
-        return pieces
     }
 
     for (const [index, node] of byteNodes) {
-        const pieces = await take(node.byteLength)
         if (node.type === 'ArrayBuffer') {
             let buffer: ArrayBuffer
             if (node.maxByteLength === undefined) buffer = new ArrayBuffer(node.byteLength)
@@ -325,12 +316,15 @@ export async function decodeStructuredLocalPluginValue<T>(
                 buffer = new BufferConstructor(node.byteLength, { maxByteLength: node.maxByteLength })
                 if (!(buffer as ResizableBuffer).resizable) throw new Error('Resizable ArrayBuffer is not supported here')
             }
+            // Each part is copied in as it is read, so a large buffer is not held twice.
             const target = new Uint8Array(buffer)
             let offset = 0
-            for (const piece of pieces) { target.set(piece, offset); offset += piece.byteLength }
+            await take(node.byteLength, piece => { target.set(piece, offset); offset += piece.byteLength })
             values[index] = buffer
         } else {
             if (typeof node.mimeType !== 'string') return invalid()
+            const pieces: Uint8Array[] = []
+            await take(node.byteLength, piece => { pieces.push(piece) })
             if (node.type === 'File') {
                 if (typeof node.name !== 'string' || !Number.isFinite(node.lastModified)) return invalid()
                 values[index] = new File(pieces as BlobPart[], node.name, { type: node.mimeType, lastModified: node.lastModified })
@@ -391,7 +385,7 @@ export async function decodeStructuredLocalPluginValue<T>(
             if ((values[index] as ArrayBufferView).byteLength !== node.byteLength) return invalid()
         } else if (node.type === 'Box') {
             const primitive = read(node.value)
-            if (!['number', 'string', 'boolean', 'bigint'].includes(typeof primitive)) return invalid()
+            if (!Object.hasOwn(boxTypes, node.name) || typeof primitive !== boxTypes[node.name]) return invalid()
             values[index] = Object(primitive)
         }
     }

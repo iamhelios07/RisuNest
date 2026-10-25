@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest'
 import {
-    STRUCTURE_MARKER, decodeStructuredLocalPluginValue, describeStructure, encodeStructuredLocalPluginValue,
+    STRUCTURE_MARKER, decodeStructuredLocalPluginValue, encodeStructuredLocalPluginValue,
     isPlainLocalPluginValue, isStructureText, parseStructureText, structureParts, structureText,
 } from './localPluginStorageValue'
 
@@ -131,7 +131,10 @@ describe('structured local plugin values', () => {
         const body = JSON.parse(text.slice(STRUCTURE_MARKER.length))
         expect(Object.keys(body)).toEqual(['parts', 'bytes', 'nodes', 'root'])
         expect(body.parts.every((part: string) => /^p:[0-9a-f]{64}$/.test(part))).toBe(true)
-        expect(describeStructure(parseStructureText(text, 7))).toBe('Uint8Array')
+        // The native side lists a value by the type and name of its first node.
+        expect(body.nodes[0]).toMatchObject({ type: 'View', name: 'Uint8Array' })
+        const boxed = JSON.parse(structureText(encodeStructuredLocalPluginValue(Object('s')), [], 8).slice(STRUCTURE_MARKER.length))
+        expect(boxed.nodes[0]).toMatchObject({ type: 'Box', name: 'String' })
         expect(isStructureText(JSON.stringify(text))).toBe(false)
     })
 
@@ -147,5 +150,7 @@ describe('structured local plugin values', () => {
         await expect(decodeStructuredLocalPluginValue(structure, async index => index ? new Uint8Array(1) : parts[0], 8)).rejects.toThrow()
         expect(() => parseStructureText(STRUCTURE_MARKER + '{"parts":["' + fakeHash(0) + '"],"bytes":1,"nodes":[],"root":null}')).toThrow()
         expect(() => parseStructureText(STRUCTURE_MARKER + '{"parts":[],"bytes":1,"nodes":[],"root":null}')).toThrow()
+        const mislabeled = structureText(encodeStructuredLocalPluginValue(Object('s')), [], 8).replace('"name":"String"', '"name":"Number"')
+        await expect(decodeStructuredLocalPluginValue(parseStructureText(mislabeled, 8), async () => new Uint8Array(), 8)).rejects.toThrow()
     })
 })
