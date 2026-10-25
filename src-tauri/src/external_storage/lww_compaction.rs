@@ -20,6 +20,11 @@ async fn pause_compaction(job_id:&str) {
     let barrier=BARRIERS.lock().unwrap().remove(job_id);
     if let Some(barrier)=barrier {barrier.reached.notify_one();barrier.resume.notified().await;}
 }
+#[cfg(test)]
+thread_local! { static RELEASED_PART_CARRIAGE:std::cell::Cell<bool>=const {std::cell::Cell::new(false)}; }
+/// Leaves plugin value parts out of checkpoints, as a released compactor does.
+#[cfg(test)]
+pub(crate) fn set_released_part_carriage_for_test(released:bool) {RELEASED_PART_CARRIAGE.with(|value|value.set(released));}
 pub(crate) struct PublishedState {
     pub catalog: PublishedCatalog,
     pub body_spool: super::capture::BackupDependencySpool,
@@ -150,10 +155,14 @@ fn live_published_objects(state:&PublishedState,capture:&mut super::capture::Cap
                 if let Some(anchor)=anchor {capture.reference(anchor,hash,bytes.len() as u64)?;}Ok(())
             }).map_err(error)?;
         // The parts of a structured plugin value are carried as controls, not assets.
+        // A part the repository no longer holds stays out, and receivers leave its value out.
         for part in parts {
             inventory.payloads.remove(&part);
-            if !emitted.insert(part.clone()) {continue}
-            let mut input=state.body_spool.control_reader(&part).map_err(error)?.ok_or_else(segment::corrupt)?;
+            #[cfg(test)]
+            if RELEASED_PART_CARRIAGE.with(std::cell::Cell::get) {continue}
+            if emitted.contains(&part) {continue}
+            let Some(mut input)=state.body_spool.control_reader(&part).map_err(error)? else {continue};
+            emitted.insert(part.clone());
             let length=input.len() as u64;
             capture.object_reader(&part,&mut input,length).map_err(error)?;
             if let Some(anchor)=anchor {capture.reference(anchor,&part,length).map_err(error)?;}

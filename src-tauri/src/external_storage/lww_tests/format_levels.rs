@@ -37,6 +37,8 @@ fn every_segment_declares_this_level_once_and_a_level_only_segment_carries_nothi
         assert!(f.a.lww_read_outbox(DecimalU64(0), 100).unwrap().entries.is_empty());
         assert_eq!(f.receive_b().await, 2);
         assert_eq!(f.b.read_root(None).unwrap().value["language"], "ja");
+        // The level unit is not content of the device's own.
+        assert_eq!(f.b.lww_binding_content().unwrap().opaque_shared_unit_count.0, 0);
 
         // A device that received the level unit queues it with the rest of
         // its state when it first publishes to a repository, and its
@@ -176,5 +178,45 @@ fn structured_plugin_value_parts_travel_raw_through_segments_and_checkpoints() {
         }
         third_engine.receive_and_apply(&mut third, DecimalU64(0), &[], &cancel).await.unwrap();
         check(&third);
+    })
+}
+
+#[test]
+fn a_checkpoint_without_the_parts_of_a_value_leaves_out_only_that_value() {
+    run(async {
+        use crate::external_storage::lww_compaction::set_released_part_carriage_for_test;
+        use crate::persistent_store::device_store::{plugin_values::PluginDeviceMutation, Section};
+        let mut f = CycleFixture::new();
+        let cancel = Cancellation::default();
+        let (_third_directory, mut third, third_engine) = third_device(&f);
+        for store in [&mut f.a, &mut third] {
+            store.device_store_mut().unwrap().set_section_participating(Section::LocalPlugins, true).unwrap();
+        }
+        structured(&mut f.a, "structured", &[vec![0u8, 255, 128]]);
+        f.a.device_store_mut().unwrap().write_plugin_device_values("synthetic-owner", &[PluginDeviceMutation::Set {
+            space: "json".into(), key: "plain".into(), value: "1".into(),
+        }]).unwrap();
+        f.publish_a().await;
+        // A released compactor writes its checkpoint without the parts.
+        let job = tempfile::tempdir().unwrap();
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        set_released_part_carriage_for_test(true);
+        let compacted = f.sender.compact_published(&mut f.a, job.path(), "00000000-0000-4000-8000-0000000000f3",
+            &writer, &f.sender.capabilities, &cancel, None).await;
+        set_released_part_carriage_for_test(false);
+        compacted.unwrap();
+        for object in f.sender.listing(&cancel).await.unwrap() {
+            f.provider.delete_object(&f.sender.repository, &object.locator, &cancel).await.unwrap();
+        }
+        third_engine.receive_and_apply(&mut third, DecimalU64(0), &[], &cancel).await.unwrap();
+        assert_eq!(plugin_value(&third, "structured"), None);
+        assert_eq!(plugin_value(&third, "plain").as_deref(), Some("1"));
+
+        // A later compaction goes on past the missing part.
+        set(&mut f.a, &["root", "language"], json!("ja"));
+        f.publish_a().await;
+        let job = tempfile::tempdir().unwrap();
+        f.sender.compact_published(&mut f.a, job.path(), "00000000-0000-4000-8000-0000000000f4",
+            &writer, &f.sender.capabilities, &cancel, None).await.unwrap();
     })
 }

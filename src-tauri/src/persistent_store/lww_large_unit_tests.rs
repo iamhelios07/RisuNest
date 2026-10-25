@@ -444,8 +444,20 @@ fn structured_plugin_values_carry_their_parts_as_dependencies() {
     published(&target, &oversized);
     let oversized = RecordDescriptor { dependencies: vec![hash.clone()], ..RecordDescriptor::content(risunest_sync_wire::hash(&oversized)) };
     assert_eq!(stage_error(&mut target, change(UnitValue::object(oversized).unwrap(), 1)), "plugin device value is too large");
-    assert_eq!(stage_error(&mut target, change(entry.value.clone(), 1)), "unit-object-body-required");
+    // A value whose part the device cannot find is left out, and the rest of its page applies.
+    const PLAIN_KEY: [&str; 4] = ["plugin-local", "synthetic-owner", "json", "plain"];
+    let header = Header { binding_authority: target.lww_binding_authority().unwrap(), request_id: uuid::Uuid::new_v4().to_string() };
+    target.lww_stage_receive(&StageReceive {
+        header: header.clone(),
+        changes: vec![change(entry.value.clone(), 1),
+            Change { key: unit_key(&PLAIN_KEY).unwrap(), stamp: stamp(1), value: inline(&serde_json::json!("remote")).unwrap() }],
+        progress: Progress { kind: "server".into(), cursor: 1.into(), writer_id: None },
+        admitted_time_upper_ms: u64::MAX.into(),
+    }).unwrap();
+    target.lww_apply_receive(&ApplyReceive { header: header.clone(), generating: vec![] }).unwrap();
+    target.lww_finish_receive(&header).unwrap();
     assert_eq!(plugin_value_at(&target, &STRUCTURED_KEY), None);
+    assert_eq!(plugin_value_at(&target, &PLAIN_KEY).as_deref(), Some("remote"));
     target.lww_put_object(&hash, &part).unwrap();
     receive(&mut target, change(entry.value.clone(), 1));
     assert_eq!(plugin_value_at(&target, &STRUCTURED_KEY), Some(text));
