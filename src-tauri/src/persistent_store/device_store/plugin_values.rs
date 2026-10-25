@@ -465,8 +465,8 @@ pub(crate) fn admit_structure_row(tx: &Connection, owner: &str, space: &str, key
         params![owner, space, key], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
     let Some((rowid, size)) = row else { return Ok(()) };
     if size < structure::MIN_TEXT_BYTES { return Ok(()); }
-    let open = || -> StoreResult<Box<dyn std::io::Read + '_>> {
-        Ok(Box::new(tx.blob_open(rusqlite::MAIN_DB, "plugin_device_storage", "value", rowid, true)?))
+    let open = || -> StoreResult<rusqlite::blob::Blob<'_>> {
+        Ok(tx.blob_open(rusqlite::MAIN_DB, "plugin_device_storage", "value", rowid, true)?)
     };
     let Some(prefix) = structure::validate_text(open)? else { return Ok(()) };
     let encoded = text_value::encode(open()?, std::io::sink(), limit)?.encoded_length;

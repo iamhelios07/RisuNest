@@ -2936,6 +2936,7 @@ export const languageKorean = {
             "warningProviderNotAtomic": '저장이 중단될 경우 선택한 위치에 불완전한 파일이 남을 수 있습니다.',
             "warningSafUnavailable": '파일 선택기를 사용할 수 없습니다. 사용할 수 있을 때 다시 시도해주세요.',
             "warningFollowupFailed": '데이터를 가져오고 화면을 새로 고쳤지만 플러그인을 다시 불러오지 못했습니다. 플러그인을 다시 불러오세요.',
+            "warningPluginValuesSkipped": '플러그인 값 {0}개를 복원하지 못했습니다. 앱을 업데이트한 뒤 다시 복원하세요.',
             "resultBackgroundExpired": '앱 전환 또는 화면 잠금 후 작업이 중단되었습니다. 다시 시도하세요.',
             "resultBackgroundExpiredPartial": '앱 전환 또는 화면 잠금 후 작업이 중단되었으며, 일부 변경 사항이 저장되었을 수 있습니다. 결과를 확인한 후 다시 시도하세요.',
         },

@@ -113,7 +113,7 @@ fn prefix(input: &mut impl BufRead) -> io::Result<Option<StructurePrefix>> {
 
 /// Accepts the whole text when it is the marker line and one JSON object, and
 /// returns its prefix.
-pub(crate) fn validate_text<'a>(mut source: impl FnMut() -> StoreResult<Box<dyn Read + 'a>>) -> StoreResult<Option<StructurePrefix>> {
+pub(crate) fn validate_text<R: Read>(mut source: impl FnMut() -> StoreResult<R>) -> StoreResult<Option<StructurePrefix>> {
     let Some(prefix) = read_prefix(source()?)? else { return Ok(None) };
     let mut input = source()?;
     io::copy(&mut (&mut input).take(MARKER.len() as u64), &mut io::sink())?;

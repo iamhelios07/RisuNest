@@ -3121,6 +3121,7 @@ export const languageEnglish = {
             "warningProviderNotAtomic": 'If saving is interrupted, an incomplete file may remain at the selected location.',
             "warningSafUnavailable": 'The file picker is unavailable. Try again when it is available.',
             "warningFollowupFailed": 'The data was imported and the screen refreshed, but plugins could not be reloaded. Reload the plugins.',
+            "warningPluginValuesSkipped": '{0} plugin values could not be restored. Update the app and restore again.',
             "resultBackgroundExpired": 'Work stopped after switching apps or locking the screen. Try again.',
             "resultBackgroundExpiredPartial": 'Work stopped after switching apps or locking the screen. Some changes may already have been saved. Check the result before trying again.',
         },
