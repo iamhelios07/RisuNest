@@ -1458,6 +1458,7 @@ const makeRisuaiAPIV3 = (
                     isTauri ? 'tauri' :
                     forageStorage.isAccount ? 'account' :
                     'local',
+                structuredLocalPluginStorage: isTauri,
             }
         },
         getLocalPluginStorage: () => {

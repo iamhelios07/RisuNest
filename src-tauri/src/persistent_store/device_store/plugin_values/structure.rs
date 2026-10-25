@@ -47,38 +47,66 @@ fn peek(input: &mut impl BufRead) -> io::Result<u8> {
 /// Reads the marker and the part list. `None` means the text is not structure
 /// form; a text that starts with the marker but has no valid prefix is an error.
 pub(crate) fn read_prefix(input: impl Read) -> io::Result<Option<StructurePrefix>> {
+    prefix(&mut BufReader::with_capacity(8 * 1024, input))
+}
+
+/// The prefix and the root's type name. The host writes the root as the first
+/// node with its type first, so this reads only a few bytes past the prefix.
+pub(crate) fn read_summary(input: impl Read) -> io::Result<Option<(StructurePrefix, String)>> {
     let mut input = BufReader::with_capacity(8 * 1024, input);
+    let Some(prefix) = prefix(&mut input)? else { return Ok(None) };
+    expect(&mut input, br#"[{"type":""#)?;
+    let mut name = word(&mut input)?;
+    if name == "View" || name == "Primitive" {
+        expect(&mut input, br#","name":""#)?;
+        name = word(&mut input)?;
+    }
+    Ok(Some((prefix, name)))
+}
+
+fn word(input: &mut impl BufRead) -> io::Result<String> {
+    let mut word = String::new();
+    loop {
+        let byte = peek(input)?;
+        input.consume(1);
+        if byte == b'"' && !word.is_empty() { return Ok(word); }
+        if !byte.is_ascii_alphanumeric() || word.len() == 32 { return Err(malformed()); }
+        word.push(byte as char);
+    }
+}
+
+fn prefix(input: &mut impl BufRead) -> io::Result<Option<StructurePrefix>> {
     let mut marker = Vec::with_capacity(MARKER.len());
-    (&mut input).take(MARKER.len() as u64).read_to_end(&mut marker)?;
+    input.take(MARKER.len() as u64).read_to_end(&mut marker)?;
     if marker != MARKER { return Ok(None); }
-    expect(&mut input, br#"{"parts":["#)?;
+    expect(input, br#"{"parts":["#)?;
     let mut parts = Vec::new();
-    if peek(&mut input)? == b']' {
+    if peek(input)? == b']' {
         input.consume(1);
     } else {
         loop {
             if parts.len() == MAX_PARTS { return Err(malformed()); }
-            expect(&mut input, br#""p:"#)?;
+            expect(input, br#""p:"#)?;
             let mut hash = [0; 64];
             input.read_exact(&mut hash).map_err(|_| malformed())?;
             if !hash.iter().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) { return Err(malformed()); }
-            expect(&mut input, b"\"")?;
+            expect(input, b"\"")?;
             parts.push(String::from_utf8(hash.to_vec()).map_err(|_| malformed())?);
             let mut separator = [0];
             input.read_exact(&mut separator).map_err(|_| malformed())?;
             match separator[0] { b',' => continue, b']' => break, _ => return Err(malformed()) }
         }
     }
-    expect(&mut input, br#","bytes":"#)?;
+    expect(input, br#","bytes":"#)?;
     let mut digits = Vec::new();
-    while peek(&mut input)?.is_ascii_digit() {
+    while peek(input)?.is_ascii_digit() {
         if digits.len() == 16 { return Err(malformed()); }
-        digits.push(peek(&mut input)?);
+        digits.push(peek(input)?);
         input.consume(1);
     }
     if digits.is_empty() || (digits.len() > 1 && digits[0] == b'0') { return Err(malformed()); }
     let bytes: u64 = std::str::from_utf8(&digits).ok().and_then(|text| text.parse().ok()).ok_or_else(malformed)?;
-    expect(&mut input, br#","nodes":"#)?;
+    expect(input, br#","nodes":"#)?;
     if bytes > text_value::MAX_VALUE_BYTES || parts.len() as u64 != bytes.div_ceil(PART_BYTES) { return Err(malformed()); }
     Ok(Some(StructurePrefix { parts, bytes }))
 }
@@ -118,6 +146,11 @@ pub(crate) fn admit_parts(db: &Connection, prefix: &StructurePrefix, encoded_tex
 pub(crate) fn row_prefix(db: &Connection, schema: &str, rowid: i64) -> StoreResult<Option<StructurePrefix>> {
     let blob = db.blob_open(schema, "plugin_device_storage", "value", rowid, true)?;
     Ok(read_prefix(blob)?)
+}
+
+pub(crate) fn row_summary(db: &Connection, rowid: i64) -> StoreResult<Option<(StructurePrefix, String)>> {
+    let blob = db.blob_open(rusqlite::MAIN_DB, "plugin_device_storage", "value", rowid, true)?;
+    Ok(read_summary(blob)?)
 }
 
 /// Every part that a live structure row in `schema` names.
@@ -261,7 +294,21 @@ mod tests {
 
     fn text(parts: &[&str], bytes: u64) -> String {
         let parts = parts.iter().map(|part| format!("\"p:{part}\"")).collect::<Vec<_>>().join(",");
-        format!("#risunest-structured:1\n{{\"parts\":[{parts}],\"bytes\":{bytes},\"nodes\":[],\"root\":null}}")
+        format!("#risunest-structured:1\n{{\"parts\":[{parts}],\"bytes\":{bytes},\"nodes\":[{{\"type\":\"View\",\"name\":\"Uint8Array\",\"buffer\":1,\"byteOffset\":0,\"byteLength\":{bytes}}},{{\"type\":\"ArrayBuffer\",\"offset\":0,\"byteLength\":{bytes}}}],\"root\":{{\"ref\":0}}}}")
+    }
+
+    #[test]
+    fn summarizes_the_root_type_from_the_first_node() {
+        let hash = "a".repeat(64);
+        let summary = read_summary(text(&[&hash], 1).as_bytes()).unwrap().unwrap();
+        assert_eq!((summary.0.bytes, summary.1.as_str()), (1, "Uint8Array"));
+        let body = |nodes: &str| format!("{}{{\"parts\":[],\"bytes\":0,\"nodes\":{nodes},\"root\":{{\"ref\":0}}}}", std::str::from_utf8(MARKER).unwrap());
+        assert_eq!(read_summary(body(r#"[{"type":"Map","entries":[]}]"#).as_bytes()).unwrap().unwrap().1, "Map");
+        assert_eq!(read_summary(body(r#"[{"type":"Primitive","name":"bigint","value":"1"}]"#).as_bytes()).unwrap().unwrap().1, "bigint");
+        assert_eq!(read_summary(b"{}".as_slice()).unwrap(), None);
+        for broken in [r#"[]"#, r#"[{"name":"Map","type":"Map"}]"#, r#"[{"type":"a b"}]"#] {
+            assert!(read_summary(body(broken).as_bytes()).is_err(), "{broken}");
+        }
     }
 
     #[test]
@@ -341,9 +388,9 @@ mod tests {
         set(&mut store, "json", "quoted", serde_json::to_string(&text(&[&missing], 1)).unwrap()).unwrap();
         set(&mut store, "string", "raw", text(&[&missing], 1)).unwrap();
         let listed = store.device_store().unwrap().list_plugin_device_storage().unwrap();
-        let listed = listed.iter().map(|item| (item.key.as_str(), item.structured, item.byte_size)).collect::<Vec<_>>();
-        assert_eq!(listed[0], ("kept", true, (stored.len() + bytes.len()) as i64));
-        assert!(!listed[1].1 && !listed[2].1);
+        let listed = listed.iter().map(|item| (item.key.as_str(), item.structure_type.as_deref(), item.byte_size)).collect::<Vec<_>>();
+        assert_eq!(listed[0], ("kept", Some("Uint8Array"), (stored.len() + bytes.len()) as i64));
+        assert!(listed[1].1.is_none() && listed[2].1.is_none());
 
         // The stored size counts the text as an encoded JSON string, escapes included.
         let size = serde_json::to_string(&stored).unwrap().len() as u64 + bytes.len() as u64;

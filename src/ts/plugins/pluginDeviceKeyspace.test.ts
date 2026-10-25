@@ -139,24 +139,28 @@ describe('plugin device keyspace', () => {
         await expect(held.getItem('string', 'kept')).resolves.toBe('text')
     })
 
-    it('round-trips JSON representations and rejects unsupported values before writing', async () => {
+    it('keeps JSON values on the web and rejects every other value before writing', async () => {
         const storage = new SafeLocalPluginStorage('json-contract')
-        const values = [{ a: 1 }, [1, null], null, 42, 'text', new Date('2020-01-01T00:00:00Z'), new Uint8Array([1, 2])]
-        for (const value of values) {
+        for (const value of [{ a: 1 }, [1, null], null, 42, 'text']) {
             await storage.setItem('value', value)
-            await expect(storage.getItem('value')).resolves.toEqual(JSON.parse(JSON.stringify(value)))
+            await expect(storage.getItem('value')).resolves.toEqual(value)
         }
+        await storage.setItem('undefined', undefined)
+        await expect(pluginDeviceStorage.getItem('safe_plugin_["json-contract","json","undefined"]')).resolves.toBe('null')
         await storage.setItem('value', 'kept')
         const cycle: { self?: unknown } = {}; cycle.self = cycle
         const write = vi.spyOn(pluginDeviceStorage, 'setItem')
-        for (const value of [undefined, () => {}, Symbol('unsupported'), cycle, 1n]) {
-            await expect(storage.setItem('value', value)).rejects.toBeInstanceOf(TypeError)
-            await expect(storage.getItem('value')).resolves.toBe('kept')
+        for (const value of [new Date(0), new Uint8Array([1, 2]), cycle, 1n, -0, [undefined], new Map()]) {
+            await expect(storage.setItem('value', value)).rejects.toThrow(new TypeError('getLocalPluginStorage values that are not JSON are not supported on the web'))
         }
+        for (const value of [() => {}, Symbol('unsupported'), { nested: () => {} }]) {
+            await expect(storage.setItem('value', value)).rejects.toThrow(new TypeError('getLocalPluginStorage cannot store this value'))
+        }
+        await expect(storage.getItem('value')).resolves.toBe('kept')
         expect(write).not.toHaveBeenCalled()
         invalidatePluginDeviceKeyspaces('json-contract')
         await expect(storage.getItem('value')).resolves.toBe('kept')
-        await expect(storage.keys()).resolves.toEqual(['value'])
+        await expect(storage.keys()).resolves.toEqual(['undefined', 'value'])
         write.mockRestore()
     })
 

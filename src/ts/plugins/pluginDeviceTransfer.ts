@@ -1,7 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
 import { isTauriAndroid } from '../platform'
 import { ANDROID_LARGE_COMMIT_SIZE, sendAndroidCommit } from '../storage/androidCommitTransport'
+import { nativeAssetByteSender } from '../storage/nativeAssetByteTransport'
 import type { PluginDeviceMutation, PluginDeviceSpace, PluginDeviceObservation } from './pluginDeviceKeyspace'
+import { structureParts, type StructuredLocalPluginValue } from './localPluginStorageValue'
 
 export const PLUGIN_DEVICE_VALUE_BYTES = 512 * 1024 * 1024
 export const PLUGIN_DEVICE_PART_BYTES = 8 * 1024 * 1024
@@ -115,4 +117,44 @@ export async function readNativePluginDeviceValue(owner: string, space: PluginDe
         if (!changed) return parts.join('')
     }
     throw new Error('Plugin device value changed during read')
+}
+
+/**
+ * Stores every part of a structure-form value as a device object and returns
+ * their hashes in order. The row that names them is committed afterwards.
+ */
+export async function storeNativePluginDeviceParts(owner: string, value: StructuredLocalPluginValue): Promise<string[]> {
+    const hashes: string[] = []
+    if (value.byteLength === 0) return hashes
+    const sender = await nativeAssetByteSender(invoke)
+    for await (const part of structureParts(value)) {
+        const uploadId = await invoke<string>('pds_open_plugin_device_part', { owner, byteLength: part.byteLength })
+        try {
+            for (let offset = 0; offset < part.byteLength;) {
+                const piece = part.subarray(offset, offset + sender.capacity)
+                const next = await sender.append('pds_append_plugin_device_part', uploadId, offset, piece)
+                if (next !== offset + piece.byteLength) throw new Error('Invalid plugin device part acknowledgement')
+                offset = next
+            }
+            hashes.push(await invoke<string>('pds_finish_plugin_device_part', { owner, uploadId }))
+        } catch (error) {
+            await invoke('pds_abort_plugin_device_part', { owner, uploadId }).catch(() => undefined)
+            throw error
+        }
+    }
+    return hashes
+}
+
+export async function readNativePluginDevicePart(hash: string, byteLength: number): Promise<Uint8Array> {
+    const part = new Uint8Array(byteLength)
+    for (let offset = 0; offset < byteLength;) {
+        const response = await invoke<unknown>('pds_read_plugin_device_part', { hash, offset })
+        const piece = response instanceof ArrayBuffer ? new Uint8Array(response)
+            : response instanceof Uint8Array ? response
+            : Array.isArray(response) ? Uint8Array.from(response as number[]) : null
+        if (!piece || piece.byteLength === 0 || piece.byteLength > byteLength - offset) throw new Error('Invalid plugin device part read')
+        part.set(piece, offset)
+        offset += piece.byteLength
+    }
+    return part
 }

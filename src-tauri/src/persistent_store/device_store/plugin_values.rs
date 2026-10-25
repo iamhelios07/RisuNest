@@ -43,8 +43,10 @@ pub(crate) struct PluginDeviceListItem {
     pub(crate) space: String,
     pub(crate) key: String,
     pub(crate) byte_size: i64,
-    /// The value is in structure form; `byte_size` includes its parts.
-    pub(crate) structured: bool,
+    /// The root's type when the value is in structure form, whose `byte_size`
+    /// then includes its parts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) structure_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -250,16 +252,16 @@ impl DeviceStore {
                     space: row.get(1)?,
                     key: row.get(2)?,
                     byte_size: row.get(3)?,
-                    structured: false,
+                    structure_type: None,
                 }, row.get::<_, i64>(4)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows.into_iter().map(|(mut item, rowid)| {
             if item.space == "json" && item.byte_size >= structure::MIN_TEXT_BYTES {
                 // A row that cannot be read lists as plain; reading it reports the damage.
-                if let Ok(Some(prefix)) = structure::row_prefix(&self.connection, "main", rowid) {
+                if let Ok(Some((prefix, root))) = structure::row_summary(&self.connection, rowid) {
                     item.byte_size = item.byte_size.saturating_add(prefix.bytes as i64);
-                    item.structured = true;
+                    item.structure_type = Some(root);
                 }
             }
             item
