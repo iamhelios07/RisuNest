@@ -737,7 +737,7 @@ await storage.removeItem('config');
 await storage.clear();
 ```
 
-Values follow the structured clone range: primitives including `undefined`, `NaN`, `Infinity`, `-0` and `BigInt`; plain objects and arrays, holes included; `Date`, `RegExp`, `Map`, `Set`, `Error` and primitive wrapper objects; `ArrayBuffer`, every TypedArray and `DataView`; `Blob` and `File`. An object reached more than once, cycles included, stays shared when it is read back. A top-level `undefined` is stored as `null`. On the web only values that JSON represents exactly are kept, and `setItem` rejects any other value with an error; `getRuntimeInfo().structuredLocalPluginStorage` is `false` there and `true` where the full range is kept.
+Values follow the structured clone range: primitives including `undefined`, `NaN`, `Infinity`, `-0` and `BigInt`; plain objects and arrays, holes included; `Date`, `RegExp`, `Map`, `Set`, `Error` and primitive wrapper objects; `ArrayBuffer`, every TypedArray and `DataView`; `Blob` and `File`. An object reached more than once stays shared when it is read back. `setItem` throws `RangeError` for a cycle made only of plain objects and arrays, and `DataCloneError` for an `ArrayBuffer` reached twice through them (two views over one buffer, for example); inside a `Map`, a `Set` or any other object, cycles and shared buffers are kept. A top-level `undefined` is stored as `null`. On the web only values that JSON represents exactly are kept, and `setItem` rejects any other value with an error; `getRuntimeInfo().structuredLocalPluginStorage` is `false` there and `true` where the full range is kept.
 
 **Use `getLocalPluginStorage()` when:**
 - You need to store objects or binary data (not just strings)
