@@ -782,6 +782,42 @@ describe('production server LWW composition', () => {
         visible(false); await settle(); visible(true); openConversation('third'); await settle()
         expect(f.invoke.mock.calls.filter(([command]) => command === 'server_sync_lww_retry')).toHaveLength(retries)
     })
+    it('rechecks a library format block through native code on open and resumes once it passes', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        let current = false
+        f.invoke.mockImplementation(async command => {
+            if (!current && (command === 'server_sync_lww_pull' || command === 'server_sync_lww_check_format')) throw { code: 'library-format-switch-required', retryable: false }
+            return command === 'server_sync_lww_pull' ? emptyReceive() : null
+        })
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: true, blockedCode: 'library-format-switch-required', error: 'library-format-switch-required' })
+        openConversation('first'); await settle()
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_check_format', { request: { bindingAuthority: '0', requestId: expect.any(String) } })
+        expect(production.getServerSyncController().snapshot().paused).toBe(true)
+        current = true
+        openConversation('second'); await settle()
+        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, blockedCode: '', error: '' })
+    })
+    it('switches the library format on request and resumes sync with the retry that follows', async () => {
+        const state = bindingContext().state
+        let current = false
+        f.invoke.mockImplementation(async command => {
+            if (command === 'server_sync_status') return { configured: true, writerId: 'writer', bindingAuthority: '0' }
+            if (command === 'pds_lww_binding_state') return state
+            if (command === 'server_sync_lww_switch_format') { current = true; return null }
+            if (!current && command === 'server_sync_lww_pull') throw { code: 'library-format-switch-required', retryable: false }
+            return command === 'server_sync_lww_pull' ? emptyReceive() : null
+        })
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: true, blockedCode: 'library-format-switch-required' })
+        await production.switchServerSyncLibraryFormat()
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_switch_format', { request: { bindingAuthority: '0', requestId: expect.any(String) } })
+        f.invoke.mockClear()
+        await production.retryServerSync(); await settle()
+        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, blockedCode: '', error: '' })
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_pull', expect.anything())
+    })
     it('drains and clears the old hydration context before a binding fence permits foreground return', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         let stopped!: (error: unknown) => void

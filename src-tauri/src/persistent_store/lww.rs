@@ -1194,6 +1194,13 @@ impl PersistentStore {
     pub(crate) fn lww_clock_state(&self) -> StoreResult<ClockState> {
         clock_state(self.device_store()?.connection())
     }
+    /// A stamp for a unit this device publishes outside its outbox.
+    pub(crate) fn lww_reserve_stamp(&mut self) -> StoreResult<Stamp> {
+        let tx = self.device_store_mut()?.transaction()?;
+        let stamp = reserve_stamp(&tx)?;
+        tx.commit()?;
+        Ok(stamp)
+    }
     fn intent_device_revision(&self, request_id: &str) -> StoreResult<i64> {
         let db = self.device_store()?.connection();
         let body: Option<String> = db.query_row("SELECT body FROM lww_intents WHERE request_id=?1", [request_id], |row| row.get(0)).optional()?;
@@ -3258,6 +3265,10 @@ fn replacement_changes(
     drop(captured);
     for unit in source.into_iter().flat_map(|source| replacement_source::units(tx, source)) {
         let (key, _) = unit?;
+        // The format level belongs to the library, so a backup never sets it.
+        if risunest_sync_wire::library_format::is_key(&key) {
+            continue;
+        }
         let captured: bool = changes.db.query_row("SELECT EXISTS(SELECT 1 FROM captured WHERE key=?1)", [key.as_str()], |row| row.get(0))?;
         if !captured {
             let skip = archived_character(&key).map(|id| archived(&id)).transpose()?.unwrap_or(false);

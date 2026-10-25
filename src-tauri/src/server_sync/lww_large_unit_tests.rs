@@ -77,6 +77,7 @@ fn a_rejected_single_entry_push_reports_unit_too_large_and_keeps_the_entry() {
             },
         ))
     });
+    server.switch_format();
     for value in ["synthetic".to_owned(), random_text(32 * 1024, 7)] {
         let (_a, mut a) = local();
         let ca = server.client(&a);
@@ -197,6 +198,7 @@ fn a_receiver_whose_base_the_server_collected_downloads_the_whole_body() {
 fn a_failed_push_keeps_its_copies_for_the_retry_and_a_finished_one_removes_them() {
     let fail_push = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (server, _) = recording_server(fail_push.clone());
+    server.switch_format();
     let (_a, mut a) = local();
     let ca = server.client(&a);
     let value = Value::String(random_text(2 * MAX_METADATA_BYTES, 3));
@@ -303,4 +305,30 @@ fn plugin_value_parts_are_prepared_into_the_object_store() {
         assert!(b.lww_verified_object_present(hash).unwrap());
         assert!(super::residency::Residency::open(b.repository_root()).unwrap().object(hash, None).unwrap().is_none());
     }
+}
+
+#[test]
+fn a_structured_plugin_value_moves_with_its_parts_through_the_server() {
+    use crate::persistent_store::device_store::{plugin_values::{structure, PluginDeviceMutation}, Section};
+    let server = LocalServerFixture::new();
+    let (_a, mut a) = local();
+    let (_b, mut b) = local();
+    for store in [&mut a, &mut b] {
+        store.device_store_mut().unwrap().set_section_participating(Section::LocalPlugins, true).unwrap();
+    }
+    let ca = server.client(&a);
+    let cb = server.client(&b);
+    let part = vec![0u8, 255, 128];
+    let hash = structure::put_part(a.device_store().unwrap().connection(), &part).unwrap();
+    let text = format!(
+        "#risunest-structured:1\n{{\"parts\":[\"p:{hash}\"],\"bytes\":3,\"nodes\":[{{\"type\":\"ArrayBuffer\",\"offset\":0,\"byteLength\":3}}],\"root\":{{\"ref\":0}}}}");
+    a.device_store_mut().unwrap().write_plugin_device_values("synthetic-owner", &[
+        PluginDeviceMutation::Set { space: "json".into(), key: "structured".into(), value: text.clone() },
+    ]).unwrap();
+    drain_publications(&ca, &mut a, &[]).unwrap();
+    assert_eq!((pending(&a), server.server.library_format()), (0, 2));
+    receive_available(&cb, &mut b, &[]).unwrap();
+    let device = b.device_store().unwrap();
+    assert_eq!(device.read_plugin_device_value("synthetic-owner", "json", "structured").unwrap(), Some(text));
+    assert_eq!(structure::read_part(device.connection(), &hash, 0).unwrap(), part);
 }

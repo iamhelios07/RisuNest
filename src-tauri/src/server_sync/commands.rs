@@ -412,6 +412,14 @@ pub(crate) async fn server_sync_lww_activate_new_device(app:AppHandle,request:cr
 #[tauri::command]
 pub(crate) async fn server_sync_lww_retry(app:AppHandle,request:crate::persistent_store::lww::Header)->Result<crate::persistent_store::lww::ApplyResult> {logged_blocking("retry",move||within(&LANES.send,|| {let _permit=claim_library(&app)?;let mut store=job_store(&app)?;with_lww_client(&mut store,None,|core,store|core.retry_unpublished(store,&request))})).await}
 #[tauri::command]
+pub(crate) async fn server_sync_lww_check_format(app:AppHandle,request:crate::persistent_store::lww::Header)->Result<()> {
+    logged_blocking("check-format",move|| within(&LANES.send,|| {let state=app.state::<ServerSyncCommandState>();let (_job,cancelled)=state.claim_transport(&app.state::<crate::native_file_jobs::NativeFileJobState>().admission,"send")?;let mut store=job_store(&app)?;with_lww_client(&mut store,Some(cancelled),|core,store|core.check_library_format(store,&request,false))})).await
+}
+#[tauri::command]
+pub(crate) async fn server_sync_lww_switch_format(app:AppHandle,request:crate::persistent_store::lww::Header)->Result<()> {
+    logged_blocking("switch-format",move|| within(&LANES.send,|| {let state=app.state::<ServerSyncCommandState>();let (_job,cancelled)=state.claim_transport(&app.state::<crate::native_file_jobs::NativeFileJobState>().admission,"send")?;let mut store=job_store(&app)?;with_lww_client(&mut store,Some(cancelled),|core,store|core.check_library_format(store,&request,true))})).await
+}
+#[tauri::command]
 pub(crate) async fn server_sync_lww_drain(app:AppHandle,request:crate::persistent_store::lww::Header,generating:Vec<crate::persistent_store::lww::MessageLocator>)->Result<()> {
     logged_blocking("drain",move||within(&LANES.send,|| {let state=app.state::<ServerSyncCommandState>();let (_job,cancelled)=state.claim_transport(&app.state::<crate::native_file_jobs::NativeFileJobState>().admission,"send")?;let mut store=job_store(&app)?;with_lww_client(&mut store,Some(cancelled),|core,store| {let mut next=request;while core.push(store,&next,&generating)?.is_some(){next.request_id=uuid::Uuid::new_v4().to_string();}if !store.lww_read_outbox(next.binding_authority,1)?.entries.is_empty(){return Err(SyncError::new("generation-active",409));}Ok(())})})).await
 }

@@ -3,7 +3,7 @@ import { externalErrorKind, externalErrorMessage, type ExternalStorageStrings } 
 import { externalJobIsActive, externalJobIsPaused } from './external/connection'
 import type { ExternalOperationProgress } from './external/progress'
 import type { ExternalConnectionSummary, ExternalJobSummary } from './external/types'
-import { registrationCodes, serverSyncErrorMessage } from './serverSyncErrorMessage'
+import { formatLevelLabel, registrationCodes, serverSyncErrorMessage } from './serverSyncErrorMessage'
 import type { getServerSyncController } from './serverSyncProduction'
 import type { SyncStatusSource } from './syncStatus'
 
@@ -23,6 +23,8 @@ export function serverSyncStatusView(view: ServerSyncView): SyncStatusView {
     if (view.progress || (connected && view.running)) return { label: copy.running, tone: 'working', stopped: false }
     if (!connected) return { label: copy.disconnected, tone: view.bindingIncomplete ? 'attention' : 'idle', stopped: false }
     if (registrationCodes.includes(view.error)) return { label: copy.registrationRequired, tone: 'attention', stopped: true }
+    const format = view.paused ? formatLevelLabel(view.error) : undefined
+    if (format) return { label: format, tone: 'attention', stopped: true }
     // An error that is still being retried is not a stop.
     if (view.error) return view.paused ? { label: copy.blocked, tone: 'attention', stopped: true } : { label: copy.failed, tone: 'failed', stopped: false }
     if (view.paused) return { label: copy.paused, tone: 'paused', stopped: false }

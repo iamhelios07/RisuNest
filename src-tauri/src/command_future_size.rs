@@ -120,6 +120,8 @@ async_commands![
     server_sync::commands::server_sync_lww_prepare_fresh_writer,
     server_sync::commands::server_sync_lww_activate_new_device,
     server_sync::commands::server_sync_lww_retry,
+    server_sync::commands::server_sync_lww_check_format,
+    server_sync::commands::server_sync_lww_switch_format,
     server_sync::commands::server_sync_lww_drain,
     server_sync::commands::server_sync_cancel,
     server_sync::commands::server_sync_notify_start,

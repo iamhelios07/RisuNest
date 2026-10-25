@@ -1,6 +1,7 @@
 use super::{
     cache::Cache,
-    client::{response_error, ServerClient, ServerConfig},
+    client::{response_code, response_error, RequestAttempt, ServerClient, ServerConfig},
+    library_format::{LibraryFormat, LEVEL},
     progress::Step,
     transfer::Transfer,
     Result, SyncError,
@@ -15,6 +16,7 @@ use crate::persistent_store::{
 };
 use risunest_sync_wire::{
     canonical,
+    library_format::{self, EMPTY_LIBRARY, PRECONDITION_HEADER},
     lww::{
         AckRequest, CancelOperationRequest, ChangesPage, OperationReceipt, PushReceipt,
         PushRequest, StatePage, StatePin, TimeSample, UnitChange,
@@ -249,6 +251,9 @@ fn observe_descriptor_purposes(
 type ClockKey = (std::path::PathBuf, String, String);
 static CLOCKS: std::sync::Mutex<std::collections::BTreeMap<ClockKey, (Instant, AdmittedClock)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// Libraries seen at this client's format level, by address and library. A
+/// level never goes down, so a library seen there stays there.
+static CURRENT_FORMAT: std::sync::Mutex<BTreeSet<(String, String)>> = std::sync::Mutex::new(BTreeSet::new());
 pub(crate) struct LwwClient {
     pub client: ServerClient,
     pub log: OperationLog,
@@ -361,6 +366,76 @@ impl LwwClient {
             clocks.insert(self.clock_key(), (sent, admitted));
         }
         Ok(upper.into())
+    }
+    fn format_key(&self) -> (String, String) {
+        let config = self.client.config();
+        (config.endpoint, config.library_id)
+    }
+    /// Fails unless the library is at this client's format level. An empty
+    /// library is switched to it, and with `switch` any library below it is.
+    pub(crate) fn require_library_format(&self, store: &mut PersistentStore, switch: bool) -> Result<()> {
+        if CURRENT_FORMAT.lock().is_ok_and(|current| current.contains(&self.format_key())) {
+            return Ok(());
+        }
+        let (head, format) = self.client.head_with_format()?;
+        if let Some(format) = format {
+            if format.level < LEVEL && format.max >= LEVEL && (switch || head.seq.as_str() == "0") {
+                return self.push_library_format(store, !switch);
+            }
+        }
+        self.accept_library_format(format)
+    }
+    /// The format check of a bound device, outside a send or receive.
+    pub(crate) fn check_library_format(&self, store: &mut PersistentStore, header: &Header, switch: bool) -> Result<()> {
+        self.check()?;
+        if store.lww_binding_authority()? != header.binding_authority {
+            return Err(SyncError::new("binding-authority-changed", 409));
+        }
+        self.require_library_format(store, switch)
+    }
+    fn accept_library_format(&self, format: Option<LibraryFormat>) -> Result<()> {
+        let code = match format {
+            None => "sync-server-update-required",
+            Some(format) if format.level == LEVEL => {
+                if let Ok(mut current) = CURRENT_FORMAT.lock() {
+                    current.insert(self.format_key());
+                }
+                return Ok(());
+            }
+            Some(format) if format.level > LEVEL => "app-update-required",
+            Some(format) if format.max < LEVEL => "sync-server-update-required",
+            Some(_) => "library-format-switch-required",
+        };
+        Err(SyncError::new(code, 409))
+    }
+    /// Pushes this client's level alone, with `empty_only` only into a library
+    /// that holds nothing else. A push whose changes all lose still succeeds,
+    /// so only the level its reply reports confirms the switch.
+    fn push_library_format(&self, store: &mut PersistentStore, empty_only: bool) -> Result<()> {
+        let stamp = store.lww_reserve_stamp()?;
+        let request = PushRequest {
+            library_id: self.client.config().library_id,
+            writer_id: stamp.writer_id.clone(),
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            changes: vec![UnitChange { key: library_format::key(), stamp, value: library_format::value(LEVEL)? }],
+        };
+        let headers = if empty_only { vec![(PRECONDITION_HEADER, EMPTY_LIBRARY.to_owned())] } else { Vec::new() };
+        match self.client.request_ambiguous_mutation(
+            reqwest::Method::POST,
+            "push",
+            Some(canonical::encode(&request)?),
+            &headers,
+            MAX_METADATA_BYTES,
+        )? {
+            RequestAttempt::Response(reply)
+                if (200..300).contains(&reply.status)
+                    || (empty_only && response_code(&reply).as_deref() == Some("library-not-empty")) =>
+            {
+                self.accept_library_format(reply.library_format)
+            }
+            RequestAttempt::Response(reply) => Err(response_error(reply)),
+            RequestAttempt::Failure { error, .. } => Err(error),
+        }
     }
     /// The client for the registration that sent a publication. The current
     /// address asks for it when that registration is the one in use.
@@ -555,6 +630,7 @@ impl LwwClient {
         if entries.is_empty() {
             return Ok(None);
         }
+        self.require_library_format(store, false)?;
         let mut admitted = self.admission()?;
         if entries
             .iter()
@@ -980,6 +1056,7 @@ impl LwwClient {
             self.prepare_archive_bodies(store, &page.page.changes)?;
             return Ok(page);
         }
+        self.require_library_format(store, false)?;
         self.client.lane().step(Step::Listing);
         let upper = self.admission()?;
         let cursor = store
