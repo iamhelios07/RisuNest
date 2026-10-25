@@ -5,6 +5,7 @@ mod character_json_export;
 mod character_png_export;
 pub mod charx;
 mod content;
+mod available_payload;
 mod dataset_export;
 mod gallery_export;
 pub(crate) mod download_handoff;
@@ -4521,6 +4522,15 @@ pub(crate) struct JobControl {
     wait_changed: Condvar,
     terminal_at: Mutex<Option<Instant>>,
     status: Mutex<JobStatus>,
+}
+
+impl crate::local_backup::CancellationProbe for JobControl {
+    fn cancellation_flag(&self) -> Option<Arc<AtomicBool>> {
+        Some(JobControl::cancellation_flag(self))
+    }
+    fn is_cancelled(&self) -> bool {
+        self.is_cancel_requested()
+    }
 }
 
 impl JobControl {
