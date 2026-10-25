@@ -715,15 +715,16 @@ These checks cannot detect a remote change that this device has not received yet
 
 ### Local Plugin Storage
 
-`getLocalPluginStorage()` is also device-local and follows the same sync rule as `safeLocalStorage`. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. In RisuNest it is confined to your plugin, and it is a separate space from `safeLocalStorage`, so clearing one leaves the other alone.
+`getLocalPluginStorage()` is also device-local and follows the same sync rule as `safeLocalStorage`. Unlike `safeLocalStorage`, it accepts objects and binary data and is appropriate for device-only settings, caches and files. In RisuNest it is confined to your plugin, and it is a separate space from `safeLocalStorage`, so clearing one leaves the other alone.
 
-`getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that supports any JSON-serializable value (unlike `safeLocalStorage` which is strings-only), with generic type support:
+`getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that keeps values in the structured clone range (unlike `safeLocalStorage` which is strings-only), with generic type support:
 
 ```javascript
 const storage = await Risuai.getLocalPluginStorage();
 
-// Store any JSON-serializable value
+// Store JSON values, or Map, Date, binary data and other cloneable values
 await storage.setItem('config', { theme: 'dark', fontSize: 14 });
+await storage.setItem('thumbnail', new Uint8Array([137, 80, 78, 71]));
 
 // Retrieve with type inference
 const config = await storage.getItem('config');
@@ -736,15 +737,17 @@ await storage.removeItem('config');
 await storage.clear();
 ```
 
+Values follow the structured clone range: primitives including `undefined`, `NaN`, `Infinity`, `-0` and `BigInt`; plain objects and arrays, holes included; `Date`, `RegExp`, `Map`, `Set`, `Error` and primitive wrapper objects; `ArrayBuffer`, every TypedArray and `DataView`; `Blob` and `File`. An object reached more than once, cycles included, stays shared when it is read back. A top-level `undefined` is stored as `null`. On the web only values that JSON represents exactly are kept, and `setItem` rejects any other value with an error; `getRuntimeInfo().structuredLocalPluginStorage` is `false` there and `true` where the full range is kept.
+
 **Use `getLocalPluginStorage()` when:**
-- You need to store structured objects (not just strings)
+- You need to store objects or binary data (not just strings)
 - Data should stay on one device
 
 ### Device-local data in RisuNest
 
 On the native app `safeLocalStorage` and `getLocalPluginStorage()` are kept in the installation's own device file. RisuNest treats both spaces as follows:
 
-- **Value size** is limited to 512 MiB of UTF-8 bytes after JSON-encoding the stored string. For `getLocalPluginStorage()`, the stored string is the serialized JSON value. An oversized write rejects without replacing the previous value. Large values still need enough WebView memory to construct and read them.
+- **Value size** is limited to 512 MiB of UTF-8 bytes after JSON-encoding the stored string. For `getLocalPluginStorage()`, the stored string is the serialized value, and binary contents add their byte length. An oversized write rejects without replacing the previous value. Large values still need enough WebView memory to construct and read them.
 - **Full backups** always include both spaces, whether or not they sync. Restoring a full backup replaces them with the backup's values.
 - **Sync** carries them only when the user turns on the local plugin data option in RisuNest settings. The option is off by default, applies to both spaces of every plugin, and covers both the sync server and external storage. With it off, each device keeps its own values.
 - **First connection to a sync target that already holds data** clears both spaces for every plugin, including plugins that are no longer installed. With the option on they are then filled from the target; with it off they start empty. Reconnecting to the same target keeps them.
@@ -1325,6 +1328,7 @@ console.log(info.app.version); // App version from version.json, e.g., '1.0.0'
 console.log(info.apiVersion);  // e.g., '3.0'
 console.log(info.platform);    // 'web' or 'tauri'
 console.log(info.saveMethod);  // 'local', 'account', or 'tauri'
+console.log(info.structuredLocalPluginStorage); // false on the web (see Local Plugin Storage)
 
 // Plugins shared with other RisuAI hosts can check the optional app metadata.
 if (info.app?.id === 'risunest') {
