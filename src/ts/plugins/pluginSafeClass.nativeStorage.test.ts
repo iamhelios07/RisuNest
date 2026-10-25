@@ -4,7 +4,7 @@ import type { PluginDeviceMutation } from './pluginDeviceKeyspace'
 
 const native = vi.hoisted(() => ({
     invoke: vi.fn(), values: new Map<string, string>(), android: false,
-    parts: new Map<string, Uint8Array>(), uploads: new Map<string, { length: number; bytes: number[] }>(), failFinish: false,
+    parts: new Map<string, Uint8Array>(), uploads: new Map<string, { owner: string; length: number; bytes: number[] }>(), failFinish: false,
 }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: 'tauri', os: native.android ? 'android' : 'windows' })))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }))
@@ -31,8 +31,11 @@ beforeEach(() => {
         if (command === 'pds_plugin_device_sequence') return 'epoch:0'
         if (command === 'native_asset_bytes_probe') return false
         if (command === 'pds_open_plugin_device_part') {
+            // The native side refuses an upload past two per plugin or eight in all.
+            const owned = [...native.uploads.values()].filter(upload => upload.owner === args.owner).length
+            if (owned >= 2 || native.uploads.size >= 8) throw new Error('plugin structure part uploads are full')
             const uploadId = `upload-${native.uploads.size}-${Math.random()}`
-            native.uploads.set(uploadId, { length: args.byteLength!, bytes: [] })
+            native.uploads.set(uploadId, { owner: args.owner, length: args.byteLength!, bytes: [] })
             return uploadId
         }
         if (command === 'pds_append_plugin_device_part') {
@@ -220,6 +223,14 @@ describe('native structured plugin values', () => {
         expect(native.values.get('value')).toBe('"kept"')
         expect(native.uploads.size).toBe(0)
         await expect(storage.getItem('value')).resolves.toBe('kept')
+    })
+
+    it('stores structured values written at once within the native upload limits', async () => {
+        const storage = new SafeLocalPluginStorage('native-concurrent')
+        await Promise.all(['a', 'b', 'c'].map((key, index) => storage.setItem(key, new Uint8Array([index]))))
+        await Promise.all(Array.from({ length: 9 }, (_, index) => new SafeLocalPluginStorage(`native-owner-${index}`).setItem('value', new Uint8Array(1))))
+        await expect(storage.getItem('c')).resolves.toEqual(new Uint8Array([2]))
+        expect(native.uploads.size).toBe(0)
     })
 
     it('commits writes to one key in call order even when an earlier one stores parts', async () => {

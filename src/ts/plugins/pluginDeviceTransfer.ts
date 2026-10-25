@@ -119,13 +119,40 @@ export async function readNativePluginDeviceValue(owner: string, space: PluginDe
     throw new Error('Plugin device value changed during read')
 }
 
+// The native side keeps at most two part uploads open per plugin and eight in
+// all. One per plugin and four in all leave room for uploads that a reloaded
+// page left open until they expire.
+const PART_STREAMS = 4
+const ownerStreams = new Map<string, Promise<void>>()
+const streamWaiters: (() => void)[] = []
+let openStreams = 0
+
+async function withPartStream<T>(stream: () => Promise<T>): Promise<T> {
+    while (openStreams >= PART_STREAMS) await new Promise<void>(resolve => streamWaiters.push(resolve))
+    openStreams++
+    try {
+        return await stream()
+    } finally {
+        openStreams--
+        streamWaiters.shift()?.()
+    }
+}
+
 /**
  * Stores every part of a structure-form value as a device object and returns
  * their hashes in order. The row that names them is committed afterwards.
  */
-export async function storeNativePluginDeviceParts(owner: string, value: StructuredLocalPluginValue): Promise<string[]> {
+export function storeNativePluginDeviceParts(owner: string, value: StructuredLocalPluginValue): Promise<string[]> {
+    if (value.byteLength === 0) return Promise.resolve([])
+    const stored = (ownerStreams.get(owner) ?? Promise.resolve()).then(() => withPartStream(() => storeParts(owner, value)))
+    const settled = stored.then(() => undefined, () => undefined)
+    ownerStreams.set(owner, settled)
+    void settled.then(() => { if (ownerStreams.get(owner) === settled) ownerStreams.delete(owner) })
+    return stored
+}
+
+async function storeParts(owner: string, value: StructuredLocalPluginValue): Promise<string[]> {
     const hashes: string[] = []
-    if (value.byteLength === 0) return hashes
     const sender = await nativeAssetByteSender(invoke)
     for await (const part of structureParts(value)) {
         const uploadId = await invoke<string>('pds_open_plugin_device_part', { owner, byteLength: part.byteLength })
