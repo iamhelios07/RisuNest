@@ -18,7 +18,6 @@ use crate::persistent_store::{
     AssetAlias, AssetOwnerHead, AssetOwnerLocator, PersistentStore,
     RevisionResult, StagingResult, StoreResult,
 };
-use crate::server_sync::residency::RemotePayloadAccess;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::fmt;
@@ -76,6 +75,9 @@ const ARCHIVE_FILE: &str = "archive.bin.part";
 struct JobCancellation<'a>(&'a JobControl);
 
 impl CancellationProbe for JobCancellation<'_> {
+    fn cancellation_flag(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        Some(self.0.cancellation_flag())
+    }
     fn is_cancelled(&self) -> bool {
         self.0.is_cancel_requested()
     }

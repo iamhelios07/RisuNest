@@ -1,6 +1,6 @@
 //! Target attachment materialization. Only verified, job-owned files reach the writer.
 use super::*;
-use crate::server_sync::residency::RemotePayloadAccess;
+use crate::server_sync::residency::HydrationSession;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -21,6 +21,39 @@ pub(super) struct PreparedAttachments {
 
 fn invalid_source(message: &'static str) -> NativeJobError {
     NativeJobError::new("invalid-source", message)
+}
+
+/// Opens a local body or downloads one only the Sync server holds. Cancelling the
+/// job stops the download.
+fn open_available(
+    cas: &PayloadCas,
+    hash: &str,
+    cancellation: &dyn CancellationProbe,
+) -> Result<Option<std::fs::File>, NativeJobError> {
+    let check = || {
+        if cancellation.is_cancelled() {
+            Err(crate::server_sync::SyncError::new("cancelled", 499))
+        } else {
+            Ok(())
+        }
+    };
+    HydrationSession::new(cas.repository_root(), cancellation.cancellation_flag())
+        .and_then(|mut session| session.open(hash, &check))
+        .map_err(|error| match check_cancelled(cancellation) {
+            Err(cancelled) => local_backup_error(cancelled),
+            Ok(()) => io_job_error(io::Error::other(error.code)),
+        })
+}
+
+fn available_size(
+    cas: &PayloadCas,
+    hash: &str,
+    cancellation: &dyn CancellationProbe,
+) -> Result<Option<u64>, NativeJobError> {
+    open_available(cas, hash, cancellation)?
+        .map(|file| file.metadata().map(|metadata| metadata.len()))
+        .transpose()
+        .map_err(io_job_error)
 }
 
 fn safe_component(value: &str) -> bool {
@@ -130,9 +163,7 @@ fn read_owner_manifest(
     if expected_size > MAX_OWNER_MANIFEST_BYTES {
         return Err(NativeJobError::too_large("owner-manifest", "owner manifest exceeds the decode limit"));
     }
-    let file = cas
-        .open_available_object(hash)
-        .map_err(io_job_error)?
+    let file = open_available(cas, hash, cancellation)?
         .ok_or_else(|| {
             NativeJobError::new("invalid-source", "legacy backup owner manifest is missing")
         })?;
@@ -242,9 +273,7 @@ fn copy_verified(
         ));
     }
     check_cancelled(cancellation).map_err(local_backup_error)?;
-    let mut source = cas
-        .open_available_object(hash)
-        .map_err(io_job_error)?
+    let mut source = open_available(cas, hash, cancellation)?
         .ok_or_else(|| invalid_source("attachment object is missing"))?;
     pins.pin_existing(cas, hash, expected, role)
         .map_err(io_job_error)?;
@@ -512,9 +541,7 @@ pub(super) fn prepare(
             .manifest_hash
             .as_deref()
             .ok_or_else(|| invalid_source("owner manifest hash is missing"))?;
-        let size = cas
-            .stat_available_object(hash)
-            .map_err(io_job_error)?
+        let size = available_size(cas, hash, cancellation)?
             .ok_or_else(|| invalid_source("owner manifest is missing"))?;
         if size > MAX_OWNER_MANIFEST_BYTES {
             return Err(NativeJobError::too_large("owner-manifest", "owner manifest exceeds the decode limit"));
@@ -544,9 +571,7 @@ pub(super) fn prepare(
                 let name = allocate_asset_name(&format!("owner:{hash}"), &ext, &mut names);
                 let path =
                     owned_directory.join(format!("compatible-owner-{}.entry", payload_keys.len()));
-                let size = cas
-                    .stat_available_object(&hash)
-                    .map_err(io_job_error)?
+                let size = available_size(cas, &hash, cancellation)?
                     .ok_or_else(|| invalid_source("owner attachment object is missing"))?;
                 copy_verified(cas, pins, &hash, size, role(&hash), &path, cancellation)?;
                 result.preserved_files += 1;
@@ -567,9 +592,7 @@ pub(super) fn prepare(
                 && !supported_image_extension(&entry.tuple[2])
                 && unverified_owner_payloads.insert(hash.clone())
             {
-                let size = cas
-                    .stat_available_object(&hash)
-                    .map_err(io_job_error)?
+                let size = available_size(cas, &hash, cancellation)?
                     .ok_or_else(|| invalid_source("owner attachment object is missing"))?;
                 loss(&mut result, "asset-playback-unverified", size);
             }
@@ -1640,12 +1663,20 @@ mod tests {
         use crate::server_sync::residency::test_remote;
         let store = crate::persistent_store::PersistentStore::open(&root.join("repository")).unwrap();
         let remote = cas.prepare_bytes(b"synthetic server-held attachment").unwrap();
-        std::fs::remove_file(cas.object_path(&remote.content_hash).unwrap().unwrap()).unwrap();
-        test_remote::hold(&root.join("repository"), &[(&remote.content_hash, remote.byte_size)]);
-        test_remote::serve(
+        let interrupted = cas.prepare_bytes(b"synthetic interrupted attachment").unwrap();
+        for (object, body) in [
+            (&remote, b"synthetic server-held attachment"),
+            (&interrupted, b"synthetic interrupted attachment"),
+        ] {
+            std::fs::remove_file(cas.object_path(&object.content_hash).unwrap().unwrap()).unwrap();
+            test_remote::serve(&root.join("repository"), &object.content_hash, body.to_vec());
+        }
+        test_remote::hold(
             &root.join("repository"),
-            &remote.content_hash,
-            b"synthetic server-held attachment".to_vec(),
+            &[
+                (&remote.content_hash, remote.byte_size),
+                (&interrupted.content_hash, interrupted.byte_size),
+            ],
         );
         copy_verified(
             &cas,
@@ -1659,6 +1690,25 @@ mod tests {
         .unwrap();
         assert_eq!(std::fs::read(root.join("remote")).unwrap(), b"synthetic server-held attachment");
         assert_eq!(test_remote::fetched(&root.join("repository")), 1);
+        // Cancelling once that download has started stops it before the body is stored.
+        struct CancelWhileDownloading<'a>(&'a Path);
+        impl CancellationProbe for CancelWhileDownloading<'_> {
+            fn is_cancelled(&self) -> bool { test_remote::fetched(self.0) > 1 }
+        }
+        let error = copy_verified(
+            &cas,
+            &mut pins,
+            &interrupted.content_hash,
+            interrupted.byte_size,
+            CasObjectRole::DirectObject,
+            &root.join("interrupted"),
+            &CancelWhileDownloading(&root.join("repository")),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(test_remote::fetched(&root.join("repository")), 2);
+        assert!(cas.stat_object(&interrupted.content_hash).unwrap().is_none());
+        assert!(!root.join("interrupted").exists());
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
