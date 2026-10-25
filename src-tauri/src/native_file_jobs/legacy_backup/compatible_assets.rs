@@ -1,6 +1,7 @@
 //! Target attachment materialization. Only verified, job-owned files reach the writer.
 use super::*;
-use crate::server_sync::residency::HydrationSession;
+use crate::native_file_jobs::available_payload::{available_payload_size, open_available_payload};
+use crate::native_file_jobs::error::asset_missing;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -21,39 +22,6 @@ pub(super) struct PreparedAttachments {
 
 fn invalid_source(message: &'static str) -> NativeJobError {
     NativeJobError::new("invalid-source", message)
-}
-
-/// Opens a local body or downloads one only the Sync server holds. Cancelling the
-/// job stops the download.
-fn open_available(
-    cas: &PayloadCas,
-    hash: &str,
-    cancellation: &dyn CancellationProbe,
-) -> Result<Option<std::fs::File>, NativeJobError> {
-    let check = || {
-        if cancellation.is_cancelled() {
-            Err(crate::server_sync::SyncError::new("cancelled", 499))
-        } else {
-            Ok(())
-        }
-    };
-    HydrationSession::new(cas.repository_root(), cancellation.cancellation_flag())
-        .and_then(|mut session| session.open(hash, &check))
-        .map_err(|error| match check_cancelled(cancellation) {
-            Err(cancelled) => local_backup_error(cancelled),
-            Ok(()) => io_job_error(io::Error::other(error.code)),
-        })
-}
-
-fn available_size(
-    cas: &PayloadCas,
-    hash: &str,
-    cancellation: &dyn CancellationProbe,
-) -> Result<Option<u64>, NativeJobError> {
-    open_available(cas, hash, cancellation)?
-        .map(|file| file.metadata().map(|metadata| metadata.len()))
-        .transpose()
-        .map_err(io_job_error)
 }
 
 fn safe_component(value: &str) -> bool {
@@ -163,10 +131,8 @@ fn read_owner_manifest(
     if expected_size > MAX_OWNER_MANIFEST_BYTES {
         return Err(NativeJobError::too_large("owner-manifest", "owner manifest exceeds the decode limit"));
     }
-    let file = open_available(cas, hash, cancellation)?
-        .ok_or_else(|| {
-            NativeJobError::new("invalid-source", "legacy backup owner manifest is missing")
-        })?;
+    let file = open_available_payload(cas, hash, cancellation, io_job_error)?
+        .ok_or_else(|| asset_missing("legacy backup owner manifest is missing"))?;
     let mut bytes = Vec::with_capacity(expected_size as usize);
     CancellationReader::new(file, cancellation)
         .take(MAX_OWNER_MANIFEST_BYTES + 1)
@@ -273,8 +239,8 @@ fn copy_verified(
         ));
     }
     check_cancelled(cancellation).map_err(local_backup_error)?;
-    let mut source = open_available(cas, hash, cancellation)?
-        .ok_or_else(|| invalid_source("attachment object is missing"))?;
+    let mut source = open_available_payload(cas, hash, cancellation, io_job_error)?
+        .ok_or_else(|| asset_missing("attachment object is missing"))?;
     pins.pin_existing(cas, hash, expected, role)
         .map_err(io_job_error)?;
     let mut output = std::fs::OpenOptions::new()
@@ -541,8 +507,8 @@ pub(super) fn prepare(
             .manifest_hash
             .as_deref()
             .ok_or_else(|| invalid_source("owner manifest hash is missing"))?;
-        let size = available_size(cas, hash, cancellation)?
-            .ok_or_else(|| invalid_source("owner manifest is missing"))?;
+        let size = available_payload_size(cas, hash, cancellation, io_job_error)?
+            .ok_or_else(|| asset_missing("owner manifest is missing"))?;
         if size > MAX_OWNER_MANIFEST_BYTES {
             return Err(NativeJobError::too_large("owner-manifest", "owner manifest exceeds the decode limit"));
         }
@@ -571,8 +537,8 @@ pub(super) fn prepare(
                 let name = allocate_asset_name(&format!("owner:{hash}"), &ext, &mut names);
                 let path =
                     owned_directory.join(format!("compatible-owner-{}.entry", payload_keys.len()));
-                let size = available_size(cas, &hash, cancellation)?
-                    .ok_or_else(|| invalid_source("owner attachment object is missing"))?;
+                let size = available_payload_size(cas, &hash, cancellation, io_job_error)?
+                    .ok_or_else(|| asset_missing("owner attachment object is missing"))?;
                 copy_verified(cas, pins, &hash, size, role(&hash), &path, cancellation)?;
                 result.preserved_files += 1;
                 result.preserved_bytes = result.preserved_bytes.saturating_add(size);
@@ -592,8 +558,8 @@ pub(super) fn prepare(
                 && !supported_image_extension(&entry.tuple[2])
                 && unverified_owner_payloads.insert(hash.clone())
             {
-                let size = available_size(cas, &hash, cancellation)?
-                    .ok_or_else(|| invalid_source("owner attachment object is missing"))?;
+                let size = available_payload_size(cas, &hash, cancellation, io_job_error)?
+                    .ok_or_else(|| asset_missing("owner attachment object is missing"))?;
                 loss(&mut result, "asset-playback-unverified", size);
             }
             keys.push(key);
@@ -1625,7 +1591,7 @@ mod tests {
         )
         .is_err());
         assert!(!root.join("overflow").exists());
-        assert!(copy_verified(
+        let missing = copy_verified(
             &cas,
             &mut pins,
             &"0".repeat(64),
@@ -1634,7 +1600,8 @@ mod tests {
             &root.join("missing"),
             &crate::local_backup::NeverCancelled,
         )
-        .is_err());
+        .unwrap_err();
+        assert_eq!(missing.code, "asset-missing");
         assert!(!root.join("missing").exists());
         copy_verified(
             &cas,
