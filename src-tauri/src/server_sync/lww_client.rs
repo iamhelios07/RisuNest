@@ -215,7 +215,7 @@ fn now_ms() -> Result<u64> {
 fn observe_dependency_purposes(key: &risunest_sync_wire::unit::UnitKey, hashes: &[String]) {
     use crate::asset_repository::body_io::{register_object_purpose, BodyPurpose};
     let purpose = match key.components()[0].as_str() {
-        "messages" => BodyPurpose::Control,
+        "messages" | "plugin-local" => BodyPurpose::Control,
         "archive" => BodyPurpose::Asset,
         _ => return,
     };
@@ -1348,6 +1348,10 @@ impl LwwClient {
                 }
                 cache.put(&body)?;
                 store.lww_put_object(descriptor_hash, &body)?;
+                // Message pages and plugin value parts are applied from the
+                // object store, never fetched later as remote assets.
+                let stored_dependencies =
+                    matches!(change.key.components()[0].as_str(), "messages" | "plugin-local");
                 if matches!(change.key.components()[0].as_str(), "messages" | "archive") {
                     controls.insert(descriptor.object_hash.clone());
                 } else if large_unit(&change.key) {
@@ -1355,7 +1359,7 @@ impl LwwClient {
                 } else {
                     remote.insert(descriptor.object_hash.clone());
                 }
-                if change.key.components()[0] == "messages" {
+                if stored_dependencies {
                     controls.extend(descriptor.dependencies.iter().cloned());
                 } else {
                     remote.extend(descriptor.dependencies.iter().cloned());
@@ -1368,7 +1372,7 @@ impl LwwClient {
                         transfer.download_reference_tree(vec![(root.clone(), vec![])])?;
                     #[cfg(test)]
                     observe_dependency_purposes(&change.key, &dependencies);
-                    if change.key.components()[0] == "messages" {
+                    if stored_dependencies {
                         controls.extend(dependencies);
                     } else {
                         remote.extend(dependencies);

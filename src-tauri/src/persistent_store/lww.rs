@@ -1063,16 +1063,21 @@ impl PersistentStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
     /// Device units are applied inside the device store, so their large bodies
-    /// are copied there from the library store where receive placed them.
+    /// and the parts a plugin value names are copied there from the library
+    /// store where receive placed them.
     fn copy_device_unit_bodies<'a>(&self, changes: impl IntoIterator<Item = &'a Change>) -> StoreResult<()> {
         let device = self.device_store()?.connection();
         for change in changes {
             let UnitValue::Object { descriptor, .. } = &change.value else { continue };
-            if !projection::is_device(&change.key)
-                || super::message_pages::retained_object_present(device, &descriptor.object_hash)?
-            {
-                continue;
+            if !projection::is_device(&change.key) { continue; }
+            for part in &descriptor.dependencies {
+                if !super::message_pages::retained_object_present(device, part)? {
+                    let body = super::message_pages::object_body(&self.connection, part)?
+                        .ok_or_else(|| error("unit-object-body-required"))?;
+                    super::message_pages::put_object(device, part, &body)?;
+                }
             }
+            if super::message_pages::retained_object_present(device, &descriptor.object_hash)? { continue; }
             if change.key.components()[0] == "plugin-local"
                 && device_store::plugin_values::text_value::object_row(&self.connection, &descriptor.object_hash)?.1
                     > device_store::plugin_values::text_value::PART_BYTES as u64

@@ -277,3 +277,30 @@ fn messages_and_archive_bodies_larger_than_a_metadata_body_are_prepared_whole() 
         assert!(b.lww_object_body(hash).unwrap().unwrap().len() > MAX_METADATA_BYTES);
     }
 }
+
+#[test]
+fn plugin_value_parts_are_prepared_into_the_object_store() {
+    let server = LocalServerFixture::new();
+    let (_a, a) = local();
+    let (_b, mut b) = local();
+    let ca = server.client(&a);
+    let cb = server.client(&b);
+    let staging = tempfile::tempdir().unwrap();
+    let cache = super::cache::Cache::open(staging.path()).unwrap();
+    let part_hash = cache.put(&[0u8, 255, 128]).unwrap();
+    let text = format!(
+        "#risunest-structured:1\n{{\"parts\":[\"p:{part_hash}\"],\"bytes\":3,\"nodes\":[{{\"type\":\"ArrayBuffer\",\"offset\":0,\"byteLength\":3}}],\"root\":{{\"ref\":0}}}}");
+    let body_hash = cache.put(&serde_json::to_vec(&text).unwrap()).unwrap();
+    let hashes = [body_hash.clone(), part_hash.clone()];
+    super::transfer::Transfer::new(&ca.client, &cache).unwrap().upload(&hashes, &[]).unwrap();
+    let change = crate::persistent_store::lww::Change {
+        key: risunest_sync_wire::unit::UnitKey::new(&["plugin-local", "synthetic-owner", "json", "structured"]).unwrap(),
+        stamp: risunest_sync_wire::stamp::Stamp { physical_ms: 1.into(), logical: 0, writer_id: b.lww_clock_state().unwrap().writer_id },
+        value: UnitValue::object(RecordDescriptor { dependencies: vec![part_hash], ..RecordDescriptor::content(body_hash) }).unwrap(),
+    };
+    cb.prepare_bodies(&mut b, &[change], 1.into()).unwrap();
+    for hash in &hashes {
+        assert!(b.lww_verified_object_present(hash).unwrap());
+        assert!(super::residency::Residency::open(b.repository_root()).unwrap().object(hash, None).unwrap().is_none());
+    }
+}

@@ -142,6 +142,31 @@ pub(crate) fn admit_parts(db: &Connection, prefix: &StructurePrefix, encoded_tex
     Ok(())
 }
 
+/// Enough of a decoded text for any prefix: the marker, at most `MAX_PARTS`
+/// part names and the byte count.
+const HEAD_BYTES: usize = 8 * 1024;
+
+struct Head(Vec<u8>);
+impl io::Write for Head {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let room = HEAD_BYTES - self.0.len();
+        self.0.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+/// Decodes a text object in the JSON string encoding once, returning its
+/// measures and the prefix of the text it holds.
+pub(crate) fn object_prefix(db: &Connection, hash: &str) -> StoreResult<(text_value::TextInfo, Option<StructurePrefix>)> {
+    let (rowid, length) = text_value::object_row(db, hash)?;
+    if length > text_value::MAX_VALUE_BYTES { return Err(invalid("plugin device value is too large")); }
+    let mut head = Head(Vec::new());
+    let blob = db.blob_open(rusqlite::MAIN_DB, "message_page_objects", "body", rowid, true)?;
+    let info = text_value::decode(blob, &mut head, text_value::MAX_VALUE_BYTES)?;
+    Ok((info, read_prefix(&head.0[..])?))
+}
+
 /// The parts a stored row names, or `None` for a plain row.
 pub(crate) fn row_prefix(db: &Connection, schema: &str, rowid: i64) -> StoreResult<Option<StructurePrefix>> {
     let blob = db.blob_open(schema, "plugin_device_storage", "value", rowid, true)?;
