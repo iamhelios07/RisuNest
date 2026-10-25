@@ -151,7 +151,10 @@
         if (!choice.confirmed) return
         busy = true
         try {
-            try { await switchExternalLwwLibraryFormat(connection.id) } catch { error = lww.formatSwitchFailed; return }
+            // A library already above this app's level stops sync with its own guidance, which the sync attempt records.
+            try { await switchExternalLwwLibraryFormat(connection.id) } catch (reason) {
+                if (externalFormatCode(reason) !== 'app-update-required') { error = lww.formatSwitchFailed; return }
+            }
             await requestExternalLwwNow(connection.id)
         } catch (reason) { error = externalErrorMessage(strings, reason) }
         finally {

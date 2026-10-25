@@ -372,6 +372,11 @@ describe('a library below this app data format', () => {
         click(lww.formatSwitch); await settle()
         expect(host.querySelector('[role="alert"]')?.textContent).toBe(lww.formatSwitchFailed)
         expect(f.retry).not.toHaveBeenCalled()
+        // A library already above this app is left to the sync attempt, which reports it.
+        f.switchFormat.mockRejectedValue({ code: 'app-update-required', retryable: false })
+        click(lww.formatSwitch); await settle()
+        expect(host.textContent).not.toContain(lww.formatSwitchFailed)
+        expect(f.retry).toHaveBeenCalledOnce()
     })
     it.each(['app-update-required', 'sync-server-update-required'])('offers no switch while %s stops sync', async code => {
         await open({ ...below, error: code, blockedCode: code })

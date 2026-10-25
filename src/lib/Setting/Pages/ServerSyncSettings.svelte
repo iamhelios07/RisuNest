@@ -183,7 +183,10 @@
         const choice = await alertCheckboxConfirm({ title: lww.formatSwitchTitle, description: lww.formatSwitchDescription, checkboxLabel: lww.formatSwitchAcknowledge, actionLabel: lww.formatSwitch, cancelLabel: language.cancel, requireChecked: true })
         if (!choice.confirmed) return
         await run(async () => {
-            try { await switchServerSyncLibraryFormat() } catch (error) { failure = lww.formatSwitchFailed; throw error }
+            // A library already above this app's level, or a server without levels, stops sync with its own guidance.
+            try { await switchServerSyncLibraryFormat() } catch (error) {
+                if (!['app-update-required', 'sync-server-update-required'].includes(errorCode(error))) { failure = lww.formatSwitchFailed; throw error }
+            }
             await retryServerSync()
         })
     }
