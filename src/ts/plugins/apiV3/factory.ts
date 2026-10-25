@@ -2,8 +2,6 @@ import { recordNativeLogError } from '../../nativeLog'
 import { isTauri } from '../../platform'
 import { consoleLog, installConsoleCapture, isConsoleLogLevel } from '../../consoleLog'
 import { attachPluginReadProvenance, collectPluginReadProvenance, type PluginReadProvenance } from '../pluginReadBaselines'
-import { createLocalPluginStorageJsonEncoder, requiresLocalPluginStorageEncoding } from '../localPluginStorageValue'
-import { SafeLocalPluginStorage, localPluginStorageJsonWrite } from '../pluginSafeClass'
 import { type PluginDownloadHandler } from './pluginDownload'
 import { installWebviewBridge } from '../../webviewDownload'
 
@@ -30,7 +28,6 @@ interface RpcMessage {
     abortId?: string;
     provenance?: PluginReadProvenance[];
     argProvenance?: PluginReadProvenance[][];
-    localPluginJson?: string;
     entries?: { level: unknown; message: unknown; tsMs: unknown }[];
     generation?: number;
 }
@@ -38,7 +35,6 @@ interface RpcMessage {
 interface RemoteRef {
     __type: 'REMOTE_REF';
     id: string;
-    localPluginStorage?: true;
 }
 
 interface CallbackRef {
@@ -63,7 +59,6 @@ await (async function() {
     const proxyRefRegistry = new WeakMap();
     const abortControllers = new Map();
     const readProvenance = new WeakMap();
-    const prepareLocalPluginJson = (${createLocalPluginStorageJsonEncoder.toString()})(${requiresLocalPluginStorageEncoding.toString()});
 
     function attachReadProvenance(value, entries) {
         for (const entry of entries || []) {
@@ -141,7 +136,7 @@ await (async function() {
                         id: val.id,
                         method: prop,
                         args: args
-                    }, val.localPluginStorage === true);
+                    });
                 }
             });
             // Store the mapping so we can serialize it back
@@ -227,24 +222,23 @@ await (async function() {
         }
     }
 
-    function collectTransferables(obj, transferables = [], seen = new WeakSet()) {
-        if (!obj || typeof obj !== 'object' || seen.has(obj)) return transferables;
-        seen.add(obj);
+    function collectTransferables(obj, transferables = []) {
+        if (!obj || typeof obj !== 'object') return transferables;
 
         if (obj instanceof ArrayBuffer ||
             obj instanceof MessagePort ||
             obj instanceof ImageBitmap ||
             (typeof OffscreenCanvas !== 'undefined' && obj instanceof OffscreenCanvas)) {
-            if (!transferables.includes(obj)) transferables.push(obj);
+            transferables.push(obj);
         }
         else if (ArrayBuffer.isView(obj) && obj.buffer instanceof ArrayBuffer) {
-            if (!transferables.includes(obj.buffer)) transferables.push(obj.buffer);
+            transferables.push(obj.buffer);
         }
         else if (Array.isArray(obj)) {
-            obj.forEach(item => collectTransferables(item, transferables, seen));
+            obj.forEach(item => collectTransferables(item, transferables));
         }
         else if (obj.constructor === Object) {
-            Object.values(obj).forEach(value => collectTransferables(value, transferables, seen));
+            Object.values(obj).forEach(value => collectTransferables(value, transferables));
         }
 
         return transferables;
@@ -313,7 +307,7 @@ await (async function() {
         if (obj.constructor === Object) {
             const out = {};
             for (const k of Object.keys(obj)) out[k] = replace(obj[k]);
-            return { result: ports.length ? out : obj, ports, cleanups };
+            return { result: out, ports, cleanups };
         }
 
         return { result: obj, ports, cleanups };
@@ -355,12 +349,8 @@ await (async function() {
         if (obj.__type === 'STREAM_PORT') return reconstruct(obj);
         if (Object.prototype.toString.call(obj) === '[object Object]') {
             const out = {};
-            let changed = false;
-            for (const k of Object.keys(obj)) {
-                out[k] = reconstruct(obj[k]);
-                if (out[k] !== obj[k]) changed = true;
-            }
-            return changed ? out : obj;
+            for (const k of Object.keys(obj)) out[k] = reconstruct(obj[k]);
+            return out;
         }
 
         return obj;
@@ -414,15 +404,8 @@ await (async function() {
     document.addEventListener('focusout', scheduleFocusedInputReport);
     window.addEventListener('scroll', scheduleFocusedInputReport, true);
 
-    function sendRequest(type, payload, localPluginStorage = false) {
+    function sendRequest(type, payload) {
         return new Promise((resolve, reject) => {
-            if (localPluginStorage && payload.method === 'setItem' && payload.args?.length === 2 && typeof payload.args[0] === 'string') {
-                const serialized = prepareLocalPluginJson(payload.args[1]);
-                if (serialized !== undefined) {
-                    payload.localPluginJson = serialized;
-                    payload.args = [payload.args[0]];
-                }
-            }
             const reqId = Math.random().toString(36).substring(2);
             pendingRequests.set(reqId, { resolve, reject });
 
@@ -730,9 +713,8 @@ export class SandboxHost {
         });
     }
 
-    private collectTransferables(obj: any, transferables: Transferable[] = [], seen = new WeakSet<object>()): Transferable[] {
-        if (!obj || typeof obj !== 'object' || seen.has(obj)) return transferables;
-        seen.add(obj);
+    private collectTransferables(obj: any, transferables: Transferable[] = []): Transferable[] {
+        if (!obj || typeof obj !== 'object') return transferables;
 
         if (obj instanceof ArrayBuffer ||
             obj instanceof MessagePort ||
@@ -740,16 +722,16 @@ export class SandboxHost {
             obj instanceof WritableStream ||
             obj instanceof TransformStream ||
             (typeof OffscreenCanvas !== 'undefined' && obj instanceof OffscreenCanvas)) {
-            if (!transferables.includes(obj)) transferables.push(obj);
+            transferables.push(obj);
         }
         else if (ArrayBuffer.isView(obj) && obj.buffer instanceof ArrayBuffer) {
-            if (!transferables.includes(obj.buffer)) transferables.push(obj.buffer);
+            transferables.push(obj.buffer);
         }
         else if (Array.isArray(obj)) {
-            obj.forEach(item => this.collectTransferables(item, transferables, seen));
+            obj.forEach(item => this.collectTransferables(item, transferables));
         }
         else if (obj.constructor === Object) {
-            Object.values(obj).forEach(value => this.collectTransferables(value, transferables, seen));
+            Object.values(obj).forEach(value => this.collectTransferables(value, transferables));
         }
 
         return transferables;
@@ -768,8 +750,7 @@ export class SandboxHost {
 
             const id = 'ref_' + Math.random().toString(36).substring(2);
             this.instanceRegistry.set(id, val);
-            return { __type: 'REMOTE_REF', id,
-                ...(val instanceof SafeLocalPluginStorage ? { localPluginStorage: true } : {}) } as RemoteRef;
+            return { __type: 'REMOTE_REF', id } as RemoteRef;
         }
 
         if(val instanceof Response) {
@@ -978,7 +959,7 @@ export class SandboxHost {
         if (obj.constructor === Object) {
             const out: any = {};
             for (const k of Object.keys(obj)) out[k] = replace(obj[k]);
-            return { result: ports.length ? out : obj, ports, cleanups };
+            return { result: out, ports, cleanups };
         }
 
         return { result: obj, ports, cleanups };
@@ -1040,12 +1021,8 @@ export class SandboxHost {
         if (obj.__type === 'STREAM_PORT') return reconstruct(obj);
         if (obj.constructor === Object) {
             const out: any = {};
-            let changed = false;
-            for (const k of Object.keys(obj)) {
-                out[k] = reconstruct(obj[k]);
-                if (out[k] !== obj[k]) changed = true;
-            }
-            return changed ? out : obj;
+            for (const k of Object.keys(obj)) out[k] = reconstruct(obj[k]);
+            return out;
         }
 
         return obj;
@@ -1196,10 +1173,6 @@ export class SandboxHost {
                 if (storageMutation) this.pendingStorageMutations += 1;
                 try {
 
-                    if (Object.hasOwn(data, 'localPluginJson') && (data.type !== 'CALL_INSTANCE' || data.method !== 'setItem')) {
-                        throw new TypeError('Invalid local plugin JSON write');
-                    }
-
                     const args = this.deserializeArgs(data.args || [], usedAbortIds);
                     const signalKey = data.type === 'CALL_ROOT' ? requestSignalKeys.get(String(data.method)) : undefined;
                     let downloadSignal: AbortSignal | undefined;
@@ -1235,14 +1208,7 @@ export class SandboxHost {
                         const instance = this.instanceRegistry.get(data.id!);
                         if (!instance) throw new Error("Instance not found or released");
                         if (typeof instance[data.method!] !== 'function') throw new Error(`Method ${data.method} missing on instance`);
-                        if (Object.hasOwn(data, 'localPluginJson')) {
-                            if (!(instance instanceof SafeLocalPluginStorage) || args.length !== 1) {
-                                throw new TypeError('Invalid local plugin JSON write');
-                            }
-                            result = await instance[localPluginStorageJsonWrite](args[0], data.localPluginJson!);
-                        } else {
-                            result = await instance[data.method!](...args);
-                        }
+                        result = await instance[data.method!](...args);
                     }
 
 
