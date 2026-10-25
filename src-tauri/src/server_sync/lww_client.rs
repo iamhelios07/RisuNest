@@ -251,9 +251,22 @@ fn observe_descriptor_purposes(
 type ClockKey = (std::path::PathBuf, String, String);
 static CLOCKS: std::sync::Mutex<std::collections::BTreeMap<ClockKey, (Instant, AdmittedClock)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
-/// Libraries seen at this client's format level, by address and library. A
-/// level never goes down, so a library seen there stays there.
+/// Libraries seen at this client's format level, by address and library,
+/// until a reply reports another level or comes from a server without levels.
 static CURRENT_FORMAT: std::sync::Mutex<BTreeSet<(String, String)>> = std::sync::Mutex::new(BTreeSet::new());
+/// Forgets a library seen at this client's level when a reply reports another
+/// level, or succeeds without the level headers, so the next check reads it again.
+pub(crate) fn observe_library_format(endpoint: &str, library_id: &str, status: u16, format: Option<LibraryFormat>) {
+    let changed = match format {
+        Some(format) => format.level != LEVEL,
+        None => (200..300).contains(&status),
+    };
+    if changed {
+        if let Ok(mut current) = CURRENT_FORMAT.lock() {
+            current.remove(&(endpoint.to_owned(), library_id.to_owned()));
+        }
+    }
+}
 pub(crate) struct LwwClient {
     pub client: ServerClient,
     pub log: OperationLog,
@@ -374,7 +387,7 @@ impl LwwClient {
     /// Fails unless the library is at this client's format level. An empty
     /// library is switched to it, and with `switch` any library below it is.
     pub(crate) fn require_library_format(&self, store: &mut PersistentStore, switch: bool) -> Result<()> {
-        if CURRENT_FORMAT.lock().is_ok_and(|current| current.contains(&self.format_key())) {
+        if !switch && CURRENT_FORMAT.lock().is_ok_and(|current| current.contains(&self.format_key())) {
             return Ok(());
         }
         let (head, format) = self.client.head_with_format()?;

@@ -859,6 +859,7 @@ impl ServerClient {
         capture.response(response.status().as_u16(), response.url().as_str(), response.headers());
         let status = response.status().as_u16();
         let library_format = super::library_format::read(response.headers())?;
+        super::lww_client::observe_library_format(&config.endpoint, &config.library_id, status, library_format);
         let object_range = response
             .headers()
             .get("x-risu-object-range")

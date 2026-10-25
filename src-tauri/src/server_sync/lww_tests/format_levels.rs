@@ -101,6 +101,42 @@ fn a_reply_without_this_level_stops_sync_and_no_level_is_pushed() {
 }
 
 #[test]
+fn a_library_seen_at_this_level_is_checked_again_once_a_reply_reports_otherwise() {
+    use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+    let rolled_back = Arc::new(AtomicBool::new(false));
+    let server = LocalServerFixture::with_router({
+        let rolled_back = rolled_back.clone();
+        move |router| {
+            router.layer(axum::middleware::map_response(move |mut response: axum::response::Response| {
+                let rolled_back = rolled_back.clone();
+                async move {
+                    if rolled_back.load(Ordering::SeqCst) {
+                        response.headers_mut().remove(HEADER);
+                        response.headers_mut().remove(MAX_HEADER);
+                    }
+                    response
+                }
+            }))
+        }
+    });
+    let (_a, mut a) = local();
+    let ca = server.client(&a);
+    save(&mut a, &["root", "language"], json!("ja"));
+    drain_publications(&ca, &mut a, &[]).unwrap();
+    let request = header(&a);
+    // A switch reads the level again although this process has seen it.
+    rolled_back.store(true, Ordering::SeqCst);
+    assert_eq!(ca.check_library_format(&mut a, &request, true).unwrap_err().code, "sync-server-update-required");
+    rolled_back.store(false, Ordering::SeqCst);
+    ca.check_library_format(&mut a, &request, true).unwrap();
+    // Once a reply arrives without the level headers, the next check reads them again.
+    rolled_back.store(true, Ordering::SeqCst);
+    save(&mut a, &["root", "language"], json!("en"));
+    drain_publications(&ca, &mut a, &[]).unwrap();
+    assert_eq!(ca.check_library_format(&mut a, &request, false).unwrap_err().code, "sync-server-update-required");
+}
+
+#[test]
 fn a_lost_race_for_an_empty_library_follows_the_level_its_refusal_reports() {
     for (level, outcome) in [("1", Some("library-format-switch-required")), ("2", None)] {
         let server = LocalServerFixture::with_router(move |router| {
