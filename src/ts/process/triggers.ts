@@ -1,5 +1,5 @@
 import { userScriptConsole } from '../userScriptConsole'
-import { RegexExecutor } from './regexExecutor'
+import { RegexExecutor, REGEX_TEST_BATCH_SIZE } from './regexExecutor'
 import { replaceRegexMatches, type RegexOperationResults } from './regexOperations'
 import { createRegexTimeoutScope, generationRegexTimeoutScope, type RegexTimeoutScope } from './regexTimeoutScope'
 import { getDisplayRegexTimeoutScope, noticeRegexTimeout } from './scriptTimeoutNotice'
@@ -2663,11 +2663,20 @@ async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTrigge
                     char.globalLore = char.globalLore ?? []
                     const name = effect.nameType === 'value' ? risuChatParser(effect.name,{chara:char}) : getVar(risuChatParser(effect.name,{chara:char}))
                     const matchingIndices: number[] = []
-                    for (let i = 0; i < char.globalLore.length; i++) {
-                        const lore = char.globalLore[i]
-                        if (lore && lore.comment !== undefined && await regexOperation('test', name, 'i', lore.comment)) {
-                            matchingIndices.push(i)
+                    const key = JSON.stringify(['trigger', char.chaId, regexTrigger, 'test', regexRule])
+                    // A batch reads the lorebook when it starts, so it sees changes made while earlier batches ran.
+                    for (let start = 0; start < char.globalLore.length; start += REGEX_TEST_BATCH_SIZE) {
+                        const indices: number[] = []
+                        const comments: string[] = []
+                        for (let i = start; i < Math.min(start + REGEX_TEST_BATCH_SIZE, char.globalLore.length); i++) {
+                            const lore = char.globalLore[i]
+                            if (lore && lore.comment !== undefined) {
+                                indices.push(i)
+                                comments.push(lore.comment)
+                            }
                         }
+                        const matches = await regexExecutor.testEach(name, 'i', comments, key)
+                        matchingIndices.push(...indices.filter((_, index) => matches[index]))
                     }
                     setVar(risuChatParser(effect.outputVar, {chara:char}), JSON.stringify(matchingIndices))
                     break

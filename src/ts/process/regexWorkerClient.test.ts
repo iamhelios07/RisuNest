@@ -281,6 +281,23 @@ describe('bounded regex execution through the real Worker handler', () => {
         } finally { vi.useRealTimers() }
     })
 
+    it('does not wait for other regex work when testEach has no inputs', async () => {
+        vi.useFakeTimers()
+        const executor = new RegexExecutor({ client: new RegexWorkerClient(() => new StallingWorker()), worker: true, requestTimeoutMs: 10 })
+        const stalled = executor.operation({ kind: 'test', pattern: 'SLOW-lock', flags: '', input: 'text' })
+        try {
+            let empty: boolean[] | undefined
+            void executor.testEach('a', '', [], 'empty').then((value) => { empty = value })
+            await vi.advanceTimersByTimeAsync(0)
+            expect(empty).toEqual([])
+        } finally {
+            // Let the stalled operation time out so later tests get the regex lock.
+            await vi.advanceTimersByTimeAsync(10)
+            await stalled
+            vi.useRealTimers()
+        }
+    })
+
     it('preserves callback captures, optional named groups, zero-width matches, and split semantics', async () => {
         const executor = new RegexExecutor({ client: new RegexWorkerClient(() => new InMemoryWorker()), worker: true })
         const input = '😀ab a'
@@ -495,6 +512,48 @@ describe('RegexWorkerClient', () => {
             await vi.advanceTimersByTimeAsync(10)
             expect(await outcome).toMatchObject({ name: 'RegexExecutionTimeoutError', ruleIndex: 2 })
         } finally { vi.useRealTimers() }
+    })
+
+    it('times each testEach input separately and keeps the results before the one that timed out', async () => {
+        vi.useFakeTimers()
+        try {
+            // Each input takes 6 ms, so the inputs together outlast the 10 ms limit.
+            class PacedWorker extends FakeWorker {
+                constructor(private readonly finished: number) { super() }
+                override postMessage(message: RegexWorkerRequest): void {
+                    super.postMessage(message)
+                    if (message.type !== 'testEach') return
+                    const matches = message.inputs.map((input) => input === message.pattern)
+                    matches.slice(0, this.finished).forEach((matched, index) => setTimeout(() => {
+                        this.respond({ type: 'progress', id: message.id, index, matched })
+                        if (index === message.inputs.length - 1) this.respond({ type: 'operationResult', id: message.id, value: matches })
+                    }, 6 * (index + 1)))
+                }
+            }
+            const finished = new RegexWorkerClient(() => new PacedWorker(3)).testEach('a', '', ['a', 'b', 'a'], { timeoutMs: 10 })
+            await vi.advanceTimersByTimeAsync(18)
+            await expect(finished).resolves.toEqual([true, false, true])
+
+            const stalled = new RegexWorkerClient(() => new PacedWorker(2)).testEach('a', '', ['a', 'b', 'a'], { timeoutMs: 10 })
+                .catch((error) => error)
+            await vi.advanceTimersByTimeAsync(21)
+            let settled = false
+            void stalled.then(() => { settled = true })
+            await vi.advanceTimersByTimeAsync(0)
+            expect(settled).toBe(false)
+            await vi.advanceTimersByTimeAsync(1)
+            expect(await stalled).toMatchObject({ name: 'RegexExecutionTimeoutError', matches: [true, false] })
+        } finally { vi.useRealTimers() }
+    })
+
+    it('reports each testEach input as it finishes, starting each at its beginning as separate operations would', () => {
+        const responses: RegexWorkerResponse[] = []
+        createRegexWorkerMessageHandler((response) => responses.push(response))({ type: 'testEach', id: 1, pattern: 'a', flags: 'g', inputs: ['a', 'a'] })
+        expect(responses).toEqual([
+            { type: 'progress', id: 1, index: 0, matched: true },
+            { type: 'progress', id: 1, index: 1, matched: true },
+            { type: 'operationResult', id: 1, value: [true, true] },
+        ])
     })
 
     it('allows only parser-independent plain replacement plans and inputs', () => {

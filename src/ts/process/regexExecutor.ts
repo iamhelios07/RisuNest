@@ -8,6 +8,8 @@ import { DEFAULT_REGEX_WORKER_TIMEOUT_MS, getSharedRegexWorkerClient, isRegexWor
 import { createRegexTimeoutScope, type RegexTimeoutScope } from './regexTimeoutScope'
 
 export const DEFAULT_REGEX_INVOCATION_TIMEOUT_MS = 30_000
+// The most inputs a caller passes to one `testEach` call.
+export const REGEX_TEST_BATCH_SIZE = 64
 export class RegexRuleSkippedError extends Error {}
 
 // Hold the queue through isolation so other rows cannot retry the culprit first.
@@ -143,6 +145,34 @@ export class RegexExecutor {
             this.lastOperationSkipped = true
             return unmatchedRegexOperation(operation)
         }
+    }
+
+    /**
+     * Tests inputs in order, as one `test` operation each would, under one lock acquisition and
+     * one Worker request, so other regex work waits at most one batch. A timeout keeps the
+     * earlier results and skips the rest.
+     */
+    async testEach(pattern: string, flags: string, inputs: readonly string[], key: string): Promise<boolean[]> {
+        if (inputs.length === 0) return []
+        return runExclusive(this.options.signal, async () => {
+            const sent = inputs.map((input) => !this.skipped(key, input))
+            const sentInputs = inputs.filter((_, index) => sent[index])
+            let matches: boolean[] = []
+            if (sentInputs.length > 0) {
+                try {
+                    matches = await this.request(
+                        (timeoutMs) => this.client.testEach(pattern, flags, sentInputs, { timeoutMs, signal: this.options.signal }),
+                        () => sentInputs.map((input) => executeRegexOperation({ kind: 'test', pattern, flags, input })),
+                    )
+                } catch (error) {
+                    if (!(error instanceof RegexExecutionTimeoutError)) throw error
+                    matches = error.matches ?? []
+                    if (matches.length < sentInputs.length) this.timeout(key, sentInputs[matches.length])
+                }
+            }
+            let next = 0
+            return inputs.map((_, index) => sent[index] && (matches[next++] ?? false))
+        })
     }
 
     async scriptOperation<K extends keyof RegexOperationResults>(operation: RegexOperation<K>, key: string): Promise<RegexOperationResults[K]> {
