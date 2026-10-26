@@ -33,9 +33,11 @@ export function isServerSyncUnavailable(error: unknown): boolean {
     if (typeof error === 'object' && error && 'retryable' in error && error.retryable === false) return false
     const code = serverSyncErrorCode(error)
     if (['server-unreachable', 'server-timeout', 'server-updating', 'request-timeout', 'incomplete-response', 'directory-unreachable', 'directory-response-error', 'directory-incomplete-response', 'sync-retry-budget-exhausted'].includes(code)) return true
+    if (typeof error !== 'object' || error === null || !('status' in error) || typeof error.status !== 'number') return false
+    // Only an activation's server check marks its failures, so a rate limit or a coded 5xx there came from the server.
+    if ('startupLocalReady' in error && (error.status === 429 || error.status >= 500 && error.status < 600)) return true
     // Tunnel/gateway HTML responses have no Sync error body.
-    return code === 'server-response-error' && typeof error === 'object' && error !== null
-        && 'status' in error && typeof error.status === 'number' && error.status >= 500 && error.status < 600
+    return code === 'server-response-error' && error.status >= 500 && error.status < 600
 }
 type Lane = 'push' | 'pull' | 'connect'
 

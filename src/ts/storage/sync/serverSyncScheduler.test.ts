@@ -12,7 +12,10 @@ describe('server LWW foreground scheduler', () => {
     it('classifies tunnel outages and timeouts without masking authentication or local failures', () => {
         for (const status of [502, 503, 504, 530]) expect(isServerSyncUnavailable({ code: 'server-response-error', status })).toBe(true)
         for (const code of ['server-timeout', 'server-updating', 'incomplete-response', 'sync-retry-budget-exhausted']) expect(isServerSyncUnavailable({ code })).toBe(true)
-        for (const error of [{ code: 'server-response-error', status: 401 }, { code: 'local-storage', status: 503 }, { code: 'server-unreachable', status: 409, retryable: false }, new TypeError('Load failed')]) {
+        // An activation's server check marks its failures with startupLocalReady.
+        for (const status of [429, 500, 503]) expect(isServerSyncUnavailable({ code: 'worker-unavailable', status, retryable: true, startupLocalReady: false })).toBe(true)
+        for (const error of [{ code: 'server-response-error', status: 401 }, { code: 'local-storage', status: 503 }, { code: 'server-unreachable', status: 409, retryable: false }, new TypeError('Load failed'),
+            { code: 'device-busy', status: 429, retryable: true }, { code: 'worker-unavailable', status: 503, retryable: true }, { code: 'server-response-error', status: 409, retryable: false, startupLocalReady: true }]) {
             expect(isServerSyncUnavailable(error)).toBe(false)
         }
     })
