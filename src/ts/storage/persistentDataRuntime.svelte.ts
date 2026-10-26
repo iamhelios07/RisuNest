@@ -227,10 +227,11 @@ export function createProductionStateAdapter(options: {
                 forceScalableProjection,
             ) ?? database
             if (isTauri) replacement.account = getDatabase().account
-            for (const character of replacement.characters) {
+            setDatabase(replacement)
+            // Loading clears every streaming flag, so running generations restore theirs afterwards.
+            for (const character of getDatabase().characters) {
                 for (const chat of character.chats) restoreStreamingConversationState(chat)
             }
-            setDatabase(replacement)
             notifyPluginStorageAuthorityReplacement()
             restoreStableWorkingSetSelection(
                 replacement,
