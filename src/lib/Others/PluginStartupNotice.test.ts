@@ -37,7 +37,7 @@ async function render() {
 const labels = () => [...document.querySelectorAll('aside button')].map(button => button.getAttribute('aria-label') ?? button.textContent?.trim())
 const close = () => document.querySelector<HTMLButtonElement>(`aside button[aria-label="${language.close}"]`)!.click()
 
-it('waits one second, closes until the next wait or failure, and hides after release', async () => {
+it('waits one second, closes until the next wait, stop or failure, and hides after release', async () => {
     vi.useFakeTimers()
     const since = Date.now()
     pluginStartupState.set({ phase: 'waiting', since })
@@ -48,6 +48,14 @@ it('waits one second, closes until the next wait or failure, and hides after rel
     await vi.advanceTimersByTimeAsync(1); await tick()
     expect(document.querySelector('[role="status"]')?.textContent).toBe(language.risuNest.pluginStartup.waiting)
     close(); await tick()
+    expect(document.querySelector('aside')).toBeNull()
+
+    // A stop while plugins still wait shows again; closing it holds even after it clears.
+    syncStatus.set({ target: 'server', syncNow: async () => {}, pendingChanges: async () => 0,
+        view: { status: { configured: true, bound: true }, running: false, paused: true, error: 'clock-skew' } as ServerSyncView }); await tick()
+    expect(document.querySelector('[role="alert"]')).not.toBeNull()
+    close(); await tick()
+    syncStatus.set(null); await tick()
     expect(document.querySelector('aside')).toBeNull()
 
     // A failure keeps the wait's start time and still shows.
@@ -74,10 +82,12 @@ it.each(['unauthorized', 'invalid-device-token', 'rate-limited'])('reports the s
         target: 'server', syncNow: async () => {}, pendingChanges: async () => 0,
         view: { status: { configured: true, bound: true }, running: false, paused: true, error: code } as ServerSyncView,
     }
-    syncStatus.set(source)
+    syncStatus.set(source); await tick()
+    const display = syncStatusDisplay(source, externalStorageStrings(DBState.db.language), false)
+    // The stop shows while plugins still wait.
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.label)
     pluginStartupState.set({ phase: 'failed', since: Date.now(), error: new Error('Sync binding is unavailable'), target: 'server' }); await tick()
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(language.risuNest.pluginStartup.syncUnfinished)
-    const display = syncStatusDisplay(source, externalStorageStrings(DBState.db.language), false)
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.label)
     if (code !== 'rate-limited') expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.error)
     expect(labels()).toContain(language.retry)
