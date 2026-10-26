@@ -1121,15 +1121,17 @@ interface PluginStorage {
  * Uses generic types for flexible value storage.
  * In RisuNest each plugin sees only the values it wrote.
  *
- * Values follow the structured clone range: primitives including undefined,
- * NaN, Infinity, -0 and BigInt; plain objects and arrays (holes included);
- * Date, RegExp, Map, Set, Error and primitive wrapper objects; ArrayBuffer,
- * every TypedArray and DataView; Blob and File. Objects reached more than once
- * stay shared. setItem throws RangeError for a cycle made only of plain objects
- * and arrays, and DataCloneError for an ArrayBuffer reached twice through them;
- * inside a Map, a Set or any other object, both are kept. A top-level undefined
- * is stored as null. On the web only values that JSON represents exactly are
- * kept; others are rejected (see `getRuntimeInfo().structuredLocalPluginStorage`).
+ * These values are kept: primitives including undefined, NaN, Infinity, -0
+ * and BigInt; plain objects and arrays (holes included); Date, RegExp, Map,
+ * Set, Error and primitive wrapper objects; ArrayBuffer, every TypedArray and
+ * DataView; Blob and File. setItem rejects other values, including ImageData,
+ * CryptoKey, DOMException, DOMMatrix, DOMPoint, DOMRect, DOMQuad and
+ * FileList. Objects reached more than once stay shared. setItem throws
+ * RangeError for a cycle made only of plain objects and arrays, and
+ * DataCloneError for an ArrayBuffer reached twice through them; inside a Map,
+ * a Set or any other object, both are kept. A top-level undefined is stored
+ * as null. On the web only values that JSON represents exactly are kept;
+ * others are rejected (see `getRuntimeInfo().structuredLocalPluginStorage`).
  * A value may take up to 512 MiB.
  *
  * **All methods return Promises** due to iframe message passing.
@@ -1138,7 +1140,7 @@ interface PluginStorage {
  * ```typescript
  * const storage = await risuai.getLocalPluginStorage();
  *
- * // Store JSON data, or Map, Date, binary data and other cloneable values
+ * // Store JSON data, or Map, Date, binary data and the other values above
  * await storage.setItem('config', { theme: 'dark', fontSize: 14 });
  *
  * // Retrieve data with type safety
@@ -1162,7 +1164,7 @@ interface SafeLocalPluginStorage {
     /**
      * Sets an item in storage
      * @param key - Storage key
-     * @param value - Value to store (any value in the structured clone range)
+     * @param value - Value to store (see SafeLocalPluginStorage for the values kept)
      * @returns Promise that resolves when item is stored
      */
     setItem<T>(key: string, value: T): Promise<void>;

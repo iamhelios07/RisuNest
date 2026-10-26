@@ -717,7 +717,7 @@ These checks cannot detect a remote change that this device has not received yet
 
 `getLocalPluginStorage()` is also device-local and follows the same sync rule as `safeLocalStorage`. Unlike `safeLocalStorage`, it accepts objects and binary data and is appropriate for device-only settings, caches and files. In RisuNest it is confined to your plugin, and it is a separate space from `safeLocalStorage`, so clearing one leaves the other alone.
 
-`getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that keeps values in the structured clone range (unlike `safeLocalStorage` which is strings-only), with generic type support:
+`getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that keeps objects and binary data (unlike `safeLocalStorage` which is strings-only), with generic type support:
 
 ```javascript
 const storage = await Risuai.getLocalPluginStorage();
@@ -737,7 +737,7 @@ await storage.removeItem('config');
 await storage.clear();
 ```
 
-Values follow the structured clone range: primitives including `undefined`, `NaN`, `Infinity`, `-0` and `BigInt`; plain objects and arrays, holes included; `Date`, `RegExp`, `Map`, `Set`, `Error` and primitive wrapper objects; `ArrayBuffer`, every TypedArray and `DataView`; `Blob` and `File`. An object reached more than once stays shared when it is read back. `setItem` throws `RangeError` for a cycle made only of plain objects and arrays, and `DataCloneError` for an `ArrayBuffer` reached twice through them (two views over one buffer, for example); inside a `Map`, a `Set` or any other object, cycles and shared buffers are kept. A top-level `undefined` is stored as `null`. On the web only values that JSON represents exactly are kept, and `setItem` rejects any other value with an error; `getRuntimeInfo().structuredLocalPluginStorage` is `false` there and `true` where the full range is kept.
+These values are kept: primitives including `undefined`, `NaN`, `Infinity`, `-0` and `BigInt`; plain objects and arrays, holes included; `Date`, `RegExp`, `Map`, `Set`, `Error` and primitive wrapper objects; `ArrayBuffer`, every TypedArray and `DataView`; `Blob` and `File`. `setItem` rejects other values with an error, including `ImageData`, `CryptoKey`, `DOMException`, `DOMMatrix`, `DOMPoint`, `DOMRect`, `DOMQuad` and `FileList`. An object reached more than once stays shared when it is read back. `setItem` throws `RangeError` for a cycle made only of plain objects and arrays, and `DataCloneError` for an `ArrayBuffer` reached twice through them (two views over one buffer, for example); inside a `Map`, a `Set` or any other object, cycles and shared buffers are kept. A top-level `undefined` is stored as `null`. On the web only values that JSON represents exactly are kept, and `setItem` rejects any other value with an error; `getRuntimeInfo().structuredLocalPluginStorage` is `false` there and `true` where all of the values above are kept.
 
 **Use `getLocalPluginStorage()` when:**
 - You need to store objects or binary data (not just strings)
