@@ -83,6 +83,13 @@ test('local plugin storage keeps structured clone values across the real iframe 
         await storage.setItem('value', { map, when: new Date(7), big: 5n, nan: NaN, negativeZero: -0, holes: [1, , 3],
             missing: undefined, set: new Set(['a']), blob: new Blob(['hi'], { type: 'text/plain' }) });
         await storage.setItem('plain', { a: [1] });
+        const shared = new Uint8Array([1, 2, 3, 4]).buffer;
+        const graph = { views: [new Uint8Array(shared, 0, 2), new Uint8Array(shared, 2, 2)], byRoot: new Map() };
+        graph.self = graph;
+        graph.list = [graph];
+        graph.byRoot.set('root', graph);
+        await storage.setItem('graph', graph);
+        const back = await storage.getItem('graph');
         const restored = await storage.getItem('value');
         const view = restored.map.get('view');
         await risuai.result({
@@ -92,11 +99,14 @@ test('local plugin storage keeps structured clone values across the real iframe 
             hole: restored.holes.length === 3 && !(1 in restored.holes), missing: 'missing' in restored && restored.missing === undefined,
             set: restored.set instanceof Set && restored.set.has('a'), blob: [restored.blob.type, await restored.blob.text()],
             plain: await storage.getItem('plain'),
+            graph: [back.self === back, back.list[0] === back, back.byRoot.get('root') === back,
+                back.views[0].buffer === back.views[1].buffer, Array.from(back.views[1])],
         });
     `))
     await expect.poll(() => page.evaluate(() => window.boundary.localResult)).toEqual({
         cycle: true, shared: true, bytes: [255, 128], time: 7, big: true, nan: true, negativeZero: true,
         hole: true, missing: true, set: true, blob: ['text/plain', 'hi'], plain: { a: [1] },
+        graph: [true, true, true, true, [3, 4]],
     })
     const rows = await page.evaluate(() => window.boundary.localRows)
     expect(rows.find(row => row.key === 'plain')?.value).toBe('{"a":[1]}')

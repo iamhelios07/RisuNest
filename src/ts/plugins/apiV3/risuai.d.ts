@@ -1126,11 +1126,9 @@ interface PluginStorage {
  * Set, Error and primitive wrapper objects; ArrayBuffer, every TypedArray and
  * DataView; Blob and File. setItem rejects other values, including ImageData,
  * CryptoKey, DOMException, DOMMatrix, DOMPoint, DOMRect, DOMQuad and
- * FileList. Objects reached more than once stay shared. setItem throws
- * RangeError for a cycle made only of plain objects and arrays, and
- * DataCloneError for an ArrayBuffer reached twice through them; inside a Map,
- * a Set or any other object, both are kept. A top-level undefined is stored
- * as null. On the web only values that JSON represents exactly are kept;
+ * FileList. Objects reached more than once stay shared, cycles and an
+ * ArrayBuffer under two views included. A top-level undefined is stored as
+ * null. On the web only values that JSON represents exactly are kept;
  * others are rejected (see `getRuntimeInfo().structuredLocalPluginStorage`).
  * A value may take up to 512 MiB.
  *
