@@ -2198,7 +2198,7 @@ impl PersistentStore {
         &self,
         staging_id: &str,
     ) -> StoreResult<commit::StagedPluginPreview> {
-        commit::staged_plugin_preview(&self.connection, staging_id)
+        commit::staged_plugin_preview(&self.connection, &self.repository_root, staging_id)
     }
 
     pub(crate) fn staged_library_counts(&self, staging_id: &str) -> StoreResult<(u64, u64)> {
@@ -2258,6 +2258,7 @@ impl PersistentStore {
     ) -> StoreResult<RevisionResult> {
         let revision = commit::replace_preserve_repositories(
             &mut self.connection,
+            &self.repository_root,
             staging_id,
             expected_revision,
         )?;
