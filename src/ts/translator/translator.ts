@@ -260,12 +260,16 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
                         "Accept": "*/*",
                     },
                     method: "GET",
+                    // The page is HTML, which the default JSON response would fail to parse.
+                    rawResponse: true,
                 })
-                const parser = new DOMParser()
-                const dom = parser.parseFromString(d.data, 'text/html')
-                const result = dom.querySelector('.result-container')?.textContent?.trim()
-                if(result){
-                    return result
+                if(d.ok){
+                    const parser = new DOMParser()
+                    const dom = parser.parseFromString(new TextDecoder().decode(d.data), 'text/html')
+                    const result = dom.querySelector('.result-container')?.textContent?.trim()
+                    if(result){
+                        return result
+                    }
                 }
             } catch (error) {
                 
