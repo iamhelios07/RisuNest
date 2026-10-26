@@ -358,7 +358,7 @@ await (async function() {
             let changed = false;
             for (const k of Object.keys(obj)) {
                 out[k] = reconstruct(obj[k]);
-                if (out[k] !== obj[k]) changed = true;
+                if (!Object.is(out[k], obj[k])) changed = true;
             }
             // Without streams the result is kept as it is, so references back to it stay intact.
             return changed ? out : obj;

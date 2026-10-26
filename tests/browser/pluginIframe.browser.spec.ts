@@ -84,7 +84,7 @@ test('local plugin storage keeps structured clone values across the real iframe 
             missing: undefined, set: new Set(['a']), blob: new Blob(['hi'], { type: 'text/plain' }) });
         await storage.setItem('plain', { a: [1] });
         const shared = new Uint8Array([1, 2, 3, 4]).buffer;
-        const graph = { views: [new Uint8Array(shared, 0, 2), new Uint8Array(shared, 2, 2)], byRoot: new Map() };
+        const graph = { views: [new Uint8Array(shared, 0, 2), new Uint8Array(shared, 2, 2)], byRoot: new Map(), nan: NaN };
         graph.self = graph;
         graph.list = [graph];
         graph.byRoot.set('root', graph);
@@ -100,13 +100,13 @@ test('local plugin storage keeps structured clone values across the real iframe 
             set: restored.set instanceof Set && restored.set.has('a'), blob: [restored.blob.type, await restored.blob.text()],
             plain: await storage.getItem('plain'),
             graph: [back.self === back, back.list[0] === back, back.byRoot.get('root') === back,
-                back.views[0].buffer === back.views[1].buffer, Array.from(back.views[1])],
+                back.views[0].buffer === back.views[1].buffer, Array.from(back.views[1]), Number.isNaN(back.nan)],
         });
     `))
     await expect.poll(() => page.evaluate(() => window.boundary.localResult)).toEqual({
         cycle: true, shared: true, bytes: [255, 128], time: 7, big: true, nan: true, negativeZero: true,
         hole: true, missing: true, set: true, blob: ['text/plain', 'hi'], plain: { a: [1] },
-        graph: [true, true, true, true, [3, 4]],
+        graph: [true, true, true, true, [3, 4], true],
     })
     const rows = await page.evaluate(() => window.boundary.localRows)
     expect(rows.find(row => row.key === 'plain')?.value).toBe('{"a":[1]}')
