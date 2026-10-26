@@ -390,6 +390,21 @@ fn characters_staged_in_pieces_match_characters_staged_whole() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(recency, [("conv-long".to_owned(), 1_700_000_000_129), ("conv-short".to_owned(), 0)]);
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let many = store.replace_begin().unwrap().staging_id;
+    let mut steps = Vec::new();
+    for index in 0..256 {
+        let counted = Arc::new(AtomicUsize::new(0));
+        let counter = counted.clone();
+        store.connection.progress_handler(1, Some(move || { counter.fetch_add(1, Ordering::Relaxed); false })).unwrap();
+        store
+            .replace_put_character_detail(&many, &json!({ "chaId": format!("many-{index}"), "name": "Many", "type": "character" }), 0)
+            .unwrap();
+        store.connection.progress_handler(1, None::<fn() -> bool>).unwrap();
+        steps.push(counted.load(Ordering::Relaxed));
+    }
+    assert!(steps[255] <= steps[0] * 2, "{steps:?}");
 }
 
 #[test]
