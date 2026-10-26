@@ -76,8 +76,9 @@ pub(crate) trait ReplacementSink: Send + Sync {
     fn expands_cold_payloads(&self) -> bool {
         false
     }
-    fn cold_payload_path(&self, _key: &str) -> Option<PathBuf> {
-        None
+    /// A staged payload for the key; an error stops the restore.
+    fn cold_payload_path(&self, _key: &str) -> StoreResult<Option<PathBuf>> {
+        Ok(None)
     }
     /// Set for a key whose entry the archive holds but could not stage.
     fn unavailable_cold_payload_reason(&self, _key: &str) -> Option<ColdPayloadUnavailable> {
@@ -181,7 +182,6 @@ impl RestoreControl for JobControl {
 pub(crate) struct RestoreProgressScale {
     pub(crate) result_source: Option<(u64, String)>,
     pub(crate) spool_directory: Option<PathBuf>,
-    pub(crate) reject_cold_references: bool,
     /// Bytes already counted before the database read started.
     pub(crate) base_bytes: u64,
     /// Fixed total for the whole job; `None` uses the database size.
@@ -369,7 +369,6 @@ fn restore_risu_save_reader_controlled<R: Read>(
             .map_err(|error| job_error(job, error))?;
     }
     let spool_directory = scale.spool_directory.clone();
-    let reject_cold_references = scale.reject_cold_references;
     let mut prefix = [0; 2];
     source.read_exact(&mut prefix).map_err(|_| invalid_source("could not read database header"))?;
     let unframed = if is_zlib_header(&prefix) { Some(RisuSaveFormat::HistoricalCompressed) }
@@ -380,7 +379,7 @@ fn restore_risu_save_reader_controlled<R: Read>(
     let staging_id = sink.begin().map_err(store_error)?.staging_id;
     let outcome = (|| {
         let parsed = match format {
-            RisuSaveFormat::Block => parse_and_stage(&mut reader, &staging_id, job, sink, limits, spool_directory.as_deref().ok_or_else(|| store_error(StoreError::Store { message: "Restore spool directory is unavailable".into() }))?, reject_cold_references)?,
+            RisuSaveFormat::Block => parse_and_stage(&mut reader, &staging_id, job, sink, limits, spool_directory.as_deref().ok_or_else(|| store_error(StoreError::Store { message: "Restore spool directory is unavailable".into() }))?)?,
             RisuSaveFormat::LegacyRaw => {
                 parse_and_stage_legacy(&mut reader, &staging_id, job, sink, limits)?
             }
@@ -1301,16 +1300,6 @@ impl<S: TrackedSource> TrackedSource for GzDecoder<BufReader<S>> {
     }
 }
 
-fn cold_expansion_required() -> NativeJobError {
-    NativeJobError::new("cold-expansion-required", "Official snapshot requires cold payload expansion before activation")
-}
-
-fn has_cold_references(character: &Value) -> bool {
-    character.get("coldstorage").and_then(Value::as_str).is_some_and(|key| !key.is_empty()) ||
-    character.get("chats").and_then(Value::as_array).is_some_and(|chats| chats.iter().any(|chat|
-        chat.get("message").and_then(Value::as_array).and_then(|messages| messages.first()).and_then(|message| message.get("data")).and_then(Value::as_str).is_some_and(|data| data.starts_with("\u{ef01}COLDSTORAGE\u{ef01}"))))
-}
-
 fn omit_unavailable_cold(character: &mut Value, job: &dyn RestoreControl) -> Result<(), NativeJobError> {
     let mut missing = 0;
     if let Some(object) = character.as_object_mut() {
@@ -1334,9 +1323,7 @@ fn parse_and_stage<R: Read>(
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
     spool_directory: &Path,
-    reject_cold_references: bool,
 ) -> Result<ParsedCounts, NativeJobError> {
-    let cold_detected = Cell::new(false);
     let mut excluded = HashSet::new();
     let mut loaded = HashSet::new();
     let mut directory = None;
@@ -1403,9 +1390,7 @@ fn parse_and_stage<R: Read>(
                 job,
                 sink,
                 spool_directory,
-                &cold_detected,
             )?;
-            if reject_cold_references && cold_detected.get() { return Err(cold_expansion_required()); }
             if retained { character_count += 1; } else { excluded.insert(name.clone()); }
             reader.counts.characters = character_count;
             reader.counts.blocks += 1;
@@ -1449,9 +1434,6 @@ fn parse_and_stage<R: Read>(
                 if let Some(value) = object.shift_remove("__directory") {
                     directory = Some(parse_directory(Some(value))?);
                 }
-                if reject_cold_references && object.get("pluginCustomStorage").and_then(Value::as_object).is_some_and(cold_plugin_storage::storage_references) {
-                    return Err(cold_expansion_required());
-                }
                 root = Some(object);
             }
             2 | 7 => {
@@ -1477,7 +1459,6 @@ fn parse_and_stage<R: Read>(
                     reader.complete_item()?;
                     continue;
                 }
-                if reject_cold_references && has_cold_references(&value) { return Err(cold_expansion_required()); }
                 if !sink.expands_cold_payloads() { omit_unavailable_cold(&mut value, job)?; }
                 assign_legacy_chat_ids(std::slice::from_mut(&mut value));
                 character_batch_bytes = character_batch_bytes.saturating_add(decoded_bytes);
@@ -1520,11 +1501,8 @@ fn parse_and_stage<R: Read>(
                 loadouts = Some(value);
             }
             11 if name == "pluginStorage" => {
-                let Some(storage) = value.as_object() else {
+                if !value.is_object() {
                     return Err(invalid("pluginStorage block must be a JSON object"));
-                };
-                if reject_cold_references && cold_plugin_storage::storage_references(storage) {
-                    return Err(cold_expansion_required());
                 }
                 plugin_storage = Some(value);
             }
@@ -1724,7 +1702,6 @@ fn read_character_block<R: Read>(
     job: &dyn RestoreControl,
     sink: &dyn ReplacementSink,
     spool_directory: &Path,
-    cold_detected: &Cell<bool>,
 ) -> Result<bool, NativeJobError> {
     let block = EncodedBlockReader {
         reader,
@@ -1739,7 +1716,6 @@ fn read_character_block<R: Read>(
         limits,
         record_bytes: &record_bytes,
         character_name: "",
-        cold_detected,
         spool_directory,
         staging_id,
         expected_id: name,
@@ -1976,8 +1952,11 @@ fn read_character_json<R: Read>(reader: &mut R, seed: CharacterSeed<'_>) -> Resu
     let mut envelope_occurrence = 0;
     let mut wrapped = false;
     if let Some(key) = metadata.cold_key {
-        seed.cold_detected.set(true);
-        if let Some(path) = seed.sink.cold_payload_path(&key) {
+        let path = seed.sink.cold_payload_path(&key).map_err(|error| {
+            *seed.staging_error.borrow_mut() = Some(error);
+            <serde_json::Error as de::Error>::custom("cold payload lookup failed")
+        })?;
+        if let Some(path) = path {
             let mut payload = File::open(path).map_err(|error| staging_io(error, seed.staging_error))?;
             if let Some(metadata) = read_character_metadata(&mut payload, &seed, true)? {
                 if upstream_import::excluded_character(metadata.kind.as_deref(), metadata.character_id.as_deref()) {
@@ -2132,7 +2111,6 @@ struct CharacterSeed<'a> {
     limits: RestoreLimits,
     record_bytes: &'a RecordBudget,
     character_name: &'a str,
-    cold_detected: &'a Cell<bool>,
     spool_directory: &'a Path,
     staging_id: &'a str,
     expected_id: &'a str,
@@ -2188,7 +2166,6 @@ impl<'de> Visitor<'de> for CharacterVisitor<'_> {
                     limits: self.0.limits,
                     record_bytes: self.0.record_bytes,
                     character_name: self.0.character_name,
-                    cold_detected: self.0.cold_detected,
                     spool_directory: self.0.spool_directory,
                     staging_id: self.0.staging_id,
                     character_id: self.0.expected_id,
@@ -2202,7 +2179,6 @@ impl<'de> Visitor<'de> for CharacterVisitor<'_> {
                 insert_detail::<A::Error>(&mut detail, self.0.record_bytes.limit, key, value)?;
             }
         }
-        if detail.get("coldstorage").and_then(Value::as_str).is_some_and(|key| !key.is_empty()) { self.0.cold_detected.set(true); }
         detail.remove("coldstorage");
         detail.remove("coldStoragedChats");
         let character_id = detail
@@ -2231,7 +2207,6 @@ struct ChatsSeed<'a> {
     limits: RestoreLimits,
     record_bytes: &'a RecordBudget,
     character_name: &'a str,
-    cold_detected: &'a Cell<bool>,
     spool_directory: &'a Path,
     staging_id: &'a str,
     character_id: &'a str,
@@ -2272,7 +2247,6 @@ impl<'de> Visitor<'de> for ChatsVisitor<'_> {
                 limits: self.0.limits,
                 record_bytes: self.0.record_bytes,
                 character_name: self.0.character_name,
-                cold_detected: self.0.cold_detected,
                 spool_directory: self.0.spool_directory,
                 seen_ids: &seen_ids,
                 staging_id: self.0.staging_id,
@@ -2299,7 +2273,6 @@ struct ConversationSeed<'a> {
     limits: RestoreLimits,
     record_bytes: &'a RecordBudget,
     character_name: &'a str,
-    cold_detected: &'a Cell<bool>,
     spool_directory: &'a Path,
     seen_ids: &'a RefCell<HashSet<String>>,
     staging_id: &'a str,
@@ -2360,7 +2333,6 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
                 saw_messages = true;
                 messages = map.next_value_seed(MessagesSeed {
                     record_bytes: self.0.record_bytes,
-                    cold_detected: self.0.cold_detected,
                     spool_directory: self.0.spool_directory,
                     staging_error: self.0.staging_error,
                     job: self.0.job,
@@ -2372,7 +2344,11 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
         }
         {
             if let Some(key) = messages.cold_key.take() {
-                let payload = match self.0.sink.cold_payload_path(&key) {
+                let path = self.0.sink.cold_payload_path(&key).map_err(|error| {
+                    *self.0.staging_error.borrow_mut() = Some(error);
+                    de::Error::custom("cold payload lookup failed")
+                })?;
+                let payload = match path {
                     Some(path) => read_cold_chat(&path, &self.0).map_err(de::Error::custom)?,
                     None => None,
                 };
@@ -2448,7 +2424,6 @@ fn read_cold_chat(path: &Path, seed: &ConversationSeed<'_>) -> Result<Option<Col
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
     let payload = deserializer.deserialize_any(ColdChatVisitor(MessagesSeed {
         record_bytes: seed.record_bytes,
-        cold_detected: seed.cold_detected,
         spool_directory: seed.spool_directory,
         staging_error: seed.staging_error,
         job: seed.job,
@@ -2586,7 +2561,6 @@ impl MessageSpool {
 
 struct MessagesSeed<'a> {
     record_bytes: &'a RecordBudget,
-    cold_detected: &'a Cell<bool>,
     spool_directory: &'a Path,
     staging_error: &'a RefCell<Option<StoreError>>,
     job: &'a dyn RestoreControl,
@@ -2630,7 +2604,6 @@ impl<'de> Visitor<'de> for MessagesVisitor<'_> {
             if spool.count == 0 {
                 spool.cold_key = message.get("data").and_then(Value::as_str)
                     .and_then(|data| data.strip_prefix("\u{ef01}COLDSTORAGE\u{ef01}")).map(str::to_owned);
-                if spool.cold_key.is_some() { self.0.cold_detected.set(true); }
             }
             let bytes = serde_json::to_vec(&message).map_err(|error| {
                 *self.0.staging_error.borrow_mut() = Some(StoreError::Store { message: error.to_string() });
@@ -3014,7 +2987,7 @@ pub(super) fn store_error(error: StoreError) -> NativeJobError {
 mod legacy_stream_tests;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::*;
     use super::*;
     use crate::persistent_store::{PersistentStore, RevisionResult, StagingResult, StoreResult};
@@ -3049,14 +3022,14 @@ mod tests {
         "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-raw-v4.expected.json"
     );
 
-    struct StoreSink {
-        store: Mutex<PersistentStore>,
+    pub(crate) struct StoreSink {
+        pub(crate) store: Mutex<PersistentStore>,
         incremental: bool,
         prepared_characters: std::collections::HashMap<String, Value>,
         fail_character_batches: bool,
         record_activation: bool,
         lose_commit_reply: bool,
-        abort_calls: AtomicUsize,
+        pub(crate) abort_calls: AtomicUsize,
         preserve_calls: AtomicUsize,
         full_character_calls: AtomicUsize,
         incremental_character_calls: AtomicUsize,
@@ -3124,8 +3097,8 @@ mod tests {
 
         fn expands_cold_payloads(&self) -> bool { self.cold_payloads.is_some() }
 
-        fn cold_payload_path(&self, key: &str) -> Option<PathBuf> {
-            self.cold_payloads.as_ref().and_then(|payloads| payloads.get(key)).cloned()
+        fn cold_payload_path(&self, key: &str) -> StoreResult<Option<PathBuf>> {
+            Ok(self.cold_payloads.as_ref().and_then(|payloads| payloads.get(key)).cloned())
         }
 
         fn unavailable_cold_payload_reason(&self, key: &str) -> Option<ColdPayloadUnavailable> {
@@ -3243,7 +3216,7 @@ mod tests {
         }
     }
 
-    fn fixture() -> (TempDir, StoreSink) {
+    pub(crate) fn fixture() -> (TempDir, StoreSink) {
         let directory = TempDir::new().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let staging = store.replace_begin().unwrap().staging_id;
@@ -3292,13 +3265,13 @@ mod tests {
         bytes
     }
 
-    fn block(block_type: u8, compressed: bool, name: &str, value: &Value) -> Vec<u8> {
+    pub(crate) fn block(block_type: u8, compressed: bool, name: &str, value: &Value) -> Vec<u8> {
         let json = serde_json::to_vec(value).unwrap();
         let payload = if compressed { gzip(&json) } else { json };
         raw_block(block_type, u8::from(compressed), name, &payload)
     }
 
-    fn valid_blocks() -> Vec<Vec<u8>> {
+    pub(crate) fn valid_blocks() -> Vec<Vec<u8>> {
         let character = json!({
             "type": "character",
             "chaId": "char-1",
@@ -3336,7 +3309,7 @@ mod tests {
         ]
     }
 
-    fn save_bytes(blocks: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
+    pub(crate) fn save_bytes(blocks: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
         let mut bytes = b"RISUSAVE\0".to_vec();
         for block in blocks {
             bytes.extend(block);
@@ -4171,42 +4144,6 @@ mod tests {
             .write_all(br#"{"format":"risunest-raw-recovery","version":1}"#)
             .unwrap();
         archive.finish().unwrap();
-    }
-
-    #[test]
-    fn official_cold_references_fail_before_activation() {
-        let mut saves = Vec::new();
-        for cold in [
-            json!({"chaId":"char-1","name":"Stub","chats":[],"coldstorage":"missing-character"}),
-            json!({"chaId":"char-1","name":"Synthetic","chats":[{"id":"chat-1","name":"Chat","message":[{"role":"char","data":"\u{ef01}COLDSTORAGE\u{ef01}missing-chat"}]}]}),
-        ] {
-            let mut blocks = valid_blocks();
-            blocks[6] = block(2, false, "char-1", &cold);
-            saves.push(blocks);
-        }
-        // Plugin values are the only cold data, in the pluginStorage block or in the root.
-        for storage in [json!({"inline":true,"_coldpluginIndex":"index"}), json!({"_coldplugin":{"plugin":"value"}})] {
-            let mut blocks = valid_blocks();
-            blocks[5] = block(11, false, "pluginStorage", &storage);
-            saves.push(blocks);
-            let mut blocks = valid_blocks();
-            blocks.remove(5);
-            blocks[0] = block(1, true, "root", &json!({"username":"Imported","pluginCustomStorage":storage}));
-            saves.push(blocks);
-        }
-        for blocks in saves {
-            let (directory, sink) = fixture();
-            let bytes = save_bytes(blocks);
-            let registry = JobRegistry::default();
-            let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
-            let error = restore_risu_save_reader_controlled(
-                bytes.as_slice(), bytes.len() as u64, 1, &job, &sink, RestoreLimits::default(), true,
-                RestoreProgressScale { spool_directory: Some(directory.path().to_owned()), reject_cold_references: true, ..Default::default() },
-            ).unwrap_err();
-            assert_eq!(error.code, "cold-expansion-required");
-            assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
-            assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
-        }
     }
 
     #[test]

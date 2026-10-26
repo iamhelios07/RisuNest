@@ -1885,7 +1885,7 @@ describe('native file jobs', () => {
         expect(commands).not.toContain('native_file_job_finalize')
     })
 
-    it.each(['compatibility-required', 'cold-expansion-required'])('maps %s without taking the replacement fence', async (code) => {
+    it('maps compatibility-required without taking the replacement fence', async () => {
         const acquire = vi.fn()
 
         const result = await runNativeOfficialAccountSnapshotRestore(
@@ -1907,7 +1907,7 @@ describe('native file jobs', () => {
                             state: 'failed',
                             phase: 'complete',
                             error: {
-                                code,
+                                code: 'compatibility-required',
                                 message: 'Legacy snapshot requires preparation',
                             },
                         }

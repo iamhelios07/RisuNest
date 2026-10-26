@@ -215,7 +215,6 @@ impl<'a> LegacyRestoreProgress<'a> {
         restore::RestoreProgressScale {
             result_source: None,
             spool_directory: None,
-            reject_cold_references: false,
             base_bytes: state.read_bytes.saturating_add(state.prepared_bytes),
             total_bytes: Some(self.budget()),
             fixed_items: Some((state.counts.entries_read, state.counts.entries_total)),
@@ -514,8 +513,8 @@ impl restore::ReplacementSink for LegacyReplacementSink {
 
     fn expands_cold_payloads(&self) -> bool { true }
 
-    fn cold_payload_path(&self, key: &str) -> Option<std::path::PathBuf> {
-        self.payloads.cold_payloads.get(key).cloned()
+    fn cold_payload_path(&self, key: &str) -> StoreResult<Option<std::path::PathBuf>> {
+        Ok(self.payloads.cold_payloads.get(key).cloned())
     }
 
     fn unavailable_cold_payload_reason(&self, key: &str) -> Option<restore::ColdPayloadUnavailable> {

@@ -2025,7 +2025,7 @@ export async function runNativeOfficialAccountSnapshotRestore(
         }
         if (
             error instanceof NativeFileJobError &&
-            (error.code === 'compatibility-required' || error.code === 'cold-expansion-required')
+            error.code === 'compatibility-required'
         ) {
             return { kind: 'compatibility-fallback' }
         }
