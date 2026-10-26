@@ -252,7 +252,7 @@
             {/if}
             {#if progressPlace === 'bound'}{@render progressPanel()}{/if}
             <div class="actions">
-                {#if view.blockedCode === 'library-format-switch-required'}<SettingButton onclick={() => void switchFormat()} disabled={busy}>{language.lwwSync.formatSwitch}</SettingButton>{/if}
+                {#if view.paused && view.error === 'library-format-switch-required'}<SettingButton onclick={() => void switchFormat()} disabled={busy}>{language.lwwSync.formatSwitch}</SettingButton>{/if}
                 {#if !view.bindingIncomplete}<SettingButton onclick={() => void run(retryServerSync)} disabled={busy}>{copy.syncNow}</SettingButton>{/if}
                 <SettingButton variant="danger" class="ml-auto" onclick={() => void run(disconnect)} busy={checkingFiles} disabled={busy}>{copy.disconnect}</SettingButton>
             </div>

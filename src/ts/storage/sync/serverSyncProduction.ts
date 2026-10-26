@@ -580,6 +580,11 @@ export function dismissServerSyncConnectionFailure(): void {
 export const holdServerSync = () => controller.beginReplacement()
 /** Raises the library to this app's data format. Sync resumes on the next retry. */
 export async function switchServerSyncLibraryFormat(): Promise<void> {
+    // A binding whose first publication stopped at the format level resumes before it switches.
+    if (!context || context.signal.aborted) {
+        await controller.ensureStatus()
+        if (persistedBinding?.target.kind === 'server') await resumeCurrentServerBinding(persistedBinding)
+    }
     const captured = context
     if (!captured) throw new Error('Sync binding is unavailable')
     await invoke('server_sync_lww_switch_format', { request: header() })

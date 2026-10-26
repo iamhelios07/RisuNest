@@ -798,25 +798,38 @@ describe('production server LWW composition', () => {
         openConversation('second'); await settle()
         expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, blockedCode: '', error: '' })
     })
-    it('switches the library format on request and resumes sync with the retry that follows', async () => {
+    it.each(['a receive', 'the initial publication'])('switches the library format stopped by %s on request and resumes sync with the retry that follows', async stoppedBy => {
         const state = bindingContext().state
+        const stop = { code: 'library-format-switch-required', retryable: false }
         let current = false
         f.invoke.mockImplementation(async command => {
             if (command === 'server_sync_status') return { configured: true, writerId: 'writer', bindingAuthority: '0' }
             if (command === 'pds_lww_binding_state') return state
             if (command === 'server_sync_lww_switch_format') { current = true; return null }
-            if (!current && command === 'server_sync_lww_pull') throw { code: 'library-format-switch-required', retryable: false }
+            if (!current && (command === 'server_sync_lww_pull' || command === 'server_sync_lww_push')) throw stop
             return command === 'server_sync_lww_pull' ? emptyReceive() : null
         })
-        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
-        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
-        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: true, blockedCode: 'library-format-switch-required' })
-        await production.switchServerSyncLibraryFormat()
-        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_switch_format', { request: { bindingAuthority: '0', requestId: expect.any(String) } })
-        f.invoke.mockClear()
-        await production.retryServerSync(); await settle()
-        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, blockedCode: '', error: '' })
-        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_pull', expect.anything())
+        try {
+            production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+            f.resumeCurrent.mockImplementation(async () => { await f.transport!.resumeBinding(bindingContext()) })
+            visible(true)
+            if (stoppedBy === 'a receive') {
+                await f.transport!.resumeBinding(bindingContext()); await settle()
+                expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: true, blockedCode: 'library-format-switch-required' })
+            } else {
+                // The binding flow stops a binding whose first publication failed, outside the scheduler.
+                await expect(f.transport!.publishInitialSharedState(bindingContext())).rejects.toBe(stop)
+                await f.transport!.fenceOldJobs(bindingContext()); f.transport!.reportStopped!(stop)
+                await production.getServerSyncController().ensureStatus()
+                expect(production.getServerSyncController().snapshot()).toMatchObject({ status: { bound: true }, paused: true, blockedCode: '', error: 'library-format-switch-required' })
+            }
+            await production.switchServerSyncLibraryFormat()
+            expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_switch_format', { request: { bindingAuthority: '0', requestId: expect.any(String) } })
+            f.invoke.mockClear()
+            await production.retryServerSync(); await settle()
+            expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, blockedCode: '', error: '' })
+            expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_pull', expect.anything())
+        } finally { f.resumeCurrent.mockReset() }
     })
     it('drains and clears the old hydration context before a binding fence permits foreground return', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()

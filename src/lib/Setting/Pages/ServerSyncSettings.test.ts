@@ -350,9 +350,10 @@ describe('a library below this app data format', () => {
         component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
         await settle()
     }
-    it('names the stop and switches after the acknowledgement, then resumes sync', async () => {
+    // A first publication that stops at the format level stops sync outside the scheduler, with no blocked code.
+    it.each(['library-format-switch-required', ''])('names the stop and switches after the acknowledgement, then resumes sync (blocked code "%s")', async blockedCode => {
         f.checkbox.mockResolvedValue({ confirmed: true, checked: true })
-        await open()
+        await open({ ...below, blockedCode })
         expect(host.textContent).toContain(lww.formatSwitchRequired)
         click(lww.formatSwitch); await settle()
         expect(f.checkbox).toHaveBeenCalledWith(expect.objectContaining({ title: lww.formatSwitchTitle, description: lww.formatSwitchDescription, checkboxLabel: lww.formatSwitchAcknowledge, actionLabel: lww.formatSwitch, requireChecked: true }))
