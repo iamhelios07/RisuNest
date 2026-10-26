@@ -306,9 +306,9 @@ mod tests {
 
     #[test]
     fn a_restore_intent_closed_without_activation_stays_dismissed_after_restart() {
-        use crate::persistent_store::lww::{ApplyReceive, Change, Header, Progress, StageReceive, UnitMutation};
+        use crate::persistent_store::lww::UnitMutation;
         use crate::persistent_store::WorkingSetCommit;
-        use risunest_sync_wire::{stamp::Stamp, unit::{UnitKey, UnitValue}};
+        use risunest_sync_wire::unit::UnitKey;
         let directory = tempfile::tempdir().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let stage = stage(&mut store);
@@ -318,24 +318,11 @@ mod tests {
         let connection = rusqlite::Connection::open(directory.path().join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
         connection.execute_batch("CREATE TRIGGER reject_restore BEFORE UPDATE ON generations BEGIN SELECT RAISE(ABORT,'synthetic disk failure'); END;").unwrap();
         assert!(store.replace_commit(&stage, Some(0)).is_err());
-        // A sync page arrives while the failure lasts. Its apply replays the intent first and fails, so its rows stay staged.
-        let page = StageReceive {
-            header: Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "receive-during-failure".into() },
-            changes: vec![Change {
-                key: UnitKey::new(&["root", "language"]).unwrap(),
-                stamp: Stamp { physical_ms: 10.into(), logical: 0, writer_id: "00000000-0000-4000-8000-000000000001".into() },
-                value: UnitValue::inline(&serde_json::to_vec(&json!("ko")).unwrap()).unwrap(),
-            }],
-            progress: Progress { kind: "server".into(), cursor: 1.into(), writer_id: None },
-            admitted_time_upper_ms: u64::MAX.into(),
-        };
-        store.lww_stage_receive(&page).unwrap();
-        assert!(store.lww_apply_receive(&ApplyReceive { header: page.header.clone(), generating: vec![] }).is_err());
         connection.execute_batch("DROP TRIGGER reject_restore").unwrap();
+        // Earlier builds drained deferred receive rows without replaying intents first, which moved
+        // the revision past the pending restore's base.
+        connection.execute("UPDATE meta SET value='1' WHERE key='currentRevision'", []).unwrap();
         drop(connection);
-        // The drain after an aborted generation applies staged rows without replaying intents first.
-        let drain = Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "drain".into() };
-        store.lww_drain_deferred(&ApplyReceive { header: drain, generating: vec![] }).unwrap();
         assert_eq!(store.revision().unwrap(), 1);
         // The next save replays the restore intent first; it now conflicts and is closed without changes.
         store.commit(&WorkingSetCommit {
