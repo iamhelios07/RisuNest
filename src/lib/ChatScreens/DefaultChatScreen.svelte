@@ -999,6 +999,8 @@
             }
         } catch (error) {
             if (!chatScreenState.matchesComposer(snapshot)) return
+            if (reverse) snapshot.composer.text = input
+            else snapshot.composer.translation = input
             if (!inputTranslationFailed) alertError(error)
             inputTranslationFailed = true
         }

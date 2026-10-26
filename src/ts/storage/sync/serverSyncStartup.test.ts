@@ -97,6 +97,51 @@ async function offlineStartup() {
 async function settings() { const Settings = (await import('src/lib/Setting/Pages/ServerSyncSettings.svelte')).default; component = ui.mount(Settings, { target: document.body }); await settle() }
 
 describe('persisted server offline startup', () => {
+    it.each([
+        { code: 'unauthorized', status: 401, retryable: false },
+        { code: 'invalid-device-token', status: 401, retryable: false },
+        { code: 'rate-limited', status: 429, retryable: true },
+    ])('reports the launch failure to the plugin receive and clears it after retry ($code)', async failure => {
+        f.activationError = failure
+        await production.installServerSyncProduction()
+        const { getSyncBindingTransport } = await import('./bindingRegistry')
+        const transport = getSyncBindingTransport({ kind: 'server', connectionId: 'server' })!
+        const context = { state: structuredClone(f.binding), signal: new AbortController().signal }
+        await expect(transport.receiveAvailableChanges!(context)).rejects.toThrow(failure.code)
+        expect(production.getServerSyncController().snapshot().error).toBe(failure.code)
+
+        const { configurePluginStartup, pluginStartupGate, retryPluginStartup } = await import('../../plugins/pluginStartupGate')
+        const { get } = await import('svelte/store')
+        let started = false
+        configurePluginStartup(() => true, async () => { if (await pluginStartupGate.ensure()) started = true })
+        try {
+            await pluginStartupGate.ensure()
+            await vi.waitFor(() => expect(get(pluginStartupGate.state)).toMatchObject({ phase: 'failed', target: 'server' }))
+            expect(started).toBe(false)
+            f.activationError = undefined; f.offline = false
+            await retryPluginStartup()
+            await vi.waitFor(() => expect(started).toBe(true))
+            expect(get(pluginStartupGate.state).phase).toBe('released')
+            expect(production.getServerSyncController().snapshot().error).toBe('')
+            await expect(transport.receiveAvailableChanges!(context)).resolves.toBeUndefined()
+        } finally {
+            configurePluginStartup(() => false, async () => {})
+            pluginStartupGate.invalidate(); pluginStartupGate.state.set({ phase: 'released', since: 0 })
+        }
+    })
+    it('reports an unavailable receive before resume and retains real authority and selection changes', async () => {
+        await production.installServerSyncProduction({ resumeBound: false })
+        const { getSyncBindingTransport } = await import('./bindingRegistry')
+        const transport = getSyncBindingTransport({ kind: 'server', connectionId: 'server' })!
+        const context = { state: structuredClone(f.binding), signal: new AbortController().signal }
+        await expect(transport.receiveAvailableChanges!(context)).rejects.toThrow('Sync binding is unavailable')
+        f.offline = false
+        await production.retryServerSync()
+        for (const field of ['targetAuthority', 'selectionEpoch'] as const) {
+            await expect(transport.receiveAvailableChanges!({ ...context, state: { ...context.state, [field]: 'changed' } })).rejects.toThrow('Sync binding changed')
+        }
+    })
+
     it('keeps real retry and disconnect settings actions while the installer waits to activate offline', async () => {
         await offlineStartup(); await settings()
         expect(production.getServerSyncController().snapshot()).toMatchObject({ status: { bound: true }, paused: false, error: 'server-unreachable' })

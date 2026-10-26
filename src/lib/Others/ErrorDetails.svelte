@@ -29,7 +29,7 @@
     <summary class="cursor-pointer text-textcolor2">{open ? language.hideErrorDetails : language.showErrorDetails}</summary>
     <div class="relative mt-2">
         <button type="button" class="absolute top-1 right-1 rounded-sm bg-bgcolor p-1 text-textcolor2"
-            title={copied === report ? language.risuNest.importDialog.copied : language.copy}
+            title={copied === report ? language.copied : language.copy}
             aria-label={language.copy} onclick={copy}>
             {#if copied === report}<CheckIcon size={14} />{:else}<CopyIcon size={14} />{/if}
         </button>

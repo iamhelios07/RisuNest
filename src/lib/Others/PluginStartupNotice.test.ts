@@ -63,15 +63,24 @@ it('waits one second, closes until the next wait or failure, and hides after rel
     expect(document.querySelector('aside')).toBeNull()
 })
 
-it('reports only a failure while the sync UI is turned off', async () => {
+it.each(['unauthorized', 'invalid-device-token', 'rate-limited'])('reports the stopped sync reason while the sync UI is turned off (%s)', async code => {
     vi.useFakeTimers()
     DBState.db.risunestSyncStatusUi = false
     pluginStartupState.set({ phase: 'waiting', since: Date.now() })
     await render()
     await vi.advanceTimersByTimeAsync(1000); await tick()
     expect(document.querySelector('aside')).toBeNull()
-    pluginStartupState.set({ phase: 'failed', since: Date.now(), error: { code: 'unauthorized' }, target: 'server' }); await tick()
+    const source: SyncStatusSource = {
+        target: 'server', syncNow: async () => {}, pendingChanges: async () => 0,
+        view: { status: { configured: true, bound: true }, running: false, paused: true, error: code } as ServerSyncView,
+    }
+    syncStatus.set(source)
+    pluginStartupState.set({ phase: 'failed', since: Date.now(), error: new Error('Sync binding is unavailable'), target: 'server' }); await tick()
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(language.risuNest.pluginStartup.syncUnfinished)
+    const display = syncStatusDisplay(source, externalStorageStrings(DBState.db.language), false)
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.label)
+    if (code !== 'rate-limited') expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.error)
+    expect(labels()).toContain(language.retry)
 })
 
 it('uses the language loaded after the app mounted', async () => {

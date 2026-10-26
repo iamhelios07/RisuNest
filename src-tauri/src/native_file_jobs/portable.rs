@@ -1046,6 +1046,7 @@ mod tests {
             super::super::JobKind::ExportPortableBackup,
             Err(failure),
             vec![],
+            None,
         );
         let status = job.status();
         assert_eq!(status.state, super::super::JobState::Cancelled);
@@ -1178,7 +1179,7 @@ mod tests {
             let context = NativePortableRestoreContext {persistent: &persistent, coordinator: &worker_coordinator};
             let result = restore_portable_with_context(source, true, 1, &owned, PersistentStore::open(&worker_target).unwrap(), &worker_job, Some((&context, None)));
             let receipt = result.as_ref().map(|result| result.revision).map_err(|error| error.code.clone());
-            super::super::finish_worker_outcome(&worker_job, JobKind::RestorePortableBackup, result, vec![]);
+            super::super::finish_worker_outcome(&worker_job, JobKind::RestorePortableBackup, result, vec![], None);
             done.send(receipt).unwrap();
         });
         struct Retire(Arc<NativeFileJobState>);
@@ -1316,7 +1317,7 @@ mod tests {
             let context = NativePortableRestoreContext {persistent: &persistent, coordinator: &worker_coordinator};
             let result = restore_portable_with_context(source, true, 1, &owned, PersistentStore::open(&worker_target).unwrap(), &worker_job, Some((&context, None)));
             let receipt = result.as_ref().map(|result| result.revision).map_err(|error| error.code.clone());
-            super::super::finish_worker_outcome(&worker_job, JobKind::RestorePortableBackup, result, vec![]);
+            super::super::finish_worker_outcome(&worker_job, JobKind::RestorePortableBackup, result, vec![], None);
             done.send(receipt).unwrap();
         });
         wait_for_job(&job, |status| status.phase == JobPhase::AwaitingBackupSelection);
@@ -1468,7 +1469,7 @@ mod tests {
             let job = super::super::JobRegistry::default()
                 .create(super::super::JobKind::RestorePortableBackup).unwrap();
             job.start(JobPhase::ReadingSource).unwrap();
-            super::super::finish_worker_outcome(&job, super::super::JobKind::RestorePortableBackup, Err(failure), vec![]);
+            super::super::finish_worker_outcome(&job, super::super::JobKind::RestorePortableBackup, Err(failure), vec![], None);
             let status = job.status();
             let returned = status.error.as_ref().unwrap();
             assert_eq!(returned.code, "portable-backup-failed");

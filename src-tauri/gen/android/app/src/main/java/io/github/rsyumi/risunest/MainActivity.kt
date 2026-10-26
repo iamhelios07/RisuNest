@@ -2046,6 +2046,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
               prepareRecoveredRisuSaveAcknowledgement(filesDir, terminal.exportId) },
             ::clearSafDestinationState,
             retainJournal = !frontendReady.isReady,
+            requiresPublicationProof = { terminal ->
+              requiresRisuSavePublicationProof(filesDir, terminal.exportId, terminal.sourceKind)
+            },
           )
         }.onFailure { Log.e(TAG, "Android SAF recovery failed", it) }.getOrNull()
       }

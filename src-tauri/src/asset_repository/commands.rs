@@ -626,11 +626,17 @@ fn append_upload(app: &AppHandle, upload_id: &str, offset: u64, data: &[u8]) -> 
 }
 
 #[tauri::command(async)]
-pub(crate) fn asset_cas_job_upload_chunk_raw(
+pub(crate) async fn asset_cas_job_upload_chunk_raw(
     app: AppHandle, request: tauri::ipc::Request<'_>,
 ) -> Result<u64, crate::asset_byte_transport::ByteTransferError> {
-    logged("asset_cas_job_upload_chunk_raw", crate::asset_byte_transport::raw_part(&request)
-        .and_then(|(id, offset, bytes)| append_upload(&app, &id, offset, bytes).map_err(Into::into)))
+    logged("asset_cas_job_upload_chunk_raw", async move {
+        let (id, offset, bytes) = crate::asset_byte_transport::raw_part(&request)?;
+        let bytes = bytes.to_vec();
+        tauri::async_runtime::spawn_blocking(move || append_upload(&app, &id, offset, &bytes))
+            .await
+            .map_err(|error| format!("failed to join CAS upload raw chunk operation: {error}"))?
+            .map_err(Into::into)
+    }.await)
 }
 
 #[tauri::command(async)]

@@ -253,6 +253,12 @@ const checkReceiveContext = (c: BindingContext) => {
     if (!context || bindingIdentity(context.state) !== bindingIdentity(c.state)) throw new Error('Sync binding changed')
     context.signal.throwIfAborted()
 }
+// A binding this launch did not resume has no context, which is its launch failure, not a binding change.
+const checkResumedReceiveContext = (c: BindingContext) => {
+    c.signal.throwIfAborted()
+    if (!context) throw new Error(error || 'Sync binding is unavailable')
+    checkReceiveContext(c)
+}
 async function startupRequest<T>(captured: BindingContext, command: string, args: Record<string, unknown>): Promise<T> {
     try {
         const result = await invoke<T>(command, args)
@@ -476,9 +482,9 @@ const transport: SyncBindingTransport = {
         if (code !== 'cancelled') { recordFailure(failures(value)[0]); changed() }
     },
     async fenceOldJobs(c) { halt(); context = undefined; persistedBinding = undefined; await scheduler.fence(); await hydrating; activationPending = undefined; await invoke('server_sync_lww_fence', { newDevice: c.mode === 'new-device' || c.mode === 'fresh-writer' }); hydrationPending = false; representativesPending = false; hydrationAgain = false },
-    async receiveAvailableChanges(c) { checkReceiveContext(c); await receiveAvailableServerChanges(); checkReceiveContext(c) },
+    async receiveAvailableChanges(c) { checkResumedReceiveContext(c); await receiveAvailableServerChanges(); checkReceiveContext(c) },
     async preparePluginStartup(c) {
-        checkReceiveContext(c)
+        checkResumedReceiveContext(c)
         if (canStartPluginsOffline(startupFailure)) return
         try { await transport.receiveAvailableChanges!(c) }
         catch (value) { checkReceiveContext(c); if (startupFailure !== value || !canStartPluginsOffline(value)) throw value }
