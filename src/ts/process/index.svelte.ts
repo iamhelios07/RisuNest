@@ -62,6 +62,9 @@ import {
     captureWindowedConversationMutationController,
     captureSelectedConversationTarget,
     flushPendingData,
+    flushPendingDataLocallyForCheckpoint,
+    capturesImmutableCharacters,
+    pendingConversationMutationDiagnostics,
     getActiveConversationSession,
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
@@ -279,7 +282,8 @@ async function acknowledgeGenerationWithDiagnostics(lifecycle: GenerationComplet
             const matchingAuthority = authority?.characterId === lifecycle.generationTarget?.characterId
                 && authority?.conversationId === lifecycle.generationTarget?.conversationId
             lifecycle.diagnostics.persistence({
-                boundary: 'final', savePath,
+                boundary: 'final', savePath, ...pendingConversationMutationDiagnostics(),
+                dirtyRecords: matchingSession ? session.pinCount('dirty') : undefined,
                 acknowledgedRevision: !authorityCurrent ? undefined : matchingSession ? session.storeRevision
                     : matchingAuthority ? authority?.storeRevision : undefined,
             })
@@ -933,21 +937,29 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     function runCurrentChatFunction(chat:Chat){
         if (!lifecycle.isTargetCurrent()) throw new PersistentMutationFencedError()
         const controller = conversationResources.windowedController
-        const source = controller?.chat === chat ? structuredClone(chat) : chat
-        const parsed = runCurrentChatParserPass({
-            chat: source,
-            database: DBState.db,
-            ownerCharacterId: nowChatroom.chaId,
-            parserCharacter: currentChar,
-            session: controller ? null : getActiveConversationSession(),
-            parser: risuChatParser,
+        if (controller?.chat !== chat) {
+            return runCurrentChatParserPass({
+                chat,
+                database: DBState.db,
+                ownerCharacterId: nowChatroom.chaId,
+                parserCharacter: currentChar,
+                session: controller ? null : getActiveConversationSession(),
+                parser: risuChatParser,
+            })
+        }
+        // The window is parsed in order without copying it, and the rows the parser changed are
+        // written as one range, so a stale controller publishes none of them.
+        const messages = chat.message.slice()
+        const parsed = messages.map((message) => {
+            const data = risuChatParser(message.data, { chara: currentChar, runVar: true })
+            return data === message.data ? message : { ...message, data }
         })
-        if (!controller) return parsed
-        for (let index = 0; index < parsed.message.length; index++) {
-            if (JSON.stringify(parsed.message[index]) === JSON.stringify(chat.message[index])) continue
-            if (!controller.applyRange(index, 1, [parsed.message[index]], 'edit')) {
-                throw new PersistentMutationFencedError()
-            }
+        const start = parsed.findIndex((message, index) => message !== messages[index])
+        if (start === -1) return chat
+        let end = parsed.length
+        while (parsed[end - 1] === messages[end - 1]) end--
+        if (!controller.applyRange(start, end - start, parsed.slice(start, end), end - start === 1 ? 'edit' : 'replace-range')) {
+            throw new PersistentMutationFencedError()
         }
         return chat
     }
@@ -2892,6 +2904,11 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 lifecycle.onProgress?.(1)
             },
             onProviderFailure: throwError,
+        },
+        checkpoint: {
+            savePath: () => lifecycle.savePath(),
+            capturesImmutableCharacters,
+            flush: () => flushPendingDataLocallyForCheckpoint('generation-checkpoint'),
         },
     })
     if (!responseApplication) {
