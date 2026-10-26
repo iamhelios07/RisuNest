@@ -144,6 +144,7 @@ export function snapshotChatScreenshotCharacter(
     const captureChat: Chat = {
         message: [],
         note: chat.note ?? '',
+        ...(chat.authorNotePreset ? { authorNotePreset: { ...chat.authorNotePreset } } : {}),
         name: chat.name ?? '',
         localLore: chat.localLore ?? [],
         scriptstate: chat.scriptstate ?? {},

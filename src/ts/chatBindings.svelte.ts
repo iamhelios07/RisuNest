@@ -23,6 +23,7 @@ import {
 } from './storage/persistentDataRuntime.svelte'
 import { SelectedConversationPromotionStaleError } from './storage/activeWorkingSet.svelte'
 import { requestScriptDisplayRefresh } from './process/scriptDisplayRefresh'
+import { authorNotePresetLinkPatch, linkedAuthorNotePreset } from './authorNotePresets'
 
 /** A binding edit during a generation would discard its response, so it waits for it. */
 export function chatBindingBlockedByGeneration(): boolean {
@@ -111,6 +112,18 @@ export async function bindPersona(conversation: Chat, index: number): Promise<vo
 
 export async function saveChatBinding(): Promise<void> {
     await flushPendingData('chat-binding')
+}
+
+/** Rewrites the stored note of the selected conversation to its linked preset, for readers that do not resolve presets. */
+export async function refreshAuthorNoteCopy(): Promise<void> {
+    const target = captureChatBindingTarget()
+    if (!target || get(doingChat)) return
+    const conversation = target.conversation
+    if (conversation.id && get(activeRerollConversations).includes(conversation.id)) return
+    const preset = linkedAuthorNotePreset(DBState.db.authorNotePresets, conversation)
+    if (!preset || conversation.note === preset.text) return
+    await updateChatBinding(conversation, authorNotePresetLinkPatch(preset))
+    await saveChatBinding()
 }
 
 export interface OnboardingTarget {

@@ -53,7 +53,8 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
         },
     }),
 }))
-import { bindPersona, captureChatBindingTarget, captureOnboardingTarget, chatBindingBlockedByGeneration, conversationMutationBlockedByGeneration, finishOnboarding, updateChatBinding } from './chatBindings.svelte'
+import { bindPersona, captureChatBindingTarget, captureOnboardingTarget, chatBindingBlockedByGeneration, conversationMutationBlockedByGeneration, finishOnboarding, refreshAuthorNoteCopy, updateChatBinding } from './chatBindings.svelte'
+import { authorNoteFingerprint } from './authorNotePresets'
 import { doingChat } from './process/generationState'
 import { activeRerollConversations } from './durableReroll'
 import { DisplayReadRecord, registerDisplayRow } from './process/scriptVariableReads'
@@ -105,6 +106,28 @@ it('blocks row mutations for generation and the matching reroll until ownership 
     doingChat.set(false)
     expect(conversationMutationBlockedByGeneration('chat')).toBe(false)
     expect(state.toast).toHaveBeenCalledTimes(2)
+})
+it('rewrites a stale author note copy of the selected chat outside generation only while it is linked', async () => {
+    state.db.authorNotePresets = [{ id: 'preset', name: 'Preset', text: 'Current' }]
+    const chat = state.db.characters[0].chats[0]
+    chat.note = 'stale'
+    chat.authorNotePreset = { id: 'preset', fingerprint: authorNoteFingerprint('stale') }
+    doingChat.set(true)
+    await refreshAuthorNoteCopy()
+    expect(state.bindings).toEqual([])
+    doingChat.set(false)
+    await refreshAuthorNoteCopy()
+    await refreshAuthorNoteCopy()
+    expect(state.bindings).toEqual([{
+        characterId: 'character',
+        conversationId: 'chat',
+        patch: { note: 'Current', authorNotePreset: { id: 'preset', fingerprint: authorNoteFingerprint('Current') } },
+    }])
+    expect(state.flushes).toEqual(['chat-binding'])
+    chat.note = 'edited by a script'
+    state.db.authorNotePresets[0].text = 'Later'
+    await refreshAuthorNoteCopy()
+    expect(state.bindings).toHaveLength(1)
 })
 it('commits persona and toggle metadata through the coordinator without reading message bodies or changing the global persona', async () => {
     const target = captureChatBindingTarget()!

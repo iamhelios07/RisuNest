@@ -1,4 +1,5 @@
 import type { Database, character, Chat } from './storage/database.svelte'
+import { effectiveAuthorNote } from './authorNotePresets'
 
 export type ChatParserUnsafeHistoryDependency =
     | 'lua'
@@ -298,7 +299,7 @@ export function createLiveChatParserIndirections(
     personaPrompt: string,
 ): Readonly<Record<string, unknown>> {
     const character = selectedCharacter
-    let authorNote = conversation.note ?? ''
+    let authorNote = effectiveAuthorNote(database.authorNotePresets, conversation)
     if (!authorNote) {
         for (const item of database.promptTemplate ?? []) {
             if (item.type !== 'authornote' || !item.defaultText) continue

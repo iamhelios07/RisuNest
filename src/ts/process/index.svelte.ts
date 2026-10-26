@@ -14,6 +14,7 @@ import { language } from "../../lang";
 import { alertError, alertToast, alertNormal } from "../alert";
 import { parseChatML } from "../parser/chatML";
 import { loadLoreBookV3Prompt } from "./lorebook.svelte";
+import { effectiveAuthorNote } from "../authorNotePresets";
 import { findCharacterbyId, getAuthorNoteDefaultText, getPersonaPrompt, getUserName, isLastCharPunctuation, trimUntilPunctuation, parseToggleSyntax, prebuiltAssetCommand } from "../util";
 import { requestChatData } from "./request/request";
 import { stableDiff } from "./stableDiff";
@@ -1363,10 +1364,11 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     let beforeDescriptionPrompts:OpenAIChat[] = []
     let afterDescriptionPrompts:OpenAIChat[] = []
 
-    if(currentChat.note){
+    const authorNote = effectiveAuthorNote(DBState.db.authorNotePresets, currentChat)
+    if(authorNote){
         unformated.authorNote.push({
             role: 'system',
-            content: risuChatParser(currentChat.note, {chara: currentChar})
+            content: risuChatParser(authorNote, {chara: currentChar})
         })
     }
     else if(getAuthorNoteDefaultText() !== ''){

@@ -29,6 +29,7 @@ import {
 import { createScriptConversationAccess, type ScriptConversationAccess } from './scriptConversationAccess';
 import { rebuildScriptDisplayRow, requestScriptDisplayRefresh } from './scriptDisplayRefresh';
 import { noteChatVariableRead } from './scriptVariableReads';
+import { effectiveAuthorNote } from '../authorNotePresets';
 import { peekActiveConversationSession } from "../storage/persistentDataRuntime.svelte";
 import { runSerializedUserTrigger } from './conversationUserTrigger';
 import { getHistoryMessage, historyLength, inheritHistoryWindow, sliceHistory } from './historyWindowIndex';
@@ -2791,13 +2792,18 @@ async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTrigge
                     break
                 }
                 case 'v2GetAuthorNote':{
-                    setVar(risuChatParser(effect.outputVar, {chara:char}), chat.note ?? '')
+                    setVar(risuChatParser(effect.outputVar, {chara:char}), effectiveAuthorNote(db.authorNotePresets, chat))
                     break
                 }
                 case 'v2SetAuthorNote':{
                     const value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
-                    writableChat().note = value
-                    if (!conversationOperation && !access && !arg.displayMode) arg.chat.note = value
+                    const target = writableChat()
+                    target.note = value
+                    delete target.authorNotePreset
+                    if (!conversationOperation && !access && !arg.displayMode) {
+                        arg.chat.note = value
+                        delete arg.chat.authorNotePreset
+                    }
                     break
                 }
                 case 'v2MakeDictVar':{

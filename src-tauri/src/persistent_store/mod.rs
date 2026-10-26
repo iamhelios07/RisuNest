@@ -1,4 +1,5 @@
 pub(crate) mod archive;
+pub(crate) mod author_note;
 mod asset_alias_orphans;
 pub(crate) mod gallery;
 pub(crate) mod asset_object_catalog;
@@ -702,6 +703,15 @@ pub(crate) struct ConversationSummary {
     pub(crate) message_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) fm_index: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuthorNotePresetUsage {
+    pub(crate) character_id: String,
+    pub(crate) character_name: String,
+    pub(crate) conversation_id: String,
+    pub(crate) conversation_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1802,6 +1812,14 @@ impl PersistentStore {
     ) -> StoreResult<ConversationPage> {
         let (connection, target) = self.read_view(lease)?;
         query::query_conversations(connection, query, &target)
+    }
+
+    pub(crate) fn query_author_note_preset_usage(
+        &self,
+        preset_id: &str,
+    ) -> StoreResult<Vec<AuthorNotePresetUsage>> {
+        let (connection, target) = self.read_view(None)?;
+        query::query_author_note_preset_usage(connection, preset_id, &target)
     }
 
     pub(crate) fn read_conversation(

@@ -977,6 +977,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_query_characters,
         persistent_store::commands::pds_read_character,
         persistent_store::commands::pds_query_conversations,
+        persistent_store::commands::pds_query_author_note_preset_usage,
         persistent_store::commands::pds_read_conversation,
         persistent_store::commands::pds_read_conversation_metadata,
         persistent_store::commands::pds_read_conversation_window,
