@@ -2238,7 +2238,10 @@ impl PersistentStore {
             });
         }
         self.stage_receive_rows(&staged)?;
-        let archived = self.restore_incoming_archives(&staged)?;
+        let archived = self.restore_incoming_archives(
+            request.header.binding_authority,
+            Some(&request.header.request_id),
+        )?;
         let mut result = self.apply_receive_rows(&request.generating, false)?;
         result.affected_keys.extend(archived);
         let tx = self.device_store_mut()?.transaction()?;
@@ -2309,37 +2312,66 @@ impl PersistentStore {
         }
         Ok(missing.into_iter().collect())
     }
-    fn restore_incoming_archives(&mut self, staged: &StageReceive) -> StoreResult<Vec<UnitKey>> {
+    /// Archives or restores, as this device does itself, every character a pending received
+    /// row flips here, whichever receive staged it, before any row is projected.
+    fn restore_incoming_archives(
+        &mut self,
+        binding_authority: DecimalU64,
+        own_request: Option<&str>,
+    ) -> StoreResult<Vec<UnitKey>> {
         self.lww_recover_intents()?;
+        let pending = {
+            let mut statement = self.connection.prepare(
+                "SELECT request_id,key,stamp,value FROM lww_receive_rows WHERE status IN ('staged','held') AND json_extract(key,'$[0]')='archive' ORDER BY key",
+            )?;
+            let rows = statement.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+            })?;
+            let mut pending = Vec::new();
+            for row in rows {
+                let (id, key, stamp, value) = row?;
+                pending.push((id, Change {
+                    key: wire(key.try_into())?,
+                    stamp: serde_json::from_str(&stamp)?,
+                    value: serde_json::from_str(&value)?,
+                }));
+            }
+            pending
+        };
         let mut affected = Vec::new();
-        for change in &staged.changes {
+        for (request_id, change) in &pending {
             let Some(restore) = self.incoming_archive_transition(change)? else {
                 continue;
             };
             let p = change.key.components();
             // A receive brings these bodies here before it is applied, so one that is still
-            // missing fails the apply before anything changes.
+            // missing fails the apply before anything changes. Another receive's row waits
+            // for that receive, which brings its bodies again.
+            let missing = |code: &str| if own_request == Some(request_id.as_str()) { Err(error(code)) } else { Ok(()) };
             let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
             if restore {
                 let generation = active_generation(&self.connection)?;
-                let archived =
-                    super::archive::read_archived_object(&self.connection, &generation, &p[1])?
-                        .ok_or_else(|| error("archive-object-missing"))?;
-                if cas.stat_object(&archived.object_hash)?.is_none() {
-                    return Err(error("archive-object-missing"));
+                let body = match super::archive::read_archived_object(&self.connection, &generation, &p[1])? {
+                    Some(archived) => cas.stat_object(&archived.object_hash)?,
+                    None => None,
+                };
+                if body.is_none() {
+                    missing("archive-object-missing")?;
+                    continue;
                 }
             } else if let Some(manifest) =
                 super::archive::owner_manifest_hash(&self.connection, &p[1])?
             {
                 if cas.stat_object(&manifest)?.is_none() {
-                    return Err(error("archive-manifest-missing"));
+                    missing("archive-manifest-missing")?;
+                    continue;
                 }
             }
             let header = Header {
-                binding_authority: staged.header.binding_authority,
+                binding_authority,
                 request_id: format!(
                     "archive-transition:{}:{}",
-                    staged.header.request_id,
+                    request_id,
                     {
                         let hash_input = change.key.as_str().as_bytes();
                         #[cfg(test)]
@@ -2432,6 +2464,17 @@ impl PersistentStore {
                     1
                 }
             });
+            // A character that was here before this apply is archived or restored only by
+            // `restore_incoming_archives`, which keeps what this device holds, so a flip it
+            // has not made waits. One this apply brings in has nothing here to keep.
+            let mut ready_archives = BTreeSet::new();
+            if !device {
+                for (_, change, _) in &changes {
+                    if change.key.components()[0] == "archive" && parent_status(&tx, &change.key)? == "ready" {
+                        ready_archives.insert(change.key.as_str().to_owned());
+                    }
+                }
+            }
             let revision = if device {
                 device_store::begin_mutation_remote(&tx)?
             } else {
@@ -2476,6 +2519,13 @@ impl PersistentStore {
                     } else {
                         LwwDecision::ApplyRemote
                     };
+                    if decision == LwwDecision::ApplyRemote
+                        && ready_archives.contains(change.key.as_str())
+                        && matches!(change.value, UnitValue::Deleted)
+                            == super::archive::is_archived(&tx, &generation, &c[1])?
+                    {
+                        continue;
+                    }
                     let new_retirement = hard_delete
                         && read_unit(&tx, &change.key)?
                             .is_none_or(|(_, v)| !matches!(v, UnitValue::Deleted));
@@ -2626,7 +2676,9 @@ impl PersistentStore {
             self.device_store()?.connection(),
             request.header.binding_authority,
         )?;
-        let result = self.apply_receive_rows(&request.generating, true)?;
+        let archived = self.restore_incoming_archives(request.header.binding_authority, None)?;
+        let mut result = self.apply_receive_rows(&request.generating, true)?;
+        result.affected_keys.extend(archived);
         self.prune_receive_history()?;
         Ok(result)
     }
