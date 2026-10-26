@@ -85,7 +85,7 @@ export function alertError(msg: string | Error) {
     let submsg = ''
 
     //check if it's a known error
-    if(msg.includes('Failed to fetch') || msg.includes("NetworkError when attempting to fetch resource.")){
+    if(msg.includes('Failed to fetch') || msg.includes("NetworkError when attempting to fetch resource.") || msg.includes('Load failed')){
         submsg =    db.usePlainFetch ? language.errors.networkFetchPlain :
                     !isTauri ? language.errors.networkFetchWeb : language.errors.networkFetch
     }
