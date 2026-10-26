@@ -6,6 +6,7 @@ import { RevisionConflictError } from './persistentDataStore'
 import { PayloadTooLargeError, UnsaveableValueError } from './nativePersistenceValue'
 import { createLeaseStub, createStoreStub } from './persistentDataStore.testSupport'
 import { canonicalJson } from './saveCoordinator'
+import { createPersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import {
     ActiveConversationSession,
     cloneConversationMetadata,
@@ -3749,6 +3750,34 @@ describe('SaveCoordinator', () => {
             mutationGeneration,
             database.characters[0],
         )).toBe(false)
+    })
+
+    it('saves a live edit made before a separate hydrated copy is adopted', async () => {
+        const database = makeChattyDatabase()
+        const storage = await createPersistentStoreHarness(structuredClone(database))
+        const hydrated = structuredClone(database.characters[0])
+        const coordinator = new SaveCoordinator({
+            store: storage.store,
+            canonicalCapture: createPersistenceCanonicalCapture({
+                root: () => captureRoot(database),
+                presets: () => null,
+                pluginStorage: () => null,
+                character: () => database.characters[0],
+                characters: () => database.characters,
+            }),
+            captureRoot: () => captureRoot(database),
+            captureCharacters: () => database.characters,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(storage.revision)
+
+        database.characters[0].chats[1].message[0].data = 'live edit before adoption'
+        expect(coordinator.adoptHydratedCharacter(storage.revision, coordinator.mutationGeneration, hydrated)).toBe(true)
+        await coordinator.flushPendingDataLocally('adoption-live-edit')
+
+        expect((await storage.store.readConversation('char-a', 'two'))?.value.message[0].data)
+            .toBe('live edit before adoption')
     })
 
     it('commits the newly selected character after the selection changes', async () => {
