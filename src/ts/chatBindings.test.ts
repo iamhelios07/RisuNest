@@ -13,7 +13,7 @@ const state = vi.hoisted(() => ({
     promotions: 0,
     released: 0,
     flushes: [] as string[],
-    bindings: [] as { characterId: string; conversationId: string; patch: unknown }[],
+    bindings: [] as { characterId: string; conversationId: string; patch: unknown; expected?: unknown }[],
     bindingGate: null as Promise<void> | null,
     toast: vi.fn(),
 }))
@@ -45,9 +45,10 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
             conversationId: string,
             patch: ConversationBindingPatch,
             publish: (committedPatch: ConversationBindingPatch) => void,
+            expected?: ConversationBindingPatch,
         ) => {
             const committedPatch = structuredClone(patch)
-            state.bindings.push({ characterId, conversationId, patch: committedPatch })
+            state.bindings.push({ characterId, conversationId, patch: committedPatch, ...(expected ? { expected: structuredClone(expected) } : {}) })
             if (state.bindingGate) await state.bindingGate
             publish(committedPatch)
         },
@@ -122,6 +123,8 @@ it('rewrites a stale author note copy of the selected chat outside generation on
         characterId: 'character',
         conversationId: 'chat',
         patch: { note: 'Current', authorNotePreset: { id: 'preset', fingerprint: authorNoteFingerprint('Current') } },
+        // The coordinator drops the copy if a write queued before it changed the note or link.
+        expected: { note: 'stale', authorNotePreset: { id: 'preset', fingerprint: authorNoteFingerprint('stale') } },
     }])
     expect(state.flushes).toEqual(['chat-binding'])
     chat.note = 'edited by a script'

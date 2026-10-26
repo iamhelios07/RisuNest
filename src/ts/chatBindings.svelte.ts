@@ -10,6 +10,7 @@ import { cloneConversationMetadata } from './storage/selectedConversationLifecyc
 import { isConversationSummaryStub } from './storage/conversationResidency'
 import {
     applyConversationBindingPatch,
+    conversationBindingHolds,
     type ConversationBindingPatch,
 } from './storage/conversationBinding'
 import {
@@ -67,12 +68,15 @@ export function captureChatBindingTarget() {
  * Persists persona or toggle bindings of a conversation. A complete selected conversation goes
  * through its session; anything else (a summary stub or the windowed selected shell) is committed
  * as metadata by the save coordinator, which also advances the baseline so the in-memory record
- * stays clean without reading message bodies.
+ * stays clean without reading message bodies. With `expected`, the patch is dropped unless the
+ * conversation still holds those fields now and, for a coordinator commit, when it is stored.
  */
 export async function updateChatBinding(
     conversation: Chat,
     patch: ConversationBindingPatch,
+    expected?: ConversationBindingPatch,
 ): Promise<void> {
+    if (expected && !conversationBindingHolds(conversation, expected)) return
     const owner = DBState.db.characters.find((character) => character.chats.includes(conversation))
     const session = getActiveConversationSession()
     if (owner && session?.matchesConversation(owner.chaId, conversation)) {
@@ -100,6 +104,7 @@ export async function updateChatBinding(
                 ?.chats.find((chat) => chat.id === conversationId)
             if (current) applyConversationBindingPatch(current, committedPatch)
         },
+        expected,
     )
 }
 
@@ -122,7 +127,9 @@ export async function refreshAuthorNoteCopy(): Promise<void> {
     if (conversation.id && get(activeRerollConversations).includes(conversation.id)) return
     const preset = linkedAuthorNotePreset(DBState.db.authorNotePresets, conversation)
     if (!preset || conversation.note === preset.text) return
-    await updateChatBinding(conversation, authorNotePresetLinkPatch(preset))
+    // An edit queued before this copy wins: the copy commits only over the note and link read here.
+    const read = { note: conversation.note, authorNotePreset: conversation.authorNotePreset }
+    await updateChatBinding(conversation, authorNotePresetLinkPatch(preset), read)
     await saveChatBinding()
 }
 

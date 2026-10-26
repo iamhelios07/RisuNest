@@ -18,3 +18,18 @@ export function applyConversationBindingPatch<T extends object>(
     }
     return target
 }
+
+function sameValue(left: unknown, right: unknown): boolean {
+    if (left === right) return true
+    if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false
+    if (Array.isArray(left) !== Array.isArray(right)) return false
+    const leftKeys = Object.keys(left)
+    return leftKeys.length === Object.keys(right).length && leftKeys.every((key) =>
+        sameValue((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]))
+}
+
+/** Whether a conversation record still holds every field of `expected`; `undefined` expects the field to be absent. */
+export function conversationBindingHolds(target: object, expected: ConversationBindingPatch): boolean {
+    return Object.entries(expected).every(([key, value]) =>
+        sameValue((target as Record<string, unknown>)[key], value))
+}
