@@ -1079,7 +1079,7 @@ describe('native file jobs', () => {
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
-    it('hands a managed character CharX export to Android SAF under a hold taken after the picker', async () => {
+    it('hands a managed character CharX export to Android SAF after the picker', async () => {
         const events: string[] = []
         const handoffPath =
             'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174002.charx'
@@ -1127,10 +1127,6 @@ describe('native file jobs', () => {
                 },
                 wait: async () => undefined,
                 reserveAndroidDestination: androidSafReservationFixture(() => events.push('picker')).reserve,
-                holdExport: async (operation, signal) => {
-                    events.push('hold')
-                    try { return await operation(signal) } finally { events.push('release') }
-                },
                 copyToAndroidSaf: async (request) => {
                     events.push(
                         `saf:${request.sourcePath}:${request.suggestedName}`,
@@ -1147,13 +1143,11 @@ describe('native file jobs', () => {
         expect(result.warningCodes).toEqual(['android-saf-provider-not-atomic'])
         expect(events).toEqual([
             'picker',
-            'hold',
             'native_file_job_start:{"request":{"kind":"export-character-charx","expectedRevision":31,"characterId":"character-id","card":{"spec":"chara_card_v3"},"module":{}}}',
             'native_file_job_status:{"jobId":"character-export"}',
             `saf:${handoffPath}:Leased.charx`,
             `native_character_charx_handoff_cleanup:{"path":"${handoffPath.replaceAll('\\', '\\\\')}"}`,
             'native_file_job_forget:{"jobId":"character-export"}',
-            'release',
         ])
     })
 
@@ -5281,17 +5275,15 @@ describe('native snapshot restore', () => {
 
 it.each([
     ['androidSaf', false], ['androidSaf', true], ['iosFiles', false], ['iosFiles', true],
-] as const)('publishes gallery downloads through %s (archive=%s) under a background hold and cleans their handoff', async (platform, archive) => {
+] as const)('publishes gallery downloads through %s (archive=%s) and cleans their handoff', async (platform, archive) => {
     const kind = archive ? 'export-gallery-zip' : 'export-gallery-file'
     const handoffPath = '/synthetic/native-file-jobs/handoffs/risu-download-123e4567-e89b-42d3-a456-426614174004.bin'
     let published = false
     let cleaned = false
-    let holding = false
     const selection = {kind: 'inlay' as const, keys: ['selected-inlay']}
     const publish = async (request: {sourcePath: string; suggestedName: string}) => {
         expect(request.sourcePath).toBe(handoffPath)
         expect(request.suggestedName).toBe(archive ? 'images.zip' : 'photo.png')
-        expect(holding).toBe(true)
         published = true
         return {bytes: 10, warningCodes: []}
     }
@@ -5301,7 +5293,6 @@ it.each([
         invoke: async (command, args) => {
             if (command === 'native_file_job_start') {
                 expect(args?.request).toEqual({kind, expectedRevision: 42, selection})
-                expect(holding).toBe(true)
                 return {jobId: 'gallery'}
             }
             if (command === 'native_file_job_status') return {jobId: 'gallery', kind, state: 'succeeded', phase: 'complete',
@@ -5314,16 +5305,11 @@ it.each([
         },
         wait: async () => {},
         reserveAndroidDestination: androidSafReservationFixture().reserve,
-        holdExport: async (operation, signal) => {
-            holding = true
-            try { return await operation(signal) } finally { holding = false }
-        },
         copyToAndroidSaf: publish,
         copyToIOSFiles: publish,
     })
     expect(published).toBe(true)
     expect(cleaned).toBe(true)
-    expect(holding).toBe(false)
     expect(result.handoffPath).toBeUndefined()
 })
 

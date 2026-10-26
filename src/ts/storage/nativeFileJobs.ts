@@ -700,8 +700,6 @@ export interface NativeBackupExportDependencies extends NativeFileJobDependencie
     copyToAndroidSaf(
         request: AndroidSafDestinationRequest,
     ): Promise<AndroidSafDestinationResult>
-    /** Keeps a user-started export running in the background, passing the signal that also ends on expiry. */
-    holdExport?<T>(operation: (signal: AbortSignal | undefined) => Promise<T>, signal: AbortSignal | undefined): Promise<T>
 }
 
 const productionDependencies: NativeFileJobDependencies = {
@@ -718,8 +716,6 @@ const productionBackupExportDependencies: NativeBackupExportDependencies = {
     copyToIOSFiles: exportIOSFile,
     copyToAndroidSaf: (request) => copyNativeExportToAndroidSaf(request),
     reserveAndroidDestination: reserveAndroidSafDestination,
-    holdExport: async (operation, signal) => (await import('../mobileBackgroundTask'))
-        .runWithMobileBackgroundTask('export', (task) => operation(task.signal), signal, true),
 }
 
 export class NativeFileJobError extends Error {
@@ -2226,8 +2222,6 @@ interface NativeManagedExportSpec {
     reservation?: AndroidSafDestinationReservation
     relaySafCopyProgress?: boolean
     retainHandoffOnPublicationFailure?: boolean
-    /** Holds its own background task; exports run inside a shared file operation already hold one. */
-    holdsBackground?: boolean
     prepareRequest(): Record<string, unknown> | Promise<Record<string, unknown>>
 }
 
@@ -2253,12 +2247,10 @@ async function runNativeManagedExport(
         reservation = await dependencies.reserveAndroidDestination(spec.destination.suggestedName, spec.androidSourceKind ?? 'risuSave', options.signal)
         owned = true
     }
-    const run = (signal = options.signal) =>
-        runNativeManagedExportToDestination(spec, { ...options, signal }, dependencies, reservation)
+    const run = () => runNativeManagedExportToDestination(spec, options, dependencies, reservation)
     // The destination is chosen by now, so the picker never holds the background task.
     options.onDestinationChosen?.()
-    const work = () => spec.holdsBackground && dependencies.holdExport ? dependencies.holdExport(run, options.signal) : run()
-    return owned ? withAndroidSafDestination(reservation, work) : work()
+    return owned ? withAndroidSafDestination(reservation, run) : run()
 }
 
 async function runNativeManagedExportToDestination(
@@ -2450,7 +2442,6 @@ export function runNativeCharacterCharxExport(
     return runNativeManagedExport(
         {
             operation: 'Native character CharX export',
-            holdsBackground: true,
             safLengthMismatchLabel: 'character CharX',
             handoffCleanupCommand: 'native_character_charx_handoff_cleanup',
             destination: input.destination,
@@ -2480,7 +2471,6 @@ export function runNativeCharacterCardExport(
     return runNativeManagedExport(
         {
             operation: 'Native character card export',
-            holdsBackground: true,
             safLengthMismatchLabel: 'character card',
             handoffCleanupCommand: 'native_character_card_handoff_cleanup',
             destination: input.destination,
@@ -2509,7 +2499,6 @@ export function runNativeRisuModuleExport(
     return runNativeManagedExport(
         {
             operation: 'Native RISUM export',
-            holdsBackground: true,
             safLengthMismatchLabel: 'RISUM',
             handoffCleanupCommand: 'native_risu_module_handoff_cleanup',
             destination: input.destination,
@@ -3714,7 +3703,6 @@ export function runNativeGalleryExport(
 ): Promise<NativeFileJobResult> {
     return runNativeManagedExport({
         operation: 'Native gallery export',
-        holdsBackground: true,
         safLengthMismatchLabel: 'gallery download',
         handoffCleanupCommand: 'native_download_handoff_cleanup',
         androidSourceKind: 'download',
