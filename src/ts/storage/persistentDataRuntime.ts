@@ -406,6 +406,8 @@ export interface PersistentDataRuntime {
     flushPendingDataLocallyForCheckpoint(reason: string): Promise<boolean>
     /** Whether complete conversations are saved against immutable captured values. */
     capturesImmutableCharacters(): boolean
+    /** Unacknowledged conversation mutation events and the age of the oldest, for diagnostics. */
+    pendingConversationMutationDiagnostics(): { pendingEvents: number; unacknowledgedMs?: number }
     acknowledgeGenerationCompletion(expectedAuthorityEpoch?: number): Promise<void>
     commitCharacterAddition(
         request: CharacterAdditionRequest,
@@ -1433,6 +1435,7 @@ export function createPersistentDataRuntime(
         flushPendingDataLocallyForCheckpoint: (reason) =>
             coordinator.flushPendingDataLocallyForCheckpoint(reason),
         capturesImmutableCharacters: () => coordinator.capturesImmutableCharacters,
+        pendingConversationMutationDiagnostics: () => coordinator.pendingConversationMutationDiagnostics,
         async acknowledgeGenerationCompletion(expectedAuthorityEpoch = coordinator.storageAuthorityEpoch) {
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
             await coordinator.flushPendingDataLocally('generation-completion')

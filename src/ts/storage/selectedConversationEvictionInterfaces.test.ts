@@ -87,6 +87,7 @@ function mockPublicGeneration(
         flushPendingData: (reason: string) => runtime.flushPendingData(reason),
         flushPendingDataLocallyForCheckpoint: (reason: string) => runtime.flushPendingDataLocallyForCheckpoint(reason),
         capturesImmutableCharacters: () => runtime.capturesImmutableCharacters(),
+        pendingConversationMutationDiagnostics: () => runtime.pendingConversationMutationDiagnostics(),
         drainDeferredLwwReceives: vi.fn(async () => undefined),
     }))
     vi.doMock('./persistentDataStoreFactory', () => ({ getPersistentDataStore: () => fixture.store }))

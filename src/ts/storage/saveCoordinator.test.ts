@@ -769,11 +769,13 @@ describe('SaveCoordinator', () => {
             .mockRejectedValueOnce(new Error('range write failed'))
             .mockImplementation(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
         let session!: ActiveConversationSession
+        let now = 1_000
         const coordinator = new SaveCoordinator({
             store: makeStore(commit),
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
             replaceDatabase: () => undefined,
+            now: () => now,
             onConversationMutationPersistenceStarted: (event) =>
                 session.beginPersistence(event.sessionVersion),
             onConversationMutationPersisted: (event) => {
@@ -803,6 +805,8 @@ describe('SaveCoordinator', () => {
         expect(session.pinCount('dirty')).toBe(1)
         expect(session.residentBytes).toBe(1)
         expect(coordinator.pendingBytes).toBeGreaterThanOrEqual(0)
+        now = 3_500
+        expect(coordinator.pendingConversationMutationDiagnostics).toEqual({ pendingEvents: 1, unacknowledgedMs: 2_500 })
 
         await coordinator.flushPendingData('retry-attempt')
 
@@ -815,6 +819,42 @@ describe('SaveCoordinator', () => {
         expect(session.pinCount('pending-save')).toBe(0)
         expect(session.pinCount('dirty')).toBe(0)
         expect(session.residentBytes).toBe(0)
+        expect(coordinator.pendingConversationMutationDiagnostics).toEqual({ pendingEvents: 0, unacknowledgedMs: undefined })
+    })
+
+    it('reports pending conversation events with the age of the oldest until they are acknowledged', async () => {
+        const database = makeChattyDatabase()
+        let session!: ActiveConversationSession
+        let now = 1_000
+        const coordinator = new SaveCoordinator({
+            store: makeStore(vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            now: () => now,
+            onConversationMutationPersistenceStarted: (event) =>
+                session.beginPersistence(event.sessionVersion),
+            onConversationMutationPersisted: (event) => {
+                session.acknowledgePersisted(event.sessionToken, event.sessionVersion, event.revision)
+            },
+        })
+        coordinator.initialize(2)
+        session = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation: database.characters[0].chats[1],
+            storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+
+        session.append({ role: 'user', data: 'first unsaved' })
+        now = 1_400
+        session.append({ role: 'char', data: 'second unsaved' })
+        now = 2_000
+        expect(coordinator.pendingConversationMutationDiagnostics).toEqual({ pendingEvents: 2, unacknowledgedMs: 1_000 })
+
+        await coordinator.flushPendingData('diagnostic-ages')
+        expect(coordinator.pendingConversationMutationDiagnostics).toEqual({ pendingEvents: 0, unacknowledgedMs: undefined })
     })
 
     it('pins only covered session commands while their store commit is in flight', async () => {

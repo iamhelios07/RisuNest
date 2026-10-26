@@ -542,6 +542,8 @@ export const flushPendingDataLocallyForCheckpoint = (reason: string): Promise<bo
     getPersistentDataRuntime().flushPendingDataLocallyForCheckpoint(reason)
 export const capturesImmutableCharacters = (): boolean =>
     getPersistentDataRuntime().capturesImmutableCharacters()
+export const pendingConversationMutationDiagnostics = (): { pendingEvents: number; unacknowledgedMs?: number } =>
+    getPersistentDataRuntime().pendingConversationMutationDiagnostics()
 export const acknowledgeGenerationCompletion = async (expectedAuthorityEpoch?: number): Promise<void> => {
     const runtime = getPersistentDataRuntime()
     const authorityEpoch = expectedAuthorityEpoch ?? runtime.getStorageAuthorityEpoch()

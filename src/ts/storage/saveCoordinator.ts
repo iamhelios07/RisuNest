@@ -264,6 +264,7 @@ interface PendingCharacterAddition {
 
 interface PendingConversationMutation {
     event: ActiveConversationMutationEvent
+    recordedAt: number
 }
 
 interface PendingWindowedActivationChange {
@@ -1227,7 +1228,7 @@ export class SaveCoordinator {
 
         const detached = safeStructuredClone(event)
         this.markPersistentDataDirty(estimatedBytes)
-        this.pendingConversationMutations.push({ event: detached })
+        this.pendingConversationMutations.push({ event: detached, recordedAt: this.currentTime() })
     }
 
     /**
@@ -1353,6 +1354,15 @@ export class SaveCoordinator {
     /** Whether complete conversations are saved against immutable captured values instead of being replaced whole. */
     get capturesImmutableCharacters(): boolean {
         return this.dependencies.canonicalCapture?.materializedCharacters !== undefined
+    }
+
+    /** Unacknowledged conversation mutation events and the age of the oldest, for diagnostics. */
+    get pendingConversationMutationDiagnostics(): { pendingEvents: number; unacknowledgedMs?: number } {
+        const oldest = this.pendingConversationMutations[0]
+        return {
+            pendingEvents: this.pendingConversationMutations.length,
+            unacknowledgedMs: oldest ? Math.max(0, this.currentTime() - oldest.recordedAt) : undefined,
+        }
     }
 
     private async runLocalFlush(reason: string): Promise<void> {

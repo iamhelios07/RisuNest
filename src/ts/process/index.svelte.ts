@@ -64,6 +64,7 @@ import {
     flushPendingData,
     flushPendingDataLocallyForCheckpoint,
     capturesImmutableCharacters,
+    pendingConversationMutationDiagnostics,
     getActiveConversationSession,
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
@@ -281,7 +282,8 @@ async function acknowledgeGenerationWithDiagnostics(lifecycle: GenerationComplet
             const matchingAuthority = authority?.characterId === lifecycle.generationTarget?.characterId
                 && authority?.conversationId === lifecycle.generationTarget?.conversationId
             lifecycle.diagnostics.persistence({
-                boundary: 'final', savePath,
+                boundary: 'final', savePath, ...pendingConversationMutationDiagnostics(),
+                dirtyRecords: matchingSession ? session.pinCount('dirty') : undefined,
                 acknowledgedRevision: !authorityCurrent ? undefined : matchingSession ? session.storeRevision
                     : matchingAuthority ? authority?.storeRevision : undefined,
             })

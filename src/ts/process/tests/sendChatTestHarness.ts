@@ -327,6 +327,7 @@ export function persistentRuntimeModule(overrides: Overrides<PersistentRuntimeMo
         flushPendingData: vi.fn(async () => undefined),
         flushPendingDataLocallyForCheckpoint: vi.fn(async () => true),
         capturesImmutableCharacters: () => true,
+        pendingConversationMutationDiagnostics: () => ({ pendingEvents: 0 }),
         getActiveConversationSession: () => null,
         peekActiveConversationSession: () => null,
         invalidateActiveConversationSession: vi.fn(),
