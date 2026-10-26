@@ -56,7 +56,7 @@ beforeEach(() => {
         if (command === 'pds_abort_plugin_device_part') { native.uploads.delete(args.uploadId!); return }
         if (command === 'pds_read_plugin_device_part') {
             const part = native.parts.get(args.hash!)
-            if (!part) throw new Error('plugin structure part is missing')
+            if (!part) throw { code: 'validation', message: 'plugin structure part is missing' }
             return part.slice(args.offset!, args.offset! + 1024 * 1024).buffer
         }
         if (command === 'pds_read_plugin_device_value') {
@@ -252,5 +252,18 @@ describe('native structured plugin values', () => {
         }
         await expect(storage.getItem('fine')).resolves.toEqual({ ok: true })
         await expect(storage.keys()).resolves.toEqual(['fine', 'future', 'missing'])
+    })
+
+    it('retries a part read that a busy store or the IPC failed, within a bound', async () => {
+        await new SafeLocalPluginStorage('native-retry').setItem('value', new Uint8Array([7]))
+        const answer = native.invoke.getMockImplementation()!
+        const failures: unknown[] = [{ code: 'store-error', message: 'database is locked' }, 'IPC request failed']
+        native.invoke.mockImplementation(async (command: string, args: unknown) => {
+            if (command === 'pds_read_plugin_device_part' && failures.length > 0) throw failures.shift()
+            return answer(command, args)
+        })
+        await expect(new SafeLocalPluginStorage('native-retry').getItem('value')).resolves.toEqual(new Uint8Array([7]))
+        failures.push(...Array.from({ length: 3 }, () => ({ code: 'store-error', message: 'database is locked' })))
+        await expect(new SafeLocalPluginStorage('native-retry').getItem('value')).rejects.toThrow('getLocalPluginStorage cannot read this value')
     })
 })

@@ -172,10 +172,34 @@ async function storeParts(owner: string, value: StructuredLocalPluginValue): Pro
     return hashes
 }
 
+const PART_READ_ATTEMPTS = 3
+const PART_READ_RETRY_DELAY_MS = 100
+
+// The native side reports a damaged or missing part as a validation error. A
+// busy store answers with a store error, and a failed IPC call with no store
+// error at all; only those two are worth another attempt.
+function isTransientPartReadError(error: unknown): boolean {
+    let value = error
+    if (typeof value === 'string') {
+        try { value = JSON.parse(value) } catch { return true }
+    }
+    const code = value && typeof value === 'object' ? (value as { code?: unknown }).code : undefined
+    return code === undefined || code === 'store-error'
+}
+
 export async function readNativePluginDevicePart(hash: string, byteLength: number): Promise<Uint8Array> {
     const part = new Uint8Array(byteLength)
     for (let offset = 0; offset < byteLength;) {
-        const response = await invoke<unknown>('pds_read_plugin_device_part', { hash, offset })
+        let response: unknown
+        for (let attempt = 1; ; attempt++) {
+            try {
+                response = await invoke<unknown>('pds_read_plugin_device_part', { hash, offset })
+                break
+            } catch (error) {
+                if (attempt === PART_READ_ATTEMPTS || !isTransientPartReadError(error)) throw error
+                await new Promise(resolve => setTimeout(resolve, PART_READ_RETRY_DELAY_MS))
+            }
+        }
         const piece = response instanceof ArrayBuffer ? new Uint8Array(response)
             : response instanceof Uint8Array ? response
             : Array.isArray(response) ? Uint8Array.from(response as number[]) : null
