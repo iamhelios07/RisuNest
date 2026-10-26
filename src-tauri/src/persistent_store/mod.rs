@@ -886,6 +886,8 @@ pub(crate) struct WorkingSetCommit {
     pub(crate) expected_revision: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gallery_pending_fence: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) device_plugin_fence: Option<device_store::plugin_gc::PluginGcFence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) root: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

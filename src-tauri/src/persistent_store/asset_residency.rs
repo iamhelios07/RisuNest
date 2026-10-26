@@ -52,6 +52,8 @@ enum Holder {
 }
 /// Bodies classified per registry question.
 const HOLDER_PAGE: usize = 1024;
+/// Offloaded bodies unlinked under one hold of the repository mutation lock.
+const EVICTION_PAGE: usize = 64;
 /// Connection IDs per connection root, read once per status or download.
 #[derive(Default)]
 struct Connections(std::collections::BTreeMap<std::path::PathBuf, BTreeSet<String>>);
@@ -993,23 +995,38 @@ impl PersistentStore {
         if !objects.is_empty() {
             check()?;
             progress.stage(Stage::Preparing, 0, None);
-            let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-            let fresh = inventory.current(self)?;
-            progress.stage(Stage::Deleting, 0, Some(total));
-            for (hash, size) in objects {
+            // Media requests take the same lock, so it is held for one page of
+            // unlinks at a time, and directories are synced after it is released.
+            for (index, page) in objects.chunks(EVICTION_PAGE).enumerate() {
                 check()?;
-                if fresh.local.contains(&hash) {
-                    progress.completed(None);
-                    continue;
+                let mut directories = BTreeSet::new();
+                let unlinked = (|| -> Result<()> {
+                    let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+                    let fresh = inventory.current(self)?;
+                    if index == 0 { progress.stage(Stage::Deleting, 0, Some(total)); }
+                    for (hash, size) in page {
+                        check()?;
+                        if fresh.local.contains(hash) {
+                            progress.completed(None);
+                            continue;
+                        }
+                        // Keep aliases and their object catalog row. Offloading is
+                        // neither a logical deletion nor an asset GC tombstone.
+                        let key = object_physical_key(hash);
+                        if let crate::asset_repository::ExactObjectUnlink::Removed { .. } =
+                            cas.unlink_retained_object(hash, *size, &key)?
+                        {
+                            directories.extend(cas.repository_root().join(&key).parent().map(std::path::Path::to_path_buf));
+                            evicted += size;
+                            progress.completed(Some(*size));
+                        } else { progress.completed(None); }
+                    }
+                    Ok(())
+                })();
+                for directory in directories {
+                    crate::trust_boundary::sync_directory(&directory)?;
                 }
-                // Keep aliases and their object catalog row. Offloading is
-                // neither a logical deletion nor an asset GC tombstone.
-                if let crate::asset_repository::ExactObjectUnlink::Removed { .. } =
-                    cas.unlink_retained_object(&hash, size, &object_physical_key(&hash))?
-                {
-                    evicted += size;
-                    progress.completed(Some(size));
-                } else { progress.completed(None); }
+                unlinked?;
             }
         }
         progress.stage(Stage::Finalizing, total, None);
