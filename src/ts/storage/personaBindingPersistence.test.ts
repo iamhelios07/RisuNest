@@ -2,6 +2,7 @@ import { expect, it, vi } from 'vitest'
 import { captureRoot, deferred, makeDatabase, SaveCoordinator } from './saveCoordinator.testSupport'
 import { applyConversationBindingPatch, type ConversationBindingPatch } from './conversationBinding'
 import { createStoreStub } from './persistentDataStore.testSupport'
+import { RevisionConflictError } from './persistentDataStore'
 import type { Chat } from './database.svelte'
 import { createConversationSummaryStub } from './conversationResidency'
 
@@ -164,4 +165,25 @@ it('drops a binding whose expected fields an earlier queued write changed and co
 
     await coordinator.mutateConversationBinding(character.chaId, 'other', { note: 'Preset copy' }, publish, { note: '', authorNotePreset: link('second') })
     expect((await stored()).note).toBe('Preset copy')
+})
+
+it('checks a conditional binding again against a write another tab commits first', async () => {
+    const { character, other, coordinator, store, commit } = setup()
+    const publish = (patch: ConversationBindingPatch) => { applyConversationBindingPatch(other, patch) }
+    const stored = async () => (await store.readConversationMetadata(character.chaId, 'other'))!.value.conversation
+    const write = commit.getMockImplementation()!
+    const otherTabWrites = (field: string, value: string) => commit.mockImplementationOnce(async (input) => {
+        const { revision } = await write({ expectedRevision: input.expectedRevision, unitMutations: [
+            { key: JSON.stringify(['conversation', character.chaId, 'other', field]), type: 'set', value },
+        ] })
+        throw new RevisionConflictError(input.expectedRevision, revision)
+    })
+
+    otherTabWrites('note', 'Other tab note')
+    await coordinator.mutateConversationBinding(character.chaId, 'other', { note: 'Preset copy' }, publish, { note: '' })
+    expect((await stored()).note).toBe('Other tab note')
+
+    otherTabWrites('name', 'Renamed in another tab')
+    await coordinator.mutateConversationBinding(character.chaId, 'other', { note: 'Preset copy' }, publish, { note: 'Other tab note' })
+    expect(await stored()).toMatchObject({ name: 'Renamed in another tab', note: 'Preset copy' })
 })
