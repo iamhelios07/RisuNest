@@ -926,13 +926,13 @@ const makeRisuaiAPIV3 = (
         setDatabase: (database: Record<string, unknown>) =>
             databaseAccess.setDatabase(database, allowedDbKeys),
         loadPlugins: oldApis.loadPlugins,
-        readImage: oldApis.readImage,
+        readImage: (path: string) => oldApis.readImage(path, { background: true }),
         readInlay: async (id: string) => {
             const conf = await getPluginPermission(permissionContext, 'inlay', 'periodically');
             if(!conf){
                 return null;
             }
-            return await getInlayAsset(id);
+            return await getInlayAsset(id, { background: true });
         },
         saveAsset: oldApis.saveAsset,
         //Same functionality, but new implementation

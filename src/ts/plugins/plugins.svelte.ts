@@ -6,6 +6,7 @@ import { getDatabase, setDatabase, setDatabaseLite } from "../storage/database.s
 import { alertConfirm, alertError } from "../alert";
 import { selectSingleFile } from "../util";
 import { markBootSuspect } from "../storage/bootAttempt";
+import type { BlobReadOptions } from "../storage/blobStore";
 import type { OpenAIChat } from "../process/index.svelte";
 import { fetchNative, globalFetch, readImage, saveAsset } from "../globalApi.svelte";
 import { DBState, hotReloading } from "../stores.svelte";
@@ -718,7 +719,7 @@ export const getV2PluginAPIs = () => {
             }
         },
         loadPlugins: loadPluginsFromPlugin,
-        readImage: (path:string) => {
+        readImage: (path:string, options?: BlobReadOptions) => {
             if(path.startsWith('assets/')){
                 //trim assets/ prefix temporarily
                 path = path.slice(7);
@@ -727,7 +728,7 @@ export const getV2PluginAPIs = () => {
                 throw new Error("readImage path cannot contain '/' or '\\' for security reasons, except assets/ prefix.");
             }
             //re-add assets/ prefix
-            return readImage('assets/' + path);
+            return readImage('assets/' + path, options);
         },
         saveAsset: (data:Uint8Array) => {
             return saveAsset(data);
