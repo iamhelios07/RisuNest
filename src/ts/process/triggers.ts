@@ -1145,7 +1145,7 @@ async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTrigge
     const generation = arg.regexGeneration ?? arg.generation?.signal
     arg.regexScope ??= generation ? generationRegexTimeoutScope(generation) : createRegexTimeoutScope()
     const regexExecutor = new RegexExecutor({ scope: arg.regexScope, onTimeout: noticeRegexTimeout,
-        invocationTimeoutMs: Number.POSITIVE_INFINITY })
+        invocationTimeoutMs: Number.POSITIVE_INFINITY, skipTimedOutRules: arg.displayMode === true })
     let regexRule: unknown
     let regexTrigger: string
     const regexOperation = <K extends keyof RegexOperationResults>(kind: K, pattern: string, flags: string, input: string) =>

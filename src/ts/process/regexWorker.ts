@@ -96,6 +96,7 @@ export function createRegexWorkerMessageHandler(
             if (entry.pattern === '') {
                 continue
             }
+            if (request.continuation) respond({ type: 'progress', id: request.id, index: nextIndex })
             try {
                 if (entry.compileError !== undefined) {
                     throw new Error(entry.compileError)

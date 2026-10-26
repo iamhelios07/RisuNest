@@ -64,7 +64,12 @@ export class StallingWorker extends InMemoryWorker {
         if (message.type === 'operation' && message.operation.pattern.startsWith('SLOW')) return
         if (message.type === 'execute') {
             const { start = 0, end = this.entries.length } = message.continuation ?? {}
-            if (this.entries.slice(start, end).some((entry) => entry[1].startsWith('SLOW'))) return
+            const slow = this.entries.findIndex((entry, index) => index >= start && index < end && entry[1].startsWith('SLOW'))
+            if (slow >= 0) {
+                // The real Worker names a rule before running it.
+                if (message.continuation) this.respond({ type: 'progress', id: message.id, index: slow })
+                return
+            }
         }
         super.postMessage(message)
     }

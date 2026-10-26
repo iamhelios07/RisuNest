@@ -123,6 +123,34 @@ test('skips a stalled regex condition and replacement and continues the trigger'
     } finally { vi.stubGlobal('Worker', originalWorker); vi.useRealTimers() }
 })
 
+test('skips a display trigger regex that timed out on other text in a later display run', async () => {
+    vi.useFakeTimers()
+    const originalWorker = globalThis.Worker
+    vi.stubGlobal('Worker', StallingWorker)
+    try {
+        const { chat, char, session } = fixture()
+        char.triggerscript = [{
+            comment: 'display test', type: 'display', conditions: [], effect: [{
+                type: 'v2RegexTest', value: 'source', valueType: 'var', regex: 'SLOW-display-trigger|text', regexType: 'value',
+                flags: '', flagsType: 'value', outputVar: 'matched', indent: 0,
+            }],
+        }] as character['triggerscript']
+        runtime.session = session
+        DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+        chat.scriptstate = { $source: '<text>' }
+        const first = runTrigger(char, 'display', { chat, displayMode: true, displayData: 'row' })
+        await vi.advanceTimersByTimeAsync(10_000)
+        await first
+        chat.scriptstate.$source = '<edited text>'
+        let finished = false
+        const edited = runTrigger(char, 'display', { chat, displayMode: true, displayData: 'row' })
+            .finally(() => { finished = true })
+        await vi.advanceTimersByTimeAsync(1)
+        expect(finished).toBe(true)
+        await edited
+    } finally { vi.stubGlobal('Worker', originalWorker); vi.useRealTimers() }
+})
+
 test('keeps stored trigger permissions and parser identity stable during display', async () => {
     const { chat, char, session } = fixture()
     char.lowLevelAccess = true

@@ -36,6 +36,11 @@ export type RegexWorkerRequest = {
 }
 
 export type RegexWorkerResponse = { type: 'ready' } | {
+    // Sent before each rule of a continuation, so a timeout names the rule that did not finish.
+    type: 'progress'
+    id: number
+    index: number
+} | {
     type: 'result'
     id: number
     data: string
@@ -76,6 +81,7 @@ interface PendingRequest {
     continuation?: { start: number, end: number, skipPlainCbs?: boolean }
     input: string
     timeoutMs: number
+    ruleIndex?: number
     signal?: AbortSignal
     abortListener?: () => void
     timeout?: ReturnType<typeof setTimeout>
@@ -86,7 +92,7 @@ interface PendingRequest {
 export class RegexExecutionTimeoutError extends Error {
     readonly category = 'regex_timeout'
 
-    constructor(readonly revision: number) {
+    constructor(readonly revision: number, readonly ruleIndex?: number) {
         super('Regex script execution timed out.')
         this.name = 'RegexExecutionTimeoutError'
     }
@@ -191,6 +197,10 @@ export class RegexWorkerClient {
             }
             const request = this.pending.get(response.id)
             if (!request || this.activeId !== response.id) return
+            if (response.type === 'progress') {
+                request.ruleIndex = response.index
+                return
+            }
             this.pending.delete(response.id)
             this.activeId = undefined
             this.cleanupPending(request)
@@ -231,7 +241,8 @@ export class RegexWorkerClient {
         if (!next) return
         const [id, request] = next
         this.activeId = id
-        request.timeout = setTimeout(() => this.replaceWorker(new RegexExecutionTimeoutError(request.plan?.revision ?? 0), id), request.timeoutMs)
+        request.timeout = setTimeout(() => this.replaceWorker(
+            new RegexExecutionTimeoutError(request.plan?.revision ?? 0, request.ruleIndex), id), request.timeoutMs)
         try {
             if (request.operation) {
                 this.worker.postMessage({ type: 'operation', id, operation: request.operation })
