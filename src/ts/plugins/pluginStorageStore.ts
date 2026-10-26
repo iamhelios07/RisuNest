@@ -1,5 +1,6 @@
 import { PluginStorageObservation, type PluginStorageWriteCheck } from './pluginStorageProtection'
 import {
+    readCurrentRevision,
     type PersistentDataStore,
     type PluginStorageMutation,
     type PluginStorageSummary,
@@ -241,7 +242,7 @@ export function createPluginStorageStore(
         await store.open()
         return acquireCurrentRevisionWithRetry(
             (revision) => store.acquireRevision(revision),
-            async () => (await store.readRoot()).revision,
+            () => readCurrentRevision(store),
         )
     }
 

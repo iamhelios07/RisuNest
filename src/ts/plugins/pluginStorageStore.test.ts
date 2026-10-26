@@ -457,12 +457,14 @@ describe('plugin storage V3 residency', () => {
             zero: { byteSize: 1, value: 0 },
             memory: { byteSize: 8, value: { ok: true } },
         }, 1)
+        store.readRevision = vi.fn(async () => 4)
 
         await expect(storage.forOwner(OWNER).snapshot()).resolves.toEqual({
             memory: { ok: true },
             zero: 0,
         })
         expect(store.acquireRevision).toHaveBeenCalledWith(4)
+        expect(store.readRoot).not.toHaveBeenCalled()
     })
 
     it('retries a transient pinned snapshot release without duplicating successful cleanup', async () => {
