@@ -383,7 +383,7 @@ fn quarantine_disposition(library: &Connection, device: &Connection, request_id:
 impl Intent<'_> {
     fn for_commit(input: &WorkingSetCommit, aliases: &[super::AssetAlias]) -> Self {
         // Older readers ignore unknown commit fields, so guarded deletes need a kind they reject.
-        if input.gallery_pending_fence.is_some() {
+        if input.gallery_pending_fence.is_some() || input.device_plugin_fence.is_some() {
             Self::GuardedGalleryDelete { commit: input.clone(), aliases: aliases.to_vec() }
         } else {
             Self::Commit { commit: input.clone(), aliases: aliases.to_vec() }
@@ -1649,6 +1649,20 @@ impl PersistentStore {
         match intent {
             Intent::Commit { commit: input, aliases }
             | Intent::GuardedGalleryDelete { commit: input, aliases } => {
+                // The device plugin values the interrupted call checked must still be current,
+                // and their writers stay out until the commit ends, as they did for that call.
+                let _barrier = match &input.device_plugin_fence {
+                    Some(fence) => {
+                        if !self.device_store()?.plugin_gc_fence_is_current(fence)? {
+                            return Err(StoreError::RevisionConflict {
+                                expected: input.expected_revision,
+                                actual: current_revision(&self.connection)?,
+                            });
+                        }
+                        Some(self.device_store()?.acquire_plugin_gc_barrier(fence)?)
+                    }
+                    None => None,
+                };
                 commit::commit_lww(
                     &mut self.connection,
                     &input,
