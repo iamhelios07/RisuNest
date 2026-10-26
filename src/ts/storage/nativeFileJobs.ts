@@ -1914,7 +1914,9 @@ async function runNativeReplacementRestore(
                     if (unchanged.revision !== upstreamPause.fence.revision) throw new Error('Native restore changed the library')
                     const plugins = await import('../plugins/apiV3/v3.svelte')
                     await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
-                    await bounded(upstreamPause.abortUnchanged(async () => { await bounded(Promise.resolve(upstreamBinding?.assertAuthority()), 'binding verification') }), 'unchanged restore recovery')
+                    // Finishing after the deadline ends the guard and the recovery that would resume the binding.
+                    await bounded(upstreamPause.abortUnchanged(async () => { await bounded(Promise.resolve(upstreamBinding?.assertAuthority()), 'binding verification') }), 'unchanged restore recovery',
+                        () => upstreamBinding?.resume())
                     await bounded(Promise.resolve(upstreamBinding?.resume()), 'binding resume')
                 } catch { await bounded(upstreamPause.finish(), 'write pause release').catch(() => {}) }
             } else await bounded(upstreamPause.finish(), 'write pause release').catch(() => {})
