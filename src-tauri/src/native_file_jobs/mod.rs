@@ -397,6 +397,17 @@ pub(crate) enum NativeFileJobStartRequest {
         concurrency: Option<u8>,
         reauthenticated: bool,
     },
+    PublishOfficialAccountAssets {
+        base_url: String,
+        credential: official_snapshot::OfficialSnapshotCredential,
+        account_id: String,
+        lease: String,
+        #[serde(default)]
+        session: Option<String>,
+        assets: Vec<official_assets::upload::PinnedAsset>,
+        #[serde(default)]
+        concurrency: Option<u8>,
+    },
 }
 
 fn portable_export_requires_revision(source: &Option<JobSource>, expected_revision: Option<i64>, _selection: &portable::PortableSelection) -> Result<bool, NativeJobError> {
@@ -2007,6 +2018,41 @@ impl NativeFileJobState {
                     },
                 }
             }
+            NativeFileJobStartRequest::PublishOfficialAccountAssets {
+                base_url,
+                credential,
+                account_id,
+                lease,
+                session,
+                assets,
+                concurrency,
+            } => {
+                let concurrency = official_assets::upload::validate_publication_start(
+                    &base_url,
+                    &account_id,
+                    &lease,
+                    session.as_deref(),
+                    &assets,
+                    concurrency,
+                )?;
+                let (root, uploads) =
+                    crate::persistent_store::commands::with_store(app.state(), |store| {
+                        official_assets::upload::pinned_uploads(store, &lease, &assets)
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::PublishOfficialAssets {
+                    request: official_assets::upload::PublicationRequest {
+                        base_url,
+                        credential,
+                        account_id,
+                        session,
+                        concurrency,
+                        root,
+                        uploads,
+                        shared: official_assets::upload::PublicationHandle::default(),
+                    },
+                }
+            }
         };
         self.spawn(task, true)
     }
@@ -2244,6 +2290,10 @@ impl NativeFileJobState {
         if let NativeFileJobTask::RestoreOfficialAssets { request } = &task {
             job.status.lock().map_err(|_| NativeJobError::new("store-error", "native job status mutex poisoned"))?
                 .official_asset_shared = Some(request.shared.clone());
+        }
+        if let NativeFileJobTask::PublishOfficialAssets { request } = &task {
+            job.status.lock().map_err(|_| NativeJobError::new("store-error", "native job status mutex poisoned"))?
+                .official_asset_publication_shared = Some(request.shared.clone());
         }
         let job_id = job.id();
         let owned_directory = match create_owned_directory(&self.root.join("jobs"), &job_id) {
@@ -2603,6 +2653,9 @@ impl NativeFileJobState {
                     }
                     NativeFileJobTask::RestoreOfficialAssets { request } => {
                         official_assets::run(request, &owned_directory, &job)
+                    }
+                    NativeFileJobTask::PublishOfficialAssets { request } => {
+                        official_assets::upload::publish(request, &job)
                     }
                 },
                 "native file job worker panicked",
@@ -2998,6 +3051,9 @@ enum NativeFileJobTask {
     RestoreOfficialAssets {
         request: official_assets::Request,
     },
+    PublishOfficialAssets {
+        request: official_assets::upload::PublicationRequest,
+    },
 }
 
 impl NativeFileJobTask {
@@ -3023,6 +3079,7 @@ impl NativeFileJobTask {
             #[cfg(feature = "native-official-publication")]
             Self::OfficialPublication { .. } => JobKind::OfficialPublicationUpload,
             Self::RestoreOfficialAssets { .. } => JobKind::RestoreOfficialAccountAssets,
+            Self::PublishOfficialAssets { .. } => JobKind::PublishOfficialAccountAssets,
         }
     }
 
@@ -3065,7 +3122,7 @@ impl NativeFileJobTask {
             Self::KeiBackup { prepared } => Some(prepared.revision()),
             #[cfg(feature = "native-official-publication")]
             Self::OfficialPublication { request, .. } => Some(request.expected_revision),
-            Self::RestoreOfficialAssets { .. } => None,
+            Self::RestoreOfficialAssets { .. } | Self::PublishOfficialAssets { .. } => None,
         }
     }
 }
@@ -3806,6 +3863,7 @@ pub(crate) enum JobKind {
     KeiBackupUpload,
     OfficialPublicationUpload,
     RestoreOfficialAccountAssets,
+    PublishOfficialAccountAssets,
 }
 
 #[allow(dead_code)]
@@ -4144,6 +4202,10 @@ pub(crate) struct JobStatus {
     pub(crate) official_asset_restore: Option<official_assets::RestoreProgress>,
     #[serde(skip_serializing)]
     pub(crate) official_asset_shared: Option<official_assets::Handle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) official_asset_publication: Option<official_assets::upload::PublicationProgress>,
+    #[serde(skip_serializing)]
+    pub(crate) official_asset_publication_shared: Option<official_assets::upload::PublicationHandle>,
 }
 
 impl JobStatus {
@@ -4177,6 +4239,8 @@ impl JobStatus {
             incomplete_restore_preview: self.incomplete_restore_preview.clone(),
             official_asset_restore: self.official_asset_restore.clone(),
             official_asset_shared: self.official_asset_shared.clone(),
+            official_asset_publication: self.official_asset_publication.clone(),
+            official_asset_publication_shared: self.official_asset_publication_shared.clone(),
         }
     }
 }
@@ -4411,6 +4475,8 @@ impl JobRegistry {
                 incomplete_restore_preview: None,
                 official_asset_restore: None,
                 official_asset_shared: None,
+                official_asset_publication: None,
+                official_asset_publication_shared: None,
             }),
         });
         self.jobs
@@ -5293,6 +5359,7 @@ impl JobControl {
             JobKind::KeiBackupUpload => JobPhase::WritingExport,
             JobKind::OfficialPublicationUpload => JobPhase::WritingExport,
             JobKind::RestoreOfficialAccountAssets => JobPhase::ReadingSource,
+            JobKind::PublishOfficialAccountAssets => JobPhase::WritingExport,
         };
         if status.state != JobState::Queued || phase != expected {
             return Err("native job can only start from queued".to_owned());

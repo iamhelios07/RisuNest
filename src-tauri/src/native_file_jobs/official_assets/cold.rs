@@ -285,7 +285,7 @@ fn cancelled() -> NativeJobError {
 
 fn stopped(reason: StopReason) -> NativeJobError {
     match reason {
-        StopReason::Authentication | StopReason::ReauthenticationNeeded => {
+        StopReason::Authentication | StopReason::ReauthenticationNeeded | StopReason::AuthWarning => {
             NativeJobError::new("reauthentication-needed", "Official account authorization failed")
         }
         StopReason::Local | StopReason::LibraryChanged => {

@@ -25,6 +25,7 @@ import {
     createOfficialAssociationMarkers,
     type OfficialAccountSnapshotDependencies,
     type OfficialAssociationMarkers,
+    type OfficialNativeAssetPublisher,
     type OfficialNativeDatabasePublisher,
     type OfficialSyncConflictBackupInput,
     type OfficialSyncConflictContext,
@@ -144,6 +145,7 @@ interface HarnessOptions {
     conflict?: OfficialSyncConflictHandler
     now?: () => number
     nativeDatabasePublisher?: OfficialNativeDatabasePublisher
+    nativeAssetPublisher?: OfficialNativeAssetPublisher
     getAccountId?: () => string | null
     flushPublicationMetadata?: () => Promise<void>
     restoreCandidate?: OfficialAccountSnapshotDependencies['restoreCandidate']
@@ -217,6 +219,7 @@ async function makeHarness(options: HarnessOptions = {}) {
         conflict: options.conflict,
         now: options.now,
         nativeDatabasePublisher: options.nativeDatabasePublisher,
+        nativeAssetPublisher: options.nativeAssetPublisher,
         getAccountId: options.getAccountId,
         flushPublicationMetadata: options.flushPublicationMetadata,
         restoreCandidate: options.restoreCandidate,
@@ -397,6 +400,70 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             'lease-release',
             'reload',
         ])
+    })
+
+    it('records native asset writes before the database write and resumes with only the unwritten assets', async () => {
+        const nativeDatabasePublisher = vi.fn<OfficialNativeDatabasePublisher>(async () => ({
+            databaseFingerprint: 'f'.repeat(64), acknowledge: vi.fn(async () => {}), completeReload: vi.fn(async () => {}),
+        }))
+        let interrupt = true
+        const nativeAssetPublisher = vi.fn<OfficialNativeAssetPublisher>(async (input) => {
+            for (const asset of input.assets) {
+                input.written(asset.key, `native/${asset.key}`)
+                if (interrupt) {
+                    interrupt = false
+                    throw new Error('synthetic asset write failure')
+                }
+            }
+            return true
+        })
+        const harness = await makeHarness({
+            accountId: 'account-1', nativeDatabasePublisher, nativeAssetPublisher,
+            flushPublicationMetadata: vi.fn(async () => {}),
+        })
+        const publication = await harness.adapter.pin(harness.imported.revision)
+
+        await expect(publication.publish()).rejects.toThrow('synthetic asset write failure')
+        const [first] = nativeAssetPublisher.mock.calls[0][0].assets
+        expect(harness.ledger.publishedAs(first.key)).toBe(`native/${first.key}`)
+        expect(nativeDatabasePublisher).not.toHaveBeenCalled()
+        await publication.publish()
+
+        const [interrupted, resumed] = nativeAssetPublisher.mock.calls.map(([input]) => input.assets)
+        expect(resumed).toEqual(interrupted.slice(1))
+        expect(harness.blobStore.read).not.toHaveBeenCalled()
+        expect(nativeDatabasePublisher.mock.calls[0][0].resourceReplacements).toEqual(
+            Object.fromEntries(interrupted.map(asset => [asset.key, `native/${asset.key}`])),
+        )
+        expect(harness.writeItem).not.toHaveBeenCalled()
+        await publication.dispose()
+    })
+
+    it('records no native asset write that settles after the signed-in account changes', async () => {
+        let accountId = 'account-1'
+        const nativeAssetPublisher = vi.fn<OfficialNativeAssetPublisher>(async (input) => {
+            accountId = 'account-2'
+            input.written(input.assets[0].key, `native/${input.assets[0].key}`)
+            return true
+        })
+        const ledger: OfficialAssetLedger = { publishedAs: () => null, record: vi.fn(), clear: vi.fn(), reset: vi.fn() }
+        const harness = await makeHarness({ getAccountId: () => accountId, nativeAssetPublisher, ledger })
+        const publication = await harness.adapter.pin(harness.imported.revision)
+
+        await expect(publication.publish()).rejects.toThrow('session changed')
+
+        expect(ledger.record).not.toHaveBeenCalled()
+        await publication.dispose()
+    })
+
+    it('leaves the assets to the web path when native asset publication is unavailable', async () => {
+        const nativeAssetPublisher = vi.fn<OfficialNativeAssetPublisher>(async () => false)
+        const harness = await makeHarness({ accountId: 'account-1', nativeAssetPublisher })
+
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+
+        const assets = nativeAssetPublisher.mock.calls[0][0].assets.map(asset => asset.key)
+        expect(harness.writeItem.mock.calls.map(([key]) => key)).toEqual([...assets, databaseKey])
     })
 
     it('falls back before native job acceptance but never after a native publication failure', async () => {

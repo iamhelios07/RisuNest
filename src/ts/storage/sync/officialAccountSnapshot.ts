@@ -125,6 +125,7 @@ export interface OfficialAccountSnapshotDependencies {
     conflict?: OfficialSyncConflictHandler
     now?(): number
     nativeDatabasePublisher?: OfficialNativeDatabasePublisher
+    nativeAssetPublisher?: OfficialNativeAssetPublisher
     /** Native identity comes from the authenticated vault session, never a restored root. */
     getAccountId?(): string | null
     flushPublicationMetadata?(): Promise<void>
@@ -149,6 +150,22 @@ export interface OfficialNativeDatabasePublicationReceipt {
 export type OfficialNativeDatabasePublisher = (
     input: OfficialNativeDatabasePublicationInput,
 ) => Promise<OfficialNativeDatabasePublicationReceipt | null>
+
+export interface OfficialNativeAssetPublicationInput {
+    accountId: string
+    lease: PersistentRevisionLease
+    assets: readonly { key: string; localKey: string }[]
+    signal?: AbortSignal
+    /** Throws once the publication no longer belongs to the signed-in account. */
+    guard(): Promise<void>
+    /** The account now holds `key` under `replacementKey`. */
+    written(key: string, replacementKey: string): void
+}
+
+/** Resolves true once every asset is written, or false to leave them all to the web path. */
+export type OfficialNativeAssetPublisher = (
+    input: OfficialNativeAssetPublicationInput,
+) => Promise<boolean>
 
 export type OfficialPullResult =
     | { kind: 'missing' }
@@ -410,7 +427,28 @@ class OfficialPinnedPublication implements PinnedPublication {
         this.assertAccountCurrent()
         const uploads = this.assets.filter(asset => !this.replacements.has(asset.key))
         let completed = 0
+        const record = (key: string, replacementKey: string) => {
+            this.replacements.set(key, replacementKey)
+            this.dependencies.ledger.record(key, replacementKey)
+            this.options.onProgress?.(++completed, uploads.length)
+        }
         this.options.onProgress?.(completed, uploads.length)
+        if (uploads.length > 0 && this.dependencies.nativeAssetPublisher && this.accountId) {
+            await this.refreshNativeLeaseIfNeeded()
+            this.assertAccountCurrent()
+            await this.dependencies.nativeAssetPublisher({
+                accountId: this.accountId,
+                lease: this.lease,
+                assets: uploads.map(({ key, localKey }) => ({ key, localKey })),
+                signal,
+                guard: async () => this.assertAccountCurrent(),
+                // The ledger follows the signed-in account, so a write settled after a switch is not recorded.
+                written: (key, replacementKey) => {
+                    this.assertAccountCurrent()
+                    record(key, replacementKey)
+                },
+            })
+        }
         for (const asset of uploads) {
             if (this.replacements.has(asset.key)) continue
             throwIfAborted(signal)
@@ -420,10 +458,7 @@ class OfficialPinnedPublication implements PinnedPublication {
             this.assertAccountCurrent()
             const result = await this.dependencies.account.writeItem(asset.key, bytes, { signal })
             this.assertAccountCurrent()
-            const replacementKey = requireWriteSuccess(result, asset.key)
-            this.replacements.set(asset.key, replacementKey)
-            this.dependencies.ledger.record(asset.key, replacementKey)
-            this.options.onProgress?.(++completed, uploads.length)
+            record(asset.key, requireWriteSuccess(result, asset.key))
             throwIfAborted(signal)
         }
 
