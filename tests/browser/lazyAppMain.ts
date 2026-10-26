@@ -9,6 +9,8 @@ import { createSyncExitCoordinator } from '../../src/ts/storage/syncExitCoordina
 import { configureSyncExitCoordinator } from '../../src/ts/storage/syncExitProduction'
 import { loadV3Plugins } from '../../src/ts/plugins/apiV3/v3.svelte'
 import { fixtureState } from './hostAdapters'
+import { FileSystemClient } from '../../src/ts/process/mcp/filesystemclient'
+import { createHostToolBridge } from '../../src/ts/plugins/hostToolBridge'
 
 installAppLockInput()
 const exitCoordinator = createSyncExitCoordinator({
@@ -40,5 +42,27 @@ const plugin = {
     },
     writes: fixtureState.writes,
 }
-Object.assign(window, { lazyImportBoundary, lazyApp: { open: openRoute, ...navigationState, lock: lockDriver, plugin } })
+const files = {
+    result: null as unknown,
+    initialActivation: false,
+    async run() {
+        this.initialActivation = navigator.userActivation.isActive
+        const access = createHostToolBridge({
+            loadHostSources: async () => new Map(),
+            builtInSourceIds: () => ['internal:fs'],
+            createBuiltInSource: async () => new FileSystemClient(),
+            pluginSources: () => new Map(),
+            pluginSourceOwner: () => undefined,
+            captureSelectedConversation: () => ({ characterId: 'synthetic', conversationId: 'synthetic' }),
+        }).forPlugin('provider-manager')
+        try {
+            const { scope } = await access.listTools()
+            await access.callTool({ scope, source: 'internal:fs', name: 'fs_write_file', arguments: { path: 'model.txt', content: 'from model' } })
+            this.result = await access.callTool({ scope, source: 'internal:fs', name: 'fs_read_file', arguments: { path: 'model.txt' } })
+        } catch (error) { this.result = { error: String(error) } }
+    },
+}
+Object.assign(window, { lazyImportBoundary, lazyApp: { open: openRoute, ...navigationState, lock: lockDriver, plugin, files } })
 mount(App, { target: document.querySelector<HTMLElement>('#app')! })
+if (new URLSearchParams(location.search).has('fsCall')) void files.run()
+export type FileSystemDriver = typeof files

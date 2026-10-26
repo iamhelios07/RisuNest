@@ -1,9 +1,66 @@
 import { test, expect } from './fixture'
 import { languageKorean as language } from '../../src/lang/ko'
+import { languageEnglish } from '../../src/lang/en'
 
-declare global { interface Window { appLockNative: { holdReady(): void; pendingReady(): boolean; finishReady(focusFirst: boolean): void; available(): void; presentations(): boolean[]; authScreens(): boolean[] }; lazyApp: { open(route: string): void; layout(mobile: boolean): void; read(): { sidebarClosing: boolean; entries: number }; lock: { initialize(nativeUnlock?: boolean): Promise<void>; bootFailure(loaded: boolean): void; requestExit(): void; changePin(): void; loading(value: boolean): void; loadingAlert(): void }; plugin: { load(script: string): Promise<void>; writes: { key: string; value: unknown }[] } }; lazyImportBoundary: { arm(route: string): void; hold(route: string): void; rejectHeld(): void; attempts(): number } } }
+declare global { interface Window {
+    filePickerProbe: { calls: number; activation: boolean; mode?: string; failure?: string }
+} }
+
+declare global { interface Window { appLockNative: { holdReady(): void; pendingReady(): boolean; finishReady(focusFirst: boolean): void; available(): void; presentations(): boolean[]; authScreens(): boolean[] }; lazyApp: { open(route: string): void; layout(mobile: boolean): void; read(): { sidebarClosing: boolean; entries: number }; lock: { initialize(nativeUnlock?: boolean): Promise<void>; bootFailure(loaded: boolean): void; requestExit(): void; changePin(): void; loading(value: boolean): void; loadingAlert(): void }; plugin: { load(script: string): Promise<void>; writes: { key: string; value: unknown }[] }; files: import('./lazyAppMain').FileSystemDriver }; lazyImportBoundary: { arm(route: string): void; hold(route: string): void; rejectHeld(): void; attempts(): number } } }
 
 const hosts = ['settings', 'custom', 'grid', 'presets', 'personas', 'mobile'] as const
+
+test.describe('file system host tools', () => {
+    test.skip(({ browserName }) => browserName !== 'chromium', 'WebKit does not provide showDirectoryPicker')
+    test.beforeEach(async ({ page }) => {
+        await page.addInitScript(() => {
+            window.filePickerProbe = { calls: 0, activation: false }
+            Object.defineProperty(window, 'showDirectoryPicker', { configurable: true, value: async (options?: { mode?: string }) => {
+                const probe = window.filePickerProbe
+                probe.calls++
+                probe.activation = navigator.userActivation.isActive
+                probe.mode = options?.mode
+                if (!probe.activation) throw new DOMException('Must be handling a user gesture to show a file picker.', 'SecurityError')
+                if (probe.failure) throw new DOMException('Storage policy blocked the picker.', probe.failure)
+                return navigator.storage.getDirectory()
+            } })
+        })
+    })
+
+    test('asks for a user click before a model tool call opens the folder picker', async ({ page }) => {
+        await page.goto('/lazyApp.html?fsCall')
+        const dialog = page.getByRole('dialog', { name: languageEnglish.mcpFileSystemAccessTitle })
+        await expect(dialog).toBeVisible()
+        expect(await page.evaluate(() => window.filePickerProbe.calls)).toBe(0)
+        await dialog.getByRole('button', { name: languageEnglish.mcpFileSystemSelectDirectory, exact: true }).click()
+        await expect.poll(() => page.evaluate(() => window.lazyApp.files.result))
+            .toEqual([{ type: 'text', text: 'from model' }])
+        expect(await page.evaluate(() => ({ ...window.filePickerProbe,
+            initialActivation: window.lazyApp.files.initialActivation })))
+            .toEqual({ calls: 1, activation: true, mode: 'readwrite', initialActivation: false })
+    })
+
+    test('cancels a model folder request without opening a native picker', async ({ page }) => {
+        await page.goto('/lazyApp.html?fsCall')
+        const dialog = page.getByRole('dialog', { name: languageEnglish.mcpFileSystemAccessTitle })
+        await expect(dialog).toBeVisible()
+        await dialog.getByRole('button', { name: languageEnglish.cancel, exact: true }).click()
+        await expect.poll(() => page.evaluate(() => window.lazyApp.files.result))
+            .toEqual({ error: 'Error: Directory selection cancelled.' })
+        expect(await page.evaluate(() => window.filePickerProbe.calls)).toBe(0)
+    })
+
+    test('retains a picker failure instead of reporting it as a cancellation', async ({ page }) => {
+        await page.goto('/lazyApp.html?fsCall')
+        const dialog = page.getByRole('dialog', { name: languageEnglish.mcpFileSystemAccessTitle })
+        await expect(dialog).toBeVisible()
+        await page.evaluate(() => { window.filePickerProbe.failure = 'NotAllowedError' })
+        await dialog.getByRole('button', { name: languageEnglish.mcpFileSystemSelectDirectory, exact: true }).click()
+        await expect.poll(() => page.evaluate(() => window.lazyApp.files.result))
+            .toEqual({ error: 'Error: Directory selection failed: NotAllowedError: Storage policy blocked the picker.' })
+    })
+})
+
 for (const back of ['header', 'Escape', 'history'] as const) {
     test(`actual mobile chat menu opens Settings and returns through ${back}`, async ({ page }) => {
         const errors: string[] = []

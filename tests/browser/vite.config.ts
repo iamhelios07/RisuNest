@@ -19,6 +19,9 @@ export default defineConfig(({ mode }) => {
                 const source = requested.replaceAll('\\', '/').replace(resolve(import.meta.dirname, '../../src').replaceAll('\\', '/') + '/', 'src/')
                 const owner = importer?.replaceAll('\\', '/') ?? ''
                 const adapter = (file: string) => stubbed(this, resolve(import.meta.dirname, file).replaceAll('\\', '/'), requested, importer!, options)
+                if (owner.endsWith('/src/ts/alert.ts') && /(?:^|\/)(stores\.svelte|database\.svelte|deviceMarkers)$/.test(source)) {
+                    return adapter('lazyAppAdapters.ts')
+                }
                 if (/\/src\/lib\/Others\/(?:MonacoEditor|TextEditorMonaco)\.svelte$/.test(owner) && ['src/ts/gui/codearea/cbsMonaco', 'src/ts/gui/colorscheme', 'src/lang'].includes(source)) {
                     return adapter('monacoAdapters.ts')
                 }

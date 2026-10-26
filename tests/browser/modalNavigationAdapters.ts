@@ -1,2 +1,2 @@
-import { writable } from 'svelte/store'
-export const alertStore = writable({ type: 'none', msg: '' })
+import { createAlertQueue } from '../../src/ts/alertQueue'
+export const alertStore = createAlertQueue({ type: 'none', msg: '' })

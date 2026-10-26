@@ -1,6 +1,8 @@
 import { MCPClientLike } from "./internalmcp";
 import type { MCPTool, RPCToolCallContent } from "./mcplib";
 import { withLibraryFileSelection } from '../../storage/libraryFileOperation';
+import { alertActionConfirm } from '../../alert';
+import { language } from 'src/lang';
 
 export class FileSystemClient extends MCPClientLike {
     private directoryHandle: FileSystemDirectoryHandle | null = null;
@@ -27,13 +29,26 @@ export class FileSystemClient extends MCPClientLike {
         }
 
         try {
-            this.directoryHandle = await withLibraryFileSelection(() => (window as any).showDirectoryPicker());
+            // Model and plugin calls arrive without the user activation the browser picker requires.
+            if (!navigator.userActivation?.isActive && !await alertActionConfirm({
+                title: language.mcpFileSystemAccessTitle,
+                description: language.mcpFileSystemAccessDescription,
+                actionLabel: language.mcpFileSystemSelectDirectory,
+                cancelLabel: language.cancel,
+            })) {
+                throw new DOMException('Directory selection cancelled.', 'AbortError');
+            }
+            this.directoryHandle = await withLibraryFileSelection(() => window.showDirectoryPicker({ mode: 'readwrite' }));
             if (!this.directoryHandle) {
-                throw new Error("Directory selection was cancelled or failed.");
+                throw new DOMException('Directory selection cancelled.', 'AbortError');
             }
             console.log(`FileSystemClient: Selected directory: ${this.directoryHandle.name}`);
         } catch (error) {
-            throw new Error("Directory selection cancelled or failed. Please try again.");
+            if (error instanceof Error && error.name === 'AbortError') {
+                throw new Error('Directory selection cancelled.', { cause: error });
+            }
+            const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+            throw new Error(`Directory selection failed: ${detail}`, { cause: error });
         }
     }
 
