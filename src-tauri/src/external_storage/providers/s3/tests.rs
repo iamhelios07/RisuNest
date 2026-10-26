@@ -1456,6 +1456,7 @@ fn a_session_opens_only_above_the_threshold_and_keeps_progress_out_of_the_vault(
             line(&records[1]),
             "POST /synthetic/synthetic-bucket/risunest/packs/pack-big?uploads= HTTP/1.1"
         );
+        assert_eq!(header(&records[1], "content-length").as_deref(), Some("0"));
     });
 }
 
