@@ -105,6 +105,17 @@ describe('structured local plugin values', () => {
         const { parts, value } = await roundTrip(stream, 8)
         expect(parts.map(part => part.byteLength)).toEqual([8, 8, 1])
         expect(value).toEqual(stream)
+        // Blob and File bytes are taken from each part as it is read, so the reader may reuse its buffer.
+        const blobs = encodeStructuredLocalPluginValue({ blob: new Blob([stream]), file: new File([stream], 'stream.bin') })
+        const blobParts: Uint8Array[] = []
+        for await (const part of structureParts(blobs, 8)) blobParts.push(part.slice())
+        const reused = new Uint8Array(8)
+        const read = await decodeStructuredLocalPluginValue<{ blob: Blob; file: File }>(
+            parseStructureText(structureText(blobs, blobParts.map((_, index) => fakeHash(index)), 8), 8),
+            async index => { reused.set(blobParts[index]); return reused.subarray(0, blobParts[index].byteLength) }, 8)
+        expect(new Uint8Array(await read.blob.arrayBuffer())).toEqual(stream)
+        expect(new Uint8Array(await read.file.arrayBuffer())).toEqual(stream)
+        expect(read.file.name).toBe('stream.bin')
         const { parts: exact } = await roundTrip(new Uint8Array(16), 8)
         expect(exact.map(part => part.byteLength)).toEqual([8, 8])
         const { parts: none, text } = await roundTrip(new Date(0))

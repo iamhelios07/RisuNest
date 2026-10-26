@@ -323,12 +323,13 @@ export async function decodeStructuredLocalPluginValue<T>(
             values[index] = buffer
         } else {
             if (typeof node.mimeType !== 'string') return invalid()
-            const pieces: Uint8Array[] = []
-            await take(node.byteLength, piece => { pieces.push(piece) })
+            // Each part is copied into the Blob as it is read, so a large Blob is not held twice.
+            let blob = new Blob([])
+            await take(node.byteLength, piece => { blob = new Blob([blob, piece as BlobPart]) })
             if (node.type === 'File') {
                 if (typeof node.name !== 'string' || !Number.isFinite(node.lastModified)) return invalid()
-                values[index] = new File(pieces as BlobPart[], node.name, { type: node.mimeType, lastModified: node.lastModified })
-            } else values[index] = new Blob(pieces as BlobPart[], { type: node.mimeType })
+                values[index] = new File([blob], node.name, { type: node.mimeType, lastModified: node.lastModified })
+            } else values[index] = new Blob([blob], { type: node.mimeType })
         }
     }
     if (partIndex !== structure.parts.length || partStart !== part.length) return invalid()

@@ -1869,6 +1869,7 @@ export const languageEnglish = {
     pluginProviderPermissionDenied: "Plugin provider permission was denied.",
     inlayPermissionConsent: "Plugin {} is requesting permission to access the inlay, which may allow it to read, write or edit the inlay content. Do you want to allow this?",
     sendChatConsent: "Plugin {} is requesting permission to send chat messages on your behalf, which will trigger AI responses. Do you want to allow this?",
+    hostToolPermissionConsent: "Plugin {} is requesting permission to call tools, including MCPs, which may allow it to read or change your data. Do you want to allow this?",
     resetAllPluginPermissions: "Reset plugin permissions",
     resetAllPluginPermissionsConfirm: "Reset all saved plugin permissions?\n\nPlugins will ask again the next time they require permission.",
     resetAllPluginPermissionsDone: "Plugin permissions have been reset",

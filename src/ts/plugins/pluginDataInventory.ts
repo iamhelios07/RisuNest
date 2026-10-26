@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { isTauri } from '../platform'
 import { acquireCurrentRevisionWithRetry, assertPinnedRevision, withPersistentRevisionLease } from '../storage/persistentRecordIterator'
-import type { PluginStorageValueCursor } from '../storage/persistentDataStore'
+import { readCurrentRevision, type PluginStorageValueCursor } from '../storage/persistentDataStore'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import { isUnownedPluginOwner, UNOWNED_PLUGIN_OWNER } from './pluginOwner'
 import {
@@ -104,7 +104,7 @@ export async function searchPluginDataValues(
     if (library.length > 0) {
         const store = getPersistentDataStore()
         const lease = await acquireCurrentRevisionWithRetry(
-            (revision) => store.acquireRevision(revision), async () => (await store.readRoot()).revision)
+            (revision) => store.acquireRevision(revision), () => readCurrentRevision(store))
         await withPersistentRevisionLease(lease, async (reader) => {
             for (const owner of new Set(library.map((item) => item.owner))) {
                 let afterKey: PluginStorageValueCursor | undefined
