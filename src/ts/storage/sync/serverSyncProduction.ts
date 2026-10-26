@@ -426,6 +426,12 @@ const scheduler = createServerSyncScheduler({
         if (receivedBodies) continueHydration(true)
     }),
     retryClock: () => retryNativeClock(true),
+    checkFormat: async () => {
+        const captured = context
+        if (!captured) throw new Error('Sync binding is unavailable')
+        await invoke('server_sync_lww_check_format', { request: header() })
+        checkContext(captured)
+    },
     publishHidden: () => attempted(async () => {
         const captured = context
         if (!captured || captured.signal.aborted) return
@@ -563,6 +569,13 @@ export function dismissServerSyncConnectionFailure(): void {
 }
 /** Stops automatic sync until the returned release runs, so an asset download is not refused as busy. */
 export const holdServerSync = () => controller.beginReplacement()
+/** Raises the library to this app's data format. Sync resumes on the next retry. */
+export async function switchServerSyncLibraryFormat(): Promise<void> {
+    const captured = context
+    if (!captured) throw new Error('Sync binding is unavailable')
+    await invoke('server_sync_lww_switch_format', { request: header() })
+    checkContext(captured)
+}
 export function retryServerSync(): Promise<void> {
     return runWithMobileBackgroundTask('sync', () => syncServerNow(), undefined, true)
 }

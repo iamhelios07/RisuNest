@@ -705,7 +705,8 @@ fn restore_portable_inner(
             }
             probe.result()?;
             archive.check_identity().map_err(error)?;
-            let warning_codes = vec![];
+            let skipped: u64 = prepared_device.iter().map(|section| section.rows().skipped()).sum();
+            let warning_codes = if skipped == 0 { vec![] } else { vec![format!("plugin-values-skipped:{skipped}")] };
             let final_revision = if !prepared_device.is_empty() {
                 let context = context.ok_or_else(|| {
                     NativeJobError::new(

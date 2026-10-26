@@ -885,6 +885,11 @@ upstream RisuAI. RisuNest adds these rules:
   are cleared for every plugin. They are filled from the target when the option is on
   and start empty when it is off. Reconnecting to the same target keeps them.
 - RisuAI and PocketRisu exports never include them.
+- `getLocalPluginStorage()` keeps the same data and binary values as upstream on the
+  native app and rejects `ImageData`, `CryptoKey`, `DOMException`, the DOM geometry
+  types and `FileList`, which upstream also stores. On the web it keeps only values that JSON represents exactly and rejects any other
+  value with an error; `getRuntimeInfo().structuredLocalPluginStorage` is `false`
+  there.
 
 ## RisuNest whole-object setters
 

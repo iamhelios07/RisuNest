@@ -212,6 +212,7 @@ function createAdapter(connectionId: string): Adapter {
         publish: call => publish(undefined, true, call),
         receive: call => withContext(call.signal, binding => receive(binding, call.turnLimit)),
         maintain: call => withContext(call.signal, async current => { current.signal.throwIfAborted(); await invoke('external_lww_maintenance', { request: header(connectionId, current) }); current.signal.throwIfAborted() }),
+        checkFormat: call => withContext(call.signal, async current => { await invoke('external_lww_check_format', { request: header(connectionId, current) }); current.signal.throwIfAborted() }),
         succeeded: operation => { reportOperation(operation); if (operation === 'receive') continueHydration(true) },
         failed: (error, operation) => {
             reportOperation(operation, error)
@@ -420,6 +421,21 @@ export async function requestExternalLwwNow(connectionId: string): Promise<void>
         await adapter.scheduler.manualNow(task.signal)
         adapter.resumeHydration(true, true)
     }, undefined, true)
+}
+
+/** Raises the library to this app's data format. Sync resumes on the next sync request. */
+export async function switchExternalLwwLibraryFormat(connectionId: string): Promise<void> {
+    const adapter = adapters.get(connectionId)
+    if (!adapter) throw new Error('Sync binding transport is unavailable')
+    // A connection whose first publication stopped at the format level resumes before it switches.
+    if (!adapter.state) await resumeCurrentSyncBinding({ kind: 'external', connectionId })
+    const state = adapter.state
+    if (adapters.get(connectionId) !== adapter || !state) throw new DOMException('Binding changed', 'AbortError')
+    const progress = beginExternalProgress(connectionId, 'sync')
+    try {
+        await progress.invoke('external_lww_switch_format', { request: header(connectionId, { state, signal: new AbortController().signal }) }, state.targetAuthority)
+        progress.finish('complete', true)
+    } catch (error) { progress.finish(externalProgressFailure(error)); throw error }
 }
 
 export function externalLwwExitDrain(connectionId: string, selectionEpoch: string, fenced = false): SyncExitDrainAdapter | null {

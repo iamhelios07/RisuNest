@@ -578,6 +578,23 @@ impl Provider for FakeProvider {
             self.write(l, None, h.as_bytes())
         })
     }
+    fn replace_descriptor<'a>(
+        &'a self,
+        r: &'a RepositoryHandle,
+        l: &'a RemoteLocator,
+        b: &'a HeadBytes,
+        c: &'a Cancellation,
+    ) -> ProviderFuture<'a, HeadReceipt> {
+        Box::pin(async move {
+            self.requested();
+            c.check()?;
+            l.validate_for(r)?;
+            if self.state.lock().unwrap().roles.get(&l.object) != Some(&ObjectRole::Descriptor) {
+                return Err(ProviderError::new(ErrorKind::Corrupt));
+            }
+            self.write(l, None, b.as_bytes())
+        })
+    }
     fn supports_incomplete_cleanup(&self) -> bool { true }
     fn cleanup_incomplete_objects<'a>(&'a self, r: &'a RepositoryHandle, _protected: &'a [String], cursor: Option<&'a str>, limit: usize, deleting: &'a (dyn Fn(bool) + Send + Sync), cancel: &'a Cancellation) -> ProviderFuture<'a,IncompleteCleanupPage> {
         Box::pin(async move {

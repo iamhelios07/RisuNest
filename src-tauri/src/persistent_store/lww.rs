@@ -1063,16 +1063,26 @@ impl PersistentStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
     /// Device units are applied inside the device store, so their large bodies
-    /// are copied there from the library store where receive placed them.
-    fn copy_device_unit_bodies<'a>(&self, changes: impl IntoIterator<Item = &'a Change>) -> StoreResult<()> {
+    /// and the parts a plugin value names are copied there from the library
+    /// store where receive placed them. Returns the keys of values whose parts
+    /// are missing: those are left out, never applied without their parts,
+    /// while the rest of the page applies.
+    fn copy_device_unit_bodies<'a>(&self, changes: impl IntoIterator<Item = &'a Change>) -> StoreResult<BTreeSet<String>> {
         let device = self.device_store()?.connection();
-        for change in changes {
+        let mut missing = BTreeSet::new();
+        'changes: for change in changes {
             let UnitValue::Object { descriptor, .. } = &change.value else { continue };
-            if !projection::is_device(&change.key)
-                || super::message_pages::retained_object_present(device, &descriptor.object_hash)?
-            {
-                continue;
+            if !projection::is_device(&change.key) { continue; }
+            for part in &descriptor.dependencies {
+                if !super::message_pages::retained_object_present(device, part)? {
+                    let Some(body) = super::message_pages::object_body(&self.connection, part)? else {
+                        missing.insert(change.key.as_str().to_owned());
+                        continue 'changes;
+                    };
+                    super::message_pages::put_object(device, part, &body)?;
+                }
             }
+            if super::message_pages::retained_object_present(device, &descriptor.object_hash)? { continue; }
             if change.key.components()[0] == "plugin-local"
                 && device_store::plugin_values::text_value::object_row(&self.connection, &descriptor.object_hash)?.1
                     > device_store::plugin_values::text_value::PART_BYTES as u64
@@ -1087,7 +1097,7 @@ impl PersistentStore {
                 .ok_or_else(|| error("unit-object-body-required"))?;
             super::message_pages::put_object(device, &descriptor.object_hash, &body)?;
         }
-        Ok(())
+        Ok(missing)
     }
     pub(crate) fn lww_put_object(&self, hash: &str, body: &[u8]) -> StoreResult<()> {
         super::message_pages::put_object(&self.connection, hash, body)
@@ -1188,6 +1198,13 @@ impl PersistentStore {
     }
     pub(crate) fn lww_clock_state(&self) -> StoreResult<ClockState> {
         clock_state(self.device_store()?.connection())
+    }
+    /// A stamp for a unit this device publishes outside its outbox.
+    pub(crate) fn lww_reserve_stamp(&mut self) -> StoreResult<Stamp> {
+        let tx = self.device_store_mut()?.transaction()?;
+        let stamp = reserve_stamp(&tx)?;
+        tx.commit()?;
+        Ok(stamp)
     }
     fn intent_device_revision(&self, request_id: &str) -> StoreResult<i64> {
         let db = self.device_store()?.connection();
@@ -1950,7 +1967,7 @@ impl PersistentStore {
                     vars.insert(p[1].clone(), value);
                 }
             }
-            if !projection::known(&key) && !projection::is_device(&key) {
+            if !projection::known(&key) && !projection::is_device(&key) && !risunest_sync_wire::library_format::is_key(&key) {
                 count += 1;
             }
         }
@@ -2159,7 +2176,7 @@ impl PersistentStore {
         Ok(())
     }
     fn stage_receive_rows(&mut self, request: &StageReceive) -> StoreResult<()> {
-        self.copy_device_unit_bodies(&request.changes)?;
+        let missing = self.copy_device_unit_bodies(&request.changes)?;
         for db in [
             &mut self.connection,
             &mut self.device_store.as_mut().map_err(|e| error(e))?.connection,
@@ -2169,7 +2186,7 @@ impl PersistentStore {
                 .is_some_and(|p| p.ends_with(device_store::DEVICE_DATABASE_FILE));
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for change in &request.changes {
-                if projection::is_device(&change.key) != device {
+                if projection::is_device(&change.key) != device || missing.contains(change.key.as_str()) {
                     continue;
                 }
                 tx.execute(
@@ -3156,14 +3173,16 @@ impl PersistentStore {
             }),
         )?;
         if target {
+            let mut missing = BTreeSet::new();
             changes.visit(false, |key, stamp, value, _| {
                 let change = Change { key, stamp: stamp.ok_or_else(|| error("request-id-integrity"))?, value };
-                self.copy_device_unit_bodies(std::iter::once(&change))
+                missing.extend(self.copy_device_unit_bodies(std::iter::once(&change))?);
+                Ok(())
             })?;
             let tx = self.device_store_mut()?.transaction()?;
             verify(&tx, header.binding_authority)?;
             verify_device_intent_revision(&tx, &header.request_id)?;
-            reset_target_device_rows(&tx, header, changes, header.binding_authority)?;
+            reset_target_device_rows(&tx, header, changes, header.binding_authority, &missing)?;
             tx.execute("UPDATE lww_intents SET complete=1 WHERE request_id=?1", [&header.request_id])?;
             tx.execute("DELETE FROM lww_intent_rows WHERE request_id=?1", [&header.request_id])?;
             tx.execute("DELETE FROM lww_intent_failures WHERE request_id=?1", [&header.request_id])?;
@@ -3253,6 +3272,10 @@ fn replacement_changes(
     drop(captured);
     for unit in source.into_iter().flat_map(|source| replacement_source::units(tx, source)) {
         let (key, _) = unit?;
+        // The format level belongs to the library, so a backup never sets it.
+        if risunest_sync_wire::library_format::is_key(&key) {
+            continue;
+        }
         let captured: bool = changes.db.query_row("SELECT EXISTS(SELECT 1 FROM captured WHERE key=?1)", [key.as_str()], |row| row.get(0))?;
         if !captured {
             let skip = archived_character(&key).map(|id| archived(&id)).transpose()?.unwrap_or(false);
@@ -3397,12 +3420,15 @@ fn reset_target_device(
     header: &Header,
     received: &[Change],
     binding: DecimalU64,
+    missing: &BTreeSet<String>,
 ) -> StoreResult<()> {
     let rows = FrozenRows::new(root)?;
     for change in received { rows.insert(intent_rows::target_row(change)?)?; }
-    reset_target_device_rows(tx, header, &rows, binding)
+    reset_target_device_rows(tx, header, &rows, binding, missing)
 }
-fn reset_target_device_rows(tx: &Transaction<'_>, header: &Header, received: &FrozenRows, binding: DecimalU64) -> StoreResult<()> {
+/// Replaces the device rows with `received`, leaving out the values in
+/// `missing` whose parts this device could not find.
+fn reset_target_device_rows(tx: &Transaction<'_>, header: &Header, received: &FrozenRows, binding: DecimalU64, missing: &BTreeSet<String>) -> StoreResult<()> {
     tx.execute("DELETE FROM hypa_embeddings", [])?;
     tx.execute("DELETE FROM plugin_device_storage", [])?;
     tx.execute("DELETE FROM lww_units", [])?;
@@ -3411,7 +3437,7 @@ fn reset_target_device_rows(tx: &Transaction<'_>, header: &Header, received: &Fr
     received.visit(false, |key, stamp, value, _| {
         let c = Change { key, stamp: stamp.ok_or_else(|| error("request-id-integrity"))?, value };
         observe(tx, &c.stamp)?;
-        if projection::is_device(&c.key) {
+        if projection::is_device(&c.key) && !missing.contains(c.key.as_str()) {
             projection::apply(tx, "", &c.key, &c.value)?;
             put_unit(tx, &c.key, &c.stamp, &c.value, &header.request_id, None)?;
             witness_received(tx, &c, binding)?;

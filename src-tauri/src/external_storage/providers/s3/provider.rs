@@ -1019,6 +1019,41 @@ impl Provider for S3Provider {
         })
     }
 
+    fn replace_descriptor<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        bytes: &'a HeadBytes,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, HeadReceipt> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = context_of(repository)?;
+            locator.validate_for(repository)?;
+            let folder = role_folder(ObjectRole::Descriptor);
+            let key = context.key(&locator.object)?;
+            if locator.collection.as_deref() != Some(folder)
+                || context.object_of(folder, &key).as_deref() != Some(locator.object.as_str())
+            {
+                return Err(corrupt());
+            }
+            let credentials = self.credentials(context).await?;
+            let response = self
+                .dispatch(
+                    context,
+                    &credentials,
+                    head_call(&key, bytes, ProviderOperation::ReplaceHead),
+                    cancel,
+                )
+                .await?;
+            self.require(context.profile, &response, &[200])?;
+            Ok(HeadReceipt {
+                version: version_of(&response.headers),
+                complete: true,
+            })
+        })
+    }
+
     /// `DeleteObject` reports 204 for a key that was removed and for one that
     /// was never there, which is the idempotence the contract asks for.
     fn delete_object<'a>(

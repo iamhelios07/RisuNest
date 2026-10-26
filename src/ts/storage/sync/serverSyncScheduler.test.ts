@@ -5,7 +5,7 @@ import { createPluginStartupGate } from '../../plugins/pluginStartupGate'
 afterEach(() => vi.useRealTimers())
 function fixture() {
     vi.useFakeTimers()
-    const dependencies = { push: vi.fn(async () => {}), pull: vi.fn(async () => {}), connect: vi.fn(async (_operationId: string) => {}), disconnect: vi.fn(async () => {}), stopNotifications: vi.fn(async () => {}), retryClock: vi.fn(async () => {}), failed: vi.fn(), recovered: vi.fn() }
+    const dependencies = { push: vi.fn(async () => {}), pull: vi.fn(async () => {}), connect: vi.fn(async (_operationId: string) => {}), disconnect: vi.fn(async () => {}), stopNotifications: vi.fn(async () => {}), retryClock: vi.fn(async () => {}), checkFormat: vi.fn(async () => {}), failed: vi.fn(), recovered: vi.fn() }
     return { ...dependencies, scheduler: createServerSyncScheduler(dependencies) }
 }
 describe('server LWW foreground scheduler', () => {
@@ -399,6 +399,28 @@ describe('server LWW foreground scheduler', () => {
         f.pull.mockClear()
         await f.scheduler.conversationOpened(); await vi.advanceTimersByTimeAsync(0)
         expect(f.retryClock).toHaveBeenCalledTimes(2); expect(f.pull).toHaveBeenCalled(); expect(f.scheduler.isBlocked()).toBe(false)
+        f.scheduler.dispose()
+    })
+    it('rechecks a library format block on each trigger, follows the code it reports, and resumes once the level matches', async () => {
+        const f = fixture(); f.pull.mockRejectedValueOnce({ code: 'library-format-switch-required', retryable: false })
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.blockedCode()).toBe('library-format-switch-required')
+        await vi.advanceTimersByTimeAsync(120_000); expect(f.checkFormat).not.toHaveBeenCalled()
+        f.checkFormat.mockRejectedValueOnce({ code: 'sync-server-update-required', retryable: false })
+        await f.scheduler.conversationOpened(); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.blockedCode()).toBe('sync-server-update-required'); expect(f.retryClock).not.toHaveBeenCalled()
+        // A check that cannot reach the server keeps the stop it already reports.
+        f.failed.mockClear(); f.checkFormat.mockRejectedValueOnce({ code: 'server-unreachable', retryable: true })
+        await f.scheduler.conversationOpened(); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.blockedCode()).toBe('sync-server-update-required'); expect(f.failed).not.toHaveBeenCalled()
+        // Edits check again once they settle.
+        f.checkFormat.mockRejectedValueOnce({ code: 'sync-server-update-required', retryable: false })
+        f.scheduler.localChange(); await vi.advanceTimersByTimeAsync(1_000); f.scheduler.localChange(); await vi.advanceTimersByTimeAsync(2_000)
+        expect(f.checkFormat).toHaveBeenCalledTimes(3); expect(f.scheduler.isBlocked()).toBe(true)
+        f.push.mockClear(); f.pull.mockClear()
+        await f.scheduler.foreground(false); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.checkFormat).toHaveBeenCalledTimes(4); expect(f.scheduler.isBlocked()).toBe(false)
+        expect(f.pull).toHaveBeenCalled(); expect(f.push).toHaveBeenCalled()
         f.scheduler.dispose()
     })
     it.each(['accepted-clock-correction-required', 'writer-collision', 'equal-stamp-integrity'])('never automatically clears %s', async code => {
