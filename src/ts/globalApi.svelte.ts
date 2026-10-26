@@ -84,6 +84,7 @@ import { backgroundErrorMessage } from './storage/backgroundErrorMessage';
 import { configureBlobStoreStorageProvider, readBlobForFacade, resolveBlobStore, subscribeNativeMediaEndpointChanges } from "./storage/platformBlobStore";
 import { inferBlobMime } from "./storage/blobStore";
 import { selectAssetSourceRoute } from "./storage/assetSourceRoute";
+import { noteMissingAssetBody, trackAssetBodyArrival } from "./storage/assetBodyArrival.svelte";
 import { readActiveAsset, storeActiveAsset } from "./storage/accountAssetAccess";
 import { AppendableBuffer } from "./appendableBuffer"
 import { beginNavigationActivity } from './ui/navigationActivity'
@@ -300,8 +301,12 @@ export async function getFileSrc(loc: string) {
         return realmHubURL + `/rs/` + loc
     }
     if (route === 'tauri-asset') {
+        const arrival = trackAssetBodyArrival(loc)
         const url = await resolveTauriAssetUrl(loc)
-        if (!url) console.error(new Error(`Missing asset: ${loc}`))
+        if (!url) {
+            console.error(new Error(`Missing asset: ${loc}`))
+            if (arrival !== undefined) noteMissingAssetBody(loc, arrival)
+        }
         return url ?? ''
     }
     if (route === 'tauri-path') {

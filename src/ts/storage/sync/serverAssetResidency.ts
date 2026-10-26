@@ -6,6 +6,7 @@ import { selectedCharID } from "src/ts/stores.svelte";
 import { getDatabase } from "../database.svelte";
 import { registerLibraryFileOperationGate } from '../libraryFileOperation';
 import { assetCleanupProgress, validAssetCleanupSnapshot, type AssetCleanupSnapshot } from './serverAssetCleanupProgress';
+import { announceAssetBodyArrivals } from '../assetBodyArrival.svelte';
 
 const operations = new Set<Promise<unknown>>();
 registerLibraryFileOperationGate(async () => {
@@ -151,6 +152,8 @@ export const downloadRemoteAssets = async (connectionId?: string, options?: { si
     run?.finish('complete', hasItems || options?.showEmpty !== false);
     return result;
   } catch (error) { run?.finish(externalProgressFailure(error)); throw error; }
+  // A failed or cancelled download can still have stored some bodies.
+  finally { announceAssetBodyArrivals(); }
 };
 let cleanup: { operationId: string; controller: AbortController } | undefined;
 export async function evictLocalAssets(): Promise<AssetResidencyStatus> {
