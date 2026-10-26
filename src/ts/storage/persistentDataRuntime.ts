@@ -402,6 +402,10 @@ export interface PersistentDataRuntime {
     markPersistentDataDirty(estimatedBytes: number): void
     flushPendingData(reason: string): Promise<void>
     flushPendingDataLocally(reason: string): Promise<void>
+    /** A local flush at a generation checkpoint; false when a storage failure took the background save path. */
+    flushPendingDataLocallyForCheckpoint(reason: string): Promise<boolean>
+    /** Whether complete conversations are saved against immutable captured values. */
+    capturesImmutableCharacters(): boolean
     acknowledgeGenerationCompletion(expectedAuthorityEpoch?: number): Promise<void>
     commitCharacterAddition(
         request: CharacterAdditionRequest,
@@ -1426,6 +1430,9 @@ export function createPersistentDataRuntime(
         flushPendingData: (reason) => coordinator.flushPendingData(reason),
         flushPendingDataLocally: (reason) =>
             coordinator.flushPendingDataLocally(reason),
+        flushPendingDataLocallyForCheckpoint: (reason) =>
+            coordinator.flushPendingDataLocallyForCheckpoint(reason),
+        capturesImmutableCharacters: () => coordinator.capturesImmutableCharacters,
         async acknowledgeGenerationCompletion(expectedAuthorityEpoch = coordinator.storageAuthorityEpoch) {
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
             await coordinator.flushPendingDataLocally('generation-completion')

@@ -5,7 +5,7 @@ import type { Chat, Database, character } from './database.svelte'
 import { RevisionConflictError } from './persistentDataStore'
 import { PayloadTooLargeError, UnsaveableValueError } from './nativePersistenceValue'
 import { createLeaseStub, createStoreStub } from './persistentDataStore.testSupport'
-import { canonicalJson } from './saveCoordinator'
+import { canonicalJson, PersistentMutationFencedError } from './saveCoordinator'
 import { createPersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import {
     ActiveConversationSession,
@@ -3106,6 +3106,42 @@ describe('SaveCoordinator', () => {
             await vi.advanceTimersByTimeAsync(2500)
             expect(onBackgroundError).toHaveBeenCalledTimes(2)
             expect(commit).toHaveBeenCalledTimes(4)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('takes the background save path for a failed generation checkpoint and rejects one during a fence', async () => {
+        vi.useFakeTimers()
+        try {
+            const database = makeDatabase()
+            const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+                .mockRejectedValueOnce(new Error('synthetic I/O failure'))
+            const onBackgroundError = vi.fn()
+            const coordinator = new SaveCoordinator({
+                store: makeStore(commit),
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+                onBackgroundError,
+            })
+            coordinator.initialize(1)
+            database.username = 'Checkpointed edit'
+            coordinator.markPersistentDataDirty(1)
+
+            await expect(coordinator.flushPendingDataLocallyForCheckpoint('generation-checkpoint')).resolves.toBe(false)
+            expect(onBackgroundError).toHaveBeenCalledOnce()
+            expect(commit).toHaveBeenCalledOnce()
+            await vi.advanceTimersByTimeAsync(2_000)
+            expect(commit).toHaveBeenCalledTimes(2)
+            expect(coordinator.hasPendingPersistenceWork).toBe(false)
+
+            const fence = await coordinator.acquireCommittedWorkingSetRefreshFence()
+            await expect(coordinator.flushPendingDataLocallyForCheckpoint('generation-checkpoint'))
+                .rejects.toBeInstanceOf(PersistentMutationFencedError)
+            coordinator.releaseDestructiveReplacementFence(fence)
+            expect(onBackgroundError).toHaveBeenCalledOnce()
+            expect(commit).toHaveBeenCalledTimes(2)
         } finally {
             vi.useRealTimers()
         }

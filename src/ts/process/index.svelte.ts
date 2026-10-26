@@ -62,6 +62,8 @@ import {
     captureWindowedConversationMutationController,
     captureSelectedConversationTarget,
     flushPendingData,
+    flushPendingDataLocallyForCheckpoint,
+    capturesImmutableCharacters,
     getActiveConversationSession,
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
@@ -2900,6 +2902,11 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 lifecycle.onProgress?.(1)
             },
             onProviderFailure: throwError,
+        },
+        checkpoint: {
+            savePath: () => lifecycle.savePath(),
+            capturesImmutableCharacters,
+            flush: () => flushPendingDataLocallyForCheckpoint('generation-checkpoint'),
         },
     })
     if (!responseApplication) {

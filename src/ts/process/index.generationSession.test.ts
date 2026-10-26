@@ -487,9 +487,12 @@ describe('sendChat generation session integration', () => {
         })
         const sending = sendChat()
         await entered.promise
-        expect(mocks.diagnosticEvents.filter(event => event.kind === 'phase').at(-1)).toMatchObject({
-            phase: 'output-application', edge: 'enter',
-        })
+        // The first applied candidate is saved inside the open aggregate span.
+        expect(mocks.diagnosticEvents.filter(event => event.kind === 'phase').slice(-3)).toEqual([
+            expect.objectContaining({ phase: 'output-application', edge: 'enter' }),
+            expect.objectContaining({ phase: 'checkpoint', edge: 'enter' }),
+            expect.objectContaining({ phase: 'checkpoint', edge: 'exit', outcome: 'ok' }),
+        ])
         expect(mocks.diagnosticEvents.some(event => ['semantic-output', 'inlay', 'tts'].includes(String(event.phase)))).toBe(false)
         finish.resolve()
         await expect(sending).resolves.toBe(true)
@@ -512,6 +515,8 @@ describe('sendChat generation session integration', () => {
         const failure = new Error('synthetic diagnostic state failure')
         Object.defineProperty(session, 'residencyFallbackActive', {
             get() {
+                // The checkpoint reads the save path while applying output; only the reads for completion diagnostics fail.
+                if (!mocks.diagnosticEvents.some(event => event.phase === 'completion-processing')) return false
                 if (failureKind === 'save-path') throw failure
                 mocks.diagnosticAuthorityError = failure
                 return false

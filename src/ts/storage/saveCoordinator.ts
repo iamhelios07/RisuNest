@@ -1335,6 +1335,26 @@ export class SaveCoordinator {
         return promise
     }
 
+    /**
+     * A local flush at a generation checkpoint. A rejection takes the background save path, which
+     * reports it and schedules any retry; a storage failure then resolves false and a fence rejects.
+     */
+    async flushPendingDataLocallyForCheckpoint(reason: string): Promise<boolean> {
+        try {
+            await this.flushPendingDataLocally(reason)
+            return true
+        } catch (error) {
+            this.handleBackgroundSaveFailure(error)
+            if (error instanceof PersistentMutationFencedError) throw error
+            return false
+        }
+    }
+
+    /** Whether complete conversations are saved against immutable captured values instead of being replaced whole. */
+    get capturesImmutableCharacters(): boolean {
+        return this.dependencies.canonicalCapture?.materializedCharacters !== undefined
+    }
+
     private async runLocalFlush(reason: string): Promise<void> {
         const authorityEpoch = this.authorityEpoch
         while (this.queuedOperationCount > 0 && !this.publicationInProgress) {
