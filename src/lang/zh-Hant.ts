@@ -1591,6 +1591,7 @@ export const languageChineseTraditional = {
     "providerPermissionConsent": "外掛 {} 正要求使用模型供應商功能，這可能讓它發出未經授權的 API 請求。要允許嗎？",
     "inlayPermissionConsent": "外掛 {} 正要求存取內嵌內容，這可能讓它讀取、寫入或編輯內嵌資料。要允許嗎？",
     "sendChatConsent": "外掛 {} 正要求以您的名義送出對話訊息，這會觸發 AI 回應。要允許嗎？",
+    "hostToolPermissionConsent": "外掛 {} 正要求呼叫工具（包括 MCP）的權限，這可能讓它讀取或變更您的資料。要允許嗎？",
     "pluginV2Warning": "外掛 V2 與 V2.1 已不再支援，不會執行。**請勿使用此版本的外掛。**若您是外掛開發者，請更新至 V3。",
     "createFolderOnBranch": "在分支上建立資料夾",
     "hamburgerButtonBottom": "將選單按鈕移至側邊欄底部",
