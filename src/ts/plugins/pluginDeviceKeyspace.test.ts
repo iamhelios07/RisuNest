@@ -276,6 +276,16 @@ describe('plugin device keyspace', () => {
         await keyspace.setItem('json', 'later', value)
         await expect(keyspace.getItem('string', 'recent')).resolves.toBe('kept')
         expect(reads).toHaveBeenCalledTimes(3)
+
+        // A whole keyspace under the native limit can still pass the cache budget.
+        const hydrated = recordingBackend(['one', 'three', 'two'].map(key => ({ owner: 'b', space: 'string' as const, key, value })))
+        const hydratedReads = vi.spyOn(hydrated.backend, 'read')
+        const loaded = new PluginDeviceKeyspace('b', hydrated.backend)
+        await expect(loaded.getItem('string', 'two')).resolves.toBe(value)
+        expect(hydratedReads).not.toHaveBeenCalled()
+        await expect(loaded.getItem('string', 'one')).resolves.toBe(value)
+        expect(hydratedReads).toHaveBeenCalledOnce()
+        await expect(loaded.keys('string')).resolves.toEqual(['one', 'three', 'two'])
     })
 
     it('does not accumulate replacement costs for the same cached key', async () => {
