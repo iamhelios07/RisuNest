@@ -123,7 +123,7 @@ class SafFileBridgeTest {
       )
       store.save(record)
       val session = SafDestinationRendererSession()
-      val recovered = session.reconcile(record, 3_000, store::save, { true }, store::clear, false,
+      val recovered = session.reconcile(record, 3_000, store::save, { true },
         { requiresRisuSavePublicationProof(root, it.exportId, it.sourceKind) })!!
       assertEquals(record.copy(publicationPrerequisitesComplete = true, updatedAtMillis = 3_000), recovered)
       assertEquals(recovered, session.status(null))
@@ -156,31 +156,30 @@ class SafFileBridgeTest {
   }
 
   @Test
-  fun `recovered receipts survive startup readiness and cannot acknowledge a newer live export`() {
+  fun `recovered receipts stay journaled until acknowledged and cannot acknowledge a newer live export`() {
     val id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     val nextId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     val file = temporaryDirectory().resolve("state.json")
     val store = SafDestinationStateStore(file, testAtomicPublisher)
     val session = SafDestinationRendererSession()
     store.save(terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false))
-    val retiredReady = AndroidFrontendReady()
-    assertTrue(retiredReady.markReady())
-    retiredReady.cancel()
-    val recovered = session.reconcile(store.load()!!, 3_000, store::save, { true }, store::clear, !retiredReady.isReady, { true })!!
+    val recovered = session.reconcile(store.load()!!, 3_000, store::save, { true }, { true })!!
     assertEquals(recovered, store.load())
     assertEquals(listOf(recovered), session.pending())
     assertFalse(session.acknowledge(id, store.load()) { false })
     assertTrue(session.hasRecovered(id))
     assertEquals(recovered, store.load())
-    session.reconcile(store.load()!!, 3_001, store::save, { true }, store::clear, false, { true })
-    assertNull(store.load())
-    assertEquals(recovered, session.status(null))
+    assertNull(session.reconcile(store.load()!!, 3_001, store::save, { true }, { true }))
+    assertEquals(recovered, store.load())
+    assertEquals(recovered, session.status(store.load()))
+    // A process that dies before acknowledgement recovers the same receipt again.
+    assertEquals(recovered, SafDestinationRendererSession().reconcile(store.load()!!, 3_002, store::save, { true }, { true }))
     val next = terminalDestinationRecord(nextId, nextId, SafDestinationSourceKind.RISU_SAVE, false)
     assertNull(session.status(next.copy(phase = SafDestinationPhase.COPYING)))
     assertEquals(next, session.status(next))
     store.save(next)
     session.own(nextId)
-    assertNull(session.reconcile(next, 3_002, store::save, { true }, store::clear, false, { true }))
+    assertNull(session.reconcile(next, 3_002, store::save, { true }, { true }))
     assertTrue(session.acknowledge(id, store.load(), store::clear))
     assertEquals(next, store.load())
     assertTrue(session.pending().isEmpty())
@@ -188,19 +187,17 @@ class SafFileBridgeTest {
   }
 
   @Test
-  fun `failed reconciliation keeps its journal and retries cleanup before clearing`() {
+  fun `failed reconciliation keeps its journal and retries cleanup`() {
     val id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     val file = temporaryDirectory().resolve("state.json")
     val store = SafDestinationStateStore(file, testAtomicPublisher)
     val session = SafDestinationRendererSession()
     store.save(terminalDestinationRecord(id, id, SafDestinationSourceKind.RISU_SAVE, false))
-    assertNull(session.reconcile(store.load()!!, 3_000, store::save, { false }, store::clear, false, { true }))
+    assertNull(session.reconcile(store.load()!!, 3_000, store::save, { false }, { true }))
     assertTrue(store.load()!!.publicationPrerequisitesComplete)
     assertTrue(session.pending().isEmpty())
-    assertNull(session.reconcile(store.load()!!, 3_000, store::save, { true }, { false }, false, { true }))
-    assertTrue(session.pending().isEmpty())
-    assertTrue(session.reconcile(store.load()!!, 3_000, store::save, { true }, store::clear, false, { true }) != null)
-    assertNull(store.load())
+    assertTrue(session.reconcile(store.load()!!, 3_000, store::save, { true }, { true }) != null)
+    assertEquals(session.pending().single(), store.load())
   }
 
   @Test
