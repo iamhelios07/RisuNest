@@ -114,14 +114,16 @@ function metadata(key: string, size: number): BlobMetadata {
     }
 }
 
-function makeBlobStore(values: ReadonlyMap<string, Uint8Array>): BlobStore {
+function makeBlobStore(values: ReadonlyMap<string, Uint8Array>, batched = true): BlobStore {
+    const stat = async (key: string) => {
+        const value = values.get(key)
+        return value ? metadata(key, value.byteLength) : null
+    }
     return {
         put: vi.fn(),
         read: vi.fn(async (key) => values.get(key)?.slice() ?? null),
-        stat: vi.fn(async (key) => {
-            const value = values.get(key)
-            return value ? metadata(key, value.byteLength) : null
-        }),
+        stat: vi.fn(stat),
+        ...(batched ? { statMany: vi.fn(async (keys: readonly string[]) => Promise.all(keys.map(stat))) } : {}),
         list: vi.fn(),
         remove: vi.fn(),
         resolveUrl: vi.fn(),
@@ -132,6 +134,7 @@ interface HarnessOptions {
     database?: Database
     accountId?: string
     blobs?: Map<string, Uint8Array>
+    batchedStat?: boolean
     remoteAssets?: Map<string, Uint8Array>
     remoteCold?: Map<string, unknown>
     databaseRead?: AccountReadResult
@@ -172,7 +175,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     const localBlobs = options.blobs ?? new Map(
         resources(database).map((key, index) => [key, Uint8Array.of(index + 1)]),
     )
-    const blobStore = makeBlobStore(localBlobs)
+    const blobStore = makeBlobStore(localBlobs, options.batchedStat)
     const remoteAssets = options.remoteAssets ?? new Map<string, Uint8Array>()
     const remoteCold = options.remoteCold ?? new Map<string, unknown>()
     const events = options.events ?? []
@@ -668,7 +671,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         }
     })
 
-    it('pins a legacy backslash asset key and uploads its normalized local payload', async () => {
+    it.each([true, false])('pins a legacy backslash asset key and uploads its normalized local payload (batched stat: %s)', async (batchedStat) => {
         const database = makeDatabase() as any
         const legacyKey = 'assets\\windows.gif'
         database.characters[0].additionalAssets = [['legacy', legacyKey, 'gif']]
@@ -678,11 +681,13 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
                 .map((key, index): [string, Uint8Array] => [key, Uint8Array.of(index + 1)]),
         )
         localBlobs.set('assets/windows.gif', Uint8Array.of(77))
-        const harness = await makeHarness({ database, blobs: localBlobs })
+        const harness = await makeHarness({ database, blobs: localBlobs, batchedStat })
 
         const publication = await harness.adapter.pin(harness.imported.revision)
         await publication.publish()
 
+        // A store that answers in batches is never asked one key at a time.
+        if (batchedStat) expect(harness.blobStore.stat).not.toHaveBeenCalled()
         const upload = harness.writes.find((write) => write.key === legacyKey)
         expect(upload?.bytes).toEqual(Uint8Array.of(77))
         const databaseWrite = harness.writes.find((write) => write.key === databaseKey)
@@ -726,7 +731,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             'C:\\app-data\\portrait.png',
         ]
         for (const key of excluded) {
-            expect(harness.blobStore.stat).not.toHaveBeenCalledWith(key)
+            expect(vi.mocked(harness.blobStore.statMany!).mock.calls.flat(2)).not.toContain(key)
             expect(harness.readItem).not.toHaveBeenCalledWith(key)
             expect(harness.writeItem.mock.calls.some(([written]) => written === key)).toBe(false)
         }
@@ -1227,9 +1232,9 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
     it('stops pinning on cancellation and releases the revision without remote probes', async () => {
         const harness = await makeHarness()
         const controller = new AbortController()
-        vi.mocked(harness.blobStore.stat).mockImplementation(async () => {
+        vi.mocked(harness.blobStore.statMany!).mockImplementation(async (keys) => {
             controller.abort()
-            return null
+            return keys.map(() => null)
         })
         const acquire = vi.spyOn(harness.store, 'acquireRevision')
         await expect(harness.adapter.pin(harness.imported.revision, { signal: controller.signal }))

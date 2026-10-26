@@ -190,6 +190,23 @@ function throwIfAborted(signal?: AbortSignal): void {
     throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
 }
 
+/** Which keys hold a local payload, in one batch where the store offers it. */
+async function statKeys(blobs: BlobStore, keys: readonly string[], signal?: AbortSignal): Promise<boolean[]> {
+    throwIfAborted(signal)
+    if (keys.length === 0) return []
+    if (blobs.statMany) {
+        const found = await blobs.statMany(keys)
+        throwIfAborted(signal)
+        return found.map(Boolean)
+    }
+    const found: boolean[] = []
+    for (const key of keys) {
+        found.push(!!await blobs.stat(key))
+        throwIfAborted(signal)
+    }
+    return found
+}
+
 function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]): {
     signal: AbortSignal
     dispose(): void
@@ -603,26 +620,21 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             if (this.dependencies.getAccountId && !accountId) {
                 throw new Error('Native official account login is required')
             }
-            const assetKeys = new Set(references.assets)
+            const keys = [...new Set(references.assets)].sort()
+            const published = keys.map(key => this.dependencies.ledger.publishedAs(key))
+            const unpublished = keys.filter((_key, index) => published[index] === null)
+            const present = await statKeys(blobs, unpublished, options.signal)
+            const legacy = unpublished.filter((key, index) => !present[index] && normalizeLegacyAssetKey(key) !== key)
+            const normalizedPresent = await statKeys(blobs, legacy.map(normalizeLegacyAssetKey), options.signal)
+            const localKeys = new Map<string, string>()
+            unpublished.forEach((key, index) => { if (present[index]) localKeys.set(key, key) })
+            legacy.forEach((key, index) => { if (normalizedPresent[index]) localKeys.set(key, normalizeLegacyAssetKey(key)) })
             const assets: PinnedAsset[] = []
-            for (const key of [...assetKeys].sort()) {
-                throwIfAborted(options.signal)
-                const publishedAs = this.dependencies.ledger.publishedAs(key)
-                if (publishedAs !== null) {
-                    assets.push({ key, localKey: key, publishedAs })
-                    continue
-                }
-                if (await blobs.stat(key)) {
-                    assets.push({ key, localKey: key, publishedAs: null })
-                    continue
-                }
-                const normalized = normalizeLegacyAssetKey(key)
-                if (normalized !== key && await blobs.stat(normalized)) {
-                    assets.push({ key, localKey: normalized, publishedAs: null })
-                    continue
-                }
-
-            }
+            keys.forEach((key, index) => {
+                const publishedAs = published[index]
+                if (publishedAs !== null) assets.push({ key, localKey: key, publishedAs })
+                else if (localKeys.has(key)) assets.push({ key, localKey: localKeys.get(key)!, publishedAs: null })
+            })
 
             return new OfficialPinnedPublication(
                 revision,
