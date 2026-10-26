@@ -35,3 +35,32 @@ it.each([
         expect(lookups).toBe(2)
     } finally { stop() }
 })
+
+it('looks up a displayed asset that had no body again as soon as a running download reports a stored body', async () => {
+    let report!: (value: { completedItems: number; totalItems: number }) => void
+    let finish!: (value: unknown) => void
+    mock.invoke.mockImplementation((name, args) => {
+        if (name !== 'asset_residency_download_remote') return Promise.resolve()
+        report = args.progress.onmessage
+        return new Promise(resolve => { finish = resolve })
+    })
+    let lookups = 0
+    const stop = toStore(() => {
+        const token = trackAssetBodyArrival('assets/received-avatar.png')
+        if (token === undefined) return lookups
+        noteMissingAssetBody('assets/received-avatar.png', token)
+        return ++lookups
+    }).subscribe(() => {})
+    try {
+        const download = downloadRemoteAssets(undefined, { progressConnectionId: 'receiver', showEmpty: false, routine: true })
+        await vi.waitFor(() => expect(report).toBeDefined())
+        report({ completedItems: 0, totalItems: 2 })
+        flushSync()
+        expect(lookups).toBe(1)
+        report({ completedItems: 1, totalItems: 2 })
+        flushSync()
+        expect(lookups).toBe(2)
+        finish(assetResidencyStatus())
+        await download
+    } finally { stop() }
+})
