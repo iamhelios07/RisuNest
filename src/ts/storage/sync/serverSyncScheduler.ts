@@ -104,8 +104,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             dependencies.recovered?.()
         }
     }
-    // A settled, cancelled publication can report server-unreachable with a nonretryable 409.
-    const blocks = (error: unknown) => (typeof error === 'object' && !!error && 'retryable' in error && error.retryable === false && code(error) !== 'server-unreachable') || integrityCodes.includes(code(error))
+    const blocks = (error: unknown) => (typeof error === 'object' && !!error && 'retryable' in error && error.retryable === false) || integrityCodes.includes(code(error))
     const fail = (error: unknown, lane?: Lane) => {
         if (isCancellation(error)) return
         if (blocked && !clockCodes.includes(blockedCode) && !formatCodes.includes(blockedCode)) return

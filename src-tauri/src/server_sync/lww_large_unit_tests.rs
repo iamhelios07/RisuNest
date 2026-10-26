@@ -205,7 +205,9 @@ fn a_failed_push_keeps_its_copies_for_the_retry_and_a_finished_one_removes_them(
     save(&mut a, &["root", "customCSS"], value.clone());
     let hash = risunest_sync_wire::hash(&risunest_sync_wire::payload_value::encode(&value).unwrap());
     let request = header(&a);
-    assert!(ca.push(&mut a, &request, &[]).is_err());
+    let error = ca.push(&mut a, &request, &[]).unwrap_err();
+    // The server never recorded the push, so it is cancelled and fails as its reply did.
+    assert_eq!((error.code.as_str(), error.status, error.retryable), ("unavailable", 503, true));
     let copies = crate::asset_repository::PayloadCas::new(&lane(&a, "send")).unwrap();
     assert!(copies.stat_object(&hash).unwrap().is_some());
     fail_push.store(false, std::sync::atomic::Ordering::Relaxed);

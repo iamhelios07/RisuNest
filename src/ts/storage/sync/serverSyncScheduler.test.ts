@@ -19,9 +19,9 @@ describe('server LWW foreground scheduler', () => {
             expect(isServerSyncUnavailable(error)).toBe(false)
         }
     })
-    it.each(['timer', 'edit', 'foreground'])('retries a settled cancelled publication on %s despite its nonretryable 409', async trigger => {
+    it.each(['timer', 'edit', 'foreground'])('retries a cancelled publication that failed with a retryable server reply on %s', async trigger => {
         const f = fixture()
-        const failure = { code: 'server-unreachable', status: 409, retryable: false }
+        const failure = { code: 'worker-unavailable', status: 503, retryable: true }
         f.push.mockRejectedValueOnce(failure)
         await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
         expect(f.failed).toHaveBeenCalledWith(failure)
