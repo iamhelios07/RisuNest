@@ -87,6 +87,23 @@ describe('live chat rows', () => {
         await expect(translate(text, false, liveRowContext())).resolves.toBe('Live translated')
         expect(f.fetch).toHaveBeenCalledOnce()
     })
+    it('sends one request for overlapping translations of the same live row text', async () => {
+        f.fetch.mockResolvedValue({ ok: true, data: { translations: [{ text: 'Shared translated' }] } })
+        const text = 'live row text parsed twice at once'
+        await expect(Promise.all([translate(text, false, liveRowContext()), translate(text, false, liveRowContext())]))
+            .resolves.toEqual(['Shared translated', 'Shared translated'])
+        expect(f.fetch).toHaveBeenCalledOnce()
+    })
+    it('sends one LLM request for overlapping translations of the same live row', async () => {
+        f.translatorType = 'llm'
+        f.request.mockResolvedValue({ type: 'success', result: '<p>LLM shared</p>' })
+        const html = '<p>live LLM row parsed twice at once</p>'
+        await expect(Promise.all([
+            translateHTML(html, false, '', 0, false, liveRowContext()),
+            translateHTML(html, false, '', 0, false, liveRowContext()),
+        ])).resolves.toEqual(['<p>LLM shared</p>', '<p>LLM shared</p>'])
+        expect(f.request).toHaveBeenCalledOnce()
+    })
     it('leaves a live row untranslated while a reply is generated', async () => {
         f.fetch.mockResolvedValue({ ok: true, data: { translations: [{ text: 'Streaming translated' }] } })
         doingChat.set(true)
