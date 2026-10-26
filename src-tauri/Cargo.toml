@@ -141,6 +141,8 @@ libc = "0.2"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 security-framework = "3.7.0"
+# Reads the WebKit termination reason inside the web content process handler.
+wry = "=0.57.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
