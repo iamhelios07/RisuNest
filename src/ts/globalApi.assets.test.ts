@@ -77,6 +77,9 @@ import { navigationActivity } from './ui/navigationActivity'
 import { get } from 'svelte/store'
 import { imageFixture } from '../../tests/support/imageFixtures'
 import { createKeyValueBlobStore, type BlobKeyValueBackend } from './storage/blobStore'
+import { announceAssetBodyArrivals } from './storage/assetBodyArrival.svelte'
+import { flushSync } from 'svelte'
+import { toStore } from 'svelte/store'
 
 function createFakeBlobStore(entries: { [key: string]: { data: Uint8Array, mime: string } }) {
     return {
@@ -90,6 +93,13 @@ function createFakeBlobStore(entries: { [key: string]: { data: Uint8Array, mime:
         list: vi.fn(async () => []),
         remove: vi.fn(async () => undefined),
     }
+}
+
+/** Resolves `loc` the way a component template does, again whenever what it read changes. */
+function watchFileSrc(loc: string) {
+    const results: Promise<string>[] = []
+    const stop = toStore(() => getFileSrc(loc)).subscribe(result => { results.push(result) })
+    return { latest: () => results.at(-1)!, count: () => results.length, stop }
 }
 
 function deferred<T>() {
@@ -459,6 +469,56 @@ describe('getFileSrc tauri asset route', () => {
         expect(await getFileSrc('assets/ghost.png')).toBe('')
         state.blobStore = createFakeBlobStore({ 'assets/ghost.png': { data: new Uint8Array([1]), mime: 'image/png' } })
         expect(await getFileSrc('assets/ghost.png')).toBe('asset:///data/assets/ghost.png')
+    })
+
+    test('resolves only a missing native asset again for a reactive reader once its body downloads', async () => {
+        state.platform = { runtime: 'tauri', os: 'windows' }
+        const entries: Parameters<typeof createFakeBlobStore>[0] = {
+            'assets/shown-avatar.png': { data: new Uint8Array([1]), mime: 'image/png' },
+        }
+        state.blobStore = createFakeBlobStore(entries)
+        const arriving = watchFileSrc('assets/arriving-avatar.png')
+        const shown = watchFileSrc('assets/shown-avatar.png')
+        try {
+            expect(await arriving.latest()).toBe('')
+            expect(await shown.latest()).toBe('asset:///data/assets/shown-avatar.png')
+            const shownResults = shown.count()
+
+            entries['assets/arriving-avatar.png'] = { data: new Uint8Array([2]), mime: 'image/png' }
+            announceAssetBodyArrivals()
+            flushSync()
+
+            expect(await arriving.latest()).toBe('asset:///data/assets/arriving-avatar.png')
+            expect(shown.count()).toBe(shownResults)
+        } finally {
+            arriving.stop()
+            shown.stop()
+        }
+    })
+
+    test('resolves a native asset again when its body downloads while the lookup runs', async () => {
+        state.platform = { runtime: 'tauri', os: 'windows' }
+        const checked = deferred<string | null>()
+        const started = deferred<void>()
+        state.blobStore = createFakeBlobStore({})
+        state.blobStore.resolveUrl = vi.fn()
+            .mockImplementationOnce(() => {
+                started.resolve()
+                return checked.promise
+            })
+            .mockResolvedValueOnce('asset:///data/assets/racing-avatar.png')
+        const reader = watchFileSrc('assets/racing-avatar.png')
+        try {
+            await started.promise
+            announceAssetBodyArrivals()
+            checked.resolve(null)
+            expect(await reader.latest()).toBe('')
+            flushSync()
+
+            expect(await reader.latest()).toBe('asset:///data/assets/racing-avatar.png')
+        } finally {
+            reader.stop()
+        }
     })
 
     test('bounds native URL entries without revoking protocol URLs', async () => {
