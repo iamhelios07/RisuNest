@@ -1421,7 +1421,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         var sourceKind = SafDestinationSourceKind.RISU_SAVE
         try {
           reconcileSafDestination()
-          if (reservationKind != null && loadSafDestinationState() != null) {
+          // Recovered receipts wait for their owner without blocking a new export.
+          val pendingState = synchronized(safDestinationStateLock) {
+            loadSafDestinationState()?.takeUnless { safDestinationRendererSession.hasRecovered(it.requestId) }
+          }
+          if (reservationKind != null && pendingState != null) {
             throw SafDestinationException("destination-busy", emptyList(), "Another Android SAF destination is pending")
           }
           val source = if (reservationKind != null) null else {
@@ -2044,8 +2048,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             ::saveSafDestinationState,
             { terminal -> !terminal.exportBound || !terminal.copyStarted ||
               prepareRecoveredRisuSaveAcknowledgement(filesDir, terminal.exportId) },
-            ::clearSafDestinationState,
-            retainJournal = !frontendReady.isReady,
             requiresPublicationProof = { terminal ->
               requiresRisuSavePublicationProof(filesDir, terminal.exportId, terminal.sourceKind)
             },

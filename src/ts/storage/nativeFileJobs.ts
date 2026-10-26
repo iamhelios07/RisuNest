@@ -16,6 +16,7 @@ import {
 import type { PreparedImmutablePayload } from './payloadCas'
 import type { DataHealthResult } from './dataHealth'
 import type { PersistentDataRuntime } from './persistentDataRuntime'
+import { readCurrentRevision } from './persistentDataStore'
 import { registerCommittedWorkingSetContinuation } from './committedWorkingSetContinuation'
 import {
     copyNativeExportToAndroidSaf,
@@ -1662,9 +1663,9 @@ async function runNativeReplacementRestore(
                             }
                             if ((terminal.state === 'failed' || terminal.state === 'cancelled') &&
                                 (kind !== 'restore-portable-backup' || !Number.isSafeInteger(terminal.activationRevision))) {
-                                const current = await bounded(runtime.store.readRoot(), 'activation revision check')
-                                if (current.revision !== upstreamPause!.fence.revision) throw new Error('Failed native activation changed the library')
-                                return current.revision
+                                const current = await bounded(readCurrentRevision(runtime.store), 'activation revision check')
+                                if (current !== upstreamPause!.fence.revision) throw new Error('Failed native activation changed the library')
+                                return current
                             }
                             if (kind === 'restore-portable-backup') {
                                 if (!Number.isSafeInteger(terminal.activationRevision)) throw new NativeFileJobError('invalid-activation-receipt','Portable activation receipt is unavailable')
@@ -1676,9 +1677,9 @@ async function runNativeReplacementRestore(
                                 if (!terminal.result) throw new Error('Native activation result is unavailable')
                                 return terminal.result.revision
                             }
-                            const current = await bounded(runtime.store.readRoot(), 'activation revision check')
-                            if (current.revision !== upstreamPause!.fence.revision) throw new Error('Failed native activation changed the library')
-                            return current.revision
+                            const current = await bounded(readCurrentRevision(runtime.store), 'activation revision check')
+                            if (current !== upstreamPause!.fence.revision) throw new Error('Failed native activation changed the library')
+                            return current
                         },
                         async afterRefresh() {
                             const plugins = await import('../plugins/apiV3/v3.svelte')
@@ -1910,8 +1911,8 @@ async function runNativeReplacementRestore(
         if (upstreamPause && portableAdoptedRevision === undefined) {
             if (!activationUnresolved && (!activationSubmitted || terminal?.state === 'cancelled' || terminal?.state === 'failed')) {
                 try {
-                    const unchanged = await bounded(runtime.store.readRoot(), 'unchanged library check')
-                    if (unchanged.revision !== upstreamPause.fence.revision) throw new Error('Native restore changed the library')
+                    const unchanged = await bounded(readCurrentRevision(runtime.store), 'unchanged library check')
+                    if (unchanged !== upstreamPause.fence.revision) throw new Error('Native restore changed the library')
                     const plugins = await import('../plugins/apiV3/v3.svelte')
                     await bounded(plugins.restartPluginsAfterAuthorityReplacement(), 'plugin restart')
                     await bounded(upstreamPause.abortUnchanged(async () => { await bounded(Promise.resolve(upstreamBinding?.assertAuthority()), 'binding verification') }), 'unchanged restore recovery')

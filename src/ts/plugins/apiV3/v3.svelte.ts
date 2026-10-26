@@ -1864,7 +1864,7 @@ export async function executePluginV3(plugin:RisuPlugin, isCurrent: () => boolea
     const api = makeRisuaiAPIV3(iframe, plugin, claimSession);
     const host = new SandboxHost(api, isTauri ? createPluginDownloadHandler({
         fetch: api.nativeFetch,
-        save: (name, bytes) => downloadFile(name, bytes, { saveDialog: true }),
+        save: (name, bytes) => downloadFile(name, bytes),
         reportError: error => alertError(String(error)),
     }) : undefined);
     host.onActivityChanged?.(notifyPluginActivity);
