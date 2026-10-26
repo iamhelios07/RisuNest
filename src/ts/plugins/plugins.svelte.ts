@@ -27,6 +27,7 @@ import {
 import { getPersistentDataStore } from "../storage/persistentDataStoreFactory";
 import {
     createPluginStorageStore,
+    dropStaleColdPluginReferences,
     registerPluginStorageLifecycle,
 } from "./pluginStorageStore";
 import { UNOWNED_PLUGIN_OWNER } from "./pluginOwner";
@@ -550,6 +551,8 @@ export async function loadPlugins(whenIdle = false, isCurrent: () => boolean = (
     await reportUnsupportedPlugins(
         enabledPlugins.filter((plugin: RisuPlugin) => !isSupportedPluginVersion(plugin)),
     )
+    try { await dropStaleColdPluginReferences(getPersistentDataStore(), pluginStorageStore) }
+    catch (error) { console.warn('Stale cold plugin storage references were not removed', error) }
 
     await applyPluginLoad(enabledPlugins.filter(isSupportedPluginVersion), () => {
         if (!allowed()) return false

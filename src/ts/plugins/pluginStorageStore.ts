@@ -487,3 +487,26 @@ export function createPluginStorageStore(
         },
     }
 }
+
+// Upstream's cold plugin storage references. Restores made before that storage
+// was imported kept them as unowned values naming items the library never held.
+const STALE_COLD_PLUGIN_KEYS = ['_coldpluginIndex', '_coldplugin']
+
+/** Deletes those values where they remain and leaves a library without them untouched. */
+export async function dropStaleColdPluginReferences(
+    store: PersistentDataStore,
+    storage: PluginStorageStore,
+): Promise<void> {
+    await store.open()
+    const stale: string[] = []
+    for (const key of STALE_COLD_PLUGIN_KEYS) {
+        if (await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, key)) stale.push(key)
+    }
+    if (stale.length === 0) return
+    const unowned = storage.forOwner(UNOWNED_PLUGIN_OWNER)
+    try {
+        await unowned.mutate(stale.map((key) => ({ type: 'delete', key })))
+    } finally {
+        unowned.dispose()
+    }
+}
