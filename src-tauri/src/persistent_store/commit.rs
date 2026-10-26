@@ -818,7 +818,7 @@ pub(super) fn replace_add_characters(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
     let mut configured_index: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM characters WHERE generation = ?1",
+        "SELECT COALESCE(MAX(configured_index) + 1, 0) FROM characters WHERE generation = ?1",
         [staging_id],
         |row| row.get(0),
     )?;
@@ -853,7 +853,7 @@ pub(super) fn replace_put_character_detail(
         ));
     }
     let configured_index: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM characters WHERE generation = ?1",
+        "SELECT COALESCE(MAX(configured_index) + 1, 0) FROM characters WHERE generation = ?1",
         [staging_id],
         |row| row.get(0),
     )?;
