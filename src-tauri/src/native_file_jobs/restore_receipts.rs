@@ -303,4 +303,69 @@ mod tests {
         reconcile_job(&store, &registry, &id).unwrap();
         assert_eq!(store.revision().unwrap(), 1);
     }
+
+    #[test]
+    fn a_restore_intent_closed_without_activation_stays_dismissed_after_restart() {
+        use crate::persistent_store::lww::{ApplyReceive, Change, Header, Progress, StageReceive, UnitMutation};
+        use crate::persistent_store::WorkingSetCommit;
+        use risunest_sync_wire::{stamp::Stamp, unit::{UnitKey, UnitValue}};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let stage = stage(&mut store);
+        let id = remember(&store, &stage);
+        let authority = read(&store).unwrap()[0].authority.clone();
+        // The activation's library write fails after its intent is reserved, as in the disk failure above.
+        let connection = rusqlite::Connection::open(directory.path().join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_restore BEFORE UPDATE ON generations BEGIN SELECT RAISE(ABORT,'synthetic disk failure'); END;").unwrap();
+        assert!(store.replace_commit(&stage, Some(0)).is_err());
+        // A sync page arrives while the failure lasts. Its apply replays the intent first and fails, so its rows stay staged.
+        let page = StageReceive {
+            header: Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "receive-during-failure".into() },
+            changes: vec![Change {
+                key: UnitKey::new(&["root", "language"]).unwrap(),
+                stamp: Stamp { physical_ms: 10.into(), logical: 0, writer_id: "00000000-0000-4000-8000-000000000001".into() },
+                value: UnitValue::inline(&serde_json::to_vec(&json!("ko")).unwrap()).unwrap(),
+            }],
+            progress: Progress { kind: "server".into(), cursor: 1.into(), writer_id: None },
+            admitted_time_upper_ms: u64::MAX.into(),
+        };
+        store.lww_stage_receive(&page).unwrap();
+        assert!(store.lww_apply_receive(&ApplyReceive { header: page.header.clone(), generating: vec![] }).is_err());
+        connection.execute_batch("DROP TRIGGER reject_restore").unwrap();
+        drop(connection);
+        // The drain after an aborted generation applies staged rows without replaying intents first.
+        let drain = Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "drain".into() };
+        store.lww_drain_deferred(&ApplyReceive { header: drain, generating: vec![] }).unwrap();
+        assert_eq!(store.revision().unwrap(), 1);
+        // The next save replays the restore intent first; it now conflicts and is closed without changes.
+        store.commit(&WorkingSetCommit {
+            expected_revision: 1,
+            unit_mutations: Some(vec![UnitMutation::Set { key: UnitKey::new(&["root", "language"]).unwrap(), value: json!("ja") }]),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(store.revision().unwrap(), 2);
+        let complete: bool = store.device_store().unwrap().connection()
+            .query_row("SELECT complete FROM lww_intents WHERE request_id=?1", [&stage], |row| row.get(0)).unwrap();
+        let activated: bool = store.library_rows()
+            .query_row("SELECT EXISTS(SELECT 1 FROM lww_requests WHERE request_id=?1)", [&stage], |row| row.get(0)).unwrap();
+        assert!(complete && !activated);
+        assert_ne!(store.read_root(None).unwrap().value["username"], "Synthetic restore");
+        // Nothing can activate this restore any more, so startup recovery reports it as interrupted.
+        let registry = JobRegistry::default();
+        reconcile(&store, &registry).unwrap();
+        let interrupted = registry.status(&id).unwrap();
+        assert!(matches!(interrupted.state, JobState::Failed | JobState::Cancelled) && interrupted.activation_revision.is_none());
+        // Startup recovery dismisses the interrupted restore the way native_file_job_forget does.
+        registry.forget(&id).unwrap();
+        forget(&store, &registry, &id).unwrap();
+        drop(store);
+        let store = PersistentStore::open(directory.path()).unwrap();
+        let restarted = JobRegistry::default();
+        reconcile(&store, &restarted).unwrap();
+        let jobs = restarted.list().unwrap();
+        assert!(jobs.is_empty(), "A dismissed restore that can never activate came back after restart: {:?}, receipt lookup {:?}",
+            jobs.iter().map(|job| (job.job_id.clone(), job.error.as_ref().map(|error| error.code.clone()))).collect::<Vec<_>>(),
+            store.lww_file_restore_receipt(&stage, &stage, &authority).map_err(|error| error.to_string()));
+        assert_eq!(read(&store).unwrap().len(), 0);
+    }
 }

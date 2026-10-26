@@ -913,7 +913,10 @@ impl PersistentStore {
         if stored_authority != authority || stage != staging_id || risunest_sync_wire::hash(body.as_bytes()) != digest {
             return Err(error("request-id-integrity"));
         }
-        let Some((revision, generation)) = activated else { return Err(error("restore-activation-pending")); };
+        // A complete intent without an activation receipt was closed without changes and is never replayed.
+        let Some((revision, generation)) = activated else {
+            return if complete { Ok(None) } else { Err(error("restore-activation-pending")) };
+        };
         let applied_digest: String = self.connection.query_row(
             "SELECT digest FROM lww_requests WHERE request_id=?1", [request_id], |row| row.get(0),
         )?;
