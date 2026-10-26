@@ -267,6 +267,7 @@ pub(crate) async fn asset_residency_download_remote(
     target: Option<crate::persistent_store::asset_residency::PreviousStorageTarget>,
     webview: tauri::Webview, progress: Option<tauri::ipc::JavaScriptChannelId>,
     transfer_progress: Option<tauri::ipc::JavaScriptChannelId>,
+    icon_priority: Option<crate::persistent_store::asset_residency::RepresentativeImagePriority>,
 ) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
     let operation = recorded("asset-download", app.state::<ServerSyncCommandState>().claim_asset_operation(operation_id))?;
     logged_blocking("asset-download", move || within(&LANES.assets, || {
@@ -289,7 +290,7 @@ pub(crate) async fn asset_residency_download_remote(
         observer.within(|| super::asset_download_progress::within(progress.map(|channel| channel.channel_on(webview)), || match target {
             Some(target) if connection_id.is_none() => store.asset_residency_download_previous(&target, Some(cancelled.clone()), selected_character_id.as_deref(), check),
             Some(_) => Err(SyncError::new("invalid-asset-download-scope", 400)),
-            None => store.asset_residency_download_remote(connection_id.as_deref(), Some(cancelled.clone()), selected_character_id.as_deref(), check),
+            None => store.asset_residency_download_remote_prioritized(connection_id.as_deref(), Some(cancelled.clone()), selected_character_id.as_deref(), icon_priority.as_ref(), check),
         }))
     })).await
 }

@@ -801,7 +801,7 @@ impl PersistentStore {
     ) -> Result<ResidencyStatus> {
         check()?;
         let targets = self.previous_storage_assets(target, &check)?;
-        self.hydrate_residency_targets(targets, cancellation, selected_character_id, check)
+        self.hydrate_residency_targets(targets, cancellation, selected_character_id, None, check)
     }
     /// Downloads the bodies another storage holds without changing the policy:
     /// every one, or only those `connection_id` holds and no other live
@@ -811,6 +811,17 @@ impl PersistentStore {
         connection_id: Option<&str>,
         cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         selected_character_id: Option<&str>,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<ResidencyStatus> {
+        self.asset_residency_download_remote_prioritized(connection_id, cancellation, selected_character_id, None, check)
+    }
+    /// The same download, with the representative images the renderer lists first.
+    pub(crate) fn asset_residency_download_remote_prioritized(
+        &self,
+        connection_id: Option<&str>,
+        cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        selected_character_id: Option<&str>,
+        icon_priority: Option<&RepresentativeImagePriority>,
         check: impl Fn() -> Result<()>,
     ) -> Result<ResidencyStatus> {
         check()?;
@@ -835,11 +846,11 @@ impl PersistentStore {
                 }
             }
         }
-        self.hydrate_residency_targets(targets, cancellation, selected_character_id, check)
+        self.hydrate_residency_targets(targets, cancellation, selected_character_id, icon_priority, check)
     }
     fn hydrate_residency_targets(
         &self, targets: BTreeSet<String>, cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-        selected_character_id: Option<&str>, check: impl Fn() -> Result<()>,
+        selected_character_id: Option<&str>, icon_priority: Option<&RepresentativeImagePriority>, check: impl Fn() -> Result<()>,
     ) -> Result<ResidencyStatus> {
         let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
         let progress = crate::server_sync::asset_download_progress::plan(targets.len());
@@ -852,7 +863,11 @@ impl PersistentStore {
                 return Err(SyncError::new("required-asset-unavailable", 409));
             }
         }
-        if !hydration.hydrate_many_outcomes(&targets.into_iter().collect::<Vec<_>>(), &check, &mut opened)?.is_empty() {
+        // Representative images come before the other bodies, so a received avatar shows early.
+        let mut ordered = if targets.is_empty() { Vec::new() } else { self.representative_image_plan(selected_character_id, icon_priority)?.0 };
+        ordered.retain(|hash| targets.contains(hash));
+        ordered.extend(targets);
+        if !hydration.hydrate_many_outcomes(&ordered, &check, &mut opened)?.is_empty() {
             return Err(SyncError::new("required-asset-unavailable", 409));
         }
         let status = self.asset_residency_status()?;
