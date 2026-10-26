@@ -4,7 +4,6 @@ import {
     writeFile,
     open as openFile,
     type FileHandle,
-    BaseDirectory,
     readFile,
     exists,
     mkdir,
@@ -116,7 +115,7 @@ let fetchLog: fetchLog[] = []
 
 import { normalizeDownloadFileName } from "./downloadFileName"
 
-export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string, options: { saveDialog?: boolean } = {}): Promise<boolean> {
+export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string): Promise<boolean> {
     name = normalizeDownloadFileName(name)
     if (typeof (dat) === 'string') {
         dat = Buffer.from(dat, 'utf-8')
@@ -139,13 +138,9 @@ export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer |
         return downloadThroughAndroidSaf(name, data)
     }
     else if (isTauri) {
-        if (options.saveDialog) {
-            const destination = await save({ defaultPath: name })
-            if (!destination) return false
-            await writeFile(destination, data)
-        } else {
-            await writeFile(name, data, { baseDir: BaseDirectory.Download })
-        }
+        const destination = await save({ defaultPath: name })
+        if (!destination) return false
+        await writeFile(destination, data)
     }
     else {
         const blob = new Blob([data], { type: 'application/octet-stream' })
