@@ -7,6 +7,7 @@ import { createConversationOperationContext } from './conversationOperationConte
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
 import { StallingWorker } from '../../../tests/support/regexWorker'
+import { authorNoteFingerprint, effectiveAuthorNote } from '../authorNotePresets'
 
 const runtime = vi.hoisted(() => ({
     unexpectedNativeRuntimeAccess: () => {
@@ -299,11 +300,17 @@ test('CAS-applies Trigger chat variables and note metadata', async () => {
     const { chat, char, session } = fixture()
     char.triggerscript[0].effect = [
         { type: 'setvar', var: 'state', value: '', operator: '=' },
+        { type: 'v2GetAuthorNote', outputVar: 'before' },
         { type: 'v2SetAuthorNote', value: 'operation note', valueType: 'value' },
     ] as never
     runtime.session = session
+    // The stored copy already equals the written value, so only the dropped link shows the write.
+    chat.note = 'operation note'
+    chat.authorNotePreset = { id: 'preset', fingerprint: authorNoteFingerprint('operation note') }
+    const presets = [{ id: 'preset', name: 'Preset', text: 'Preset note' }]
     DBState.db = {
         characters: [char],
+        authorNotePresets: presets,
         templateDefaultVariables: '',
     } as never
 
@@ -312,8 +319,9 @@ test('CAS-applies Trigger chat variables and note metadata', async () => {
         manualName: 'ordered',
     })
 
-    expect(chat.scriptstate).toEqual({ '$state': '' })
-    expect(chat.note).toBe('operation note')
+    expect(chat.scriptstate).toEqual({ '$state': '', '$before': 'Preset note' })
+    expect(effectiveAuthorNote(presets, chat)).toBe('operation note')
+    expect(chat.authorNotePreset).toBeUndefined()
     expect(session.version).toBe(1)
 })
 

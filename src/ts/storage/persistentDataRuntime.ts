@@ -475,6 +475,7 @@ export interface PersistentDataRuntime {
         conversationId: string,
         patch: import('./conversationBinding').ConversationBindingPatch,
         publish: (committedPatch: import('./conversationBinding').ConversationBindingPatch) => void,
+        expected?: import('./conversationBinding').ConversationBindingPatch,
     ): Promise<void>
     mutatePersistentCharacterDetail(
         characterId: string,
@@ -1585,12 +1586,14 @@ export function createPersistentDataRuntime(
             conversationId,
             patch,
             publish,
+            expected,
         ) =>
             coordinator.mutateConversationBinding(
                 characterId,
                 conversationId,
                 patch,
                 publish,
+                expected,
             ),
         expirePersistentTrash: (now) => coordinator.expirePersistentTrash(now),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>

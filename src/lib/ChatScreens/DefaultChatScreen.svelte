@@ -1100,7 +1100,7 @@
         source: character,
         chat: ChatRecord,
     ) {
-        const character = snapshotChatScreenshotCharacter(source, chat)
+        const character = snapshotChatScreenshotCharacter(source, chat, DBState.db.authorNotePresets)
         const database = {
             characters: [character],
             mainPrompt: DBState.db.mainPrompt,

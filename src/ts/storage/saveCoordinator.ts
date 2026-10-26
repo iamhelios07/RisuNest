@@ -33,7 +33,7 @@ import {
 } from './conversationResidency'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
-import { applyConversationBindingPatch, type ConversationBindingPatch } from './conversationBinding'
+import { applyConversationBindingPatch, conversationBindingHolds, type ConversationBindingPatch } from './conversationBinding'
 import { withPersistentRevisionLease } from './persistentRecordIterator'
 import type {
     ActiveConversationMutationEvent,
@@ -1763,33 +1763,29 @@ export class SaveCoordinator {
     /**
      * Commits persona or toggle bindings of a conversation that has no active session (a summary
      * stub or the windowed selected shell) using metadata only, then lets the caller publish the
-     * same change to the in-memory record so the shell matches its baseline.
+     * same change to the in-memory record so the shell matches its baseline. With `expected`, the
+     * patch is dropped unless the stored conversation still holds those fields when it commits.
      */
     mutateConversationBinding(
         characterId: string,
         conversationId: string,
         patch: ConversationBindingPatch,
         publish: (committedPatch: ConversationBindingPatch) => void,
+        expected?: ConversationBindingPatch,
     ): Promise<void> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
-        const clonePatch = (): ConversationBindingPatch =>
-            Object.fromEntries(Object.entries(patch).map(([key, value]) => [
+        const cloneBinding = (binding: ConversationBindingPatch): ConversationBindingPatch =>
+            Object.fromEntries(Object.entries(binding).map(([key, value]) => [
                 key, value === undefined ? undefined : canonicalClone(value),
             ]))
+        const clonePatch = () => cloneBinding(patch)
         patch = clonePatch()
+        if (expected) expected = cloneBinding(expected)
         return this.enqueue(async () => {
             await this.flushIterations('chat-binding', true)
-            const metadata = await this.dependencies.store.readConversationMetadata(
-                characterId,
-                conversationId,
-            )
-            if (!metadata) throw new Error('Binding conversation is unavailable')
-            this.assertReadRevision(this.revision, metadata.revision)
-            const conversation = applyConversationBindingPatch({ ...metadata.value.conversation }, patch)
-            const changes = diffFields(['conversation', characterId, conversationId], metadata.value.conversation, conversation, new Set(['id']))
-            if (!changes.length) return
-            const committed = await this.commitRoutine({ expectedRevision:this.revision, unitMutations:changes })
+            const committed = await this.commitConversationBinding(characterId, conversationId, patch, expected)
+            if (!committed) return
             this.currentRevision = committed.revision
             // Advance only these fields in the baseline; concurrent unrelated edits remain dirty.
             if (this.windowedCharacterBaseline?.authority.characterId === characterId) {
@@ -1809,6 +1805,36 @@ export class SaveCoordinator {
             this.dependencies.onLocalRevision?.(committed.revision)
             await this.finishExplicitCommit(committed.revision)
         })
+    }
+
+    /**
+     * Writes the binding fields that differ from the stored conversation, or returns null when
+     * nothing is written. When another writer commits first, a binding with `expected` reads the
+     * conversation again so the condition is checked against that write instead of resending.
+     */
+    private async commitConversationBinding(
+        characterId: string,
+        conversationId: string,
+        patch: ConversationBindingPatch,
+        expected: ConversationBindingPatch | undefined,
+    ): Promise<{ revision: DataRevision } | null> {
+        while (true) {
+            const metadata = await this.dependencies.store.readConversationMetadata(characterId, conversationId)
+            if (!metadata) throw new Error('Binding conversation is unavailable')
+            this.assertReadRevision(this.revision, metadata.revision)
+            if (expected && !conversationBindingHolds(metadata.value.conversation, expected)) return null
+            const conversation = applyConversationBindingPatch({ ...metadata.value.conversation }, patch)
+            const changes = diffFields(['conversation', characterId, conversationId], metadata.value.conversation, conversation, new Set(['id']))
+            if (!changes.length) return null
+            const commit = { expectedRevision: this.revision, unitMutations: changes }
+            if (!expected) return this.commitRoutine(commit)
+            try {
+                return await this.dependencies.store.commit(canonicalClone(commit))
+            } catch (error) {
+                if (!(error instanceof RevisionConflictError) || error.actualRevision <= commit.expectedRevision) throw error
+                this.currentRevision = error.actualRevision
+            }
+        }
     }
 
     mutatePersistentCharacterDetail(

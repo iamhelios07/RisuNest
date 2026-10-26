@@ -12,6 +12,7 @@ import { RegexExecutor } from '../../../process/regexExecutor'
 import { getRegexExecutionPlan } from '../../../process/regexExecutionPlan'
 import { RegexWorkerClient } from '../../../process/regexWorkerClient'
 import { InMemoryWorker } from '../../../../../tests/support/regexWorker'
+import { authorNotePresetLinkPatch } from '../../../authorNotePresets'
 
 vi.mock('../../../platform', async () => (await import('../../../platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
 
@@ -139,7 +140,7 @@ async function createProductScreenshotJob(input: {
     const parserContext = input.renderContext.parserContext
     const sourceCharacter = parserContext.character
     const sourceChat = sourceCharacter.chats[sourceCharacter.chatPage]
-    const captureCharacter = snapshotChatScreenshotCharacter(sourceCharacter, sourceChat)
+    const captureCharacter = snapshotChatScreenshotCharacter(sourceCharacter, sourceChat, parserContext.database.authorNotePresets)
     const renderContext: ChatScreenshotRenderContext = {
         ...input.renderContext,
         parserContext: {
@@ -1218,7 +1219,7 @@ test('keeps chardisplayasset command and exclusions in the minimal frozen charac
     ]
     source.prebuiltAssetCommand = true
     source.prebuiltAssetExclude = ['excluded.png']
-    const projected = snapshotChatScreenshotCharacter(source, source.chats[0])
+    const projected = snapshotChatScreenshotCharacter(source, source.chats[0], undefined)
     const database = { characters: [projected] } as Database
 
     live.database = makeDatabase(makeCharacter('Changed'), 'Changed')
@@ -1230,4 +1231,18 @@ test('keeps chardisplayasset command and exclusions in the minimal frozen charac
 
     expect(output).toContain('Visible display asset')
     expect(output).not.toContain('Excluded display asset')
+})
+
+test('keeps the author note of a preset-linked chat in the minimal frozen character', () => {
+    const source = makeCharacter('Frozen')
+    const preset = { id: 'preset', name: 'Preset', text: 'Frozen preset note' }
+    Object.assign(source.chats[0], authorNotePresetLinkPatch(preset, 'Stale copy'))
+    const projected = snapshotChatScreenshotCharacter(source, source.chats[0], [preset])
+    preset.text = 'Edited after capture'
+
+    expect(risuChatParser('{{authornote}}', {
+        db: { characters: [projected] } as Database,
+        chara: projected,
+        selectedCharID: 0,
+    })).toBe('Frozen preset note')
 })

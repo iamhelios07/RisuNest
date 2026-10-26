@@ -818,6 +818,16 @@ pub(crate) fn pds_query_conversations(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_query_author_note_preset_usage(
+    state: State<'_, PersistentStoreState>,
+    preset_id: String,
+) -> Result<Vec<super::AuthorNotePresetUsage>, StoreError> {
+    logged("pds_query_author_note_preset_usage", with_store(state, |store| {
+        store.query_author_note_preset_usage(&preset_id)
+    }))
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_read_conversation(
     state: State<'_, PersistentStoreState>,
     character_id: String,
