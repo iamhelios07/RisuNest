@@ -15,7 +15,7 @@ import { registerSyncBindingTransport, resumeCurrentSyncBinding } from '../bindi
 import { SERVER_SYNC_DEVICE_CHANGED_EVENT } from '../serverSyncNativeSignals'
 import { downloadRemoteAssets } from '../serverAssetResidency'
 import { isLibraryFileOperationReserved, registerLibraryFileOperationGate, subscribeLibraryFileOperationReleased } from '../../libraryFileOperation'
-import { createLwwScheduler, type LwwCall, type LwwOperation, type LwwTurn } from './lwwScheduler'
+import { createLwwScheduler, failureKind, formatKinds, type LwwCall, type LwwOperation, type LwwTurn } from './lwwScheduler'
 import type { ExternalStorageState } from './types'
 import { beginExternalProgress, clearExternalProgress, clearExternalSyncProgress, externalProgressFailure, type ExternalProgressRun } from './progress'
 
@@ -80,7 +80,9 @@ function createAdapter(connectionId: string): Adapter {
     const reportOperation = (operation: LwwOperation | 'assets', error?: unknown) => {
         if (error === undefined) operationFailures.delete(operation)
         else operationFailures.set(operation, error)
-        reportFailure(connectionId, [...operationFailures.values()].at(-1))
+        const values = [...operationFailures.values()]
+        // A format level stop stays reported with its switch while another operation fails.
+        reportFailure(connectionId, values.find(value => formatKinds.includes(failureKind(value))) ?? values.at(-1))
     }
     /** `continuation` lets hydration that received pages or a manual sync requested start or continue while hidden. */
     const continueHydration = (continuation = false) => {

@@ -386,9 +386,12 @@ describe('native external LWW adapter', () => {
         expect(failures.get('sync')).toEqual(stop)
         await vi.advanceTimersByTimeAsync(120_000); await settle()
         expect(checks()).toHaveLength(0)
+        // A body download that fails meanwhile does not hide the stop and its switch.
+        fixture.download.mockClear(); fixture.download.mockRejectedValueOnce({ code: 'download-unavailable' })
         Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' }); document.dispatchEvent(new Event('visibilitychange')); await settle()
         Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' }); document.dispatchEvent(new Event('visibilitychange')); await settle(); await settle()
         expect(checks()).toEqual([['external_lww_check_format', { request: expect.objectContaining({ connectionId: 'sync', bindingAuthority: '4' }) }]])
+        expect(fixture.download).toHaveBeenCalledOnce()
         expect(failures.get('sync')).toEqual(stop)
         await switchExternalLwwLibraryFormat('sync')
         expect(fixture.invoke).toHaveBeenCalledWith('external_lww_switch_format', { request: expect.objectContaining({ connectionId: 'sync', bindingAuthority: '4' }), progress: expect.anything() })
