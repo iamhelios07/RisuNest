@@ -156,7 +156,7 @@ function createAdapter(connectionId: string): Adapter {
     }
     // Native code returns one bounded page per call and lists the next batch at once while segments remain;
     // with `completeAvailable` it also lists again after a finished listing, so later arrivals are received too.
-    const receive = async (binding: BindingContext, turnLimit?: number, completeAvailable = false): Promise<LwwTurn> => {
+    const receivePages = async (binding: BindingContext, turnLimit?: number, completeAvailable = false): Promise<LwwTurn> => {
         const progress = beginExternalProgress(connectionId, 'sync')
         let received = 0
         try {
@@ -174,6 +174,13 @@ function createAdapter(connectionId: string): Adapter {
                 if (turnLimit !== undefined && received >= turnLimit) { progress.finish('complete', true); return { count: received, more: true } }
             }
         } catch (error) { progress.finish(externalProgressFailure(error)); throw error }
+    }
+    // The plugin startup receive runs beside the scheduler, and native code hands every receive the first unfinished page.
+    let receiving: Promise<unknown> = Promise.resolve()
+    const receive = (binding: BindingContext, turnLimit?: number, completeAvailable = false): Promise<LwwTurn> => {
+        const turn = receiving.then(() => receivePages(binding, turnLimit, completeAvailable))
+        receiving = turn.catch(() => {})
+        return turn
     }
     const publishTurn = async (current: BindingContext, bound: boolean, flush: boolean, call?: LwwCall): Promise<LwwTurn> => {
         current.signal.throwIfAborted()

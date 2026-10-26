@@ -314,6 +314,21 @@ describe('native external LWW adapter', () => {
         expect(fixture.apply.mock.calls).toEqual([[request], [next]])
         fixture.invoke.mockRejectedValueOnce({ kind: 'corrupt' })
         await expect(transport.receiveAvailableChanges(context())).rejects.toEqual({ kind: 'corrupt' })
+
+        // A routine receive in flight keeps it from taking the same first page.
+        let complete: (() => void) | undefined
+        fixture.invoke.mockClear()
+        fixture.invoke.mockImplementation(async command => {
+            if (command === 'external_lww_receive' && !complete) { await new Promise<void>(resolve => { complete = resolve }); return null }
+            return command === 'external_lww_receive' ? null : command === 'external_lww_publish' ? { segments: '0', more: false } : undefined
+        })
+        const receives = () => fixture.invoke.mock.calls.filter(([command]) => command === 'external_lww_receive').length
+        fixture.viewport!({}); await settle()
+        expect(receives()).toBe(1)
+        const startup = transport.receiveAvailableChanges(context()); await settle()
+        expect(receives()).toBe(1)
+        complete!(); await startup
+        expect(receives()).toBe(2)
     })
     it('shows why sync stopped when a committed switch cannot resume', async () => {
         dispose = await installExternalLwwAdapters(state()); await settle()
