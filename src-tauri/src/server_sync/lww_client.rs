@@ -803,19 +803,25 @@ impl LwwClient {
             &[],
             MAX_METADATA_BYTES,
         );
+        // A cancelled publication fails as its request did, so a busy or
+        // unreachable server stays retryable and a refusal does not.
         let failure = match &reply {
             Ok(super::client::RequestAttempt::Response(reply))
                 if reply.status == 413 && publication.request.changes.len() == 1 =>
             {
-                Some("unit-too-large".into())
+                Some(SyncError::new("unit-too-large", 413))
             }
             Ok(super::client::RequestAttempt::Response(reply))
                 if !(200..300).contains(&reply.status) =>
             {
-                Some(
+                Some(SyncError::new(
                     super::client::response_code(reply)
-                        .unwrap_or_else(|| "server-unreachable".into()),
-                )
+                        .unwrap_or_else(|| "server-response-error".into()),
+                    reply.status,
+                ))
+            }
+            Ok(super::client::RequestAttempt::Failure { error, .. }) | Err(error) => {
+                Some(SyncError::new(error.code.clone(), error.status))
             }
             _ => None,
         };
@@ -837,12 +843,13 @@ impl LwwClient {
                 lane.items_done(publication.entries.len());
                 Ok(Some(receipt))
             }
+            OperationReceipt::Rejected { error, .. } if error == "operation-cancelled" => {
+                Err(failure.unwrap_or_else(|| SyncError::new("server-unreachable", 503)))
+            }
             OperationReceipt::Rejected { error, .. } => Err(SyncError::new(
                 if error == "clock-skew" {
                     self.forget_clock();
                     error
-                } else if error == "operation-cancelled" {
-                    failure.unwrap_or_else(|| "server-unreachable".into())
                 } else {
                     error
                 },

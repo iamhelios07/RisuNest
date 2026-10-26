@@ -22,8 +22,8 @@ export interface LwwSchedulerDependencies {
 }
 type ExplicitKind = 'publish' | 'receive' | 'manual'
 // Another device can switch the library format, so these blocks are checked again on each sync trigger.
-const formatKinds = ['libraryFormatSwitchRequired', 'appUpdateRequired']
-const failureKind = (error: unknown) => (error as { kind?: string; code?: string } | undefined)?.kind ?? (error as { code?: string } | undefined)?.code ?? ''
+export const formatKinds = ['libraryFormatSwitchRequired', 'appUpdateRequired']
+export const failureKind = (error: unknown) => (error as { kind?: string; code?: string } | undefined)?.kind ?? (error as { code?: string } | undefined)?.code ?? ''
 /** Whether a failure stops the operation until recovery instead of retrying it. */
 const blocks = (error: unknown) => {
     const failure = error as { retryable?: boolean; action?: string } | undefined

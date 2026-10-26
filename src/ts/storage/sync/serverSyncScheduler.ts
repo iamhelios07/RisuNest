@@ -33,9 +33,11 @@ export function isServerSyncUnavailable(error: unknown): boolean {
     if (typeof error === 'object' && error && 'retryable' in error && error.retryable === false) return false
     const code = serverSyncErrorCode(error)
     if (['server-unreachable', 'server-timeout', 'server-updating', 'request-timeout', 'incomplete-response', 'directory-unreachable', 'directory-response-error', 'directory-incomplete-response', 'sync-retry-budget-exhausted'].includes(code)) return true
+    if (typeof error !== 'object' || error === null || !('status' in error) || typeof error.status !== 'number') return false
+    // Only an activation's server check marks its failures, so a rate limit or a coded 5xx there came from the server.
+    if ('startupLocalReady' in error && (error.status === 429 || error.status >= 500 && error.status < 600)) return true
     // Tunnel/gateway HTML responses have no Sync error body.
-    return code === 'server-response-error' && typeof error === 'object' && error !== null
-        && 'status' in error && typeof error.status === 'number' && error.status >= 500 && error.status < 600
+    return code === 'server-response-error' && error.status >= 500 && error.status < 600
 }
 type Lane = 'push' | 'pull' | 'connect'
 
@@ -65,7 +67,8 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     let outageUntil = 0
     let outageAttempt = 0
     let outageEpoch = 0
-    const waiting = () => Date.now() < outageUntil
+    // A monotonic clock, so setting the device clock back does not extend the delay.
+    const waiting = () => performance.now() < outageUntil
     const resetOutage = () => { clearTimeout(outageTimer); outageUntil = 0; outageAttempt = 0 }
     const scheduleOutage = () => {
         clearTimeout(outageTimer)
@@ -73,7 +76,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         outageTimer = setTimeout(() => {
             connect(); void pull().catch(() => {}); void push().catch(() => {})
             dependencies.retrying?.()
-        }, outageUntil - Date.now())
+        }, outageUntil - performance.now())
     }
     const failedLanes = new Set<Lane>()
     let disconnectingFully = false
@@ -101,8 +104,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             dependencies.recovered?.()
         }
     }
-    // A settled, cancelled publication can report server-unreachable with a nonretryable 409.
-    const blocks = (error: unknown) => (typeof error === 'object' && !!error && 'retryable' in error && error.retryable === false && code(error) !== 'server-unreachable') || integrityCodes.includes(code(error))
+    const blocks = (error: unknown) => (typeof error === 'object' && !!error && 'retryable' in error && error.retryable === false) || integrityCodes.includes(code(error))
     const fail = (error: unknown, lane?: Lane) => {
         if (isCancellation(error)) return
         if (blocked && !clockCodes.includes(blockedCode) && !formatCodes.includes(blockedCode)) return
@@ -113,7 +115,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         // Concurrent lane failures share one delay. Edits and foreground changes do not bypass it.
         if (isServerSyncUnavailable(error) && !waiting()) {
             outageEpoch++
-            outageUntil = Date.now() + Math.min(300_000, 5_000 * 2 ** Math.min(outageAttempt++, 6))
+            outageUntil = performance.now() + Math.min(300_000, 5_000 * 2 ** Math.min(outageAttempt++, 6))
             clear()
             scheduleOutage()
         }

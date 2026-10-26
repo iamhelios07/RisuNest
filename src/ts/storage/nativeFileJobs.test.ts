@@ -484,6 +484,41 @@ describe('native restore response deadlines', () => {
             expect(host.commands()).not.toContain('native_file_job_cancel')
         } finally { finish(); release() }
     })
+
+    it('resumes the binding when the unchanged check after a failed activation finishes past its deadline', async () => {
+        const restoreClock = clock()
+        const registry = await vi.importActual<typeof import('./sync/bindingRegistry')>('./sync/bindingRegistry')
+        const target = {kind:'server' as const, connectionId:'synthetic-late-unchanged'}
+        binding.invoke.mockImplementation(async command => {
+            if (command !== 'pds_lww_binding_state') throw new Error(`Unexpected native binding command: ${command}`)
+            return {target,targetAuthority:'1',selectionEpoch:'1',libraryId:'synthetic',progress:null}
+        })
+        binding.prepare.mockImplementation(registry.prepareBoundLibraryReplacement)
+        const unsupported = async (): Promise<never> => { throw new Error('Restore must not switch its binding') }
+        let resumed = 0
+        const release = registry.registerSyncBindingTransport(target, {
+            inspectTarget: unsupported, pullAvailableState: unsupported,
+            replaceFromTarget: unsupported, publishInitialSharedState: unsupported,
+            receiveAvailableChanges: async () => {}, fenceOldJobs: async () => {},
+            resumeBinding: async () => { resumed++ },
+        })
+        let checking = false
+        let finish!: () => void
+        const check = new Promise<void>(resolve => { finish = resolve })
+        // Ending the guard late also ends the recovery that would have resumed the binding.
+        const runtime = {...restoreRuntime(8), beginActivatedLibraryGuard: () => ({complete(){}, abortUnchanged: async () => { checking = true; await check }})}
+        const host = createNativeJobHost([{...status('waitingForInput'),phase:'awaiting-activation'},status('failed')])
+        try {
+            const outcome = expect(runNativeBlockRisuSaveRestore(runtime, {type:'desktopPath',path:'synthetic.risudat'}, {}, {...host.dependencies,restoreClock})).rejects.toThrow()
+            await vi.waitFor(() => expect(checking).toBe(true))
+            restoreClock.expire()
+            await outcome
+            expect(registry.isSyncBindingReplacementPending()).toBe(true)
+            finish()
+            await vi.waitFor(() => expect(registry.isSyncBindingReplacementPending()).toBe(false))
+            expect(resumed).toBe(1)
+        } finally { finish(); release() }
+    })
 })
 
 function pluginValuePreview(keys: readonly string[]): NativeStagedPluginPreview {
