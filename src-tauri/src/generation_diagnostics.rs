@@ -30,7 +30,7 @@ codes!(SkipReason { Ineligible, Compatibility, MissingCapture, CompleteGate, Sto
 codes!(ResultKind { Buffered, Streaming, Multiline, Failed });
 codes!(SavePath { Windowed, Complete, Fallback, Unknown });
 codes!(Boundary { Checkpoint, Final });
-codes!(Lifecycle { Background, Stop, Exit, Expiry, MemoryWarning, TrimMemory });
+codes!(Lifecycle { Active, Background, Stop, Exit, Expiry, MemoryWarning, TrimMemory });
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase", deny_unknown_fields)]
@@ -613,7 +613,7 @@ mod tests {
         let state = Diagnostics::default();
         let sink = crate::native_log::NativeLogState::for_tests();
         state.document_started(&sink);
-        for event in ["stop", "exit"] {
+        for event in ["stop", "exit", "active"] {
             state.record(serde_json::from_value(serde_json::json!({"kind":"lifecycle", "documentSequence":1,
                 "eventSequence":1, "event":event})).unwrap(), &sink).unwrap();
             assert_eq!(tail(&sink)["event"], event);
