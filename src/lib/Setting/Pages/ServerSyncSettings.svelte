@@ -511,7 +511,10 @@
     }
     .kv.review {
         padding: 0.75rem 0.875rem;
-        border: 1px solid color-mix(in srgb, var(--risu-theme-primary-500) 35%, transparent);
+        /* Android WebView 113 computes a color-mix() border shorthand to currentColor. */
+        border-width: 1px;
+        border-style: solid;
+        border-color: color-mix(in srgb, var(--risu-theme-primary-500) 35%, transparent);
         border-radius: 0.5rem;
         background: color-mix(in srgb, var(--risu-theme-primary-500) 8%, transparent);
     }
