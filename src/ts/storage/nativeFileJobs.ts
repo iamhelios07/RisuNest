@@ -448,6 +448,7 @@ export interface NativePortableBodyRetryRequest {
 export interface NativeFileJobStatus {
     officialAssets?: OfficialAccountAssetProgress
     officialAssetRestore?: NativeOfficialAssetRestoreProgress
+    officialAssetPublication?: NativeOfficialAssetPublicationProgress
     exportCaptureRevision?: number
     portableBodyRetry?: {stagingId: string; catalogSha256: string; pending: boolean; available: boolean; sourceRequired: boolean}
     jobId: string
@@ -473,6 +474,7 @@ export interface NativeFileJobStatus {
         | 'restore-native-snapshot'
         | 'official-publication-upload'
         | 'restore-official-account-assets'
+        | 'publish-official-account-assets'
     expectedRevision?: number
     activationRevision?: number
     activationAuthority?: string
@@ -2028,7 +2030,7 @@ export async function runNativeOfficialAccountSnapshotRestore(
         }
         if (
             error instanceof NativeFileJobError &&
-            (error.code === 'compatibility-required' || error.code === 'cold-expansion-required')
+            error.code === 'compatibility-required'
         ) {
             return { kind: 'compatibility-fallback' }
         }
@@ -3688,6 +3690,136 @@ export async function runNativeOfficialAssetRestore(
         reason: terminal.officialAssetRestore?.reason,
         cancelled: terminal.state === 'cancelled',
         unsettled: keys.filter((_key, index) => !settled[index]),
+    }
+}
+
+export interface NativeOfficialAssetPublicationProgress {
+    written: number
+    failed: number
+    bytes: number
+    active: number
+    limit: number
+    waitingUntil?: number
+    reason?: 'authentication' | 'reauthentication-needed' | 'local' | 'service' | 'auth-warning'
+    session?: string
+    warning?: string
+    reloadSession: boolean
+}
+
+export interface NativeOfficialAssetPublicationRequest {
+    baseUrl: string
+    credential: { kind: 'risu-auth'; token: string }
+    accountId: string
+    /** The native lease of the revision being published, which keeps the bodies pinned. */
+    lease: string
+    session: string | null
+    assets: readonly { localKey: string; key: string }[]
+    concurrency?: 1 | 2 | 4
+}
+
+export interface NativeOfficialAssetPublicationOptions {
+    signal?: AbortSignal
+    /** Runs on every poll; a failure cancels the job and is thrown once the job has stopped. */
+    guard?(): Promise<void>
+    /** The account now holds the asset under `replacementKey`. */
+    written?(key: string, replacementKey: string): void
+    progress?(progress: NativeOfficialAssetPublicationProgress): void
+}
+
+export interface NativeOfficialAssetPublicationResult {
+    reason?: NativeOfficialAssetPublicationProgress['reason']
+    cancelled: boolean
+    failed: number
+    session: string | null
+    warning: string | null
+    reloadSession: boolean
+    /** Keys the account does not hold yet, in request order. */
+    unwritten: string[]
+}
+
+export async function runNativeOfficialAssetPublication(
+    request: NativeOfficialAssetPublicationRequest,
+    options: NativeOfficialAssetPublicationOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeOfficialAssetPublicationResult> {
+    if (!dependencies.isTauri()) throw new Error('Native official asset publication requires Tauri')
+    if (options.signal?.aborted) throw abortError()
+    const { assets } = request
+    const started = await invokeNative(dependencies, 'native_file_job_start', {
+        request: { kind: 'publish-official-account-assets', ...request },
+    }) as { jobId?: unknown }
+    if (typeof started?.jobId !== 'string' || !started.jobId) {
+        throw new NativeFileJobError('invalid-result', 'Native official asset publication start returned no job ID')
+    }
+    const jobId = started.jobId
+    const written = new Uint8Array(assets.length)
+    let read = 0
+    let ended = false
+    let cancelling = false
+    let ownership: { error: unknown } | undefined
+    const cancel = async () => {
+        if (cancelling) return
+        cancelling = true
+        await invokeNative(dependencies, 'native_file_job_cancel', { jobId })
+    }
+    const readSettled = async () => {
+        while (true) {
+            const page = await invokeNative(dependencies, 'native_official_asset_publication_settled', {
+                jobId, offset: read, limit: officialAssetPage,
+            }) as { entries: { index: number; replacementKey: string | null }[]; total: number }
+            for (const { index, replacementKey } of page.entries) {
+                if (!Number.isInteger(index) || index < 0 || index >= assets.length || written[index]
+                    || (replacementKey !== null && (typeof replacementKey !== 'string' || !replacementKey))) {
+                    throw new NativeFileJobError('invalid-result', 'Native official asset publication settled an unknown asset')
+                }
+                written[index] = replacementKey === null ? 2 : 1
+                if (replacementKey !== null) options.written?.(assets[index].key, replacementKey)
+            }
+            read += page.entries.length
+            if (page.entries.length === 0 || read >= page.total) return
+        }
+    }
+    const status = async () => await invokeNative(dependencies, 'native_file_job_status', { jobId }) as NativeFileJobStatus
+    const poll = async () => {
+        while (true) {
+            if (!ownership && !cancelling) {
+                try { await options.guard?.() }
+                catch (error) { ownership = { error } }
+            }
+            if (ownership || options.signal?.aborted) await cancel()
+            const current = await status()
+            if (current.officialAssetPublication) options.progress?.(current.officialAssetPublication)
+            await readSettled()
+            if (isTerminalJob(current)) { ended = true; return current }
+            await dependencies.wait(150)
+        }
+    }
+    let terminal: NativeFileJobStatus
+    try {
+        terminal = await poll()
+    } finally {
+        try {
+            if (!ended) {
+                await cancel()
+                while (!isTerminalJob(await status())) await dependencies.wait(150)
+            }
+            await invokeNative(dependencies, 'native_file_job_forget', { jobId })
+        } catch {}
+    }
+    if (ownership) throw ownership.error
+    if (terminal.state === 'failed') {
+        throw new NativeFileJobError(terminal.error?.code ?? 'native-job-failed',
+            terminal.error?.message ?? 'Native official asset publication failed', terminal.warningCodes ?? [])
+    }
+    const progress = terminal.officialAssetPublication
+    return {
+        reason: progress?.reason,
+        cancelled: terminal.state === 'cancelled',
+        failed: progress?.failed ?? 0,
+        session: progress?.session ?? null,
+        warning: progress?.warning ?? null,
+        reloadSession: progress?.reloadSession ?? false,
+        unwritten: assets.filter((_asset, index) => written[index] !== 1).map(asset => asset.key),
     }
 }
 
