@@ -211,6 +211,15 @@ fn release_abandoned<R: tauri::Runtime>(app: &AppHandle<R>, abandoned: Abandoned
     })
 }
 
+fn release_logged<R: tauri::Runtime>(app: &AppHandle<R>, abandoned: AbandonedCasJobs) {
+    match release_abandoned(app, abandoned) {
+        // Opening the store judges these journals again (`open_for_renderer`).
+        Err(error) if error.ends_with("persistent store has not been opened") => {}
+        Err(error) => crate::nlog!("error", "failed to release abandoned CAS jobs: {error}"),
+        Ok(()) => {}
+    }
+}
+
 impl DurableCasJobState {
     pub(crate) fn close_for_cleanup(&self) -> Result<(), String> {
         self.clear_uploads()?;
@@ -240,11 +249,7 @@ impl DurableCasJobState {
     fn release_in_background<R: tauri::Runtime>(&self, app: &AppHandle<R>, abandoned: AbandonedCasJobs) {
         if abandoned.cleanup_uploads || !abandoned.journal_ids.is_empty() || abandoned.listing_failure.is_some() {
             let app = app.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                if let Err(error) = release_abandoned(&app, abandoned) {
-                    crate::nlog!("error", "failed to release abandoned CAS jobs: {error}");
-                }
-            });
+            tauri::async_runtime::spawn_blocking(move || release_logged(&app, abandoned));
         }
     }
 
@@ -1640,7 +1645,7 @@ mod tests {
             let mut store = PersistentStore::open(root).unwrap();
             // A saved publication whose segment row is gone has ended, which only the store shows.
             let owner = CasJobOwner::from_another_process(CasJobOwnerKind::ExternalPublication, "publication");
-            drop(journal(&mut store, "publication", owner, true));
+            drop(journal(&mut store, "page-start-publication", owner, true));
         }
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -1661,7 +1666,11 @@ mod tests {
         // A page that starts before the renderer opens the store cannot judge the journal.
         let error = release_abandoned(app.handle(), AbandonedCasJobs::snapshot(root)).unwrap_err();
         assert!(error.contains("has not been opened"), "{error}");
-        assert_eq!(journal_ids(root), ["publication".to_owned()].into());
+        assert_eq!(journal_ids(root), ["page-start-publication".to_owned()].into());
+        // That attempt is retried below, so it is not logged as a failure.
+        release_logged(app.handle(), AbandonedCasJobs::snapshot(root));
+        assert!(!crate::native_log::global_state().tail(None).iter()
+            .any(|entry| entry.message.contains("CAS jobs: page-start-publication")));
 
         persistent_store::commands::open_for_renderer(app.handle(), &app.state()).unwrap();
 
