@@ -926,7 +926,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             record: (keys) => { for (const key of keys) parseReads.note(key) },
         } : undefined,
         signal: options.signal, scope: options.regexScope, worker: options.regexWorker,
-        onTimeout: noticeRegexTimeout,
+        onTimeout: noticeRegexTimeout, skipTimedOutRules: mode === 'editdisplay',
     })
 
     async function executeScript(entry:RegexExecutionPlanEntry){
