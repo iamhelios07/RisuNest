@@ -65,7 +65,8 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     let outageUntil = 0
     let outageAttempt = 0
     let outageEpoch = 0
-    const waiting = () => Date.now() < outageUntil
+    // A monotonic clock, so setting the device clock back does not extend the delay.
+    const waiting = () => performance.now() < outageUntil
     const resetOutage = () => { clearTimeout(outageTimer); outageUntil = 0; outageAttempt = 0 }
     const scheduleOutage = () => {
         clearTimeout(outageTimer)
@@ -73,7 +74,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         outageTimer = setTimeout(() => {
             connect(); void pull().catch(() => {}); void push().catch(() => {})
             dependencies.retrying?.()
-        }, outageUntil - Date.now())
+        }, outageUntil - performance.now())
     }
     const failedLanes = new Set<Lane>()
     let disconnectingFully = false
@@ -113,7 +114,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         // Concurrent lane failures share one delay. Edits and foreground changes do not bypass it.
         if (isServerSyncUnavailable(error) && !waiting()) {
             outageEpoch++
-            outageUntil = Date.now() + Math.min(300_000, 5_000 * 2 ** Math.min(outageAttempt++, 6))
+            outageUntil = performance.now() + Math.min(300_000, 5_000 * 2 ** Math.min(outageAttempt++, 6))
             clear()
             scheduleOutage()
         }

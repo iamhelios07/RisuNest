@@ -80,6 +80,18 @@ describe('server LWW foreground scheduler', () => {
         expect(f.recovered).toHaveBeenCalledOnce()
         f.scheduler.dispose()
     })
+    it('ends an outage delay on time after the device clock is set back', async () => {
+        const f = fixture()
+        f.pull.mockRejectedValueOnce({ code: 'server-unreachable', retryable: true })
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.isWaiting()).toBe(true)
+        // A clock that ran an hour fast is corrected.
+        vi.setSystemTime(Date.now() - 3_600_000)
+        await vi.advanceTimersByTimeAsync(5000)
+        expect(f.pull).toHaveBeenCalledTimes(2)
+        expect(f.scheduler.isWaiting()).toBe(false)
+        f.scheduler.dispose()
+    })
     it('correlates notification retries until the socket connects or a fresh session starts', async () => {
         const f = fixture()
         f.connect.mockRejectedValueOnce({ code: 'server-unreachable' })
