@@ -16,11 +16,22 @@
       "appPermissions": {
         "entitlements": [],
         "privacy": {
+          "NSFaceIDUsageDescription": "RisuNest uses Face ID to unlock the app.",
           "NSCameraUsageDescription": "Scan a QR code you choose to connect RisuNest.",
           "NSLocalNetworkUsageDescription": "Connect to a local AI provider or RisuNest sync server that you choose."
         }
       },
       "versions": [
+        {
+          "version": "1.2.0",
+          "buildVersion": "1.2.0",
+          "date": "2026-10-27T21:21:59Z",
+          "localizedDescription": "### Breaking Changes\n\n- The sync data format of the Sync server and external storage changes (Sync server update required). After updating every device, switch the format in the sync settings; after the switch, only the same or newer versions can sync with each other.\n\n### New Features\n\n- Added an app lock (if you forget the PIN, you may need to restore your data from a backup).\n- Added author's note presets.\n- Added binary data support to plugin local storage (getLocalPluginStorage).\n- Added a separate permission for plugin tool calls.\n- Added a setting that sends only the current chat to plugins (reduces memory usage).\n\n### Improvements\n\n- Changed deleting a character, module, or similar item to also delete its assets.\n- Responses being generated are now kept if the app closes.\n- Added execution time limits to regex scripts and triggers, and made Lua stop properly on timeout (prevents endless loading).\n- Changed desktop downloads to ask for a save location.\n- Removed the Keep Session Alive setting (a web-only feature).\n- Changed Lua scripts to run in a Worker and CBS to run compiled.\n- Improved performance and memory usage of regex, rendering, lorebooks, storage, restores, and more.\n- Improved error messages and logging.\n\n### Fixes\n\n- Fixed plugins not loading when the Sync server is unavailable.\n- Fixed messages updated by Lua scripts not re-rendering and chat variables not being saved.\n- Fixed CSS and plugins that work with the chat screen not finding chat content.\n- Fixed YouTube embeds not playing.\n- Fixed Google Translate failures and content that could disappear when translation failed.\n- Fixed issues with RisuAI account restores and PocketRisu restores.\n- Fixed RisuAI/PocketRisu compatible exports failing.\n- Fixed Separate Parameters overwriting saved values.\n- Fixed S3 and GitHub external storage sync issues.",
+          "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.2.0/RisuNest-1.2.0-ios-aarch64-unsigned.ipa",
+          "size": 78466287,
+          "sha256": "3312f14be1f1d6c4e39fab7f1d26c0bf7ffb9a5aa83b426ed45007f2e1ecc593",
+          "minOSVersion": "16.4"
+        },
         {
           "version": "1.1.0",
           "buildVersion": "1.1.0",
@@ -62,11 +73,11 @@
           "minOSVersion": "16.4"
         }
       ],
-      "version": "1.1.0",
-      "versionDate": "2026-10-21T23:52:47Z",
-      "versionDescription": "- Applied RisuAI v2026.10.211 changes.\n- Added asset and inlay (chat attachment) galleries.\n- Expanded image format support for personas, character icons, and more.\n- Improved tasks such as responses and sync to keep running after leaving the app on mobile.\n- Added progress and resuming to RisuAI account restores and improved their performance.\n- Fixed external storage sync showing as complete before it had finished.\n- Optimized memory usage when sending messages in long chats.\n- Fixed compatibility issues in some Lua modules (such as Lightboard).\n- Fixed a bug where the built-in translator could send translation requests repeatedly.\n- Fixed clock and server connection issues in external storage and Sync synchronization.\n- Fixed PocketRisu exports not working with some settings.\n- Fixed asset bot downloads from Realm and CharX imports not working properly.\n- Replaced the Gemini/Gemma tokenizer with the Gemma 4 tokenizer.\n- Added a setting for the scroll navigation buttons.\n- Changed update checks to run at every app start.\n- Improved overall performance of storage, backups, restores, sync, rendering, and startup.\n- Improved error messages and logging.",
-      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.1.0/RisuNest-1.1.0-ios-aarch64-unsigned.ipa",
-      "size": 77609969
+      "version": "1.2.0",
+      "versionDate": "2026-10-27T21:21:59Z",
+      "versionDescription": "### Breaking Changes\n\n- The sync data format of the Sync server and external storage changes (Sync server update required). After updating every device, switch the format in the sync settings; after the switch, only the same or newer versions can sync with each other.\n\n### New Features\n\n- Added an app lock (if you forget the PIN, you may need to restore your data from a backup).\n- Added author's note presets.\n- Added binary data support to plugin local storage (getLocalPluginStorage).\n- Added a separate permission for plugin tool calls.\n- Added a setting that sends only the current chat to plugins (reduces memory usage).\n\n### Improvements\n\n- Changed deleting a character, module, or similar item to also delete its assets.\n- Responses being generated are now kept if the app closes.\n- Added execution time limits to regex scripts and triggers, and made Lua stop properly on timeout (prevents endless loading).\n- Changed desktop downloads to ask for a save location.\n- Removed the Keep Session Alive setting (a web-only feature).\n- Changed Lua scripts to run in a Worker and CBS to run compiled.\n- Improved performance and memory usage of regex, rendering, lorebooks, storage, restores, and more.\n- Improved error messages and logging.\n\n### Fixes\n\n- Fixed plugins not loading when the Sync server is unavailable.\n- Fixed messages updated by Lua scripts not re-rendering and chat variables not being saved.\n- Fixed CSS and plugins that work with the chat screen not finding chat content.\n- Fixed YouTube embeds not playing.\n- Fixed Google Translate failures and content that could disappear when translation failed.\n- Fixed issues with RisuAI account restores and PocketRisu restores.\n- Fixed RisuAI/PocketRisu compatible exports failing.\n- Fixed Separate Parameters overwriting saved values.\n- Fixed S3 and GitHub external storage sync issues.",
+      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.2.0/RisuNest-1.2.0-ios-aarch64-unsigned.ipa",
+      "size": 78466287
     }
   ],
   "news": []
