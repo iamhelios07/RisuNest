@@ -80,3 +80,14 @@ describe('error dialogs for exports that lack a file', () => {
         expect(get(alertStore).msg).toContain('assets/private.png')
     })
 })
+
+describe('error dialogs for failed requests', () => {
+    it.each([
+        ['Chromium', 'Failed to fetch'],
+        ['Firefox', 'NetworkError when attempting to fetch resource.'],
+        ['WebKit', 'Load failed'],
+    ])('adds the network help to the %s fetch failure', (_engine, message) => {
+        alertError(new TypeError(message))
+        expect(get(alertStore)).toMatchObject({ type: 'error', msg: message, submsg: language.errors.networkFetchWeb })
+    })
+})

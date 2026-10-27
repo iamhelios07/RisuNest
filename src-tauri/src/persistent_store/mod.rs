@@ -886,6 +886,8 @@ pub(crate) struct WorkingSetCommit {
     pub(crate) expected_revision: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gallery_pending_fence: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) device_plugin_fence: Option<device_store::plugin_gc::PluginGcFence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) root: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2198,7 +2200,7 @@ impl PersistentStore {
         &self,
         staging_id: &str,
     ) -> StoreResult<commit::StagedPluginPreview> {
-        commit::staged_plugin_preview(&self.connection, staging_id)
+        commit::staged_plugin_preview(&self.connection, &self.repository_root, staging_id)
     }
 
     pub(crate) fn staged_library_counts(&self, staging_id: &str) -> StoreResult<(u64, u64)> {
@@ -2258,6 +2260,7 @@ impl PersistentStore {
     ) -> StoreResult<RevisionResult> {
         let revision = commit::replace_preserve_repositories(
             &mut self.connection,
+            &self.repository_root,
             staging_id,
             expected_revision,
         )?;

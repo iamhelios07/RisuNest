@@ -870,19 +870,15 @@ impl Provider for S3Provider {
                 return Ok(None);
             }
             let credentials = self.credentials(context).await?;
-            let mut response = self
-                .dispatch(
-                    context,
-                    &credentials,
-                    Call::object(
-                        reqwest::Method::POST,
-                        &key,
-                        ProviderOperation::UploadSession,
-                    )
-                    .query("uploads", String::new()),
-                    cancel,
-                )
-                .await?;
+            let mut call = Call::object(
+                reqwest::Method::POST,
+                &key,
+                ProviderOperation::UploadSession,
+            )
+            .query("uploads", String::new());
+            // Without it the empty POST states no length, which some endpoints refuse.
+            call.content_length = Some(0);
+            let mut response = self.dispatch(context, &credentials, call, cancel).await?;
             self.require(profile, &response, &[200])?;
             let body =
                 common::read_bounded(&mut response.body, common::MAX_CONTROL_BODY, cancel).await?;

@@ -39,6 +39,7 @@ async_command_arity!(A, B, C, D, E);
 async_command_arity!(A, B, C, D, E, G);
 async_command_arity!(A, B, C, D, E, G, H);
 async_command_arity!(A, B, C, D, E, G, H, I);
+async_command_arity!(A, B, C, D, E, G, H, I, J);
 
 fn future_bytes<Args>(command: impl AsyncCommand<Args>) -> usize {
     command.future_bytes()

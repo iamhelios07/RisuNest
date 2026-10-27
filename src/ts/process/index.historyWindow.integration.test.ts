@@ -697,9 +697,13 @@ describe('a windowed send through the production runtime', () => {
         }
     })
 
-    it('stores trigger, Lua, @@inject and response writes inside the window and leaves earlier messages byte-identical', async () => {
+    it('stores trigger, Lua, @@inject, parser and response writes inside the window and leaves earlier messages byte-identical', async () => {
         const original = storedMessages()
-        const { store, backgroundErrors } = await bootWindowedConversation(structuredClone(original))
+        Object.assign(original[910], { data: '{{setvar::window_var::first}}x', extra: { nested: ['한글', '🙂'] } })
+        Object.assign(original[920], { extra: { unchanged: true } })
+        original[930].data = 'y{{getvar::window_var}}'
+        original[940].data = '{{getvar::window_var}}z'
+        const { store, backgroundErrors, reopen } = await bootWindowedConversation(structuredClone(original))
         const { sendChat } = await import('./index.svelte')
         vi.spyOn(console, 'log').mockImplementation(() => undefined)
 
@@ -709,9 +713,16 @@ describe('a windowed send through the production runtime', () => {
         expect(current.runtime.getSelectedConversationMode()).toBe('windowed')
         const persisted = (await store.readConversation('character-a', 'chat-a'))!.value.message
         expect(JSON.stringify(persisted.slice(0, WINDOW_START))).toBe(JSON.stringify(original.slice(0, WINDOW_START)))
+        expect((await reopen()).scriptstate.$window_var).toBe('first')
         const inserted = persisted[960]
         expect(persisted.slice(WINDOW_START)).toEqual([
-            ...original.slice(WINDOW_START, 950),
+            ...original.slice(WINDOW_START, 910),
+            { ...original[910], data: 'x' },
+            ...original.slice(911, 930),
+            { ...original[930], data: 'yfirst' },
+            ...original.slice(931, 940),
+            { ...original[940], data: 'firstz' },
+            ...original.slice(941, 950),
             { ...original[950], data: 'STORED:inside' },
             ...original.slice(951, 960),
             { role: 'char', data: 'lua inserted', chatId: inserted.chatId },

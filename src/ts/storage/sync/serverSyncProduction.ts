@@ -501,10 +501,13 @@ const transport: SyncBindingTransport = {
             activationPending = c
             try { await ensureActivated(c) }
             catch (value) {
-                if (binding || c.holdAutomaticSync || !isServerSyncUnavailable(value)) throw value
+                // A busy or unavailable local store is tried again by automatic sync too, without the offline notice.
+                if (binding || c.holdAutomaticSync || !isServerSyncUnavailable(value)
+                    && !['library-operation-busy', 'server-sync-busy', 'asset-jobs-busy', 'local-store-unavailable'].includes(serverSyncErrorCode(value))) throw value
                 checkContext(c)
                 attemptFailed = true
-                scheduler.reportFailure(value)
+                // The receive that activates the binding again clears it.
+                scheduler.reportFailure(value, 'pull')
             }
             persistedBinding = c.state; hydrationPending = true
             if (!c.holdAutomaticSync) { await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() }
@@ -577,6 +580,11 @@ export function dismissServerSyncConnectionFailure(): void {
 export const holdServerSync = () => controller.beginReplacement()
 /** Raises the library to this app's data format. Sync resumes on the next retry. */
 export async function switchServerSyncLibraryFormat(): Promise<void> {
+    // A binding whose first publication stopped at the format level resumes before it switches.
+    if (!context || context.signal.aborted) {
+        await controller.ensureStatus()
+        if (persistedBinding?.target.kind === 'server') await resumeCurrentServerBinding(persistedBinding)
+    }
     const captured = context
     if (!captured) throw new Error('Sync binding is unavailable')
     await invoke('server_sync_lww_switch_format', { request: header() })

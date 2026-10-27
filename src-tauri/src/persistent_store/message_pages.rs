@@ -543,9 +543,10 @@ fn capture(
                 if index != position {
                     return Err(codec_error("noncontiguous conversation messages"));
                 }
-                let body: String = tx.query_row(
+                let body: String = tx.prepare_cached(
                     "SELECT value FROM messages WHERE generation=?1 AND character_id=?2
                     AND conversation_id=?3 AND message_index=?4",
+                )?.query_row(
                     params![generation, character, conversation, position as i64],
                     |r| r.get(0),
                 )?;
@@ -730,8 +731,8 @@ fn stage_pages(
             if index as i64 != position {
                 return Err(codec_error("noncontiguous conversation messages"));
             }
-            let body: String = tx.query_row("SELECT value FROM messages WHERE generation=?1 AND character_id=?2
-                AND conversation_id=?3 AND message_index=?4", params![generation, character, conversation, position],
+            let body: String = tx.prepare_cached("SELECT value FROM messages WHERE generation=?1 AND character_id=?2
+                AND conversation_id=?3 AND message_index=?4")?.query_row(params![generation, character, conversation, position],
                 |row| row.get(0))?;
             let body = payload_value::canonicalize(body.as_bytes()).map_err(codec_error)?;
             if {
@@ -825,9 +826,10 @@ fn next_hash(
         )));
     }
     // Upstream import staging may have inserted messages without a computed cache.
-    let body: String = tx.query_row(
+    let body: String = tx.prepare_cached(
         "SELECT value FROM messages WHERE generation=?1 AND character_id=?2
         AND conversation_id=?3 AND message_index=?4",
+    )?.query_row(
         params![generation, character, conversation, index],
         |r| r.get(0),
     )?;

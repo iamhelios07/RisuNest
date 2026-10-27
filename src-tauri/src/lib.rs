@@ -396,7 +396,9 @@ fn builder_with_main_window(
         builder = builder.on_web_content_process_terminate(|webview| {
             if webview.label() == "main" {
                 crate::nlog!("error", "WebKit web content process ended");
-                generation_diagnostics::renderer_exit(generation_diagnostics::RendererExit::Apple { reason: "unknown" });
+                generation_diagnostics::renderer_exit(generation_diagnostics::RendererExit::apple(
+                    wry::web_content_process_termination_reason(),
+                ));
                 generation_diagnostics::reload_result("requested");
                 renderer_recovery::renderer_exited(webview.app_handle());
                 // A quit that arrives before the reloaded document is ready no longer waits for it.
@@ -941,6 +943,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_file_jobs::native_file_job_forget,
         native_file_jobs::official_assets::native_official_asset_restore_enqueue,
         native_file_jobs::official_assets::native_official_asset_restore_settled,
+        native_file_jobs::official_assets::upload::native_official_asset_publication_settled,
         native_file_jobs::native_portable_handoff_cleanup,
         native_file_jobs::native_raw_recovery_handoff_cleanup,
         native_file_jobs::native_portable_select_sections,

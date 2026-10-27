@@ -252,7 +252,7 @@
             {/if}
             {#if progressPlace === 'bound'}{@render progressPanel()}{/if}
             <div class="actions">
-                {#if view.blockedCode === 'library-format-switch-required'}<SettingButton onclick={() => void switchFormat()} disabled={busy}>{language.lwwSync.formatSwitch}</SettingButton>{/if}
+                {#if view.paused && view.error === 'library-format-switch-required'}<SettingButton onclick={() => void switchFormat()} disabled={busy}>{language.lwwSync.formatSwitch}</SettingButton>{/if}
                 {#if !view.bindingIncomplete}<SettingButton onclick={() => void run(retryServerSync)} disabled={busy}>{copy.syncNow}</SettingButton>{/if}
                 <SettingButton variant="danger" class="ml-auto" onclick={() => void run(disconnect)} busy={checkingFiles} disabled={busy}>{copy.disconnect}</SettingButton>
             </div>
@@ -511,7 +511,10 @@
     }
     .kv.review {
         padding: 0.75rem 0.875rem;
-        border: 1px solid color-mix(in srgb, var(--risu-theme-primary-500) 35%, transparent);
+        /* Android WebView 113 computes a color-mix() border shorthand to currentColor. */
+        border-width: 1px;
+        border-style: solid;
+        border-color: color-mix(in srgb, var(--risu-theme-primary-500) 35%, transparent);
         border-radius: 0.5rem;
         background: color-mix(in srgb, var(--risu-theme-primary-500) 8%, transparent);
     }
