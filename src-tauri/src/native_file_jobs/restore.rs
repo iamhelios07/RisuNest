@@ -2617,7 +2617,7 @@ impl<'de> Visitor<'de> for MessagesVisitor<'_> {
             de::Error::custom(message)
         };
         let mut spool = MessageSpool::new(self.0.spool_directory, self.0.record_bytes.limit).map_err(&spool_error)?;
-        let file = spool.file.as_mut().expect("created message spool");
+        let mut file = io::BufWriter::with_capacity(READ_CHUNK_BYTES, spool.file.take().expect("created message spool"));
         while let Some(message) = sequence.next_element_seed(BoundedValueSeed(self.0.record_bytes))? {
             if self.0.job.is_cancel_requested() {
                 return Err(de::Error::custom("restore cancelled while reading messages"));
@@ -2636,6 +2636,8 @@ impl<'de> Visitor<'de> for MessagesVisitor<'_> {
             spool.count = spool.count.checked_add(1).ok_or_else(|| de::Error::custom("message count overflow"))?;
             spool.last_time = message.get("time").and_then(Value::as_i64);
         }
+        // Replay rewinds and reads the file, so every buffered record must reach it first.
+        spool.file = Some(file.into_inner().map_err(|error| spool_error(error.into_error()))?);
         Ok(spool)
     }
 
