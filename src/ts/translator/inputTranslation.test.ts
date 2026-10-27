@@ -71,6 +71,13 @@ describe('translation error ownership', () => {
         await expect(translate(draft, false)).resolves.toBe(draft)
         expect(f.alert).toHaveBeenCalledExactlyOnceWith(provider === 'deepl' ? 'ERR::DeepL API Errorsynthetic unavailable' : 'synthetic unavailable')
     })
+    it.each(['deepl', 'llm'])('still rejects a %s input translation that overlaps a pending display translation', async provider => {
+        f.translatorType = provider
+        const text = `${provider} text shown and typed at once`
+        const [display, input] = await Promise.allSettled([translate(text, false, liveRowContext()), translate(text, false, undefined, 'throw')])
+        expect(display).toEqual({ status: 'fulfilled', value: text })
+        expect(input.status).toBe('rejected')
+    })
     it.each(['streaming', 'multiline'])('leaves unexpected %s responses to the input owner', async type => {
         f.translatorType = 'llm'
         f.request.mockResolvedValue({ type, result: [] })

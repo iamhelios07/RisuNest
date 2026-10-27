@@ -46,6 +46,7 @@ function rememberTranslation(key: string, value: string): void {
 }
 
 // Requests still in flight, so overlapping parses of one row pay for a text once.
+// Keys carry the error mode, since a shared request reports a failure only one way.
 const pendingTranslations = new Map<string, Promise<string>>()
 const pendingLLMTranslations = new Map<string, Promise<string>>()
 
@@ -90,7 +91,7 @@ export async function translate(text:string, reverse:boolean, captureContext?: T
         if(cached !== undefined){
             return cached
         }
-        const key = translationCacheKey(db, db.translator, target, reverse, text)
+        const key = errorMode + translationCacheKey(db, db.translator, target, reverse, text)
         let pending = pendingTranslations.get(key)
         if(!pending){
             pending = runTranslator(text, reverse, db.translator, target, undefined, captureContext, errorMode)
@@ -653,7 +654,7 @@ function translateLLM(text:string, arg:{to:string, from:string, regenerate?:bool
     if(arg.regenerate){
         return requestLLMTranslation(text, arg, captureContext, errorMode)
     }
-    const key = normalizeLLMCacheKey(text)
+    const key = errorMode + normalizeLLMCacheKey(text)
     let pending = pendingLLMTranslations.get(key)
     if(!pending){
         pending = requestLLMTranslation(text, arg, captureContext, errorMode)
