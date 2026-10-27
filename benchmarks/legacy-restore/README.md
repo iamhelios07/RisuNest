@@ -39,7 +39,7 @@ node benchmarks/legacy-restore/resource-measure.mjs <compiled-test-executable> .
 Use new fixture directories. Database and attachment cases accept 100, 300 and
 600 decimal MB; record cases accept 1, 8 and 32 MiB; asset-count cases accept
 64 and 256 assets of 96 KiB each; the message-count case accepts 100,000
-messages of 512 bytes, 1,000 per conversation, in a block RisuSave database.
+messages (512-byte text, 1,000 per conversation) in a block RisuSave database.
 Pass their manifest to the same measurement runner. Each native case runs in a
 fresh process, authenticates synthetic ciphertext when applicable, replaces a
 real persistent store, and verifies every conversation and attachment payload.
