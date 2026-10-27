@@ -65,11 +65,17 @@ describe('translation error ownership', () => {
         f.request.mockResolvedValue({ type: 'success', result: 'Translated draft' })
         await expect(translate(draft, false, undefined, 'throw')).resolves.toBe('Translated draft')
     })
-    it.each(['deepl', 'llm'])('keeps the existing %s alert and original text for callers using the default mode', async provider => {
+    it.each(['deepl', 'llm'])('keeps the %s alert and original text for callers using the default mode and translates again later', async provider => {
         f.translatorType = provider
         const draft = `${provider} explicit translation`
+        const row = `<p>${provider} shown row</p><risu-style>.row { color: red; }</risu-style>`
         await expect(translate(draft, false)).resolves.toBe(draft)
-        expect(f.alert).toHaveBeenCalledExactlyOnceWith(provider === 'deepl' ? 'ERR::DeepL API Errorsynthetic unavailable' : 'synthetic unavailable')
+        await expect(translateHTML(row, false, '', 0, false, liveRowContext())).resolves.toBe(row)
+        const failure = provider === 'deepl' ? 'ERR::DeepL API Errorsynthetic unavailable' : 'ERR::synthetic unavailable'
+        expect(new Set(f.alert.mock.calls.map(([message]) => message))).toEqual(new Set([failure]))
+        f.fetch.mockResolvedValue({ ok: true, data: { translations: [{ text: 'Translated draft' }] } })
+        f.request.mockResolvedValue({ type: 'success', result: 'Translated draft' })
+        await expect(translate(draft, false)).resolves.toBe('Translated draft')
     })
     it.each(['deepl', 'llm'])('still rejects a %s input translation that overlaps a pending display translation', async provider => {
         f.translatorType = provider

@@ -46,7 +46,8 @@ function rememberTranslation(key: string, value: string): void {
 }
 
 // Requests still in flight, so overlapping parses of one row pay for a text once.
-// Keys carry the error mode, since a shared request reports a failure only one way.
+// A translation reports its failure in one error mode, so its key carries the mode;
+// an LLM request returns its failure for each caller to report.
 const pendingTranslations = new Map<string, Promise<string>>()
 const pendingLLMTranslations = new Map<string, Promise<string>>()
 
@@ -150,7 +151,7 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
                 fullResult.push(chunk[0])
                 continue
             }
-            const result = await translateMain(trimed, arg, captureContext, errorMode);
+            const result = await translateMain(trimed, arg, captureContext);
 
             if(result.startsWith('ERR::')){
                 if (errorMode === 'throw') throw new Error(result)
@@ -181,11 +182,11 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
 
 }
 
-async function translateMain(text:string, arg:{from:string, to:string, host:string, translatorNote?:string}, captureContext?: TranslateHTMLContext, errorMode: 'alert' | 'throw' = 'alert'){
+async function translateMain(text:string, arg:{from:string, to:string, host:string, translatorNote?:string}, captureContext?: TranslateHTMLContext){
     let db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
     if(db.translatorType === 'llm'){
         const tr = arg.to || 'en'
-        return translateLLM(text, {to: tr, from: arg.from, translatorNote: arg.translatorNote}, captureContext, errorMode)
+        return translateLLM(text, {to: tr, from: arg.from, translatorNote: arg.translatorNote}, captureContext)
     }
     if(db.translatorType === 'deepl'){
         const body = {
@@ -397,8 +398,12 @@ export async function translateHTML(
     if(db.translatorType === 'llm'){
         const tr = db.translator || 'en'
         const from = db.translatorInputLanguage
-        const r = await translateLLM(html, {to: tr, from: from, regenerate}, captureContext)
+        let r = await translateLLM(html, {to: tr, from: from, regenerate}, captureContext)
         signal?.throwIfAborted()
+        if(r.startsWith('ERR::')){
+            alertError(r)
+            r = html
+        }
         if(db.playMessageOnTranslateEnd){
             const audio = new Audio(sendSound);
             audio.play().catch(() => {});
@@ -650,21 +655,22 @@ function normalizeLLMCacheKey(key:string):string{
     return key.replace(inlaySlotMarkerRegex, '')
 }
 
-function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}, captureContext?: TranslateHTMLContext, errorMode: 'alert' | 'throw' = 'alert'):Promise<string>{
+/** The translation, or an `ERR::` message that the caller reports like the other translators' errors. */
+function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}, captureContext?: TranslateHTMLContext):Promise<string>{
     if(arg.regenerate){
-        return requestLLMTranslation(text, arg, captureContext, errorMode)
+        return requestLLMTranslation(text, arg, captureContext)
     }
-    const key = errorMode + normalizeLLMCacheKey(text)
+    const key = normalizeLLMCacheKey(text)
     let pending = pendingLLMTranslations.get(key)
     if(!pending){
-        pending = requestLLMTranslation(text, arg, captureContext, errorMode)
+        pending = requestLLMTranslation(text, arg, captureContext)
             .finally(() => pendingLLMTranslations.delete(key))
         pendingLLMTranslations.set(key, pending)
     }
     return pending
 }
 
-async function requestLLMTranslation(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}, captureContext?: TranslateHTMLContext, errorMode: 'alert' | 'throw' = 'alert'):Promise<string>{
+async function requestLLMTranslation(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}, captureContext?: TranslateHTMLContext):Promise<string>{
     if(!arg.regenerate){
         const cacheMatch = await LLMCacheStorage.getItem(normalizeLLMCacheKey(text))
         if(cacheMatch !== null){
@@ -727,14 +733,10 @@ async function requestLLMTranslation(text:string, arg:{to:string, from:string, r
     }, 'translate')
 
     if(rq.type === 'fail'){
-        if (errorMode === 'throw') throw new Error(rq.result)
-        alertError(rq.result)
-        return text
+        return 'ERR::' + rq.result
     }
     if(rq.type === 'streaming' || rq.type === 'multiline'){
-        if (errorMode === 'throw') throw new Error('Unexpected response type')
-        alertError('Unexpected response type')
-        return text
+        return 'ERR::Unexpected response type'
     }
     const result = rq.result.replace(/<style-data style-index="(\d+)" ?\/?>/g, (match, p1) => {
         return styleDecodes[parseInt(p1)] ?? ''
