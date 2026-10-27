@@ -58,7 +58,7 @@ SectionEnd
     for (let index = 0; index < paths.length; index++) {
       assert.equal(readFileSync(join(directory, `display-${index}`), 'utf16le'), `${displayed[index]}\r\n${paths[index]}`);
     }
-  } finally { rmSync(directory, { recursive: true, force: true }); }
+  } finally { rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 import { readFileSync, mkdirSync, copyFileSync, symlinkSync, unlinkSync } from 'node:fs';
 
@@ -128,7 +128,7 @@ catch { $missingFailed = $true }
       replaced: 'replacement', successAttempts: 2, sharingFailures: 2,
       timeoutCode: 32, timeoutAttempts: 1, missingFailed: true, missingAttempts: 1,
     });
-  } finally { rmSync(directory, { recursive: true, force: true }); }
+  } finally { rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test('released uninstall validation selects exact previous sources and keeps the legacy baseline', { skip: process.platform !== 'win32' }, () => {
@@ -167,7 +167,7 @@ ConvertTo-Json -Depth 8 -InputObject $result
     assert.equal(resumablePrevious[0].directory, 'previous-bundle');
     assert.equal(resumablePrevious[2].directory, 'current-bundle');
     assert.equal(existsSync(join(resumablePrevious[1].directory, 'risunest-sync-bundle.json')), true);
-  } finally { rmSync(directory, { recursive: true, force: true }); }
+  } finally { rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 const q = value => value.replaceAll('$', '$$').replaceAll('"', '$\\"');
