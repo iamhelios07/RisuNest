@@ -80,6 +80,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          # Node 24 before 24.22.0 can enqueue into a cancelled web stream, which fails the web-export tests.
+          check-latest: true
       - uses: pnpm/action-setup@v4
       - run: pnpm install --frozen-lockfile
       - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
