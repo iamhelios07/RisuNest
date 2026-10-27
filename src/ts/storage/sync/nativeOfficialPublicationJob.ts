@@ -1,4 +1,4 @@
-import { runWithDeferredMobileBackgroundTask, runWithMobileBackgroundTask, measuredTaskPercent, type MobileBackgroundTask } from '../../mobileBackgroundTask'
+import { measuredTaskPercent } from '../../mobileBackgroundTask'
 import type { AccountStorage } from '../accountStorage'
 import {
     cancelNativeOfficialPublication,
@@ -54,20 +54,14 @@ function hasDrainedNativeOfficialPublicationCancellation(error: unknown): boolea
         && error.nativeOfficialPublicationCancellationDrained === true
 }
 
-/** A save starts an automatic publication, so it is protected only if the app leaves the screen while it runs. */
-function runPublication<T>(userInitiated: boolean | undefined, operation: (task: MobileBackgroundTask) => Promise<T>, signal?: AbortSignal): Promise<T> {
-    return userInitiated
-        ? runWithMobileBackgroundTask('sync', operation, signal, true)
-        : runWithDeferredMobileBackgroundTask('sync', operation, signal)
-}
-
 export function createNativeOfficialPublicationJobPublisher(
     dependencies: NativeOfficialPublicationJobDependencies,
 ): OfficialNativeDatabasePublisher {
     const runAttempt = dependencies.runAttempt ?? runNativeOfficialPublicationAttempt
     const continueAttempt = dependencies.continueAttempt ?? continueNativeOfficialPublication
     const cancelAttempt = dependencies.cancelAttempt ?? cancelNativeOfficialPublication
-    return async (input) => runPublication(input.userInitiated, async (background) => {
+    return async (input) => {
+        const { background } = input
         const recovered = await dependencies.reconcilePendingPublications?.({
             accountId: input.accountId,
             revision: input.revision,
@@ -182,7 +176,7 @@ export function createNativeOfficialPublicationJobPublisher(
             acknowledge: result.receipt.acknowledge,
             completeReload: result.completeReload,
         }
-    }, input.signal)
+    }
 }
 
 export interface NativeOfficialAssetPublisherDependencies {
@@ -201,47 +195,40 @@ export function createNativeOfficialAssetPublisher(
     const run = dependencies.run ?? runNativeOfficialAssetPublication
     return async (input) => {
         if (!hasNativePersistentRevisionLease(input.lease)) return false
-        return runPublication(input.userInitiated, async (background) => {
-            let remaining = input.assets
-            let settled = 0
-            const written = (key: string, replacementKey: string) => {
-                input.written(key, replacementKey)
-                background.progress(measuredTaskPercent(++settled, input.assets.length))
+        let remaining = input.assets
+        const result = await dependencies.account.writeOfficialDatabaseFromNative(async (context) => {
+            const outcome = await run({
+                baseUrl: dependencies.baseUrl,
+                credential: context.credential,
+                accountId: input.accountId,
+                lease: input.lease[nativePersistentRevisionLease],
+                session: context.session,
+                assets: remaining,
+            }, { signal: context.signal, guard: input.guard, written: input.written })
+            const unwritten = new Set(outcome.unwritten)
+            remaining = remaining.filter(asset => unwritten.has(asset.key))
+            if (outcome.cancelled) {
+                throw new DOMException('Official account asset publication was cancelled', 'AbortError')
             }
-            const result = await dependencies.account.writeOfficialDatabaseFromNative(async (context) => {
-                const outcome = await run({
-                    baseUrl: dependencies.baseUrl,
-                    credential: context.credential,
-                    accountId: input.accountId,
-                    lease: input.lease[nativePersistentRevisionLease],
-                    session: context.session,
-                    assets: remaining,
-                }, { signal: context.signal, guard: input.guard, written })
-                const unwritten = new Set(outcome.unwritten)
-                remaining = remaining.filter(asset => unwritten.has(asset.key))
-                if (outcome.cancelled) {
-                    throw new DOMException('Official account asset publication was cancelled', 'AbortError')
-                }
-                const reported = { session: outcome.session, warning: outcome.warning }
-                if (outcome.reason === 'reauthentication-needed') return { kind: 'reauthentication-needed', ...reported }
-                if (outcome.reason === 'auth-warning') return { kind: 'auth-warning', ...reported }
-                return {
-                    kind: 'written',
-                    ...reported,
-                    replacementKey: '',
-                    reloadSession: outcome.reloadSession,
-                    receipt: outcome,
-                }
-            }, { signal: background.signal })
-            if (result === null) return false
-            if (result.kind === 'auth-warning') {
-                throw new Error('Official account authorization warning while writing assets')
+            const reported = { session: outcome.session, warning: outcome.warning }
+            if (outcome.reason === 'reauthentication-needed') return { kind: 'reauthentication-needed', ...reported }
+            if (outcome.reason === 'auth-warning') return { kind: 'auth-warning', ...reported }
+            return {
+                kind: 'written',
+                ...reported,
+                replacementKey: '',
+                reloadSession: outcome.reloadSession,
+                receipt: outcome,
             }
-            await result.completeReload()
-            if (result.receipt.reason || remaining.length > 0) {
-                throw new Error('Official account asset publication did not complete')
-            }
-            return true
-        }, input.signal)
+        }, { signal: input.background.signal })
+        if (result === null) return false
+        if (result.kind === 'auth-warning') {
+            throw new Error('Official account authorization warning while writing assets')
+        }
+        await result.completeReload()
+        if (result.receipt.reason || remaining.length > 0) {
+            throw new Error('Official account asset publication did not complete')
+        }
+        return true
     }
 }
