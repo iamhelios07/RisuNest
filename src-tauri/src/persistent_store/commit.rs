@@ -861,6 +861,7 @@ pub(super) fn replace_put_character_detail(
         &transaction,
         staging_id,
         detail,
+        None,
         configured_index,
         conversation_count,
     )?;
@@ -2077,6 +2078,7 @@ pub(super) fn put_character_detail(
         transaction,
         generation,
         detail,
+        None,
         configured_index,
         conversation_count,
     )
@@ -2120,11 +2122,11 @@ fn put_full_character(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let detail = without_field(character, "chats")?;
     put_character_records(
         transaction,
         generation,
-        &detail,
+        character,
+        Some("chats"),
         configured_index,
         chats.len() as i64,
     )?;
@@ -2144,6 +2146,7 @@ fn put_character_records(
     transaction: &Transaction<'_>,
     generation: &str,
     detail: &Value,
+    omitted: Option<&str>,
     configured_index: i64,
     conversation_count: i64,
 ) -> StoreResult<()> {
@@ -2190,7 +2193,7 @@ fn put_character_records(
             character_type,
             creator_notes,
             trash_time,
-            serde_json::to_string(detail)?,
+            serde_json::to_string(&WithoutField(object, omitted))?,
         ],
     )?;
     Ok(())
@@ -2785,6 +2788,15 @@ fn without_field(value: &Value, field: &str) -> StoreResult<Value> {
     let mut object = object(value, "JSON object")?.clone();
     object.shift_remove(field);
     Ok(Value::Object(object))
+}
+
+// Serializes the same text as `without_field` without copying the object.
+struct WithoutField<'a>(&'a Map<String, Value>, Option<&'a str>);
+
+impl Serialize for WithoutField<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().filter(|(key, _)| Some(key.as_str()) != self.1))
+    }
 }
 
 #[cfg(test)]
