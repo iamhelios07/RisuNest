@@ -75,6 +75,7 @@ pub(crate) fn restore_official_snapshot(
             base_bytes: downloaded_bytes,
             total_bytes: Some(downloaded_bytes * 2),
             spool_directory: Some(owned_directory.to_path_buf()),
+            cold_payloads: Some(sink.cold.items_read()),
             ..Default::default()
         },
     )
@@ -1254,6 +1255,7 @@ mod tests {
             {"id": "chat-2", "name": "Missing", "message": [{"role": "char", "data": "\u{ef01}COLDSTORAGE\u{ef01}cold-missing"}]}
         ]}});
         let chat = serde_json::json!({"message": messages});
+        let block_count = blocks.len() as u64;
         let restore = restore_from_account(blocks, move |key| match key {
             "cold-character" => response("200 OK", "", &cold_item(&character, "gzip")),
             "cold-chat" => response("200 OK", "", &cold_item(&chat, "zlib")),
@@ -1264,6 +1266,9 @@ mod tests {
 
         let result = restore.outcome.unwrap();
         assert_eq!(result.warning_codes, ["unavailable-cold-payloads:1", "missing-backup-data:1", "damaged-plugin-storage:1"]);
+        // Each item read counts with the blocks: the character and chat while the
+        // blocks are read, and the plugin value once `staging-database` has begun.
+        assert_eq!(restore.job.status().progress.completed_items, block_count + 3);
         let preview = restore.job.status().incomplete_restore_preview.unwrap();
         assert_eq!(preview.unavailable_cold_keys, ["cold-missing"]);
         assert_eq!(preview.character_names, ["Expanded"]);

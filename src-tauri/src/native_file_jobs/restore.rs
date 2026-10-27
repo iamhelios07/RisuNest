@@ -22,6 +22,8 @@ use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
 const LEGACY_RISU_SAVE_PREFIX: &[u8] = b"\0RISUSAVE\0";
@@ -188,6 +190,8 @@ pub(crate) struct RestoreProgressScale {
     pub(crate) total_bytes: Option<u64>,
     /// Keeps the top-level item counter at this value instead of counting blocks.
     pub(crate) fixed_items: Option<(u64, Option<u64>)>,
+    /// Cold payloads the sink has read from outside the source, counted with the blocks.
+    pub(crate) cold_payloads: Option<Arc<AtomicU64>>,
     /// Counters gathered before the database read, carried into every report.
     pub(crate) counts: ImportCounts,
 }
@@ -1550,6 +1554,7 @@ fn parse_and_stage<R: Read>(
             if markers != 0 { job.record_restore_omission("pluginStorage", markers).map_err(|error| job_error(job, error))?; }
         } else if cold_plugin_storage::references(pointer.as_ref(), legacy.as_ref()) {
             cold_plugin_storage::import(storage, pointer, legacy, sink, job, limits)?;
+            reader.report_progress()?;
         }
     }
     if let Some(meta) = plugin_storage_meta {
@@ -2728,7 +2733,10 @@ impl<'a, R: Read> TrackedReader<'a, R> {
         let total = self.scale.total_bytes.unwrap_or(self.total);
         let (completed_items, total_items) = match self.scale.fixed_items {
             Some((completed, total)) => (completed, total),
-            None => (self.completed_items, None),
+            None => {
+                let cold = self.scale.cold_payloads.as_ref().map_or(0, |count| count.load(Ordering::Acquire));
+                (self.completed_items.saturating_add(cold), None)
+            }
         };
         JobProgress {
             completed_bytes: self
@@ -2744,9 +2752,7 @@ impl<'a, R: Read> TrackedReader<'a, R> {
 
     /// Reports the byte-level database read under the current stage.
     fn report(&mut self) -> Result<(), NativeJobError> {
-        self.job
-            .set_progress(self.top_level_progress())
-            .map_err(|error| job_error(self.job, error))?;
+        self.report_progress()?;
         self.job
             .set_detail(JobDetail::new(
                 self.stage,
@@ -2755,6 +2761,14 @@ impl<'a, R: Read> TrackedReader<'a, R> {
                 Some(self.total),
                 self.counts.clone(),
             ))
+            .map_err(|error| job_error(self.job, error))
+    }
+
+    /// Reports the top-level counters alone, for cold payloads read after the
+    /// database bytes, so the item stage keeps its detail.
+    fn report_progress(&self) -> Result<(), NativeJobError> {
+        self.job
+            .set_progress(self.top_level_progress())
             .map_err(|error| job_error(self.job, error))
     }
 
