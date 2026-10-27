@@ -218,6 +218,7 @@ impl<'a> LegacyRestoreProgress<'a> {
             base_bytes: state.read_bytes.saturating_add(state.prepared_bytes),
             total_bytes: Some(self.budget()),
             fixed_items: Some((state.counts.entries_read, state.counts.entries_total)),
+            cold_payloads: None,
             counts: state.counts.clone(),
         }
     }

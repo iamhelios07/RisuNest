@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read as _, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +24,8 @@ pub(crate) struct ColdSource<'a> {
     job: &'a JobControl,
     limit: u64,
     state: Mutex<State>,
+    /// Items read and handed to staging, which the restore counts as progress.
+    items_read: Arc<AtomicU64>,
 }
 
 struct State {
@@ -61,7 +64,13 @@ impl<'a> ColdSource<'a> {
             job,
             limit,
             state: Mutex::new(State { scheduler, sequence: 0, previous: None, unavailable: HashMap::new(), fatal: None }),
+            items_read: Arc::default(),
         })
+    }
+
+    /// The count of items read so far, for the restore's progress.
+    pub(crate) fn items_read(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.items_read)
     }
 
     /// The inflated item, or `None` when the account holds no readable item for
@@ -123,6 +132,7 @@ impl<'a> ColdSource<'a> {
             match (state.scheduler.finish(attempt, exchange, super::now_ms()), fetched) {
                 (Outcome::Install, Some(Fetched::Present)) => {
                     state.previous = Some(path.clone());
+                    self.items_read.fetch_add(1, Ordering::AcqRel);
                     return Ok(Some(path));
                 }
                 (Outcome::Install, Some(Fetched::Unavailable(reason))) => {
