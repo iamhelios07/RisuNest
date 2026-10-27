@@ -201,40 +201,47 @@ export function createNativeOfficialAssetPublisher(
     const run = dependencies.run ?? runNativeOfficialAssetPublication
     return async (input) => {
         if (!hasNativePersistentRevisionLease(input.lease)) return false
-        let remaining = input.assets
-        const result = await dependencies.account.writeOfficialDatabaseFromNative(async (context) => {
-            const outcome = await run({
-                baseUrl: dependencies.baseUrl,
-                credential: context.credential,
-                accountId: input.accountId,
-                lease: input.lease[nativePersistentRevisionLease],
-                session: context.session,
-                assets: remaining,
-            }, { signal: context.signal, guard: input.guard, written: input.written })
-            const unwritten = new Set(outcome.unwritten)
-            remaining = remaining.filter(asset => unwritten.has(asset.key))
-            if (outcome.cancelled) {
-                throw new DOMException('Official account asset publication was cancelled', 'AbortError')
+        return runPublication(input.userInitiated, async (background) => {
+            let remaining = input.assets
+            let settled = 0
+            const written = (key: string, replacementKey: string) => {
+                input.written(key, replacementKey)
+                background.progress(measuredTaskPercent(++settled, input.assets.length))
             }
-            const reported = { session: outcome.session, warning: outcome.warning }
-            if (outcome.reason === 'reauthentication-needed') return { kind: 'reauthentication-needed', ...reported }
-            if (outcome.reason === 'auth-warning') return { kind: 'auth-warning', ...reported }
-            return {
-                kind: 'written',
-                ...reported,
-                replacementKey: '',
-                reloadSession: outcome.reloadSession,
-                receipt: outcome,
+            const result = await dependencies.account.writeOfficialDatabaseFromNative(async (context) => {
+                const outcome = await run({
+                    baseUrl: dependencies.baseUrl,
+                    credential: context.credential,
+                    accountId: input.accountId,
+                    lease: input.lease[nativePersistentRevisionLease],
+                    session: context.session,
+                    assets: remaining,
+                }, { signal: context.signal, guard: input.guard, written })
+                const unwritten = new Set(outcome.unwritten)
+                remaining = remaining.filter(asset => unwritten.has(asset.key))
+                if (outcome.cancelled) {
+                    throw new DOMException('Official account asset publication was cancelled', 'AbortError')
+                }
+                const reported = { session: outcome.session, warning: outcome.warning }
+                if (outcome.reason === 'reauthentication-needed') return { kind: 'reauthentication-needed', ...reported }
+                if (outcome.reason === 'auth-warning') return { kind: 'auth-warning', ...reported }
+                return {
+                    kind: 'written',
+                    ...reported,
+                    replacementKey: '',
+                    reloadSession: outcome.reloadSession,
+                    receipt: outcome,
+                }
+            }, { signal: background.signal })
+            if (result === null) return false
+            if (result.kind === 'auth-warning') {
+                throw new Error('Official account authorization warning while writing assets')
             }
-        }, { signal: input.signal })
-        if (result === null) return false
-        if (result.kind === 'auth-warning') {
-            throw new Error('Official account authorization warning while writing assets')
-        }
-        await result.completeReload()
-        if (result.receipt.reason || remaining.length > 0) {
-            throw new Error('Official account asset publication did not complete')
-        }
-        return true
+            await result.completeReload()
+            if (result.receipt.reason || remaining.length > 0) {
+                throw new Error('Official account asset publication did not complete')
+            }
+            return true
+        }, input.signal)
     }
 }

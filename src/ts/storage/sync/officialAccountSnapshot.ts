@@ -156,6 +156,7 @@ export interface OfficialNativeAssetPublicationInput {
     lease: PersistentRevisionLease
     assets: readonly { key: string; localKey: string }[]
     signal?: AbortSignal
+    userInitiated?: boolean
     /** Throws once the publication no longer belongs to the signed-in account. */
     guard(): Promise<void>
     /** The account now holds `key` under `replacementKey`. */
@@ -441,6 +442,7 @@ class OfficialPinnedPublication implements PinnedPublication {
                 lease: this.lease,
                 assets: uploads.map(({ key, localKey }) => ({ key, localKey })),
                 signal,
+                userInitiated: this.options.userInitiated,
                 guard: async () => this.assertAccountCurrent(),
                 // The ledger follows the signed-in account, so a write settled after a switch is not recorded.
                 written: (key, replacementKey) => {

@@ -555,20 +555,35 @@ it('uses indeterminate mobile progress for reauthentication retries and forwards
     } finally { lease.mockRestore() }
 })
 
-it('holds a user-started publication immediately and a save-driven one only once the app leaves the screen', async () => {
+it('holds a user-started database or asset publication immediately and a save-driven one only once the app leaves the screen', async () => {
     const deferredHold = vi.spyOn(mobileTasks, 'runWithDeferredMobileBackgroundTask')
     const immediateHold = vi.spyOn(mobileTasks, 'runWithMobileBackgroundTask')
     try {
-        const publish = createNativeOfficialPublicationJobPublisher({
+        const publishDatabase = createNativeOfficialPublicationJobPublisher({
             ...accountHarness(), baseUrl: 'https://hub.invalid',
             runAttempt: async () => ({ kind: 'completed', receipt: receipt({ kind: 'written', accountId: 'account-1', session: 'session-1', saveDate: 'date', status: 200, replacementKey: 'database/database.bin', warning: null, reloadSession: false }) }),
         })
-        await publish({ revision: 7, accountId: 'account-1', lease: pinnedLease(), resourceReplacements: {} })
-        expect(deferredHold).toHaveBeenCalledExactlyOnceWith('sync', expect.any(Function), undefined)
-        expect(immediateHold).not.toHaveBeenCalled()
-        await publish({ revision: 8, accountId: 'account-1', lease: pinnedLease(), resourceReplacements: {}, userInitiated: true })
-        expect(immediateHold).toHaveBeenCalledExactlyOnceWith('sync', expect.any(Function), undefined, true)
-        expect(deferredHold).toHaveBeenCalledOnce()
+        const publishAssets = createNativeOfficialAssetPublisher({
+            ...accountHarness(), baseUrl: 'https://hub.invalid',
+            run: async () => ({ cancelled: false, failed: 0, session: 'session-2', warning: null, reloadSession: false, unwritten: [] }),
+        })
+        const publications = [
+            (userInitiated?: boolean) => publishDatabase({ revision: 7, accountId: 'account-1', lease: pinnedLease(), resourceReplacements: {}, userInitiated }),
+            (userInitiated?: boolean) => publishAssets({
+                accountId: 'account-1', lease: pinnedLease(), assets: [{ key: 'assets/a.png', localKey: 'assets/a.png' }],
+                guard: async () => {}, written: () => {}, userInitiated,
+            }),
+        ]
+        for (const publish of publications) {
+            deferredHold.mockClear()
+            immediateHold.mockClear()
+            await publish()
+            expect(deferredHold).toHaveBeenCalledExactlyOnceWith('sync', expect.any(Function), undefined)
+            expect(immediateHold).not.toHaveBeenCalled()
+            await publish(true)
+            expect(immediateHold).toHaveBeenCalledExactlyOnceWith('sync', expect.any(Function), undefined, true)
+            expect(deferredHold).toHaveBeenCalledOnce()
+        }
     } finally {
         deferredHold.mockRestore()
         immediateHold.mockRestore()
@@ -624,9 +639,14 @@ describe('native official asset publisher', () => {
         const harness = accountHarness()
         const written = vi.fn()
         const guard = vi.fn(async () => {})
+        const progress = vi.fn()
+        const hold = vi.spyOn(mobileTasks, 'runWithDeferredMobileBackgroundTask').mockImplementationOnce(async (_kind, operation, signal) => operation({ signal, progress, dispose: async () => {} }))
         const publish = createNativeOfficialAssetPublisher({ ...harness, baseUrl: 'https://hub.invalid', run })
 
-        await expect(publish({ accountId: 'account-1', lease: pinnedLease(), assets, guard, written })).resolves.toBe(true)
+        try {
+            await expect(publish({ accountId: 'account-1', lease: pinnedLease(), assets, guard, written })).resolves.toBe(true)
+        } finally { hold.mockRestore() }
+        expect(progress.mock.calls).toEqual([[50], [100]])
 
         expect(invoke).toHaveBeenCalledWith('native_file_job_start', { request: {
             kind: 'publish-official-account-assets',

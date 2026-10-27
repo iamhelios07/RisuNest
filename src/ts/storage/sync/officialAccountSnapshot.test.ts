@@ -421,7 +421,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             accountId: 'account-1', nativeDatabasePublisher, nativeAssetPublisher,
             flushPublicationMetadata: vi.fn(async () => {}),
         })
-        const publication = await harness.adapter.pin(harness.imported.revision)
+        const publication = await harness.adapter.pin(harness.imported.revision, { userInitiated: true })
 
         await expect(publication.publish()).rejects.toThrow('synthetic asset write failure')
         const [first] = nativeAssetPublisher.mock.calls[0][0].assets
@@ -435,6 +435,8 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(nativeDatabasePublisher.mock.calls[0][0].resourceReplacements).toEqual(
             Object.fromEntries(interrupted.map(asset => [asset.key, `native/${asset.key}`])),
         )
+        expect([...nativeAssetPublisher.mock.calls, ...nativeDatabasePublisher.mock.calls].map(([input]) => input.userInitiated))
+            .toEqual([true, true, true])
         expect(harness.writeItem).not.toHaveBeenCalled()
         await publication.dispose()
     })
