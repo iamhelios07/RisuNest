@@ -31,14 +31,16 @@ node benchmarks/legacy-restore/resource-fixtures.mjs encrypted-database 100 .tmp
 node benchmarks/legacy-restore/resource-fixtures.mjs attachment 100 .tmp/attachment-100
 node benchmarks/legacy-restore/resource-fixtures.mjs record 1 .tmp/record-1
 node benchmarks/legacy-restore/resource-fixtures.mjs assets 64 .tmp/assets-64
+node benchmarks/legacy-restore/resource-fixtures.mjs messages 100000 .tmp/messages-100000
 cargo test --manifest-path src-tauri/Cargo.toml --lib --locked --no-run
 node benchmarks/legacy-restore/resource-measure.mjs <compiled-test-executable> .tmp/encrypted-100/manifest.json .tmp/attachment-100/manifest.json .tmp/record-1/manifest.json
 ```
 
 Use new fixture directories. Database and attachment cases accept 100, 300 and
 600 decimal MB; record cases accept 1, 8 and 32 MiB; asset-count cases accept
-64 and 256 assets of 96 KiB each. Pass their manifest to the same measurement
-runner. Each native case runs in a
+64 and 256 assets of 96 KiB each; the message-count case accepts 100,000
+messages of 512 bytes, 1,000 per conversation, in a block RisuSave database.
+Pass their manifest to the same measurement runner. Each native case runs in a
 fresh process, authenticates synthetic ciphertext when applicable, replaces a
 real persistent store, and verifies every conversation and attachment payload.
 Only the account-key request is replaced by a synthetic key. The attachment
