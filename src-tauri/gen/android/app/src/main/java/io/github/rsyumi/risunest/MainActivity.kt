@@ -626,6 +626,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       AndroidSafAtomicPublisher,
     )
   }
+  private val safDestinationReceipts by lazy {
+    SafDestinationReceiptStore(File(filesDir, "native-file-jobs/android-saf-receipts"), AndroidSafAtomicPublisher)
+  }
   private val safDestinationPicker = registerForActivityResult(
     object : ActivityResultContracts.CreateDocument("application/octet-stream") {
       override fun createIntent(context: Context, input: String): Intent =
@@ -1462,6 +1465,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           )
           withContext(Dispatchers.IO) {
             synchronized(safDestinationStateLock) {
+              keepRecoveredSafReceipt(loadSafDestinationState(), requestId, safDestinationRendererSession, safDestinationReceipts)
               saveSafDestinationState(state)
               safDestinationRendererSession.own(requestId, rendererGeneration)
             }
@@ -1605,7 +1609,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
     fun acknowledgeExport(requestId: String): Boolean = synchronized(safDestinationStateLock) {
       if (safDestinationRendererSession.hasRecovered(requestId)) {
-        return@synchronized safDestinationRendererSession.acknowledge(requestId, loadSafDestinationState(), ::clearSafDestinationState)
+        return@synchronized runCatching { safDestinationReceipts.clear(requestId) }.getOrDefault(false) &&
+          safDestinationRendererSession.acknowledge(requestId, loadSafDestinationState(), ::clearSafDestinationState)
       }
       acknowledgeSafDestinationExport(
         requestId,
@@ -2038,24 +2043,27 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   private suspend fun reconcileSafDestination() {
-    val record = withContext(Dispatchers.IO) {
+    val records = withContext(Dispatchers.IO) {
       synchronized(safDestinationStateLock) {
-        val current = loadSafDestinationState() ?: return@synchronized null
-        runCatching {
-          safDestinationRendererSession.reconcile(
-            current,
-            System.currentTimeMillis(),
-            ::saveSafDestinationState,
-            { terminal -> !terminal.exportBound || !terminal.copyStarted ||
-              prepareRecoveredRisuSaveAcknowledgement(filesDir, terminal.exportId) },
-            requiresPublicationProof = { terminal ->
-              requiresRisuSavePublicationProof(filesDir, terminal.exportId, terminal.sourceKind)
-            },
-          )
-        }.onFailure { Log.e(TAG, "Android SAF recovery failed", it) }.getOrNull()
+        fun recover(record: SafDestinationRecord, save: (SafDestinationRecord) -> Unit) =
+          runCatching {
+            safDestinationRendererSession.reconcile(
+              record,
+              System.currentTimeMillis(),
+              save,
+              { terminal -> !terminal.exportBound || !terminal.copyStarted ||
+                prepareRecoveredRisuSaveAcknowledgement(filesDir, terminal.exportId) },
+              requiresPublicationProof = { terminal ->
+                requiresRisuSavePublicationProof(filesDir, terminal.exportId, terminal.sourceKind)
+              },
+            )
+          }.onFailure { Log.e(TAG, "Android SAF recovery failed", it) }.getOrNull()
+        runCatching { safDestinationReceipts.loadAll() }.getOrDefault(emptyList())
+          .mapNotNull { recover(it, safDestinationReceipts::save) } +
+          listOfNotNull(loadSafDestinationState()?.let { recover(it, ::saveSafDestinationState) })
       }
     }
-    record?.let { dispatchSafDestination(it, destinationMessage(it)) }
+    for (record in records) dispatchSafDestination(record, destinationMessage(record))
   }
 
   private suspend fun finalizeSafDestination(
