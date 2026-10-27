@@ -81,7 +81,7 @@ import {
 import { observePersistentSaveChanges } from './storage/persistentSaveObserver.svelte';
 import { backgroundErrorMessage } from './storage/backgroundErrorMessage';
 import { configureBlobStoreStorageProvider, readBlobForFacade, resolveBlobStore, subscribeNativeMediaEndpointChanges } from "./storage/platformBlobStore";
-import { inferBlobMime } from "./storage/blobStore";
+import { inferBlobMime, type BlobReadOptions } from "./storage/blobStore";
 import { selectAssetSourceRoute } from "./storage/assetSourceRoute";
 import { noteMissingAssetBody, trackAssetBodyArrival } from "./storage/assetBodyArrival.svelte";
 import { readActiveAsset, storeActiveAsset } from "./storage/accountAssetAccess";
@@ -365,16 +365,17 @@ export async function getFileSrc(loc: string) {
  * Reads an image file and returns its data.
  * 
  * @param {string} data - The path to the image file.
+ * @param {BlobReadOptions} [options] - How a stored asset is read.
  * @returns {Promise<Uint8Array>} - A promise that resolves to the data of the image file.
  */
-export async function readImage(data: string) {
+export async function readImage(data: string, options?: BlobReadOptions) {
     if (!isTauri) await forageStorage.Init()
     const isAsset = data.startsWith('assets/') && data.length > 'assets/'.length
     if (isAsset) {
         return await readActiveAsset(await resolveBlobStore(), data, {
             officialAccount: forageStorage.isAccount,
             tauri: isTauri,
-        })
+        }, options)
     }
     if (isTauri) {
         if (data.startsWith('assets')) {
