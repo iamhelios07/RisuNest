@@ -4069,11 +4069,14 @@ fn validate_detail_transition(
     if next.stage < previous.stage {
         return Err("native job stage cannot move backwards".to_owned());
     }
+    // A stage total may become unknown, as when a restore starts reading
+    // payloads of unknown size, but it never changes to another value.
     if next.stage == previous.stage
         && (next.stage_completed < previous.stage_completed
             || previous
                 .stage_total
-                .is_some_and(|total| next.stage_total != Some(total)))
+                .zip(next.stage_total)
+                .is_some_and(|(before, after)| before != after))
     {
         return Err("native job stage progress is invalid or non-monotonic".to_owned());
     }

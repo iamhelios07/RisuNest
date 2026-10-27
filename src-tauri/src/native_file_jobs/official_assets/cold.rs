@@ -4,7 +4,7 @@
 use super::download::{latin1_header, AccountReader};
 use super::scheduler::{Exchange, Outcome, Pause, Scheduler, Settled, StopReason};
 use crate::native_file_jobs::official_snapshot::{await_network_operation, OfficialSnapshotCredential, NETWORK_IDLE_TIMEOUT};
-use crate::native_file_jobs::restore::{is_zlib_header, ColdPayloadUnavailable};
+use crate::native_file_jobs::restore::{is_zlib_header, report_cold_payload_bytes, ColdPayloadProgress, ColdPayloadUnavailable};
 use crate::native_file_jobs::{JobControl, NativeJobError};
 use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, RETRY_AFTER};
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read as _, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,8 +24,8 @@ pub(crate) struct ColdSource<'a> {
     job: &'a JobControl,
     limit: u64,
     state: Mutex<State>,
-    /// Items read and handed to staging, which the restore counts as progress.
-    items_read: Arc<AtomicU64>,
+    /// Items handed to staging and bytes received, which the restore counts as progress.
+    progress: Arc<ColdPayloadProgress>,
 }
 
 struct State {
@@ -64,13 +64,13 @@ impl<'a> ColdSource<'a> {
             job,
             limit,
             state: Mutex::new(State { scheduler, sequence: 0, previous: None, unavailable: HashMap::new(), fatal: None }),
-            items_read: Arc::default(),
+            progress: Arc::default(),
         })
     }
 
-    /// The count of items read so far, for the restore's progress.
-    pub(crate) fn items_read(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.items_read)
+    /// What has been read so far, for the restore's progress.
+    pub(crate) fn progress(&self) -> Arc<ColdPayloadProgress> {
+        Arc::clone(&self.progress)
     }
 
     /// The inflated item, or `None` when the account holds no readable item for
@@ -121,6 +121,7 @@ impl<'a> ColdSource<'a> {
             };
             state.sequence += 1;
             let path = self.reader.directory.join(format!("cold-{}.json", state.sequence));
+            let received = self.progress.bytes.load(Ordering::Acquire);
             let (exchange, fetched) = match tauri::async_runtime::block_on(self.read(key, &path)) {
                 Read::Cancelled => {
                     state.scheduler.abandon(attempt);
@@ -129,10 +130,14 @@ impl<'a> ColdSource<'a> {
                 Read::Body(fetched) => (Exchange::Body, Some(fetched)),
                 Read::Ended(exchange) => (exchange, None),
             };
+            let received = self.progress.bytes.load(Ordering::Acquire) - received;
+            if received != 0 {
+                report_cold_payload_bytes(self.job, received)?;
+            }
             match (state.scheduler.finish(attempt, exchange, super::now_ms()), fetched) {
                 (Outcome::Install, Some(Fetched::Present)) => {
                     state.previous = Some(path.clone());
-                    self.items_read.fetch_add(1, Ordering::AcqRel);
+                    self.progress.items.fetch_add(1, Ordering::AcqRel);
                     return Ok(Some(path));
                 }
                 (Outcome::Install, Some(Fetched::Unavailable(reason))) => {
@@ -225,6 +230,7 @@ impl<'a> ColdSource<'a> {
                 Err(read) => return read,
             };
             received += chunk.len() as u64;
+            self.progress.bytes.fetch_add(chunk.len() as u64, Ordering::AcqRel);
             if received > self.limit {
                 return Read::Body(Fetched::Unavailable(ColdPayloadUnavailable::TooLarge));
             }

@@ -75,7 +75,7 @@ pub(crate) fn restore_official_snapshot(
             base_bytes: downloaded_bytes,
             total_bytes: Some(downloaded_bytes * 2),
             spool_directory: Some(owned_directory.to_path_buf()),
-            cold_payloads: Some(sink.cold.items_read()),
+            cold_payloads: Some(sink.cold.progress()),
             ..Default::default()
         },
     )
@@ -1223,21 +1223,30 @@ mod tests {
         job: std::sync::Arc<JobControl>,
         outcome: Result<JobResultSummary, NativeJobError>,
         cold_reads: Vec<String>,
+        /// The job's detail as each cold item read arrived, by key.
+        cold_read_details: Vec<(String, Option<JobDetail>)>,
     }
 
     /// Restores `blocks` as the account snapshot while `cold` answers each cold
     /// item read by its key.
     fn restore_from_account(blocks: Vec<Vec<u8>>, cold: impl Fn(&str) -> Vec<u8> + Send + 'static) -> AccountRestore {
         let snapshot = restore::tests::save_bytes(blocks);
-        let (base_url, requests) = account_server(move |path, key| {
-            if path == "/hub/account/coldstorage" { cold(key) } else { response("200 OK", "", &snapshot) }
+        let job = JobRegistry::default().create(JobKind::RestoreOfficialAccountSnapshot).unwrap();
+        let details = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base_url, requests) = account_server({
+            let (job, details) = (job.clone(), details.clone());
+            move |path, key| {
+                if path != "/hub/account/coldstorage" { return response("200 OK", "", &snapshot) }
+                details.lock().unwrap().push((key.to_owned(), job.status().detail));
+                cold(key)
+            }
         });
         let (directory, sink) = restore::tests::fixture();
         let owned = TempDir::new().unwrap();
-        let job = JobRegistry::default().create(JobKind::RestoreOfficialAccountSnapshot).unwrap();
         let outcome = restore_official_snapshot(request(base_url), 1, owned.path(), &job, &sink);
         let cold_reads = requests.lock().unwrap().iter().filter(|head| head.contains(" /hub/account/coldstorage ")).cloned().collect();
-        AccountRestore { _directory: directory, sink, job, outcome, cold_reads }
+        let cold_read_details = details.lock().unwrap().clone();
+        AccountRestore { _directory: directory, sink, job, outcome, cold_reads, cold_read_details }
     }
 
     #[test]
@@ -1256,8 +1265,10 @@ mod tests {
         ]}});
         let chat = serde_json::json!({"message": messages});
         let block_count = blocks.len() as u64;
+        let character = cold_item(&character, "gzip");
+        let character_bytes = character.len() as u64;
         let restore = restore_from_account(blocks, move |key| match key {
-            "cold-character" => response("200 OK", "", &cold_item(&character, "gzip")),
+            "cold-character" => response("200 OK", "", &character),
             "cold-chat" => response("200 OK", "", &cold_item(&chat, "zlib")),
             "cold-null" => response("200 OK", "", &cold_item(&Value::Null, "deflate")),
             "cold-flaky" => response("503 Service Unavailable", "Retry-After: 0\r\n", b""),
@@ -1269,6 +1280,13 @@ mod tests {
         // Each item read counts with the blocks: the character and chat while the
         // blocks are read, and the plugin value once `staging-database` has begun.
         assert_eq!(restore.job.status().progress.completed_items, block_count + 3);
+        // The character's chats are read within its block, and the database read
+        // moves by the character's bytes, its total unknown from then on.
+        let detail_at = |key: &str| restore.cold_read_details.iter().find(|(read, _)| read == key).and_then(|(_, detail)| detail.clone()).unwrap();
+        let (before, after) = (detail_at("cold-character"), detail_at("cold-chat"));
+        assert_eq!(before.stage, JobStage::ReadingDatabase);
+        assert!(before.stage_total.is_some());
+        assert_eq!((after.stage, after.stage_completed, after.stage_total), (before.stage, before.stage_completed + character_bytes, None));
         let preview = restore.job.status().incomplete_restore_preview.unwrap();
         assert_eq!(preview.unavailable_cold_keys, ["cold-missing"]);
         assert_eq!(preview.character_names, ["Expanded"]);

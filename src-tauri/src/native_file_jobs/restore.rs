@@ -191,9 +191,29 @@ pub(crate) struct RestoreProgressScale {
     /// Keeps the top-level item counter at this value instead of counting blocks.
     pub(crate) fixed_items: Option<(u64, Option<u64>)>,
     /// Cold payloads the sink has read from outside the source, counted with the blocks.
-    pub(crate) cold_payloads: Option<Arc<AtomicU64>>,
+    pub(crate) cold_payloads: Option<Arc<ColdPayloadProgress>>,
     /// Counters gathered before the database read, carried into every report.
     pub(crate) counts: ImportCounts,
+}
+
+/// What a sink has read from outside the source: items count with the blocks and
+/// bytes with the database read.
+#[derive(Debug, Default)]
+pub(crate) struct ColdPayloadProgress {
+    pub(crate) items: AtomicU64,
+    pub(crate) bytes: AtomicU64,
+}
+
+/// Reports cold payload bytes read while the database read waits for the sink,
+/// so a block with many references keeps moving. The read's detail then has no
+/// known total, matching what the reader reports next.
+pub(crate) fn report_cold_payload_bytes(job: &JobControl, bytes: u64) -> Result<(), NativeJobError> {
+    let Some(mut detail) = job.status().detail.filter(|detail| detail.stage_unit == StageUnit::Bytes) else {
+        return Ok(());
+    };
+    detail.stage_completed = detail.stage_completed.saturating_add(bytes);
+    detail.stage_total = None;
+    job.set_detail(detail).map_err(|error| job_error(job, error))
 }
 
 pub(crate) fn restore_block_risu_save(
@@ -2752,7 +2772,7 @@ impl<'a, R: Read> TrackedReader<'a, R> {
         let (completed_items, total_items) = match self.scale.fixed_items {
             Some((completed, total)) => (completed, total),
             None => {
-                let cold = self.scale.cold_payloads.as_ref().map_or(0, |count| count.load(Ordering::Acquire));
+                let cold = self.scale.cold_payloads.as_ref().map_or(0, |cold| cold.items.load(Ordering::Acquire));
                 (self.completed_items.saturating_add(cold), None)
             }
         };
@@ -2771,12 +2791,14 @@ impl<'a, R: Read> TrackedReader<'a, R> {
     /// Reports the byte-level database read under the current stage.
     fn report(&mut self) -> Result<(), NativeJobError> {
         self.report_progress()?;
+        let cold = self.scale.cold_payloads.as_ref().map_or(0, |cold| cold.bytes.load(Ordering::Acquire));
         self.job
             .set_detail(JobDetail::new(
                 self.stage,
                 StageUnit::Bytes,
-                self.completed,
-                Some(self.total),
+                self.completed.saturating_add(cold),
+                // Cold payloads not read yet have no known size.
+                (cold == 0).then_some(self.total),
                 self.counts.clone(),
             ))
             .map_err(|error| job_error(self.job, error))
