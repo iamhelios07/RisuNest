@@ -758,7 +758,7 @@ fn stream_legacy_characters<S: TrackedSource>(
         let start = decoded_position(input);
         let packed = rmpv::decode::read_value_with_max_depth(input, LEGACY_CHARACTER_DEPTH)
             .map_err(|error| messagepack_error(error, job))?;
-        let bytes = decoded_position(input) - start;
+        let bytes = (decoded_position(input) - start).saturating_add(binary_json_growth(&packed));
         let mut character = match messagepack_to_json(packed, job)? {
             JsonSlot::Value(value) => value,
             JsonSlot::Undefined => Value::Null,
@@ -1062,6 +1062,22 @@ fn legacy_chat_id(value: Option<&Value>) -> Option<String> {
         Value::String(id) => Some(id.clone()),
         Value::Number(id) => Some(id.to_string()),
         _ => None,
+    }
+}
+
+// Each `bin` byte at index i becomes `"i":byte,` once converted, so a batch
+// charges that JSON text rather than the one MessagePack byte.
+fn binary_json_growth(value: &MessagePackValue) -> u64 {
+    let digits = |value: usize| u64::from(value.checked_ilog10().unwrap_or(0)) + 1;
+    match value {
+        MessagePackValue::Binary(bytes) => bytes
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| digits(index) + digits(usize::from(*byte)) + 3)
+            .sum(),
+        MessagePackValue::Array(values) => values.iter().map(binary_json_growth).sum(),
+        MessagePackValue::Map(entries) => entries.iter().map(|(_, value)| binary_json_growth(value)).sum(),
+        _ => 0,
     }
 }
 
